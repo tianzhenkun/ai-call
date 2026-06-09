@@ -1,0 +1,108 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.pytest-cache/
+# 临时 pytest 目录
+pytest-cache-files-*/
+
+# Translations
+*.mo
+*.pot
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Project specific
+logs/
+*.log
+*.db
+*.sqlite3
+.venv/
+.uv-cache/
+.uv-python/
+alembic/versions/*
+.ruff_cache/
+.ruff.toml
+.mypy_cache/
+env/.env.dev
+env/.env.local
+env/.env.prod
+
+# DevOps
+devops/nginx/ssl
+
+# Local planning and temporary test files
+/agent.md
+/crud.md
+/AGENTS.md
+/docs/superpowers/
+# 本次占位符替换与盖章演示相关文件
+/scripts/demo_word_render_and_seal.py
+/scripts/demo_word_render_and_seal/
+/tmp/demo_word_render_and_seal_output/
+/docs/催收函文书模板占位符别名清单.md
+/docs/催收函文书任务新增接口说明.md
+/催收函文书管理所需接口.pdf
+
+# Local RPA runtime files, generated cases, accounts, screenshots and reports
+/runtime/
+/app/rpa/litigation/v1/runs/
+/app/rpa/litigation/v1/storage/
+.codegraph/
+.trae/
+.claude/
+/app/rpa/litigation/court_storage_state.json
+/app/rpa/litigation/runs/

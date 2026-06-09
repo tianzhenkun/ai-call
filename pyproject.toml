@@ -1,0 +1,125 @@
+[project]
+name = "lingchen-ai-call-base"
+version = "0.1.0"
+description = "智能外呼独立后端基座"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiofiles==24.1.0",
+    "aiosqlite==0.22.1",
+    "apscheduler==3.11.0",
+    "asyncmy==0.2.10",
+    "asyncpg==0.30.0",
+    "bcrypt==5.0.0",
+    "bleach==6.3.0",
+    "cryptography==46.0.5",
+    "fastapi==0.135.1",
+    "greenlet==3.1.1",
+    "httpx==0.28.1",
+    "itsdangerous==2.2.0",
+    "loguru==0.7.3",
+    "passlib==1.7.4",
+    "pillow==11.0.0",
+    "psycopg==3.3.2",
+    "psycopg-binary==3.3.2",
+    "pydantic-settings==2.13.1",
+    "pydantic-validation-decorator==0.1.4",
+    "pyjwt==2.12.1",
+    "pymysql==1.1.2",
+    "pytest==9.0.2",
+    "python-multipart==0.0.22",
+    "redis==7.3.0",
+    "rich==13.9.4",
+    "ruff==0.14.13",
+    "sqlalchemy==2.0.48",
+    "typer==0.19.0",
+    "user-agents==2.2.0",
+    "uvicorn==0.41.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.13",
+]
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+preview = true
+fix = true
+show-fixes = true
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+extend-include = ["*.pyw"]
+
+[tool.ruff.lint]
+select = [
+    "FAST",
+    "F",
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+]
+ignore = [
+    "E501",
+    "B008",
+    "C901",
+    "W191",
+    "B904",
+    "B010",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+preview = true
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+norecursedirs = [
+    ".git",
+    ".pytest_cache",
+    ".venv",
+    ".uv-cache",
+    ".uv-python",
+    "pytest-cache-files-*",
+]
