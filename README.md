@@ -17,7 +17,7 @@
 ## 目录说明
 
 ```text
-app/api/v1/ai_call/      智能外呼模块，Phase 00 从这里开始实现
+app/api/v1/ai_call/      智能外呼模块，Phase A 从这里开始实现
 app/api/v1/system/       基座系统能力
 app/core/                数据库、Redis、异常、日志、中间件
 app/common/              通用响应、枚举、常量
@@ -50,4 +50,4 @@ GET /ai-call/health
 
 ## 下一步
 
-按 `docs/livekit-ai-outbound/phases/phase-00-web-business-loop.md` 中的 Phase 00 方案，实现 Web 版商业闭环。
+按 `docs/livekit-ai-outbound/OUTLINE.md` 和 `docs/livekit-ai-outbound/phases/phase-a-e2e-core-engine.md` 推进 Phase A：Web 端到端核心引擎。
