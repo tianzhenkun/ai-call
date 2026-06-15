@@ -1,37 +1,56 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import status
 
 from app.common.constant import RET
 from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.exceptions import AiCallError
-from app.services.ai_call.orchestrator import AiCallOrchestrator
+from app.services.ai_call.orchestrator import (
+    AiCallOrchestrator,
+    BrowserEventReportResult,
+    CreateSessionResult,
+    EndSessionResult,
+    EventListResult,
+    ReissueTokenResult,
+    SessionStatusResult,
+)
 
 
 class AiCallService:
     def __init__(self, orchestrator: AiCallOrchestrator) -> None:
         self.orchestrator = orchestrator
 
-    async def create_web_session(self, voice: str | None, prompt: str | None):
+    async def create_web_session(
+        self,
+        voice: str | None,
+        prompt: str | None,
+    ) -> CreateSessionResult:
         try:
             return await self.orchestrator.create_web_session(voice=voice, prompt=prompt)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def reissue_browser_token(self, call_id: str):
+    async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
         try:
             return await self.orchestrator.reissue_browser_token(call_id)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def get_session(self, call_id: str):
+    async def get_session(self, call_id: str) -> SessionStatusResult:
         try:
             return await self.orchestrator.get_session(call_id)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def list_events(self, call_id: str, limit: int, after_event_id: str | None):
+    async def list_events(
+        self,
+        call_id: str,
+        limit: int,
+        after_event_id: str | None,
+    ) -> EventListResult:
         try:
             return await self.orchestrator.list_events(
                 call_id=call_id,
@@ -41,7 +60,12 @@ class AiCallService:
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def report_browser_event(self, call_id: str, event_type: str, timestamp):
+    async def report_browser_event(
+        self,
+        call_id: str,
+        event_type: str,
+        timestamp: datetime | None,
+    ) -> BrowserEventReportResult:
         try:
             return await self.orchestrator.report_browser_event(
                 call_id=call_id,
@@ -51,7 +75,7 @@ class AiCallService:
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def end_session(self, call_id: str):
+    async def end_session(self, call_id: str) -> EndSessionResult:
         try:
             return await self.orchestrator.end_session(call_id)
         except AiCallError as exc:

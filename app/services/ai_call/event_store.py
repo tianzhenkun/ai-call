@@ -18,6 +18,8 @@ class AiCallEvent:
 
 
 class InMemoryEventStore:
+    """Phase A 运行态事件存储；只服务延迟验证，不承诺进程重启后的追溯。"""
+
     def __init__(self) -> None:
         self._events: list[AiCallEvent] = []
 

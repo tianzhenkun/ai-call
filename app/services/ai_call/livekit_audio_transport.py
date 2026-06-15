@@ -80,6 +80,7 @@ class LiveKitRoomAudioTransport:
         source = self._sources.get(call_id)
         if source is None:
             return
+        # 打断时先清空播放队列，再补短淡出帧，减少残留音频和爆音。
         clear_queue = getattr(source, "clear_queue", None)
         if clear_queue is not None:
             await self._maybe_await(clear_queue())

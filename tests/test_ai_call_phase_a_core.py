@@ -561,6 +561,14 @@ def test_metrics_calculates_first_audio_and_interrupt_latency() -> None:
     assert snapshot["lastModelFirstAudioMs"] == 820
     assert snapshot["lastBrowserFirstAudioMs"] == 960
     assert snapshot["lastInterruptStopMs"] == 180
+    assert snapshot["modelFirstAudioCount"] == 1
+    assert snapshot["modelFirstAudioP50Ms"] == 820
+    assert snapshot["modelFirstAudioP90Ms"] == 820
+    assert snapshot["modelFirstAudioMaxMs"] == 820
+    assert snapshot["browserFirstAudioCount"] == 1
+    assert snapshot["browserFirstAudioP50Ms"] == 960
+    assert snapshot["browserFirstAudioP90Ms"] == 960
+    assert snapshot["browserFirstAudioMaxMs"] == 960
 
 
 @pytest.mark.anyio
@@ -1275,6 +1283,52 @@ async def test_realtime_agent_runner_redacts_provider_session_instructions_in_ev
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_redacts_provider_audio_delta_in_events() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    raw_delta = base64.b64encode(b"\x00\x01\x02\x03").decode()
+    provider = FakeRealtimeProvider(
+        [
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "type": "response.audio.delta",
+                    "delta": raw_delta,
+                },
+            ),
+        ]
+    )
+    session = CallSession(
+        call_id="call_audio_redact",
+        room_name="ai-call-call_audio_redact",
+        participant_identity="browser-call_audio_redact",
+        status=CallSessionStatus.CONNECTED,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "prompt",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_audio_redact")
+
+    event = store.list("call_audio_redact")[0]
+    assert event.payload["delta"] == "<redacted_audio_delta>"
+    assert event.payload["deltaBytes"] == 4
+    assert raw_delta not in str(event.payload)
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_starts_opening_response_with_configured_message() -> None:
     registry = InMemorySessionRegistry()
     provider = FakeRealtimeProvider([])
@@ -1903,6 +1957,8 @@ def test_phase_a_web_probe_page_wires_core_session_endpoints() -> None:
     assert 'href="/static/ai-call/phase-a.css"' in html
     assert 'src="/static/ai-call/phase-a.js"' in html
     assert 'id="end-session"' in html
+    assert 'id="metric-model-stats"' in html
+    assert 'id="metric-browser-stats"' in html
     assert "/ai-call/sessions" in script
     assert "/browser-events" in script
     assert "browser_ready" in script
@@ -1931,6 +1987,36 @@ def test_phase_a_web_probe_reports_local_speech_for_fast_barge_in() -> None:
     assert "createMediaStreamSource" in script
     assert "getByteTimeDomainData" in script
     assert 'type: "browser_user_speech_started"' in script
+
+
+def test_phase_a_web_probe_reports_browser_first_audio_from_remote_audio_level() -> None:
+    script = read_phase_a_web_asset("phase-a.js")
+
+    assert "startRemoteAudioMonitor(track)" in script
+    assert "REMOTE_AUDIO_START_RMS = 0.015" in script
+    assert "pendingBrowserFirstAudioTurnId" in script
+    assert 'event.type === "opening_started"' in script
+    assert 'event.type === "user_speech_stopped"' in script
+    assert 'type: "browser_first_audio"' in script
+    assert "media.onplaying" not in script
+
+
+def test_phase_a_web_probe_fetches_events_incrementally() -> None:
+    script = read_phase_a_web_asset("phase-a.js")
+
+    assert "EVENT_RENDER_LIMIT = 300" in script
+    assert "state.lastEventId = event.eventId" in script
+    assert 'params.set("afterEventId", state.lastEventId)' in script
+    assert "appendEvents(data.rows)" in script
+
+
+def test_phase_a_web_probe_stops_polling_on_terminal_status() -> None:
+    script = read_phase_a_web_asset("phase-a.js")
+
+    assert 'return status === "completed" || status === "failed"' in script
+    assert "stopPolling()" in script
+    assert "stopClientAudioRuntime()" in script
+    assert "disableSessionControls()" in script
 
 
 def test_phase_a_web_probe_debounces_local_speech_before_reporting_barge_in() -> None:

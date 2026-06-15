@@ -1,6 +1,6 @@
 # 端到端 AI 外呼引擎总纲
 
-最后更新：2026-06-14
+最后更新：2026-06-15
 
 ## 1. 文档定位
 
@@ -24,8 +24,11 @@ AI 实现前必须按顺序执行：
 
 | 项 | 当前值 |
 |---|---|
-| 当前阶段 | Phase A：Web 端到端核心引擎 |
-| 当前阶段文档 | [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md) |
+| 当前阶段 | Phase B：Web 商用闭环正式设计准备 |
+| 最近收尾阶段 | Phase A：Web 端到端核心引擎实现已收尾，补证项见验收报告 |
+| Phase A 设计文档 | [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md) |
+| Phase A 验收报告 | [phases/phase-a-acceptance-report.md](phases/phase-a-acceptance-report.md) |
+| Phase B 当前文档 | [phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)，正式设计待生成 |
 | 当前入口 | 浏览器入口优先 |
 | 当前模型 | 固定使用阿里百炼 `qwen3.5-omni-plus-realtime` |
 | 当前音色策略 | 前端下拉选择阿里官方 `voice` 参数，默认 `Tina` |
@@ -171,8 +174,8 @@ flowchart TB
 
 | 阶段 | 状态 | 目标 | 完成定义 |
 |---|---|---|---|
-| Phase A：Web 端到端核心引擎 | 当前阶段 | 基于总纲方案从零实现可复用核心模块，保留浏览器入口 | 浏览器通过 LiveKit Room 与 Agent 完成端到端 S2S 对话，并具备事件、状态和延迟指标 |
-| Phase B：Web 商用闭环 | 未开始，已有预设计 | 在 Web 入口下补齐通话记录、生效配置、事件指标、结果查询，并按 Phase A 结果决定是否接入录音和最小转人工 | 每通 Web 会话可按 `call_id` 复盘状态、事件、指标和结果；录音、最小转人工按 Phase A 结果定稿 |
+| Phase A：Web 端到端核心引擎 | 实现已收尾，仍有补证项 | 基于总纲方案从零实现可复用核心模块，保留浏览器入口 | 浏览器通过 LiveKit Room 与 Agent 完成端到端 S2S 对话，并具备事件、状态和延迟指标；补证项见验收报告 |
+| Phase B：Web 商用闭环 | 正式设计准备中，已有预设计 | 在 Web 入口下补齐通话记录、生效配置、事件指标、结果查询，并按 Phase A 结果决定是否接入录音和最小转人工 | 每通 Web 会话可按 `call_id` 复盘状态、事件、指标和结果；录音、最小转人工按 Phase A 结果定稿 |
 | Phase C：Web 并发压测与容量验证 | 未开始 | 在不接真实 SIP 的情况下验证模型、Agent、LiveKit、事件、录音和成本的容量边界 | 形成容量报告：在指定配置和场景下可支持的并发会话数、新建速率、首个瓶颈、扩容方式和超限策略 |
 | Phase D：生产加固与运维兜底 | 未开始 | 监控、告警、回滚、限流、排障和故障兜底 | 有 SLO、告警、排障、压测复现和故障兜底 |
 | Phase E：真实 SIP 入口 | 未开始 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
@@ -191,8 +194,9 @@ Phase A 只建立 Web 入口下的端到端核心通话链路，实施时按以�
 
 ## 10. 阶段推进规则
 
-1. 当前只推进 Phase A。
+1. 当前推进 Phase B 正式技术设计，不直接进入 Phase B 实现。
 2. 任何阶段完成后，必须同步更新本文档的“当前状态”和“阶段路线”。
 3. 进入新阶段前，必须先生成或更新该阶段技术设计文档。
-4. 进入 Phase C 前，必须基于 Phase A/B 的真实实现生成并发压测技术设计文档；Phase C 的核心交付物是容量报告，不是新业务功能。
-5. 真实 SIP 只在 Phase E 接入；前面阶段如果需要模拟电话侧能力，统一通过 WebRTC/浏览器入口验证。
+4. Phase A 验收报告中的补证项必须在 Phase B 实现前关闭，或在 Phase B 正式设计中列为已接受风险。
+5. 进入 Phase C 前，必须基于 Phase A/B 的真实实现生成并发压测技术设计文档；Phase C 的核心交付物是容量报告，不是新业务功能。
+6. 真实 SIP 只在 Phase E 接入；前面阶段如果需要模拟电话侧能力，统一通过 WebRTC/浏览器入口验证。

@@ -1,10 +1,12 @@
 # Phase A：Web 端到端核心引擎详细设计
 
-最后更新：2026-06-14
+最后更新：2026-06-15
 
 ## 1. 文档定位
 
 本文档用于指导 AI 智能体实现 Phase A。它只定义本阶段必须做对的工程契约，不展开后续 SIP、批量外呼、坐席系统、并发压测和生产运维细节。
+
+收尾状态：Phase A 实现已收尾，验收结论和剩余补证项见 [phase-a-acceptance-report.md](phase-a-acceptance-report.md)。本文档保留为 Phase A 的设计基线，不继续追加 Phase B 实现细节。
 
 实现前必须先读：
 

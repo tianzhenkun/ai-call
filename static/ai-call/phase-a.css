@@ -267,6 +267,12 @@
         font-weight: 700;
       }
 
+      .metric .value-small {
+        font-size: 14px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+
       .main-stack {
         display: grid;
         gap: 16px;

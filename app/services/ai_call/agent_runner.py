@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -50,19 +51,6 @@ class RoomAudioTransportProtocol(AudioPublisherProtocol, Protocol):
 
 
 ProviderFactory = Callable[[CallSession], RealtimeProviderProtocol]
-
-
-class NullRealtimeAgentRunner:
-    """Phase A 第一切片占位 Agent；真实音频接入在后续切片替换。"""
-
-    async def start(self, session: CallSession) -> None:
-        _ = session
-
-    async def start_opening(self, call_id: str) -> None:
-        _ = call_id
-
-    async def stop(self, call_id: str) -> None:
-        _ = call_id
 
 
 class RealtimeCallAgentRunner:
@@ -171,7 +159,7 @@ class RealtimeCallAgentRunner:
                 call_id,
                 provider_event.type,
                 "provider",
-                self._event_payload(provider_event.payload),
+                self._event_payload(provider_event.type, provider_event.payload),
             )
             if self._is_interrupt_event(call_id, provider_event.type):
                 await self._confirm_interrupt(call_id, provider, event_timestamp)
@@ -189,6 +177,7 @@ class RealtimeCallAgentRunner:
         provider = self._providers.get(call_id)
         if provider is None:
             return False
+        # 本地 VAD 通常早于供应商事件；最近播过 AI 音频的短窗口允许打断。
         if session.status != CallSessionStatus.AI_SPEAKING:
             if not self._has_recent_ai_audio(call_id, trigger_timestamp):
                 return False
@@ -216,7 +205,10 @@ class RealtimeCallAgentRunner:
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         elif event_type == "user_speech_started" and session.status == CallSessionStatus.CONNECTED:
             self.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
-        elif event_type == "user_speech_stopped" and session.status == CallSessionStatus.USER_SPEAKING:
+        elif (
+            event_type == "user_speech_stopped"
+            and session.status == CallSessionStatus.USER_SPEAKING
+        ):
             metrics.mark_user_speech_stopped(timestamp)
             self.registry.transition(call_id, CallSessionStatus.AI_THINKING)
         elif event_type == "model_audio_delta" and session.status in {
@@ -226,7 +218,10 @@ class RealtimeCallAgentRunner:
             self._cancel_playout_task_nowait(call_id)
             metrics.mark_model_audio_delta(timestamp)
             self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
-        elif event_type == "model_response_done" and session.status == CallSessionStatus.AI_SPEAKING:
+        elif (
+            event_type == "model_response_done"
+            and session.status == CallSessionStatus.AI_SPEAKING
+        ):
             self._complete_ai_speaking_after_playout(call_id)
         elif event_type == "model_error":
             self.registry.transition(call_id, CallSessionStatus.FAILED)
@@ -250,20 +245,34 @@ class RealtimeCallAgentRunner:
         self.registry.get(call_id).last_event_at = event.timestamp
         return event.timestamp
 
-    def _event_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _event_payload(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         event_payload = dict(payload)
         session = event_payload.get("session")
         if isinstance(session, dict) and isinstance(session.get("instructions"), str):
             session_payload = dict(session)
             session_payload["instructions"] = "<redacted>"
             event_payload["session"] = session_payload
+        if event_type == "model_audio_delta":
+            # 原始音频 delta 只用于实时播放，事件列表只保留体积信息。
+            delta = event_payload.get("delta")
+            if isinstance(delta, str):
+                event_payload["delta"] = "<redacted_audio_delta>"
+                event_payload["deltaBytes"] = self._base64_decoded_size(delta)
         return event_payload
+
+    @staticmethod
+    def _base64_decoded_size(value: str) -> int | None:
+        try:
+            return len(base64.b64decode(value))
+        except Exception:
+            return None
 
     async def _publish_model_audio_delta(
         self,
         call_id: str,
         provider_event: ProviderEvent,
     ) -> None:
+        # 供应商在打断后仍可能吐缓存音频，发布前用状态闸门拦截。
         if self.registry.get(call_id).status != CallSessionStatus.AI_SPEAKING:
             return
         if self.audio_publisher is None:

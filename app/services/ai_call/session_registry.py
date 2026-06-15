@@ -110,6 +110,8 @@ class CallSession:
 
 
 class InMemorySessionRegistry:
+    """Phase A 会话注册表；正式会话持久化和跨进程恢复留给后续阶段。"""
+
     def __init__(self) -> None:
         self._sessions: dict[str, CallSession] = {}
 
