@@ -64,7 +64,7 @@ class FakeAgentRunner:
         self.started_call_ids: list[str] = []
         self.stopped_call_ids: list[str] = []
         self.started_opening_call_ids: list[str] = []
-        self.browser_interrupts: list[tuple[str, datetime]] = []
+        self.browser_speech_candidates: list[tuple[str, datetime]] = []
 
     async def start(self, session: CallSession) -> None:
         self.started_call_ids.append(session.call_id)
@@ -75,9 +75,13 @@ class FakeAgentRunner:
     async def stop(self, call_id: str) -> None:
         self.stopped_call_ids.append(call_id)
 
-    async def confirm_browser_interrupt(self, call_id: str, trigger_timestamp: datetime) -> bool:
-        self.browser_interrupts.append((call_id, trigger_timestamp))
-        return True
+    async def record_browser_speech_candidate(
+        self,
+        call_id: str,
+        trigger_timestamp: datetime,
+    ) -> bool:
+        self.browser_speech_candidates.append((call_id, trigger_timestamp))
+        return False
 
 
 class FailingAgentRunner(FakeAgentRunner):
@@ -627,7 +631,7 @@ async def test_browser_ready_opening_marks_model_response_timing_baseline() -> N
 
 
 @pytest.mark.anyio
-async def test_browser_user_speech_started_confirms_interrupt_while_ai_speaking() -> None:
+async def test_browser_user_speech_started_records_candidate_while_ai_speaking() -> None:
     orchestrator, _livekit, agent = build_orchestrator()
     created = await orchestrator.create_web_session(voice=None, prompt=None)
     orchestrator.registry.transition(created.call_id, CallSessionStatus.CONNECTED)
@@ -640,14 +644,14 @@ async def test_browser_user_speech_started_confirms_interrupt_while_ai_speaking(
         timestamp=reported_at,
     )
 
-    assert agent.browser_interrupts == [(created.call_id, reported_at)]
+    assert agent.browser_speech_candidates == [(created.call_id, reported_at)]
     events = await orchestrator.list_events(created.call_id)
     assert events.rows[-1].type == "browser_user_speech_started"
     assert events.rows[-1].source == "browser"
 
 
 @pytest.mark.anyio
-async def test_browser_user_speech_started_is_forwarded_for_runner_side_decision() -> None:
+async def test_browser_user_speech_started_is_forwarded_as_candidate() -> None:
     orchestrator, _livekit, agent = build_orchestrator()
     created = await orchestrator.create_web_session(voice=None, prompt=None)
     orchestrator.registry.transition(created.call_id, CallSessionStatus.CONNECTED)
@@ -659,7 +663,7 @@ async def test_browser_user_speech_started_is_forwarded_for_runner_side_decision
         timestamp=reported_at,
     )
 
-    assert agent.browser_interrupts == [(created.call_id, reported_at)]
+    assert agent.browser_speech_candidates == [(created.call_id, reported_at)]
     events = await orchestrator.list_events(created.call_id)
     assert events.rows[-1].type == "browser_user_speech_started"
     assert events.rows[-1].source == "browser"
@@ -887,16 +891,28 @@ def test_qwen_session_update_and_server_event_mapping() -> None:
 
     assert payload["type"] == "session.update"
     assert payload["session"]["voice"] == "Tina"
+    assert payload["session"]["input_audio_transcription"] == {"language": "zh"}
     assert payload["session"]["turn_detection"] == {
         "type": "server_vad",
         "threshold": 0.5,
         "silence_duration_ms": 800,
+        "create_response": False,
+        "interrupt_response": False,
     }
 
     assert map_qwen_server_event({"type": "response.audio.delta"}) == "model_audio_delta"
     assert map_qwen_server_event({"type": "input_audio_buffer.speech_stopped"}) == (
         "user_speech_stopped"
     )
+    assert map_qwen_server_event({"type": "conversation.item.created"}) == (
+        "conversation_item_created"
+    )
+    assert map_qwen_server_event({"type": "input_audio_buffer.committed"}) == (
+        "input_audio_committed"
+    )
+    assert map_qwen_server_event(
+        {"type": "conversation.item.input_audio_transcription.failed"}
+    ) == "user_transcript_failed"
     assert map_qwen_server_event({"type": "unknown.event"}) is None
 
 
@@ -994,7 +1010,19 @@ async def test_qwen_provider_receives_mapped_events_and_preserves_payload() -> N
         incoming=[
             {"type": "session.created", "session": {"id": "sess_1"}},
             {"type": "response.audio.delta", "delta": "AAAA"},
-            {"type": "unknown.event", "value": 1},
+            {"type": "conversation.item.created", "item": {"id": "item_1"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item_1"},
+            {
+                "type": "conversation.item.input_audio_transcription.failed",
+                "error": {"code": "asr_failed", "message": "no speech"},
+            },
+            {
+                "type": "unknown.event",
+                "authorization": "Bearer secret",
+                "audio": "AAAA",
+                "delta": "x" * 600,
+                "value": 1,
+            },
         ]
     )
 
@@ -1013,9 +1041,26 @@ async def test_qwen_provider_receives_mapped_events_and_preserves_payload() -> N
     async for event in provider.receive_events():
         events.append(event)
 
-    assert [event.type for event in events] == ["model_session_started", "model_audio_delta"]
+    assert [event.type for event in events] == [
+        "model_session_started",
+        "model_audio_delta",
+        "conversation_item_created",
+        "input_audio_committed",
+        "user_transcript_failed",
+        "provider_event_unmapped",
+    ]
     assert events[0].payload == {"type": "session.created", "session": {"id": "sess_1"}}
     assert events[1].payload == {"type": "response.audio.delta", "delta": "AAAA"}
+    assert events[5].payload == {
+        "rawType": "unknown.event",
+        "raw": {
+            "type": "unknown.event",
+            "authorization": "<redacted>",
+            "audio": "<redacted_audio>",
+            "delta": "<redacted_large_delta>",
+            "value": 1,
+        },
+    }
 
 
 @pytest.mark.anyio
@@ -1027,6 +1072,7 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
         [
             ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
             ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
             ProviderEvent(type="user_speech_stopped", payload={}),
             ProviderEvent(type="model_audio_delta", payload={"delta": "AAAA"}),
             ProviderEvent(type="model_response_done", payload={}),
@@ -1072,9 +1118,110 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
     assert [event.type for event in store.list("call_1")] == [
         "model_session_started",
         "user_speech_started",
+        "user_transcript_delta",
         "user_speech_stopped",
         "model_audio_delta",
         "model_response_done",
+    ]
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_uses_qwen_text_stash_transcript_preview() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider(
+        [
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+            ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(
+                type="user_transcript_delta",
+                payload={"text": "", "stash": "今天"},
+            ),
+            ProviderEvent(
+                type="user_transcript_delta",
+                payload={"text": "今天", "stash": "天气怎么样"},
+            ),
+            ProviderEvent(type="user_speech_stopped", payload={}),
+        ]
+    )
+    session = CallSession(
+        call_id="call_qwen_transcript",
+        room_name="ai-call-call_qwen_transcript",
+        participant_identity="browser-call_qwen_transcript",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_qwen_transcript")
+
+    assert provider.created_responses == [None]
+    assert registry.get("call_qwen_transcript").status == CallSessionStatus.AI_THINKING
+    transcript_events = [
+        event for event in store.list("call_qwen_transcript") if event.type == "user_transcript_delta"
+    ]
+    assert transcript_events[-1].payload == {"text": "今天", "stash": "天气怎么样"}
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_records_transcription_failure_without_reply() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider(
+        [
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+            ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(
+                type="user_transcript_failed",
+                payload={"error": {"code": "asr_failed", "message": "no speech"}},
+            ),
+            ProviderEvent(type="user_speech_stopped", payload={}),
+        ]
+    )
+    session = CallSession(
+        call_id="call_transcript_failed",
+        room_name="ai-call-call_transcript_failed",
+        participant_identity="browser-call_transcript_failed",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_transcript_failed")
+
+    assert provider.created_responses == []
+    assert registry.get("call_transcript_failed").status == CallSessionStatus.CONNECTED
+    assert [event.type for event in store.list("call_transcript_failed")] == [
+        "model_session_started",
+        "user_speech_started",
+        "user_transcript_failed",
+        "user_speech_stopped",
     ]
 
 
@@ -1379,6 +1526,8 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
                 payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
             ),
             ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+            ProviderEvent(type="user_speech_stopped", payload={}),
         ]
     )
     publisher = FakeAudioPublisher()
@@ -1408,10 +1557,12 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
     await runner.wait("call_interrupt")
 
     assert provider.cancelled_response_count == 1
-    assert provider.cleared_input_count == 1
+    assert provider.cleared_input_count == 0
+    assert provider.created_responses == [None]
     assert publisher.stopped_call_ids == ["call_interrupt"]
-    assert registry.get("call_interrupt").status == CallSessionStatus.USER_SPEAKING
+    assert registry.get("call_interrupt").status == CallSessionStatus.AI_THINKING
     event_types = [event.type for event in store.list("call_interrupt")]
+    assert "interrupt_candidate" in event_types
     assert "interrupt_confirmed" in event_types
     assert registry.get("call_interrupt").metrics["lastInterruptStopMs"] is not None
 
@@ -1432,6 +1583,8 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
             ),
             ProviderEvent(type="model_response_done", payload={}),
             ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+            ProviderEvent(type="user_speech_stopped", payload={}),
         ]
     )
     publisher = WaitingAudioPublisher()
@@ -1461,10 +1614,12 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
     await runner.wait("call_playout_interrupt")
 
     assert provider.cancelled_response_count == 1
-    assert provider.cleared_input_count == 1
+    assert provider.cleared_input_count == 0
+    assert provider.created_responses == [None]
     assert publisher.stopped_call_ids == ["call_playout_interrupt"]
-    assert registry.get("call_playout_interrupt").status == CallSessionStatus.USER_SPEAKING
+    assert registry.get("call_playout_interrupt").status == CallSessionStatus.AI_THINKING
     event_types = [event.type for event in store.list("call_playout_interrupt")]
+    assert "interrupt_candidate" in event_types
     assert "interrupt_confirmed" in event_types
     assert registry.get("call_playout_interrupt").metrics["lastInterruptStopMs"] is not None
 
@@ -1485,6 +1640,8 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
             ),
             ProviderEvent(type="model_response_done", payload={}),
             ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+            ProviderEvent(type="user_speech_stopped", payload={}),
         ]
     )
     publisher = ImmediatePlayoutAudioPublisher()
@@ -1514,14 +1671,138 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
     await runner.wait("call_tail_interrupt")
 
     assert provider.cancelled_response_count == 1
+    assert provider.created_responses == [None]
     assert publisher.stopped_call_ids == ["call_tail_interrupt"]
-    assert registry.get("call_tail_interrupt").status == CallSessionStatus.USER_SPEAKING
+    assert registry.get("call_tail_interrupt").status == CallSessionStatus.AI_THINKING
     event_types = [event.type for event in store.list("call_tail_interrupt")]
+    assert "interrupt_candidate" in event_types
     assert "interrupt_confirmed" in event_types
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_confirms_browser_interrupt_while_ai_speaking() -> None:
+async def test_realtime_agent_runner_continues_ai_audio_for_noise_without_transcript() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    output_pcm = b"\x01\x02" * 240
+    provider = FakeRealtimeProvider(
+        [
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+            ),
+            ProviderEvent(type="user_speech_started", payload={}),
+            ProviderEvent(type="user_speech_stopped", payload={}),
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+            ),
+            ProviderEvent(type="model_response_done", payload={}),
+        ]
+    )
+    publisher = FakeAudioPublisher()
+    session = CallSession(
+        call_id="call_noise",
+        room_name="ai-call-call_noise",
+        participant_identity="browser-call_noise",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_noise")
+
+    assert provider.cancelled_response_count == 0
+    assert provider.created_responses == []
+    assert publisher.stopped_call_ids == []
+    assert len(publisher.published) == 2
+    assert registry.get("call_noise").status == CallSessionStatus.CONNECTED
+    event_types = [event.type for event in store.list("call_noise")]
+    assert "interrupt_candidate" in event_types
+    assert "interrupt_ignored" in event_types
+    assert "interrupt_confirmed" not in event_types
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_transcript() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
+    output_pcm = b"\x01\x02" * 240
+    session = CallSession(
+        call_id="call_opening_noise",
+        room_name="ai-call-call_opening_noise",
+        participant_identity="browser-call_opening_noise",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "opening_enabled": True,
+            "opening_message": "您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+    )
+
+    await runner.start(session)
+    await provider.emit(ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}))
+    await runner.start_opening("call_opening_noise")
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.close_events()
+    await runner.wait("call_opening_noise")
+
+    assert provider.cancelled_response_count == 0
+    assert provider.created_responses == [
+        "请主动说出开场白：您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？"
+    ]
+    assert publisher.stopped_call_ids == []
+    assert len(publisher.published) == 2
+    event_types = [event.type for event in store.list("call_opening_noise")]
+    assert "interrupt_candidate" in event_types
+    assert "interrupt_ignored" in event_types
+    assert "interrupt_confirmed" not in event_types
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_records_browser_interrupt_candidate_while_ai_speaking() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = FakeRealtimeProvider([])
@@ -1551,26 +1832,27 @@ async def test_realtime_agent_runner_confirms_browser_interrupt_while_ai_speakin
     await runner.start(session)
     registry.transition("call_browser_interrupt", CallSessionStatus.CONNECTED)
     registry.transition("call_browser_interrupt", CallSessionStatus.AI_SPEAKING)
-    confirmed = await runner.confirm_browser_interrupt(
+    confirmed = await runner.record_browser_speech_candidate(
         "call_browser_interrupt",
         datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
     )
 
-    assert confirmed is True
-    assert provider.cancelled_response_count == 1
-    assert provider.cleared_input_count == 1
-    assert publisher.stopped_call_ids == ["call_browser_interrupt"]
-    assert registry.get("call_browser_interrupt").status == CallSessionStatus.USER_SPEAKING
-    interrupt_event = [
-        event for event in store.list("call_browser_interrupt") if event.type == "interrupt_confirmed"
+    assert confirmed is False
+    assert provider.cancelled_response_count == 0
+    assert provider.cleared_input_count == 0
+    assert publisher.stopped_call_ids == []
+    assert registry.get("call_browser_interrupt").status == CallSessionStatus.AI_SPEAKING
+    candidate_event = [
+        event for event in store.list("call_browser_interrupt") if event.type == "interrupt_candidate"
     ][-1]
-    assert interrupt_event.payload == {
+    assert candidate_event.payload == {
+        "source": "browser",
         "reason": "browser_user_speech_started_during_ai_audio"
     }
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_confirms_browser_interrupt_after_recent_ai_audio() -> None:
+async def test_realtime_agent_runner_records_browser_candidate_after_recent_ai_audio() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -1609,17 +1891,20 @@ async def test_realtime_agent_runner_confirms_browser_interrupt_after_recent_ai_
     await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
     registry.transition("call_recent_audio_interrupt", CallSessionStatus.CONNECTED)
 
-    confirmed = await runner.confirm_browser_interrupt(
+    confirmed = await runner.record_browser_speech_candidate(
         "call_recent_audio_interrupt",
         datetime.now(timezone.utc),
     )
     await provider.close_events()
     await runner.wait("call_recent_audio_interrupt")
 
-    assert confirmed is True
-    assert provider.cancelled_response_count == 1
-    assert publisher.stopped_call_ids == ["call_recent_audio_interrupt"]
-    assert registry.get("call_recent_audio_interrupt").status == CallSessionStatus.USER_SPEAKING
+    assert confirmed is False
+    assert provider.cancelled_response_count == 0
+    assert publisher.stopped_call_ids == []
+    assert registry.get("call_recent_audio_interrupt").status == CallSessionStatus.CONNECTED
+    assert "interrupt_candidate" in [
+        event.type for event in store.list("call_recent_audio_interrupt")
+    ]
 
 
 @pytest.mark.anyio
@@ -1653,27 +1938,25 @@ async def test_realtime_agent_runner_recovers_from_stop_audio_failure_during_int
     await runner.start(session)
     registry.transition("call_stop_audio_failure_interrupt", CallSessionStatus.CONNECTED)
     registry.transition("call_stop_audio_failure_interrupt", CallSessionStatus.AI_SPEAKING)
-    confirmed = await runner.confirm_browser_interrupt(
-        "call_stop_audio_failure_interrupt",
-        datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
-    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}))
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
     await provider.close_events()
     await runner.wait("call_stop_audio_failure_interrupt")
 
     event_types = [event.type for event in store.list("call_stop_audio_failure_interrupt")]
-    assert confirmed is True
     assert publisher.stopped_call_ids == ["call_stop_audio_failure_interrupt"]
     assert provider.cancelled_response_count == 1
-    assert provider.cleared_input_count == 1
+    assert provider.cleared_input_count == 0
+    assert provider.created_responses == [None]
     assert "interrupt_cleanup_failed" in event_types
+    assert "interrupt_candidate" in event_types
     assert "interrupt_confirmed" in event_types
-    assert registry.get("call_stop_audio_failure_interrupt").status == (
-        CallSessionStatus.USER_SPEAKING
-    )
+    assert registry.get("call_stop_audio_failure_interrupt").status == CallSessionStatus.AI_THINKING
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_ignores_stale_audio_after_browser_interrupt() -> None:
+async def test_realtime_agent_runner_ignores_stale_audio_after_confirmed_interrupt() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -1711,10 +1994,8 @@ async def test_realtime_agent_runner_ignores_stale_audio_after_browser_interrupt
     )
     await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
 
-    confirmed = await runner.confirm_browser_interrupt(
-        "call_stale_audio",
-        datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
-    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}))
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -1724,15 +2005,18 @@ async def test_realtime_agent_runner_ignores_stale_audio_after_browser_interrupt
     await provider.close_events()
     await runner.wait("call_stale_audio")
 
-    assert confirmed is True
+    assert provider.cancelled_response_count == 1
     assert len(publisher.published) == 1
+    assert "interrupt_confirmed" in [
+        event.type for event in store.list("call_stale_audio")
+    ]
     assert [event.type for event in store.list("call_stale_audio")].count(
         "ai_audio_published"
     ) == 1
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_clears_inflight_audio_after_browser_interrupt() -> None:
+async def test_realtime_agent_runner_confirms_interrupt_after_inflight_audio_publishes() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -1770,20 +2054,18 @@ async def test_realtime_agent_runner_clears_inflight_audio_after_browser_interru
     )
     await asyncio.wait_for(publisher.publish_started.wait(), timeout=1)
 
-    confirmed = await runner.confirm_browser_interrupt(
-        "call_inflight_audio",
-        datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
-    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}))
     publisher.publish_release.set()
     await provider.close_events()
     await runner.wait("call_inflight_audio")
 
-    assert confirmed is True
+    assert provider.cancelled_response_count == 1
     assert len(publisher.published) == 1
-    assert publisher.stopped_call_ids == ["call_inflight_audio", "call_inflight_audio"]
-    assert "ai_audio_published" not in [
-        event.type for event in store.list("call_inflight_audio")
-    ]
+    assert publisher.stopped_call_ids == ["call_inflight_audio"]
+    event_types = [event.type for event in store.list("call_inflight_audio")]
+    assert event_types.count("ai_audio_published") == 1
+    assert "interrupt_confirmed" in event_types
 
 
 @pytest.mark.anyio
@@ -1954,8 +2236,14 @@ def test_phase_a_web_probe_page_wires_core_session_endpoints() -> None:
 
     assert 'id="create-session"' in html
     assert 'rel="icon"' in html
-    assert 'href="/static/ai-call/phase-a.css"' in html
-    assert 'src="/static/ai-call/phase-a.js"' in html
+    assert (
+        'href="/static/ai-call/phase-a.css"' in html
+        or 'href="./phase-a.css"' in html
+    )
+    assert (
+        'src="/static/ai-call/phase-a.js"' in html
+        or 'src="./phase-a.js"' in html
+    )
     assert 'id="end-session"' in html
     assert 'id="metric-model-stats"' in html
     assert 'id="metric-browser-stats"' in html

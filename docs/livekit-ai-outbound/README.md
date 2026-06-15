@@ -10,16 +10,17 @@
 
 当前模型固定为阿里百炼 `qwen3.5-omni-plus-realtime`。音色由 Phase A 前端下拉选择阿里官方 `voice` 参数，后端透传给模型，不建设模型切换、模型路由或音色管理能力。
 
-当前 Phase A 实现已收尾，可以进入 Phase B 正式技术设计；Phase A 剩余补证项以验收报告为准。
+当前 Phase A 实现已收尾，Phase B1 记录与查询正式技术设计已生成并待评审；Phase A 剩余补证项以验收报告为准。
 
 ## 阅读顺序
 
 1. [OUTLINE.md](OUTLINE.md)：总纲，包含系统目标、总体架构图、阶段规划和当前阶段。
 2. [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md)：Phase A 技术设计。
 3. [phases/phase-a-acceptance-report.md](phases/phase-a-acceptance-report.md)：Phase A 验收报告和补证项。
-4. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
+4. [phases/phase-b1-record-query-design.md](phases/phase-b1-record-query-design.md)：Phase B1 记录与查询正式技术设计。
+5. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
 
-Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它可以作为 Phase B 正式技术设计的输入，但不能直接作为实现依据。
+Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它已作为 Phase B1 正式设计的输入，后续实现以 B1 正式设计文档为准。
 
 AI 智能体实现前必须先读 `OUTLINE.md`，再读当前阶段文档，最后用代码和测试核对真实进度。
 

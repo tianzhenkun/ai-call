@@ -40,7 +40,7 @@ class RealtimeAgentRunnerProtocol(Protocol):
 
     async def start_opening(self, call_id: str) -> None: ...
 
-    async def confirm_browser_interrupt(
+    async def record_browser_speech_candidate(
         self,
         call_id: str,
         trigger_timestamp: datetime,
@@ -408,7 +408,7 @@ class AiCallOrchestrator:
             )
         reported_at = timestamp or utc_now()
         should_start_opening = False
-        should_confirm_browser_interrupt = False
+        should_record_browser_speech_candidate = False
         if event_type == "browser_first_audio":
             metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
             metrics.mark_browser_first_audio(reported_at)
@@ -420,7 +420,7 @@ class AiCallOrchestrator:
                     self._config_value(session.effective_config, "opening_enabled", False)
                 )
         elif event_type == "browser_user_speech_started":
-            should_confirm_browser_interrupt = True
+            should_record_browser_speech_candidate = True
         else:
             raise AiCallError(
                 error_id="unsupported_browser_event",
@@ -435,8 +435,8 @@ class AiCallOrchestrator:
             payload={"reportedAt": reported_at.isoformat()},
         )
         session.last_event_at = event.timestamp
-        if should_confirm_browser_interrupt:
-            await self.agent_runner.confirm_browser_interrupt(call_id, reported_at)
+        if should_record_browser_speech_candidate:
+            await self.agent_runner.record_browser_speech_candidate(call_id, reported_at)
         if should_start_opening:
             opening_started_at = self._append_event(
                 call_id,

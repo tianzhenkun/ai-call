@@ -493,7 +493,7 @@ async function reportBrowserUserSpeechStarted() {
     method: "POST",
     body: JSON.stringify({ type: "browser_user_speech_started" }),
   });
-  log("已上报 browser_user_speech_started");
+  log("已上报 browser_user_speech_started 候选");
 }
 
 async function reportBrowserReady() {

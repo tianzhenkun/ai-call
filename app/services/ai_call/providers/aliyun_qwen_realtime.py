@@ -23,10 +23,14 @@ WebSocketFactory = Callable[[str, dict[str, str]], Awaitable[QwenWebSocketProtoc
 QWEN_SERVER_EVENT_MAPPING = {
     "session.created": "model_session_started",
     "session.updated": "model_session_updated",
+    "conversation.item.created": "conversation_item_created",
+    "input_audio_buffer.committed": "input_audio_committed",
+    "input_audio_buffer.cleared": "input_audio_cleared",
     "input_audio_buffer.speech_started": "user_speech_started",
     "input_audio_buffer.speech_stopped": "user_speech_stopped",
     "conversation.item.input_audio_transcription.delta": "user_transcript_delta",
     "conversation.item.input_audio_transcription.completed": "user_transcript_done",
+    "conversation.item.input_audio_transcription.failed": "user_transcript_failed",
     "response.created": "model_response_started",
     "response.audio.delta": "model_audio_delta",
     "response.audio.done": "model_audio_done",
@@ -44,6 +48,9 @@ class QwenRealtimeSessionConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    input_audio_language: str = "zh"
+    vad_create_response: bool = False
+    vad_interrupt_response: bool = False
     temperature: float = 0.7
 
 
@@ -55,11 +62,16 @@ def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, A
             "voice": config.voice,
             "input_audio_format": "pcm",
             "output_audio_format": "pcm",
+            "input_audio_transcription": {
+                "language": config.input_audio_language,
+            },
             "instructions": config.instructions,
             "turn_detection": {
                 "type": config.vad_type,
                 "threshold": config.vad_threshold,
                 "silence_duration_ms": config.vad_silence_duration_ms,
+                "create_response": config.vad_create_response,
+                "interrupt_response": config.vad_interrupt_response,
             },
             "temperature": config.temperature,
         },
@@ -71,6 +83,50 @@ def map_qwen_server_event(event: dict[str, Any]) -> str | None:
     if not isinstance(event_type, str):
         return None
     return QWEN_SERVER_EVENT_MAPPING.get(event_type)
+
+
+def build_unmapped_provider_event(event: dict[str, Any]) -> ProviderEvent:
+    raw_type = event.get("type")
+    return ProviderEvent(
+        type="provider_event_unmapped",
+        payload={
+            "rawType": raw_type if isinstance(raw_type, str) else None,
+            "raw": sanitize_qwen_event_payload(event),
+        },
+    )
+
+
+def sanitize_qwen_event_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            str(key): _sanitize_qwen_value(str(key), value)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [sanitize_qwen_event_payload(value) for value in payload]
+    if isinstance(payload, str):
+        return _truncate_payload_string(payload)
+    return payload
+
+
+def _sanitize_qwen_value(key: str, value: Any) -> Any:
+    key_lower = key.lower()
+    if any(
+        sensitive in key_lower
+        for sensitive in ("authorization", "token", "api_key", "apikey", "secret", "password")
+    ):
+        return "<redacted>"
+    if key_lower in {"audio"}:
+        return "<redacted_audio>"
+    if key_lower == "delta" and isinstance(value, str) and len(value) > 512:
+        return "<redacted_large_delta>"
+    return sanitize_qwen_event_payload(value)
+
+
+def _truncate_payload_string(value: str, max_length: int = 500) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[:max_length]}...<truncated:{len(value)}>"
 
 
 class AliyunQwenRealtimeProvider:
@@ -134,6 +190,8 @@ class AliyunQwenRealtimeProvider:
             event_type = map_qwen_server_event(payload)
             if event_type is not None:
                 yield ProviderEvent(type=event_type, payload=payload)
+            else:
+                yield build_unmapped_provider_event(payload)
 
     async def close(self) -> None:
         if self._websocket is None:

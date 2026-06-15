@@ -24,11 +24,11 @@ AI 实现前必须按顺序执行：
 
 | 项 | 当前值 |
 |---|---|
-| 当前阶段 | Phase B：Web 商用闭环正式设计准备 |
+| 当前阶段 | Phase B1：记录与查询正式设计待评审 |
 | 最近收尾阶段 | Phase A：Web 端到端核心引擎实现已收尾，补证项见验收报告 |
 | Phase A 设计文档 | [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md) |
 | Phase A 验收报告 | [phases/phase-a-acceptance-report.md](phases/phase-a-acceptance-report.md) |
-| Phase B 当前文档 | [phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)，正式设计待生成 |
+| Phase B 当前文档 | [phases/phase-b1-record-query-design.md](phases/phase-b1-record-query-design.md)，预设计见 [phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md) |
 | 当前入口 | 浏览器入口优先 |
 | 当前模型 | 固定使用阿里百炼 `qwen3.5-omni-plus-realtime` |
 | 当前音色策略 | 前端下拉选择阿里官方 `voice` 参数，默认 `Tina` |
@@ -118,8 +118,8 @@ flowchart TB
   end
 
   subgraph Store["数据与可观测性"]
-    Events["Event Store<br/>通话事件 / 指标 / 延迟"]
-    DB["Database<br/>通话记录 / 生效配置 / 结果"]
+    Events["Event Store<br/>通话事件 / 延迟线索"]
+    DB["Database<br/>通话记录 / 关键事件 / 结果"]
     Files["OSS / MinIO / sys_oss<br/>录音 / 转写 / 质检产物"]
     Metrics["Logs / Metrics / Trace<br/>排障 / 告警"]
   end
@@ -168,14 +168,16 @@ flowchart TB
 | S2S Provider Adapter | 屏蔽模型协议，统一模型事件 | 不管理通话生命周期 |
 | Call State Machine | 管理接通、说话、打断、等待、结束、失败 | 不生成业务话术 |
 | Tool Services | 结束通话、请求转人工、事件上报 | 不做长耗时复杂业务流程 |
-| 数据与可观测性 | 事件、指标、录音、生效配置、结果复盘 | 不影响实时首包链路 |
+| 数据与可观测性 | 事件、运行指标、录音、结果复盘 | 不影响实时首包链路 |
 
 ## 8. 阶段路线
 
 | 阶段 | 状态 | 目标 | 完成定义 |
 |---|---|---|---|
 | Phase A：Web 端到端核心引擎 | 实现已收尾，仍有补证项 | 基于总纲方案从零实现可复用核心模块，保留浏览器入口 | 浏览器通过 LiveKit Room 与 Agent 完成端到端 S2S 对话，并具备事件、状态和延迟指标；补证项见验收报告 |
-| Phase B：Web 商用闭环 | 正式设计准备中，已有预设计 | 在 Web 入口下补齐通话记录、生效配置、事件指标、结果查询，并按 Phase A 结果决定是否接入录音和最小转人工 | 每通 Web 会话可按 `call_id` 复盘状态、事件、指标和结果；录音、最小转人工按 Phase A 结果定稿 |
+| Phase B1：记录与查询 | 正式设计已生成，待评审 | 在 Web 入口下补齐通话记录、关键事件和结果查询 | 每通 Web 会话可按 `call_id` 复盘状态、事件时间线和失败原因 |
+| Phase B2：录音闭环 | 未开始 | 定稿并接入 LiveKit Egress 录音、文件索引和查询播放 | 录音文件可生成、索引、查询和播放 |
+| Phase B3：最小转人工 | 未开始 | 支持转人工请求状态和基础接管事件，不做完整坐席系统 | 转人工请求、接管、失败或取消有状态记录 |
 | Phase C：Web 并发压测与容量验证 | 未开始 | 在不接真实 SIP 的情况下验证模型、Agent、LiveKit、事件、录音和成本的容量边界 | 形成容量报告：在指定配置和场景下可支持的并发会话数、新建速率、首个瓶颈、扩容方式和超限策略 |
 | Phase D：生产加固与运维兜底 | 未开始 | 监控、告警、回滚、限流、排障和故障兜底 | 有 SLO、告警、排障、压测复现和故障兜底 |
 | Phase E：真实 SIP 入口 | 未开始 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
@@ -194,9 +196,9 @@ Phase A 只建立 Web 入口下的端到端核心通话链路，实施时按以�
 
 ## 10. 阶段推进规则
 
-1. 当前推进 Phase B 正式技术设计，不直接进入 Phase B 实现。
+1. 当前推进 Phase B1 正式技术设计评审，不直接进入 B1 实现。
 2. 任何阶段完成后，必须同步更新本文档的“当前状态”和“阶段路线”。
 3. 进入新阶段前，必须先生成或更新该阶段技术设计文档。
-4. Phase A 验收报告中的补证项必须在 Phase B 实现前关闭，或在 Phase B 正式设计中列为已接受风险。
+4. Phase A 验收报告中的补证项必须在 B1 实现或验收前关闭，或在 B1 正式设计中列为已接受风险。
 5. 进入 Phase C 前，必须基于 Phase A/B 的真实实现生成并发压测技术设计文档；Phase C 的核心交付物是容量报告，不是新业务功能。
 6. 真实 SIP 只在 Phase E 接入；前面阶段如果需要模拟电话侧能力，统一通过 WebRTC/浏览器入口验证。

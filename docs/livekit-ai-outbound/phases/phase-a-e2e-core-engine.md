@@ -595,10 +595,14 @@ Qwen 服务端事件映射：
 |---|---|
 | `session.created` | `model_session_started` |
 | `session.updated` | `model_session_updated` |
+| `conversation.item.created` | `conversation_item_created` |
+| `input_audio_buffer.committed` | `input_audio_committed` |
+| `input_audio_buffer.cleared` | `input_audio_cleared` |
 | `input_audio_buffer.speech_started` | `user_speech_started` |
 | `input_audio_buffer.speech_stopped` | `user_speech_stopped` |
 | `conversation.item.input_audio_transcription.delta` | `user_transcript_delta` |
 | `conversation.item.input_audio_transcription.completed` | `user_transcript_done` |
+| `conversation.item.input_audio_transcription.failed` | `user_transcript_failed` |
 | `response.created` | `model_response_started` |
 | `response.audio.delta` | `model_audio_delta` |
 | `response.audio.done` | `model_audio_done` |
@@ -606,6 +610,9 @@ Qwen 服务端事件映射：
 | `response.audio_transcript.done` | `ai_transcript_done` |
 | `response.done` | `model_response_done` |
 | `error` | `model_error` |
+| 未映射事件 | `provider_event_unmapped` |
+
+`conversation.item.input_audio_transcription.delta` 使用阿里事件中的 `text + stash` 作为当前用户转写预览，不按传统增量字段追加。未知事件必须脱敏记录，便于判断供应商是否返回了未覆盖的提交、转写失败或协议事件。
 
 默认 `session.update` 配置由服务端运行配置生成，不由前端请求传入：
 
@@ -617,11 +624,16 @@ Qwen 服务端事件映射：
     "voice": "Tina",
     "input_audio_format": "pcm",
     "output_audio_format": "pcm",
+    "input_audio_transcription": {
+      "language": "zh"
+    },
     "instructions": "你是一个电话外呼助手，回答要简短自然。",
     "turn_detection": {
       "type": "server_vad",
       "threshold": 0.5,
-      "silence_duration_ms": 800
+      "silence_duration_ms": 800,
+      "create_response": false,
+      "interrupt_response": false
     },
     "temperature": 0.7
   }
@@ -632,9 +644,10 @@ Qwen 服务端事件映射：
 
 1. `semantic_vad` 可作为后续优化开关，不作为 Phase A 必须项。
 2. `enable_search` 和工具调用默认关闭，避免影响延迟和可控性。
-3. 模型输入转写仅用于调试和复盘，不能等同于模型真实理解。
-4. `turn_detection` 的 `threshold`、`silence_duration_ms` 等参数来自配置文件；测试时如需调参，修改配置并重启服务，不通过 API 逐通覆盖。
-5. 开场白由同一个 Realtime 会话生成，不单独调用 TTS；实现时需要确保开场白文本进入模型上下文。
+3. `input_audio_transcription.language` 固定为 `zh`，用于明确中文外呼输入语言，避免供应商侧按空语言配置处理。
+4. 模型输入转写仅用于调试和复盘，不能等同于模型真实理解。
+5. `turn_detection` 的 `threshold`、`silence_duration_ms` 等参数来自配置文件；测试时如需调参，修改配置并重启服务，不通过 API 逐通覆盖。
+6. 开场白由同一个 Realtime 会话生成，不单独调用 TTS；实现时需要确保开场白文本进入模型上下文。
 
 ## 10. 打断、沉默和异常处理
 
@@ -643,26 +656,28 @@ Qwen 服务端事件映射：
 触发条件：
 
 1. AI 正在说话。
-2. 收到用户有效语音开始事件，或 LiveKit 音频能量持续超过阈值。
-3. 不是短促弱反馈、背景噪声或明显 AI 回声。
+2. 浏览器音量检测或 Qwen VAD 只先进入 `interrupt_candidate`。
+3. 出现有效用户转写或其他明确人声确认后，才写入 `interrupt_confirmed`。
+4. 不是短促弱反馈、背景噪声或明显 AI 回声。
 
 处理动作：
 
-1. 立即停止向 LiveKit 发布旧 AI 音频。
-2. 清空本地播放队列。
-3. 向 Qwen 发送 `response.cancel`。
-4. 必要时发送 `input_audio_buffer.clear` 清理旧输入缓存。
-5. 写入 `interrupt_confirmed` 和 `interrupt_stop_ms`。
+1. 候选打断只记录事件，不暂停 AI 音频，也不拦截后续音频。
+2. 确认真人说话后，向 Qwen 发送 `response.cancel`，但不立即清理用户当前输入音频。
+3. 对没有有效转写的噪声写入 `interrupt_ignored`，不创建下一轮回复。
+4. 写入 `interrupt_candidate`、`interrupt_confirmed` 和 `interrupt_stop_ms`。
 
 ### 10.2 误打断防护
 
 Phase A 只做基础策略：
 
 1. 浏览器采集麦克风时按服务端返回的配置启用 `echoCancellation`、`noiseSuppression`、`autoGainControl`。
-2. AI 说话时，短于 300ms 的声音不直接确认打断。
-3. “嗯、好、对”等弱反馈不默认打断，先记录 `interrupt_ignored`。
-4. 连续背景噪声只写异常事件，不进入 `interrupted`。
-5. 如果误打断仍频繁，再调整 Qwen `turn_detection.threshold` 和 `silence_duration_ms`。
+2. 浏览器 RMS 音量检测不能直接确认打断，只能作为候选信号。
+3. Qwen `turn_detection` 不自动创建回复，也不自动打断；是否回复由 Agent 状态机决定。
+4. AI 说话时，只有候选信号不改变播放链路，避免噪声造成半句静音。
+5. “嗯、好、对”等弱反馈不默认打断，先记录 `interrupt_ignored`。
+6. 连续背景噪声只写 `interrupt_ignored`，不进入 `interrupted`。
+7. 如果误打断仍频繁，再调整 Qwen `turn_detection.threshold` 和 `silence_duration_ms`，或进入算法版 VAD/降噪增强。
 
 ### 10.3 沉默和等待
 
@@ -712,12 +727,13 @@ Phase A 只做基础策略：
 9. `model_audio_delta`
 10. `ai_audio_published`
 11. `model_response_done`
-12. `interrupt_confirmed`
-13. `interrupt_ignored`
-14. `silence_timeout`
-15. `model_error`
-16. `participant_left`
-17. `session_completed`
+12. `interrupt_candidate`
+13. `interrupt_confirmed`
+14. `interrupt_ignored`
+15. `silence_timeout`
+16. `model_error`
+17. `participant_left`
+18. `session_completed`
 18. `session_failed`
 
 指标口径：

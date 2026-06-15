@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -53,6 +54,23 @@ class RoomAudioTransportProtocol(AudioPublisherProtocol, Protocol):
 ProviderFactory = Callable[[CallSession], RealtimeProviderProtocol]
 
 
+@dataclass(slots=True)
+class PendingUserTurn:
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    transcript_parts: list[str] = field(default_factory=list)
+    response_requested: bool = False
+    interrupt_candidate: bool = False
+    interrupt_confirmed: bool = False
+    interrupt_ignored: bool = False
+    interrupt_trigger_at: datetime | None = None
+    interrupt_reason: str = "user_speech_started_during_ai_audio"
+
+    @property
+    def transcript(self) -> str:
+        return "".join(self.transcript_parts).strip()
+
+
 class RealtimeCallAgentRunner:
     def __init__(
         self,
@@ -80,6 +98,7 @@ class RealtimeCallAgentRunner:
         self._audio_tasks: dict[str, asyncio.Task[None]] = {}
         self._playout_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_ai_audio_published_at: dict[str, datetime] = {}
+        self._pending_user_turns: dict[str, PendingUserTurn] = {}
 
     async def start(self, session: CallSession) -> None:
         provider = self.provider_factory(session)
@@ -120,6 +139,7 @@ class RealtimeCallAgentRunner:
         if provider is not None:
             await provider.close()
         self._last_ai_audio_published_at.pop(call_id, None)
+        self._pending_user_turns.pop(call_id, None)
 
     async def wait(self, call_id: str) -> None:
         for task in (self._tasks.get(call_id), self._audio_tasks.get(call_id)):
@@ -161,36 +181,42 @@ class RealtimeCallAgentRunner:
                 "provider",
                 self._event_payload(provider_event.type, provider_event.payload),
             )
-            if self._is_interrupt_event(call_id, provider_event.type):
-                await self._confirm_interrupt(call_id, provider, event_timestamp)
+            if provider_event.type == "user_speech_started":
+                await self._handle_user_speech_started(call_id, provider, event_timestamp)
+            elif provider_event.type == "user_speech_stopped":
+                await self._handle_user_speech_stopped(call_id, provider, event_timestamp)
+            elif provider_event.type in {"user_transcript_delta", "user_transcript_done"}:
+                await self._handle_user_transcript(
+                    call_id,
+                    provider,
+                    provider_event,
+                    event_timestamp,
+                )
             else:
                 self._apply_provider_event(call_id, provider_event.type, event_timestamp)
             if provider_event.type == "model_audio_delta":
                 await self._publish_model_audio_delta(call_id, provider_event)
 
-    async def confirm_browser_interrupt(
+    async def record_browser_speech_candidate(
         self,
         call_id: str,
         trigger_timestamp: datetime,
     ) -> bool:
         session = self.registry.get(call_id)
-        provider = self._providers.get(call_id)
-        if provider is None:
-            return False
-        # 本地 VAD 通常早于供应商事件；最近播过 AI 音频的短窗口允许打断。
-        if session.status != CallSessionStatus.AI_SPEAKING:
-            if not self._has_recent_ai_audio(call_id, trigger_timestamp):
-                return False
-            if session.status not in {CallSessionStatus.CONNECTED, CallSessionStatus.AI_THINKING}:
-                return False
-            self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
-        await self._confirm_interrupt(
+        if session.status != CallSessionStatus.AI_SPEAKING and not self._has_recent_ai_audio(
             call_id,
-            provider,
             trigger_timestamp,
+        ):
+            return False
+        turn = self._pending_turn(call_id)
+        self._mark_interrupt_candidate(
+            call_id=call_id,
+            turn=turn,
+            trigger_timestamp=trigger_timestamp,
+            source="browser",
             reason="browser_user_speech_started_during_ai_audio",
         )
-        return True
+        return False
 
     def _apply_provider_event(
         self,
@@ -227,6 +253,170 @@ class RealtimeCallAgentRunner:
             self.registry.transition(call_id, CallSessionStatus.FAILED)
 
         self.registry.get(call_id).metrics = metrics.snapshot()
+
+    async def _handle_user_speech_started(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        timestamp: datetime,
+    ) -> None:
+        session = self.registry.get(call_id)
+        turn = self._pending_turn(call_id, reset_if_finished=True)
+        turn.started_at = timestamp
+
+        if session.status in {
+            CallSessionStatus.CONNECTED,
+            CallSessionStatus.AI_THINKING,
+        } and self._has_recent_ai_audio(call_id, timestamp):
+            self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+            session = self.registry.get(call_id)
+
+        if session.status == CallSessionStatus.CONNECTED:
+            self.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
+            return
+
+        if session.status != CallSessionStatus.AI_SPEAKING:
+            return
+
+        self._mark_interrupt_candidate(
+            call_id=call_id,
+            turn=turn,
+            trigger_timestamp=timestamp,
+            source="provider",
+            reason="user_speech_started_during_ai_audio",
+        )
+        await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+
+    async def _handle_user_speech_stopped(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        timestamp: datetime,
+    ) -> None:
+        turn = self._pending_turn(call_id)
+        turn.stopped_at = timestamp
+        await self._maybe_request_response_from_turn(call_id, provider, timestamp)
+        if not turn.transcript and not turn.response_requested:
+            self._ignore_empty_turn(call_id, turn, "no_valid_transcript")
+
+    async def _handle_user_transcript(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        provider_event: ProviderEvent,
+        timestamp: datetime,
+    ) -> None:
+        text = self._transcript_text(provider_event)
+        if not text:
+            return
+        turn = self._pending_turn(call_id)
+        if provider_event.type == "user_transcript_done" or (
+            provider_event.type == "user_transcript_delta"
+            and (
+                "text" in provider_event.payload
+                or "stash" in provider_event.payload
+            )
+        ):
+            turn.transcript_parts = [text]
+        else:
+            turn.transcript_parts.append(text)
+        await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+        await self._maybe_request_response_from_turn(call_id, provider, timestamp)
+
+    def _pending_turn(self, call_id: str, reset_if_finished: bool = False) -> PendingUserTurn:
+        turn = self._pending_user_turns.get(call_id)
+        if turn is None or (
+            reset_if_finished
+            and (
+                turn.response_requested
+                or (turn.stopped_at is not None and not turn.transcript)
+            )
+        ):
+            turn = PendingUserTurn()
+            self._pending_user_turns[call_id] = turn
+        return turn
+
+    def _mark_interrupt_candidate(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        trigger_timestamp: datetime,
+        source: str,
+        reason: str,
+    ) -> None:
+        if not turn.interrupt_candidate:
+            self._append_event(
+                call_id,
+                "interrupt_candidate",
+                "agent",
+                {"source": source, "reason": reason},
+            )
+        turn.interrupt_candidate = True
+        turn.interrupt_ignored = False
+        turn.interrupt_trigger_at = trigger_timestamp
+        turn.interrupt_reason = reason
+
+    async def _maybe_confirm_interrupt_from_turn(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        timestamp: datetime,
+    ) -> None:
+        turn = self._pending_turn(call_id)
+        if not turn.interrupt_candidate or turn.interrupt_confirmed or not turn.transcript:
+            return
+        await self._confirm_interrupt(
+            call_id,
+            provider,
+            turn.interrupt_trigger_at or timestamp,
+            reason=turn.interrupt_reason,
+            clear_input_audio=False,
+        )
+        turn.interrupt_confirmed = True
+
+    async def _maybe_request_response_from_turn(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        timestamp: datetime,
+    ) -> None:
+        turn = self._pending_turn(call_id)
+        if turn.response_requested or turn.stopped_at is None or not turn.transcript:
+            return
+        await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+
+        metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
+        metrics.mark_user_speech_stopped(turn.stopped_at)
+        session = self.registry.get(call_id)
+        if session.status in {
+            CallSessionStatus.USER_SPEAKING,
+            CallSessionStatus.CONNECTED,
+            CallSessionStatus.INTERRUPTED,
+        }:
+            self.registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        await provider.create_response()
+        turn.response_requested = True
+        session.metrics = metrics.snapshot()
+
+    def _ignore_empty_turn(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        reason: str,
+    ) -> None:
+        if turn.interrupt_candidate and not turn.interrupt_ignored:
+            self._append_event(
+                call_id,
+                "interrupt_ignored",
+                "agent",
+                {"reason": reason},
+            )
+            turn.interrupt_candidate = False
+            turn.interrupt_ignored = True
+        session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.USER_SPEAKING:
+            self.registry.transition(call_id, CallSessionStatus.WAITING)
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
 
     def _append_event(
         self,
@@ -310,12 +500,20 @@ class RealtimeCallAgentRunner:
         elapsed_seconds = (trigger_timestamp - last_published_at).total_seconds()
         return 0 <= elapsed_seconds <= self.browser_interrupt_recent_audio_seconds
 
-    def _is_interrupt_event(self, call_id: str, event_type: str) -> bool:
-        session = self.registry.get(call_id)
-        return (
-            event_type == "user_speech_started"
-            and session.status == CallSessionStatus.AI_SPEAKING
-        )
+    @staticmethod
+    def _transcript_text(provider_event: ProviderEvent) -> str:
+        payload = provider_event.payload
+        if provider_event.type == "user_transcript_done":
+            value = payload.get("transcript")
+        elif provider_event.type == "user_transcript_delta":
+            text = payload.get("text")
+            stash = payload.get("stash")
+            if isinstance(text, str) or isinstance(stash, str):
+                return f"{text or ''}{stash or ''}".strip()
+            value = payload.get("delta")
+        else:
+            value = payload.get("delta")
+        return value.strip() if isinstance(value, str) else ""
 
     async def _confirm_interrupt(
         self,
@@ -323,6 +521,7 @@ class RealtimeCallAgentRunner:
         provider: RealtimeProviderProtocol,
         trigger_timestamp: datetime,
         reason: str = "user_speech_started_during_ai_audio",
+        clear_input_audio: bool = False,
     ) -> None:
         await self._cancel_playout_task(call_id)
 
@@ -352,16 +551,17 @@ class RealtimeCallAgentRunner:
                     "message": str(exc),
                 }
             )
-        try:
-            await provider.clear_input_audio()
-        except Exception as exc:
-            cleanup_errors.append(
-                {
-                    "step": "clear_input_audio",
-                    "errorType": type(exc).__name__,
-                    "message": str(exc),
-                }
-            )
+        if clear_input_audio:
+            try:
+                await provider.clear_input_audio()
+            except Exception as exc:
+                cleanup_errors.append(
+                    {
+                        "step": "clear_input_audio",
+                        "errorType": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
 
         event_timestamp = self._append_event(
             call_id,
