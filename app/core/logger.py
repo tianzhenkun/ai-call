@@ -1,5 +1,6 @@
 import atexit
 import logging
+import re
 import sys
 
 from loguru import logger
@@ -10,6 +11,13 @@ from app.config.setting import settings
 
 # 全局变量记录日志处理器ID
 _logger_handlers = []
+
+SENSITIVE_LOGGER_NAMES = ("websockets", "httpcore", "httpx", "livekit")
+BEARER_TOKEN_PATTERN = re.compile(r"(Authorization:\s*Bearer\s+)[^\s'\"]+", re.IGNORECASE)
+
+
+def sanitize_log_message(message: str) -> str:
+    return BEARER_TOKEN_PATTERN.sub(r"\1<redacted>", message)
 
 
 class InterceptHandler(logging.Handler):
@@ -37,7 +45,10 @@ class InterceptHandler(logging.Handler):
             depth += 1
 
         # 使用 Loguru 记录日志
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level,
+            sanitize_log_message(record.getMessage()),
+        )
 
 
 def cleanup_logging() -> None:
@@ -127,6 +138,12 @@ def setup_logging() -> None:
     # 步骤8：配置第三方库日志
     for logger_name in logger_name_list:
         logger_ = logging.getLogger(logger_name)
+        logger_.handlers = [InterceptHandler()]
+        logger_.propagate = False
+
+    for logger_name in SENSITIVE_LOGGER_NAMES:
+        logger_ = logging.getLogger(logger_name)
+        logger_.setLevel(logging.INFO)
         logger_.handlers = [InterceptHandler()]
         logger_.propagate = False
 

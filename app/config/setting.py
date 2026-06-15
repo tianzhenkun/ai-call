@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     LIVEKIT_URL: str = ""
     LIVEKIT_API_KEY: str = ""
     LIVEKIT_API_SECRET: str = ""
+    LIVEKIT_BROWSER_TOKEN_TTL_SECONDS: int = 600
     LIVEKIT_RTC_TCP_PORT: int = 7881
     LIVEKIT_ICE_UDP_RANGE: str = "50000-50100"
 
@@ -127,6 +128,23 @@ class Settings(BaseSettings):
     DASHSCOPE_REGION: str = "cn-beijing"
     DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     DASHSCOPE_WEBSOCKET_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+    DASHSCOPE_REALTIME_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+
+    QWEN_REALTIME_MODEL: str = "qwen3.5-omni-plus-realtime"
+    QWEN_REALTIME_VOICE: str = "Tina"
+    QWEN_REALTIME_TURN_DETECTION_TYPE: str = "server_vad"
+    QWEN_REALTIME_VAD_THRESHOLD: float = 0.5
+    QWEN_REALTIME_VAD_SILENCE_DURATION_MS: int = 800
+
+    AI_CALL_DEFAULT_PROMPT: str = "你是一个电话外呼助手，回答要简短自然。"
+    AI_CALL_STANDALONE_ENABLE: bool = False
+    AI_CALL_OPENING_ENABLED: bool = True
+    AI_CALL_OPENING_MESSAGE: str = "您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？"
+    AI_CALL_EVENT_STORE: Literal["memory", "jsonl"] = "memory"
+
+    WEB_AUDIO_ECHO_CANCELLATION: bool = True
+    WEB_AUDIO_NOISE_SUPPRESSION: bool = True
+    WEB_AUDIO_AUTO_GAIN_CONTROL: bool = True
 
     ASR_PROVIDER: str = ""
     ASR_MODEL: str = ""
@@ -297,7 +315,7 @@ class Settings(BaseSettings):
             "summary": self.SUMMARY,
             "docs_url": None,
             "redoc_url": None,
-            "root_path": self.ROOT_PATH,
+            "root_path": "" if self.AI_CALL_STANDALONE_ENABLE else self.ROOT_PATH,
             "responses": {
                 200: {"description": "成功"},
                 400: {"description": "请求参数错误"},

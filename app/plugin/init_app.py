@@ -28,6 +28,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     返回:
     - AsyncGenerator[Any, Any]: 生命周期上下文生成器。
     """
+    if settings.AI_CALL_STANDALONE_ENABLE:
+        log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
+        yield
+        log.info("✅ AI Call standalone 模式关闭")
+        return
+
     from app.api.v1.system.dict.service import DictDataService
     from app.api.v1.system.oss.service import OssService
     from app.core.ap_scheduler import SchedulerUtil
@@ -113,10 +119,14 @@ def register_routers(app: FastAPI) -> None:
     - None
     """
     from app.api.v1.ai_call import AiCallRouter
+
+    app.include_router(AiCallRouter)
+    if settings.AI_CALL_STANDALONE_ENABLE:
+        return
+
     from app.api.v1.system import system_router
 
     app.include_router(system_router)
-    app.include_router(AiCallRouter)
 
     from app.core.discover import get_dynamic_router
 
