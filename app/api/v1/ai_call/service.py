@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import status
 
 from app.common.constant import RET
@@ -41,12 +43,19 @@ class AiCallService:
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
 
-    async def report_browser_event(self, call_id: str, event_type: str, timestamp):
+    async def report_browser_event(
+        self,
+        call_id: str,
+        event_type: str,
+        timestamp,
+        payload: dict[str, Any] | None = None,
+    ):
         try:
             return await self.orchestrator.report_browser_event(
                 call_id=call_id,
                 event_type=event_type,
                 timestamp=timestamp,
+                payload=payload,
             )
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc

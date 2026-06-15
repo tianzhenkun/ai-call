@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -23,11 +24,14 @@ class CreateWebSessionRequest(AiCallBaseSchema):
 class BrowserEventReportRequest(AiCallBaseSchema):
     type: str = Field(description="浏览器事件类型")
     timestamp: datetime | None = Field(default=None, description="浏览器侧事件时间")
+    payload: dict[str, Any] = Field(default_factory=dict, description="浏览器侧事件载荷")
 
 
 class EffectiveConfigOut(AiCallBaseSchema):
     model: str
     voice: str
+    input_transcription_model: str
+    input_transcription_language: str
     prompt_hash: str
     opening_enabled: bool
     opening_message_hash: str

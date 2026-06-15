@@ -615,11 +615,17 @@ Qwen 服务端事件映射：
     "voice": "Tina",
     "input_audio_format": "pcm",
     "output_audio_format": "pcm",
+    "input_audio_transcription": {
+      "model": "qwen3-asr-flash-realtime",
+      "language": "zh"
+    },
     "instructions": "你是一个电话外呼助手，回答要简短自然。",
     "turn_detection": {
-      "type": "server_vad",
+      "type": "semantic_vad",
       "threshold": 0.5,
-      "silence_duration_ms": 800
+      "silence_duration_ms": 800,
+      "create_response": false,
+      "interrupt_response": false
     },
     "temperature": 0.7
   }
@@ -628,7 +634,7 @@ Qwen 服务端事件映射：
 
 注意：
 
-1. `semantic_vad` 可作为后续优化开关，不作为 Phase A 必须项。
+1. `input_audio_transcription.language` 默认显式设为 `zh`，当前 Phase A 验收场景按中文通话优先。
 2. `enable_search` 和工具调用默认关闭，避免影响延迟和可控性。
 3. 模型输入转写仅用于调试和复盘，不能等同于模型真实理解。
 4. `turn_detection` 的 `threshold`、`silence_duration_ms` 等参数来自配置文件；测试时如需调参，修改配置并重启服务，不通过 API 逐通覆盖。
@@ -717,6 +723,7 @@ Phase A 只做基础策略：
 16. `participant_left`
 17. `session_completed`
 18. `session_failed`
+19. `browser_remote_audio_track_state`
 
 指标口径：
 
@@ -744,9 +751,11 @@ Phase A 只做基础策略：
 | `DASHSCOPE_REALTIME_URL` | 是 | 默认 `wss://dashscope.aliyuncs.com/api-ws/v1/realtime` |
 | `QWEN_REALTIME_MODEL` | 否 | 固定模型，默认 `qwen3.5-omni-plus-realtime`；不作为前端参数 |
 | `QWEN_REALTIME_VOICE` | 否 | 默认音色，建议 `Tina`；前端可传 `voice` 覆盖 |
+| `QWEN_REALTIME_INPUT_TRANSCRIPTION_MODEL` | 否 | 输入音频转写模型，默认 `qwen3-asr-flash-realtime` |
+| `QWEN_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE` | 否 | 输入音频转写语言，默认 `zh` |
 | `AI_CALL_OPENING_ENABLED` | 否 | 是否启用固定开场白，默认 `true` |
 | `AI_CALL_OPENING_MESSAGE` | 否 | 固定开场白文本，不作为前端请求参数 |
-| `QWEN_REALTIME_TURN_DETECTION_TYPE` | 否 | 默认 `server_vad`；不作为前端请求参数 |
+| `QWEN_REALTIME_TURN_DETECTION_TYPE` | 否 | 默认 `semantic_vad`；不作为前端请求参数 |
 | `QWEN_REALTIME_VAD_THRESHOLD` | 否 | 默认 `0.5`，用于判断用户开始说话 |
 | `QWEN_REALTIME_VAD_SILENCE_DURATION_MS` | 否 | 默认 `800`，用于判断用户说完 |
 | `WEB_AUDIO_ECHO_CANCELLATION` | 否 | 默认 `true`，浏览器麦克风回声消除 |

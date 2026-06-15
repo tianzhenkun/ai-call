@@ -63,6 +63,8 @@ ALLOWED_TRANSITIONS: dict[CallSessionStatus, set[CallSessionStatus]] = {
         CallSessionStatus.FAILED,
     },
     CallSessionStatus.AI_THINKING: {
+        CallSessionStatus.CONNECTED,
+        CallSessionStatus.USER_SPEAKING,
         CallSessionStatus.AI_SPEAKING,
         CallSessionStatus.WAITING,
         CallSessionStatus.ENDING,

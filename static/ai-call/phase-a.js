@@ -4,7 +4,13 @@ const state = {
         localTrack: null,
         pollTimer: null,
         pendingBrowserFirstAudio: false,
-        reportedBrowserFirstAudioFor: null,
+        browserFirstAudioReportInFlight: false,
+        remoteAudioContext: null,
+        remoteAudioMonitorTimer: null,
+        remoteAudioAnalyser: null,
+        remoteAudioSamples: null,
+        remoteAudioHotTicks: 0,
+        remoteAudioAttachments: [],
         reportedBrowserReadyFor: null,
         speechAudioContext: null,
         speechMonitorTimer: null,
@@ -13,7 +19,11 @@ const state = {
         browserSpeechActive: false,
         browserSpeechHotTicks: 0,
         browserSpeechQuietTicks: 0,
+        browserSpeechLastActiveAt: 0,
+        browserSpeechReportArmed: false,
         lastBrowserSpeechReportAt: 0,
+        browserSpeechNoiseFloor: 0,
+        browserSpeechNoiseSampleCount: 0,
       };
 
       const BROWSER_SPEECH_POLL_MS = 40;
@@ -21,7 +31,16 @@ const state = {
       const BROWSER_SPEECH_RELEASE_RMS = 0.025;
       const BROWSER_SPEECH_START_TICKS = 4;
       const BROWSER_SPEECH_RELEASE_TICKS = 8;
-      const BROWSER_SPEECH_REPORT_COOLDOWN_MS = 1200;
+      const BROWSER_SPEECH_REPORT_COOLDOWN_MS = 700;
+      const BROWSER_SPEECH_HOLD_MS = 900;
+      const BROWSER_SPEECH_NOISE_SAMPLE_COUNT = 20;
+      const BROWSER_SPEECH_NOISE_MULTIPLIER = 1.6;
+      const BROWSER_SPEECH_NOISE_OFFSET = 0.018;
+      const BROWSER_SPEECH_MAX_START_RMS = 0.068;
+      const BROWSER_SPEECH_RELEASE_RATIO = 0.45;
+      const REMOTE_AUDIO_POLL_MS = 40;
+      const REMOTE_AUDIO_FIRST_RMS = 0.012;
+      const REMOTE_AUDIO_FIRST_TICKS = 2;
 
       const el = {
         statusPill: document.querySelector("#status-pill"),
@@ -116,13 +135,6 @@ const state = {
           return;
         }
 
-        for (const event of events) {
-          if (event.type === "user_speech_stopped") {
-            state.pendingBrowserFirstAudio = true;
-            state.reportedBrowserFirstAudioFor = null;
-          }
-        }
-
         el.eventList.innerHTML = events
           .slice()
           .reverse()
@@ -172,13 +184,24 @@ const state = {
         state.room = room;
         room.on(RoomEvent.TrackSubscribed, (track) => {
           if (track.kind !== "audio") return;
+          detachRemoteAudioElements("track_subscribed");
           const media = track.attach();
           media.autoplay = true;
-          media.onplaying = () => reportBrowserFirstAudio();
+          media.onplaying = () => reportBrowserFirstAudio().catch((error) => log(error.message));
+          state.remoteAudioAttachments.push({ track, media });
           document.body.appendChild(media);
-          log("已订阅远端音频");
+          startRemoteAudioMonitor(track);
+          reportBrowserRemoteAudioTrackState("track_subscribed", track).catch((error) =>
+            log(error.message),
+          );
+          log(`已订阅远端音频，当前播放元素 ${state.remoteAudioAttachments.length}`);
+        });
+        room.on(RoomEvent.TrackUnsubscribed, (track) => {
+          if (track.kind !== "audio") return;
+          detachRemoteAudioElements("track_unsubscribed");
         });
         room.on(RoomEvent.Disconnected, () => {
+          detachRemoteAudioElements("room_disconnected");
           el.micState.textContent = "已断开";
           log("LiveKit Room 已断开");
         });
@@ -198,6 +221,7 @@ const state = {
           el.connectRoom.disabled = true;
           log("麦克风已发布到 LiveKit Room");
         } catch (error) {
+          detachRemoteAudioElements("connect_failed");
           stopLocalSpeechMonitor();
           if (audioTrack) {
             audioTrack.stop();
@@ -206,6 +230,118 @@ const state = {
           state.room = null;
           state.localTrack = null;
           throw error;
+        }
+      }
+
+      function armBrowserFirstAudio() {
+        state.pendingBrowserFirstAudio = true;
+        state.remoteAudioHotTicks = 0;
+      }
+
+      function remoteAudioTrackId(track) {
+        if (!track) return "";
+        return track.sid || track.trackSid || track.mediaStreamTrack?.id || "";
+      }
+
+      function detachRemoteAudioElements(reason) {
+        stopRemoteAudioMonitor();
+        const detachedCount = state.remoteAudioAttachments.length;
+        for (const attachment of state.remoteAudioAttachments) {
+          const { track, media } = attachment;
+          media.onplaying = null;
+          media.pause();
+          if (typeof track.detach === "function") {
+            try {
+              track.detach(media);
+            } catch (_error) {
+              try {
+                track.detach();
+              } catch (_ignored) {}
+            }
+          }
+          media.remove();
+        }
+        state.remoteAudioAttachments = [];
+        if (detachedCount > 0) {
+          reportBrowserRemoteAudioTrackState(reason, null, { detachedCount }).catch((error) =>
+            log(error.message),
+          );
+        }
+      }
+
+      async function reportBrowserRemoteAudioTrackState(reason, track = null, extra = {}) {
+        if (!state.session) return;
+        await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
+          method: "POST",
+          body: JSON.stringify({
+            type: "browser_remote_audio_track_state",
+            payload: {
+              reason,
+              trackSid: remoteAudioTrackId(track),
+              remoteAudioElementCount: state.remoteAudioAttachments.length,
+              ...extra,
+            },
+          }),
+        });
+      }
+
+      function startRemoteAudioMonitor(track) {
+        stopRemoteAudioMonitor();
+        const mediaStreamTrack = track.mediaStreamTrack;
+        if (!mediaStreamTrack || !window.AudioContext) return;
+
+        const audioContext = new AudioContext();
+        const stream = new MediaStream([mediaStreamTrack]);
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+
+        state.remoteAudioContext = audioContext;
+        state.remoteAudioAnalyser = analyser;
+        state.remoteAudioSamples = new Uint8Array(analyser.fftSize);
+        state.remoteAudioHotTicks = 0;
+        state.remoteAudioMonitorTimer = window.setInterval(
+          checkRemoteAudioLevel,
+          REMOTE_AUDIO_POLL_MS,
+        );
+      }
+
+      function stopRemoteAudioMonitor() {
+        if (state.remoteAudioMonitorTimer) {
+          window.clearInterval(state.remoteAudioMonitorTimer);
+        }
+        if (state.remoteAudioContext) {
+          state.remoteAudioContext.close().catch(() => {});
+        }
+        state.remoteAudioMonitorTimer = null;
+        state.remoteAudioContext = null;
+        state.remoteAudioAnalyser = null;
+        state.remoteAudioSamples = null;
+        state.remoteAudioHotTicks = 0;
+      }
+
+      function checkRemoteAudioLevel() {
+        if (!state.remoteAudioAnalyser || !state.remoteAudioSamples) return;
+        if (!state.pendingBrowserFirstAudio || state.browserFirstAudioReportInFlight) return;
+
+        state.remoteAudioAnalyser.getByteTimeDomainData(state.remoteAudioSamples);
+        let sumSquares = 0;
+        for (const sample of state.remoteAudioSamples) {
+          const centered = (sample - 128) / 128;
+          sumSquares += centered * centered;
+        }
+        const rms = Math.sqrt(sumSquares / state.remoteAudioSamples.length);
+
+        if (rms >= REMOTE_AUDIO_FIRST_RMS) {
+          state.remoteAudioHotTicks += 1;
+        } else {
+          state.remoteAudioHotTicks = 0;
+        }
+
+        if (state.remoteAudioHotTicks >= REMOTE_AUDIO_FIRST_TICKS) {
+          state.remoteAudioHotTicks = 0;
+          reportBrowserFirstAudio().catch((error) => log(error.message));
         }
       }
 
@@ -227,6 +363,8 @@ const state = {
         state.browserSpeechActive = false;
         state.browserSpeechHotTicks = 0;
         state.browserSpeechQuietTicks = 0;
+        state.browserSpeechLastActiveAt = 0;
+        state.browserSpeechReportArmed = false;
         state.lastBrowserSpeechReportAt = 0;
         state.speechMonitorTimer = window.setInterval(
           checkLocalSpeechLevel,
@@ -248,7 +386,43 @@ const state = {
         state.browserSpeechActive = false;
         state.browserSpeechHotTicks = 0;
         state.browserSpeechQuietTicks = 0;
+        state.browserSpeechLastActiveAt = 0;
+        state.browserSpeechReportArmed = false;
         state.lastBrowserSpeechReportAt = 0;
+        state.browserSpeechNoiseFloor = 0;
+        state.browserSpeechNoiseSampleCount = 0;
+      }
+
+      function updateBrowserSpeechNoiseFloor(rms) {
+        if (state.browserSpeechActive) return;
+        if (state.browserSpeechNoiseSampleCount >= BROWSER_SPEECH_NOISE_SAMPLE_COUNT) return;
+        if (rms >= BROWSER_SPEECH_START_RMS) return;
+
+        state.browserSpeechNoiseFloor =
+          (state.browserSpeechNoiseFloor * state.browserSpeechNoiseSampleCount + rms) /
+          (state.browserSpeechNoiseSampleCount + 1);
+        state.browserSpeechNoiseSampleCount += 1;
+      }
+
+      function currentBrowserSpeechStartRms() {
+        if (state.browserSpeechNoiseSampleCount < BROWSER_SPEECH_NOISE_SAMPLE_COUNT) {
+          return BROWSER_SPEECH_START_RMS;
+        }
+        return Math.min(
+          BROWSER_SPEECH_MAX_START_RMS,
+          Math.max(
+            BROWSER_SPEECH_START_RMS,
+            state.browserSpeechNoiseFloor * BROWSER_SPEECH_NOISE_MULTIPLIER +
+              BROWSER_SPEECH_NOISE_OFFSET,
+          ),
+        );
+      }
+
+      function currentBrowserSpeechReleaseRms(startRms) {
+        return Math.max(
+          BROWSER_SPEECH_RELEASE_RMS,
+          startRms * BROWSER_SPEECH_RELEASE_RATIO,
+        );
       }
 
       function checkLocalSpeechLevel() {
@@ -261,19 +435,33 @@ const state = {
           sumSquares += centered * centered;
         }
         const rms = Math.sqrt(sumSquares / state.speechSamples.length);
-        const speechStarted = rms >= BROWSER_SPEECH_START_RMS;
-        const speechReleased = rms <= BROWSER_SPEECH_RELEASE_RMS;
+        updateBrowserSpeechNoiseFloor(rms);
+        const speechStartRms = currentBrowserSpeechStartRms();
+        const speechReleaseRms = currentBrowserSpeechReleaseRms(speechStartRms);
+        const speechStarted = rms >= speechStartRms;
+        const speechReleased = rms <= speechReleaseRms;
+        const now = Date.now();
 
         if (speechStarted) {
           state.browserSpeechHotTicks += 1;
           state.browserSpeechQuietTicks = 0;
+          state.browserSpeechLastActiveAt = now;
+          state.browserSpeechReportArmed = true;
         } else if (speechReleased) {
           state.browserSpeechQuietTicks += 1;
           state.browserSpeechHotTicks = 0;
         } else {
           state.browserSpeechHotTicks = 0;
           state.browserSpeechQuietTicks = 0;
+          if (state.browserSpeechActive) {
+            state.browserSpeechLastActiveAt = now;
+            state.browserSpeechReportArmed = true;
+          }
         }
+
+        const speechHeldRecently =
+          state.browserSpeechActive &&
+          now - state.browserSpeechLastActiveAt <= BROWSER_SPEECH_HOLD_MS;
 
         if (
           !state.browserSpeechActive &&
@@ -281,27 +469,47 @@ const state = {
         ) {
           state.browserSpeechActive = true;
           state.browserSpeechHotTicks = 0;
-          reportBrowserUserSpeechStarted().catch((error) => log(error.message));
+          state.browserSpeechLastActiveAt = now;
+          if (reportBrowserUserSpeechStarted()) {
+            state.browserSpeechReportArmed = false;
+          }
         } else if (
           state.browserSpeechActive &&
+          state.browserSpeechReportArmed &&
+          speechHeldRecently
+        ) {
+          state.browserSpeechHotTicks = 0;
+          if (reportBrowserUserSpeechStarted()) {
+            state.browserSpeechReportArmed = false;
+          }
+        } else if (
+          state.browserSpeechActive &&
+          !speechHeldRecently &&
           state.browserSpeechQuietTicks >= BROWSER_SPEECH_RELEASE_TICKS
         ) {
           state.browserSpeechActive = false;
           state.browserSpeechQuietTicks = 0;
+          state.browserSpeechLastActiveAt = 0;
+          state.browserSpeechReportArmed = false;
+          armBrowserFirstAudio();
         }
       }
 
-      async function reportBrowserUserSpeechStarted() {
-        if (!state.session) return;
+      function reportBrowserUserSpeechStarted() {
+        if (!state.session) return false;
         const now = Date.now();
-        if (now - state.lastBrowserSpeechReportAt < BROWSER_SPEECH_REPORT_COOLDOWN_MS) return;
+        if (now - state.lastBrowserSpeechReportAt < BROWSER_SPEECH_REPORT_COOLDOWN_MS) {
+          return false;
+        }
         state.lastBrowserSpeechReportAt = now;
 
-        await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
+        api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
           method: "POST",
           body: JSON.stringify({ type: "browser_user_speech_started" }),
-        });
-        log("已上报 browser_user_speech_started");
+        })
+          .then(() => log("已上报 browser_user_speech_started"))
+          .catch((error) => log(error.message));
+        return true;
       }
 
       async function reportBrowserReady() {
@@ -314,22 +522,27 @@ const state = {
         });
         state.reportedBrowserReadyFor = state.session.callId;
         log("已上报 browser_ready");
+        armBrowserFirstAudio();
         await refreshAll();
       }
 
       async function reportBrowserFirstAudio() {
         if (!state.session || !state.pendingBrowserFirstAudio) return;
-        if (state.reportedBrowserFirstAudioFor === state.session.callId) return;
+        if (state.browserFirstAudioReportInFlight) return;
 
-        await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
-          method: "POST",
-          body: JSON.stringify({ type: "browser_first_audio" }),
-        });
-        state.pendingBrowserFirstAudio = false;
-        state.reportedBrowserFirstAudioFor = state.session.callId;
-        log("已上报 browser_first_audio");
-        await refreshStatus();
-        await refreshEvents();
+        state.browserFirstAudioReportInFlight = true;
+        try {
+          await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
+            method: "POST",
+            body: JSON.stringify({ type: "browser_first_audio" }),
+          });
+          state.pendingBrowserFirstAudio = false;
+          log("已上报 browser_first_audio");
+          await refreshStatus();
+          await refreshEvents();
+        } finally {
+          state.browserFirstAudioReportInFlight = false;
+        }
       }
 
       async function refreshStatus() {
@@ -362,6 +575,7 @@ const state = {
 
       async function endSession() {
         if (!state.session) return;
+        detachRemoteAudioElements("session_ending");
         stopLocalSpeechMonitor();
         if (state.localTrack) {
           state.localTrack.stop();

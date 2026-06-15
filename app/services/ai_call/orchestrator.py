@@ -68,6 +68,8 @@ class AiCallRuntimeConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    qwen_realtime_input_transcription_model: str = "qwen3-asr-flash-realtime"
+    qwen_realtime_input_transcription_language: str = "zh"
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -80,6 +82,12 @@ class AiCallRuntimeConfig:
             dashscope_realtime_url=settings.DASHSCOPE_REALTIME_URL,
             qwen_realtime_model=settings.QWEN_REALTIME_MODEL,
             qwen_realtime_voice=settings.QWEN_REALTIME_VOICE,
+            qwen_realtime_input_transcription_model=(
+                settings.QWEN_REALTIME_INPUT_TRANSCRIPTION_MODEL
+            ),
+            qwen_realtime_input_transcription_language=(
+                settings.QWEN_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE
+            ),
             default_prompt=settings.AI_CALL_DEFAULT_PROMPT,
             opening_enabled=settings.AI_CALL_OPENING_ENABLED,
             opening_message=settings.AI_CALL_OPENING_MESSAGE,
@@ -118,6 +126,8 @@ class EffectiveConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    input_transcription_model: str = "qwen3-asr-flash-realtime"
+    input_transcription_language: str = "zh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +408,7 @@ class AiCallOrchestrator:
         call_id: str,
         event_type: str,
         timestamp: datetime | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> BrowserEventReportResult:
         session = self.registry.get(call_id)
         if session.status not in RUNNING_STATUSES:
@@ -421,6 +432,8 @@ class AiCallOrchestrator:
                 )
         elif event_type == "browser_user_speech_started":
             should_confirm_browser_interrupt = True
+        elif event_type == "browser_remote_audio_track_state":
+            pass
         else:
             raise AiCallError(
                 error_id="unsupported_browser_event",
@@ -428,11 +441,15 @@ class AiCallOrchestrator:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
+        event_payload = {
+            "reportedAt": reported_at.isoformat(),
+            **self._sanitize_browser_event_payload(payload or {}),
+        }
         event = self.event_store.append(
             call_id=call_id,
             type=event_type,
             source="browser",
-            payload={"reportedAt": reported_at.isoformat()},
+            payload=event_payload,
         )
         session.last_event_at = event.timestamp
         if should_confirm_browser_interrupt:
@@ -486,6 +503,8 @@ class AiCallOrchestrator:
         return EffectiveConfig(
             model=self.config.qwen_realtime_model,
             voice=resolved_voice,
+            input_transcription_model=self.config.qwen_realtime_input_transcription_model,
+            input_transcription_language=self.config.qwen_realtime_input_transcription_language,
             prompt=resolved_prompt,
             prompt_hash=self._hash_text(resolved_prompt),
             opening_enabled=self.config.opening_enabled,
@@ -512,6 +531,20 @@ class AiCallOrchestrator:
         if isinstance(config, dict):
             return config.get(key, default)
         return getattr(config, key, default)
+
+    @staticmethod
+    def _sanitize_browser_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            if not isinstance(key, str) or key == "reportedAt":
+                continue
+            if len(sanitized) >= 20:
+                break
+            if isinstance(value, str):
+                sanitized[key[:80]] = value[:200]
+            elif isinstance(value, int | float | bool) or value is None:
+                sanitized[key[:80]] = value
+        return sanitized
 
     @staticmethod
     def _new_call_id() -> str:

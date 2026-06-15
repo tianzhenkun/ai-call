@@ -132,7 +132,9 @@ class Settings(BaseSettings):
 
     QWEN_REALTIME_MODEL: str = "qwen3.5-omni-plus-realtime"
     QWEN_REALTIME_VOICE: str = "Tina"
-    QWEN_REALTIME_TURN_DETECTION_TYPE: str = "server_vad"
+    QWEN_REALTIME_INPUT_TRANSCRIPTION_MODEL: str = "qwen3-asr-flash-realtime"
+    QWEN_REALTIME_INPUT_TRANSCRIPTION_LANGUAGE: str = "zh"
+    QWEN_REALTIME_TURN_DETECTION_TYPE: str = "semantic_vad"
     QWEN_REALTIME_VAD_THRESHOLD: float = 0.5
     QWEN_REALTIME_VAD_SILENCE_DURATION_MS: int = 800
 

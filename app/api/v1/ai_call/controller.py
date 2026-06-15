@@ -107,6 +107,7 @@ async def report_browser_event_controller(
         call_id=call_id,
         event_type=request.type,
         timestamp=request.timestamp,
+        payload=request.payload,
     )
     return SuccessResponse(data=EventOut.model_validate(result), msg="上报成功")
 

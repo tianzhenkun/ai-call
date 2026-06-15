@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import struct
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -156,24 +155,14 @@ class LiveKitRoomAudioTransport:
             return None
 
         sample_count = len(frame.data) // frame.sample_width_bytes
-        fade_sample_count = frame.sample_rate_hz * self.fade_out_ms // 1000
+        fade_ms = min(self.fade_out_ms, self.frame_size_ms)
+        fade_sample_count = frame.sample_rate_hz * fade_ms // 1000
         fade_sample_count = min(sample_count, fade_sample_count)
         if fade_sample_count <= 0:
             return None
 
-        source_offset = (sample_count - fade_sample_count) * frame.sample_width_bytes
-        samples = struct.unpack(
-            "<" + "h" * fade_sample_count,
-            frame.data[source_offset:],
-        )
-        faded = bytearray(fade_sample_count * frame.sample_width_bytes)
-        denominator = max(1, fade_sample_count - 1)
-        for index, sample in enumerate(samples):
-            scale = (denominator - index) / denominator
-            struct.pack_into("<h", faded, index * frame.sample_width_bytes, round(sample * scale))
-
         return PcmAudioFrame(
-            data=bytes(faded),
+            data=b"\x00" * (fade_sample_count * frame.sample_width_bytes),
             sample_rate_hz=frame.sample_rate_hz,
             channels=frame.channels,
             sample_width_bytes=frame.sample_width_bytes,

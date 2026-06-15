@@ -44,7 +44,11 @@ class QwenRealtimeSessionConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    auto_create_response: bool = False
+    auto_interrupt_response: bool = False
     temperature: float = 0.7
+    input_audio_transcription_model: str = "qwen3-asr-flash-realtime"
+    input_audio_transcription_language: str = "zh"
 
 
 def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, Any]:
@@ -55,11 +59,17 @@ def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, A
             "voice": config.voice,
             "input_audio_format": "pcm",
             "output_audio_format": "pcm",
+            "input_audio_transcription": {
+                "model": config.input_audio_transcription_model,
+                "language": config.input_audio_transcription_language,
+            },
             "instructions": config.instructions,
             "turn_detection": {
                 "type": config.vad_type,
                 "threshold": config.vad_threshold,
                 "silence_duration_ms": config.vad_silence_duration_ms,
+                "create_response": config.auto_create_response,
+                "interrupt_response": config.auto_interrupt_response,
             },
             "temperature": config.temperature,
         },
