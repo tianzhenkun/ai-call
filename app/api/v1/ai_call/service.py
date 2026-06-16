@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,12 +65,22 @@ class AiCallService:
                 call_id=call_id,
             )
         except AiCallError as exc:
-            await self._mirror_runtime_events(call_id)
+            await self._mirror_runtime_events(call_id, skip_event_types={"session_failed"})
             await self.record_service.fail_session(
                 call_id,
                 end_reason=exc.error_id,
                 failure_stage=exc.error_id,
                 failure_message=exc.msg,
+            )
+            await self._append_terminal_event_once(
+                call_id=call_id,
+                event_type="session_failed",
+                source="orchestrator",
+                payload={
+                    "endReason": exc.error_id,
+                    "failureStage": exc.error_id,
+                    "failureMessage": exc.msg,
+                },
             )
             raise self._to_custom_exception(exc) from exc
         await self._mirror_runtime_events(call_id)
@@ -148,14 +159,17 @@ class AiCallService:
             result = await self.orchestrator.end_session(call_id)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
-        await self._mirror_runtime_events(call_id)
+        await self._mirror_runtime_events(
+            call_id,
+            skip_event_types={"session_completed", "session_failed"},
+        )
         if self.record_service is not None:
             if result.status == CallSessionStatus.COMPLETED:
                 await self.record_service.complete_session(
                     call_id,
                     end_reason="web_user_end",
                 )
-                await self.record_service.append_terminal_event(
+                await self._append_terminal_event_once(
                     call_id=call_id,
                     event_type="session_completed",
                     source="orchestrator",
@@ -167,6 +181,16 @@ class AiCallService:
                     end_reason="unknown",
                     failure_stage="runtime",
                     failure_message="会话已失败",
+                )
+                await self._append_terminal_event_once(
+                    call_id=call_id,
+                    event_type="session_failed",
+                    source="orchestrator",
+                    payload={
+                        "endReason": "unknown",
+                        "failureStage": "runtime",
+                        "failureMessage": "会话已失败",
+                    },
                 )
         return result
 
@@ -233,11 +257,43 @@ class AiCallService:
             "total": len(rows),
         }
 
-    async def _mirror_runtime_events(self, call_id: str) -> None:
+    async def _mirror_runtime_events(
+        self,
+        call_id: str,
+        *,
+        skip_event_types: set[str] | None = None,
+    ) -> None:
         if self.record_service is None:
             return
         with_runtime_rows = self.orchestrator.event_store.list(call_id=call_id, limit=1000)
-        await self.record_service.mirror_runtime_events(with_runtime_rows)
+        await self.record_service.mirror_runtime_events(
+            with_runtime_rows,
+            skip_event_types=skip_event_types,
+        )
+
+    async def _append_terminal_event_once(
+        self,
+        *,
+        call_id: str,
+        event_type: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.record_service is None:
+            return
+        existing = await self.record_service.list_events(
+            call_id,
+            limit=1,
+            event_type=event_type,
+        )
+        if existing:
+            return
+        await self.record_service.append_terminal_event(
+            call_id=call_id,
+            event_type=event_type,
+            source=source,
+            payload=payload,
+        )
 
     def _ensure_record_service(self) -> None:
         if self.record_service is None:

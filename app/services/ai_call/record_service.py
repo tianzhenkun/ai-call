@@ -110,9 +110,16 @@ class AiCallRecordService:
             ended_at=ended_at,
         )
 
-    async def mirror_runtime_events(self, events: list[AiCallEvent]) -> list[AiCallEventModel]:
+    async def mirror_runtime_events(
+        self,
+        events: list[AiCallEvent],
+        skip_event_types: set[str] | None = None,
+    ) -> list[AiCallEventModel]:
         persisted: list[AiCallEventModel] = []
+        skipped = skip_event_types or set()
         for event in events:
+            if event.type in skipped:
+                continue
             persisted.append(
                 await self.repository.append_event(
                     event_id=event.event_id,

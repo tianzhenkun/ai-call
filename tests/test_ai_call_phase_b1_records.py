@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -152,6 +157,7 @@ async def test_end_session_updates_record_terminal_state_and_reason(b1_service) 
         timestamp=None,
     )
     await service.end_session(result.call_id)
+    await service.end_session(result.call_id)
 
     record = await record_service.get_record(result.call_id)
     assert record is not None
@@ -163,6 +169,8 @@ async def test_end_session_updates_record_terminal_state_and_reason(b1_service) 
     assert record.duration_ms >= 0
 
     events = await record_service.list_events(result.call_id)
+    event_types = [event.event_type for event in events]
+    assert event_types.count("session_completed") == 1
     terminal_event = events[-1]
     assert terminal_event.event_type == "session_completed"
     assert terminal_event.payload == {"endReason": "web_user_end"}
@@ -189,3 +197,49 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+def test_record_route_uses_ai_call_db_dependency_without_system_import_cycle(tmp_path: Path) -> None:
+    db_name = tmp_path / "ai_call_b1_route"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ENVIRONMENT": "dev",
+            "AI_CALL_STANDALONE_ENABLE": "True",
+            "REDIS_ENABLE": "False",
+            "DATABASE_TYPE": "sqlite",
+            "DATABASE_NAME": str(db_name),
+        }
+    )
+    code = """
+import asyncio
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call import model as ai_call_model
+from app.core.database import create_tables
+
+_ = ai_call_model
+asyncio.run(create_tables())
+
+app = FastAPI()
+app.include_router(AiCallRouter)
+
+with TestClient(app) as client:
+    response = client.get('/ai-call/records')
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['code'] == 200
+    assert body['rows'] == []
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr

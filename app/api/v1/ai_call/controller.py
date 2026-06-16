@@ -26,10 +26,11 @@ AiCallRouter = APIRouter(prefix="/ai-call", tags=["智能外呼"])
 
 
 async def ai_call_db_getter() -> AsyncGenerator[AsyncSession, None]:
-    from app.core.dependencies import db_getter
+    from app.core.database import async_db_session
 
-    async for db in db_getter():
-        yield db
+    async with async_db_session() as session:
+        async with session.begin():
+            yield session
 
 
 def get_ai_call_service(
