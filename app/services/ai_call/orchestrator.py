@@ -230,9 +230,10 @@ class AiCallOrchestrator:
         self,
         voice: str | None,
         prompt: str | None,
+        call_id: str | None = None,
     ) -> CreateSessionResult:
         self.config.ensure_ready()
-        call_id = self._new_call_id()
+        call_id = call_id or self._new_call_id()
         room_name = f"ai-call-{call_id}"
         participant_identity = f"browser-{call_id}"
         effective_config = self._build_effective_config(

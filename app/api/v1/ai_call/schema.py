@@ -18,6 +18,8 @@ class AiCallBaseSchema(BaseModel):
 class CreateWebSessionRequest(AiCallBaseSchema):
     voice: str | None = Field(default=None, description="Qwen Realtime voice 参数")
     prompt: str | None = Field(default=None, description="本通会话的模型指令")
+    business_type: str | None = Field(default=None, description="上游业务类型")
+    business_id: str | None = Field(default=None, description="上游业务ID")
 
 
 class BrowserEventReportRequest(AiCallBaseSchema):
@@ -89,3 +91,41 @@ class EventListOut(AiCallBaseSchema):
 class EndSessionOut(AiCallBaseSchema):
     call_id: str
     status: CallSessionStatus
+
+
+class RecordOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    business_type: str | None = None
+    business_id: str | None = None
+    entry_type: str
+    room_name: str | None = None
+    participant_identity: str | None = None
+    status: str
+    end_reason: str | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+    started_at: datetime
+    answered_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+
+
+class RecordEventOut(AiCallBaseSchema):
+    id: str
+    event_id: str
+    call_id: str
+    event_type: str
+    source: str
+    event_time: datetime
+    payload: dict
+
+
+class RecordDetailOut(AiCallBaseSchema):
+    record: RecordOut
+    last_event: RecordEventOut | None = None
+
+
+class RecordEventListOut(AiCallBaseSchema):
+    rows: list[RecordEventOut]
+    total: int

@@ -1,9 +1,12 @@
+from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Path, Query
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common.response import ResponseSchema, SuccessResponse
+from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 
 from .schema import (
     BrowserEventReportRequest,
@@ -12,6 +15,8 @@ from .schema import (
     EndSessionOut,
     EventListOut,
     EventOut,
+    RecordDetailOut,
+    RecordEventListOut,
     SessionStatusOut,
     TokenOut,
 )
@@ -20,8 +25,17 @@ from .service import AiCallService, get_default_ai_call_service
 AiCallRouter = APIRouter(prefix="/ai-call", tags=["智能外呼"])
 
 
-def get_ai_call_service() -> AiCallService:
-    return get_default_ai_call_service()
+async def ai_call_db_getter() -> AsyncGenerator[AsyncSession, None]:
+    from app.core.dependencies import db_getter
+
+    async for db in db_getter():
+        yield db
+
+
+def get_ai_call_service(
+    db: Annotated[AsyncSession, Depends(ai_call_db_getter)],
+) -> AiCallService:
+    return get_default_ai_call_service(db)
 
 
 @AiCallRouter.get("/health", summary="智能外呼模块健康检查")
@@ -41,11 +55,79 @@ async def create_session_controller(
     result = await service.create_web_session(
         voice=request.voice if request else None,
         prompt=request.prompt if request else None,
+        business_type=request.business_type if request else None,
+        business_id=request.business_id if request else None,
     )
     return SuccessResponse(
         data=CreateSessionOut.model_validate(result),
         msg="创建成功",
     )
+
+
+@AiCallRouter.get(
+    "/records",
+    summary="查询通话记录列表",
+)
+async def list_records_controller(
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    call_id: Annotated[str | None, Query(alias="callId")] = None,
+    business_type: Annotated[str | None, Query(alias="businessType")] = None,
+    business_id: Annotated[str | None, Query(alias="businessId")] = None,
+    status: str | None = None,
+    entry_type: Annotated[str | None, Query(alias="entryType")] = None,
+    started_at_begin: Annotated[datetime | None, Query(alias="startedAtBegin")] = None,
+    started_at_end: Annotated[datetime | None, Query(alias="startedAtEnd")] = None,
+    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
+    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 10,
+) -> JSONResponse:
+    result = await service.list_records(
+        call_id=call_id,
+        business_type=business_type,
+        business_id=business_id,
+        status=status,
+        entry_type=entry_type,
+        started_at_begin=started_at_begin,
+        started_at_end=started_at_end,
+        page_num=page_num,
+        page_size=page_size,
+    )
+    return TableResponse(rows=result["rows"], total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/records/{callId}",
+    summary="查询通话记录详情",
+    response_model=ResponseSchema[RecordDetailOut],
+)
+async def get_record_detail_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.get_record_detail(call_id)
+    return SuccessResponse(data=RecordDetailOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/records/{callId}/events",
+    summary="查询通话记录事件",
+    response_model=ResponseSchema[RecordEventListOut],
+)
+async def list_record_events_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    after_event_id: Annotated[str | None, Query(alias="afterEventId")] = None,
+    event_type: Annotated[str | None, Query(alias="eventType")] = None,
+    source: str | None = None,
+) -> JSONResponse:
+    result = await service.list_record_events(
+        call_id=call_id,
+        limit=limit,
+        after_event_id=after_event_id,
+        event_type=event_type,
+        source=source,
+    )
+    return SuccessResponse(data=RecordEventListOut.model_validate(result), msg="查询成功")
 
 
 @AiCallRouter.post(
