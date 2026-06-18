@@ -22,8 +22,7 @@ class OssCRUD(CRUDBase[OssModel, None, None]):
         - dict | None: OSS对象信息
         """
         return await self.raw_one(
-            "SELECT * FROM sys_oss WHERE oss_id = :oss_id",
-            {"oss_id": oss_id}
+            "SELECT * FROM sys_oss WHERE oss_id = :oss_id", {"oss_id": oss_id}
         )
 
     async def get_url_by_oss_id_crud(self, oss_id: int) -> dict | None:
@@ -38,7 +37,7 @@ class OssCRUD(CRUDBase[OssModel, None, None]):
         """
         return await self.raw_one(
             "SELECT oss_id, url, original_name, file_suffix FROM sys_oss WHERE oss_id = :oss_id",
-            {"oss_id": oss_id}
+            {"oss_id": oss_id},
         )
 
     async def get_list_by_oss_ids_crud(self, oss_ids: list[int]) -> list[dict]:
@@ -58,8 +57,7 @@ class OssCRUD(CRUDBase[OssModel, None, None]):
         params = {f"id_{i}": oss_id for i, oss_id in enumerate(oss_ids)}
 
         return await self.raw_dicts(
-            f"SELECT * FROM sys_oss WHERE oss_id IN ({placeholders})",
-            params
+            f"SELECT * FROM sys_oss WHERE oss_id IN ({placeholders})", params
         )
 
     async def get_url_list_by_oss_ids_crud(self, oss_ids: list[int]) -> list[dict]:
@@ -80,5 +78,5 @@ class OssCRUD(CRUDBase[OssModel, None, None]):
 
         return await self.raw_dicts(
             f"SELECT oss_id, url, original_name, file_suffix FROM sys_oss WHERE oss_id IN ({placeholders})",
-            params
+            params,
         )

@@ -41,7 +41,9 @@ class OperationLogRoute(APIRoute):
 
             # 请求后的处理
             process_time = time.time() - start_time
-            log.info(f"Request: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.4f}s")
+            log.info(
+                f"Request: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.4f}s"
+            )
 
             return response
 

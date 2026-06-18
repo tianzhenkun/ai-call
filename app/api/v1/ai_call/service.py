@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,9 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.common.constant import RET
 from app.config.setting import settings
+from app.core.database import async_db_session
 from app.core.exceptions import CustomException
+from app.services.ai_call.dialogue_service import (
+    AiCallDialoguePersistenceWorker,
+    AiCallDialogueRuntimeStore,
+    AiCallDialogueService,
+)
 from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
+from app.services.ai_call.handoff_service import AiCallHandoffService
+from app.services.ai_call.livekit_egress import LiveKitEgressManager
 from app.services.ai_call.orchestrator import (
     AiCallOrchestrator,
     BrowserEventReportResult,
@@ -20,9 +30,35 @@ from app.services.ai_call.orchestrator import (
     ReissueTokenResult,
     SessionStatusResult,
 )
+from app.services.ai_call.prompt_config import (
+    CALL_END_TOOL_INSTRUCTIONS,
+    PROMPT_PROVIDER_STATIC_PROFILE,
+    BusinessPromptResolver,
+    DebugPromptProvider,
+    DefaultPromptProvider,
+    PromptComponent,
+    PromptComposer,
+    PromptEffectiveConfig,
+    PromptResolveContext,
+    normalize_scene_code,
+)
 from app.services.ai_call.record_service import AiCallRecordService
-from app.services.ai_call.session_registry import CallSessionStatus
+from app.services.ai_call.recording_service import AiCallRecordingService
+from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
+from app.services.ai_call.system_prompt_player import LiveKitSystemPromptPlayer
+from app.services.ai_call.voice_profile import (
+    VOICE_GENDER_FEMALE,
+    VOICE_GENDER_MALE,
+    VOICE_GENDER_UNKNOWN,
+    VOICE_TYPE_CUSTOM_CLONE,
+    builtin_voice_profile_values,
+)
 from app.utils.id_util import generate_snowflake_id
+
+if TYPE_CHECKING:
+    from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
+    from app.services.ai_call.handoff_trigger_service import AiCallHandoffTriggerWorker
+    from app.services.ai_call.offline_asr_service import AiCallOfflineAsrWorker
 
 
 class AiCallService:
@@ -30,16 +66,33 @@ class AiCallService:
         self,
         orchestrator: AiCallOrchestrator,
         record_service: AiCallRecordService | None = None,
+        recording_service: AiCallRecordingService | None = None,
+        dialogue_service: AiCallDialogueService | None = None,
+        handoff_service: AiCallHandoffService | None = None,
+        handoff_exception_manager: AiCallHandoffExceptionManager | None = None,
+        prompt_repository: AiCallRecordRepository | None = None,
+        prompt_resolver: BusinessPromptResolver | None = None,
+        prompt_composer: PromptComposer | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.record_service = record_service
+        self.recording_service = recording_service
+        self.dialogue_service = dialogue_service
+        self.handoff_service = handoff_service
+        self.handoff_exception_manager = handoff_exception_manager
+        self.prompt_repository = prompt_repository or (
+            record_service.repository if record_service is not None else None
+        )
+        self.prompt_resolver = prompt_resolver
+        self.prompt_composer = prompt_composer
 
     async def create_web_session(
         self,
         voice: str | None,
         prompt: str | None,
-        business_type: str | None = None,
         business_id: str | None = None,
+        scene_code: str | None = None,
+        business_params: dict | None = None,
     ) -> CreateSessionResult:
         if self.record_service is None:
             try:
@@ -47,41 +100,201 @@ class AiCallService:
             except AiCallError as exc:
                 raise self._to_custom_exception(exc) from exc
 
+        if self.prompt_resolver is not None or self.prompt_composer is not None:
+            scene_code = self._require_scene_code(scene_code)
+            if _strip_or_none(prompt):
+                raise CustomException(
+                    msg="调试提示词已下线，请使用业务场景提示词配置",
+                    code=RET.ERROR.code,
+                    status_code=400,
+                )
+
+        resolved_voice = await self._resolve_voice(voice)
         call_id = f"call_{generate_snowflake_id()}"
         room_name = f"ai-call-{call_id}"
         participant_identity = f"browser-{call_id}"
         await self.record_service.create_web_record(
             call_id=call_id,
-            business_type=business_type,
             business_id=business_id,
             room_name=room_name,
             participant_identity=participant_identity,
         )
         try:
-            result = await self.orchestrator.create_web_session(
-                voice=voice,
-                prompt=prompt,
+            prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=call_id,
+                business_id=business_id,
+                scene_code=scene_code,
+                business_params=business_params or {},
+                debug_prompt=None,
+            )
+            result = await self.orchestrator.create_web_session(
+                voice=resolved_voice,
+                prompt=None,
+                call_id=call_id,
+                prompt_effective_config=prompt_effective_config,
             )
         except AiCallError as exc:
-            await self._mirror_runtime_events(call_id)
             await self.record_service.fail_session(
                 call_id,
                 end_reason=exc.error_id,
-                failure_stage=exc.error_id,
+                failure_stage=self._failure_stage_for_end_reason(exc.error_id),
                 failure_message=exc.msg,
             )
             raise self._to_custom_exception(exc) from exc
-        await self._mirror_runtime_events(call_id)
         await self.record_service.mark_status(call_id, result.status)
+        if self.recording_service is not None:
+            await self.recording_service.start_for_session(
+                call_id=result.call_id,
+                room_name=result.room_name,
+                customer_participant_identity=result.participant_identity,
+                ai_participant_identity=f"agent-{result.call_id}",
+            )
         return result
+
+    async def list_voice_profiles(
+        self,
+        *,
+        voice_type: str | None = None,
+        gender: str | None = None,
+        target_model: str | None = None,
+        page_num: int = 1,
+        page_size: int = 200,
+    ) -> dict:
+        repository = self._ensure_prompt_repository()
+        resolved_target_model = (
+            target_model or self.orchestrator.config.qwen_realtime_model
+        ).strip() or self.orchestrator.config.qwen_realtime_model
+        await self._ensure_builtin_voice_profiles(repository, resolved_target_model)
+        rows, total = await repository.list_voice_profiles(
+            target_model=resolved_target_model,
+            voice_type=_strip_or_none(voice_type),
+            gender=_strip_or_none(gender),
+            page_num=page_num,
+            page_size=page_size,
+        )
+        return {
+            "rows": [self._voice_profile_to_dict(row) for row in rows],
+            "total": total,
+        }
+
+    async def create_voice_profile(self, values: dict) -> dict:
+        repository = self._ensure_prompt_repository()
+        values = self._normalize_voice_profile_values(values)
+        existing = await repository.get_voice_profile_by_voice(
+            voice=values["voice"],
+            target_model=values["target_model"],
+        )
+        if existing is not None:
+            raise CustomException(
+                msg="该模型下音色已存在",
+                code=RET.ERROR.code,
+                status_code=400,
+            )
+        profile = await repository.create_voice_profile(**values)
+        return self._voice_profile_to_dict(profile)
+
+    async def list_prompt_profiles(
+        self,
+        *,
+        scene_code: str | None = None,
+        page_num: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        repository = self._ensure_prompt_repository()
+        rows, total = await repository.list_prompt_profiles(
+            scene_code=normalize_scene_code(scene_code),
+            page_num=page_num,
+            page_size=page_size,
+        )
+        return {
+            "rows": [self._prompt_profile_to_dict(row) for row in rows],
+            "total": total,
+        }
+
+    async def get_prompt_profile(self, profile_id: int) -> dict:
+        repository = self._ensure_prompt_repository()
+        profile = await repository.get_prompt_profile(profile_id)
+        if profile is None:
+            raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
+        return self._prompt_profile_to_dict(profile)
+
+    async def create_prompt_profile(self, values: dict) -> dict:
+        repository = self._ensure_prompt_repository()
+        values = self._normalize_prompt_profile_values(values)
+        await self._ensure_prompt_profile_unique(repository, values)
+        profile = await repository.create_prompt_profile(**values)
+        return self._prompt_profile_to_dict(profile)
+
+    async def update_prompt_profile(self, profile_id: int, values: dict) -> dict:
+        repository = self._ensure_prompt_repository()
+        values = self._normalize_prompt_profile_values(values)
+        existing = await repository.get_prompt_profile(profile_id)
+        if existing is None:
+            raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
+        await self._ensure_prompt_profile_unique(repository, values, current_id=profile_id)
+        profile = await repository.update_prompt_profile(profile_id, **values)
+        if profile is None:
+            raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
+        return self._prompt_profile_to_dict(profile)
+
+    async def list_prompt_components(self) -> dict:
+        composer = self._ensure_prompt_composer()
+        components = [
+            *composer.public_components(),
+            PromptComponent(
+                component_key="call_end_tool",
+                name="结束通话工具约束",
+                content=CALL_END_TOOL_INSTRUCTIONS,
+            ),
+        ]
+        rows = [
+            {
+                "componentKey": component.component_key,
+                "name": component.name,
+                "content": component.content,
+            }
+            for component in components
+        ]
+        return {"rows": rows, "total": len(rows)}
+
+    async def preview_prompt_profile(
+        self,
+        *,
+        business_id: str | None,
+        scene_code: str | None,
+        business_params: dict | None,
+        prompt: str | None,
+    ) -> dict:
+        scene_code = self._require_scene_code(scene_code)
+        if _strip_or_none(prompt):
+            raise CustomException(
+                msg="调试提示词已下线，请使用业务场景提示词配置",
+                code=RET.ERROR.code,
+                status_code=400,
+            )
+        try:
+            effective_config = await self._resolve_prompt_effective_config(
+                call_id="preview",
+                business_id=business_id,
+                scene_code=scene_code,
+                business_params=business_params or {},
+                debug_prompt=None,
+            )
+        except AiCallError as exc:
+            raise self._to_custom_exception(exc) from exc
+        return {
+            "instructions": effective_config.instructions,
+            "openingMessage": effective_config.opening_message,
+            "promptHash": effective_config.prompt_hash,
+            "openingMessageHash": effective_config.opening_message_hash,
+            "promptSourceKey": effective_config.prompt_source_key,
+        }
 
     async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
         try:
             result = await self.orchestrator.reissue_browser_token(call_id)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
-        await self._mirror_runtime_events(call_id)
         return result
 
     async def get_session(self, call_id: str) -> SessionStatusResult:
@@ -97,31 +310,21 @@ class AiCallService:
         after_event_id: str | None,
     ) -> EventListResult:
         try:
-            if self.record_service is not None:
-                rows = await self.record_service.list_events(
-                    call_id,
-                    limit=limit,
-                    after_event_id=after_event_id,
-                )
-                if rows:
-                    runtime_rows = [
-                        AiCallEvent(
-                            event_id=row.event_id,
-                            call_id=row.call_id,
-                            type=row.event_type,
-                            timestamp=row.event_time,
-                            source=row.source,
-                            payload=row.payload,
-                        )
-                        for row in rows
-                    ]
-                    return EventListResult(rows=runtime_rows, total=len(runtime_rows))
             return await self.orchestrator.list_events(
                 call_id=call_id,
                 limit=limit,
                 after_event_id=after_event_id,
             )
         except AiCallError as exc:
+            if self.record_service is not None:
+                record = await self.record_service.get_record(call_id)
+                if record is not None:
+                    rows = await self.record_service.list_events(
+                        call_id,
+                        limit=limit,
+                        after_event_id=after_event_id,
+                    )
+                    return self._event_rows_to_runtime_result(rows)
             raise self._to_custom_exception(exc) from exc
 
     async def report_browser_event(
@@ -131,6 +334,11 @@ class AiCallService:
         timestamp: datetime | None,
     ) -> BrowserEventReportResult:
         try:
+            if event_type == "browser_disconnect" and self.recording_service is not None:
+                await self.orchestrator.get_session(call_id)
+                await self.recording_service.stop_for_session(call_id)
+            elif event_type == "browser_ready":
+                await self._start_browser_ready_recording_tracks(call_id)
             result = await self.orchestrator.report_browser_event(
                 call_id=call_id,
                 event_type=event_type,
@@ -138,29 +346,46 @@ class AiCallService:
             )
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
-        await self._mirror_runtime_events(call_id)
-        if self.record_service is not None and event_type == "browser_ready":
-            await self.record_service.mark_answered(call_id, result.timestamp)
+        if self.record_service is not None:
+            if event_type == "browser_ready":
+                await self.record_service.mark_answered(call_id, result.timestamp)
+            elif event_type == "browser_disconnect":
+                await self.record_service.complete_session(
+                    call_id,
+                    end_reason="browser_disconnect",
+                    ended_at=result.timestamp,
+                )
+                await self._finalize_handoffs_for_call(
+                    call_id,
+                    end_reason="browser_disconnect",
+                )
+                await self._enqueue_offline_asr_if_recordings_closed(call_id)
         return result
 
-    async def end_session(self, call_id: str) -> EndSessionResult:
+    async def end_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str = "web_user_end",
+    ) -> EndSessionResult:
         try:
-            result = await self.orchestrator.end_session(call_id)
+            session = await self.orchestrator.get_session(call_id)
+            if self.recording_service is not None and session.status != CallSessionStatus.COMPLETED:
+                await self.recording_service.stop_for_session(call_id)
+            result = await self.orchestrator.end_session(call_id, end_reason=end_reason)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
-        await self._mirror_runtime_events(call_id)
         if self.record_service is not None:
             if result.status == CallSessionStatus.COMPLETED:
                 await self.record_service.complete_session(
                     call_id,
-                    end_reason="web_user_end",
+                    end_reason=end_reason,
                 )
-                await self.record_service.append_terminal_event(
-                    call_id=call_id,
-                    event_type="session_completed",
-                    source="orchestrator",
-                    payload={"endReason": "web_user_end"},
+                await self._finalize_handoffs_for_call(
+                    call_id,
+                    end_reason=end_reason,
                 )
+                await self._enqueue_offline_asr_if_recordings_closed(call_id)
             elif result.status == CallSessionStatus.FAILED:
                 await self.record_service.fail_session(
                     call_id,
@@ -168,6 +393,8 @@ class AiCallService:
                     failure_stage="runtime",
                     failure_message="会话已失败",
                 )
+                await self._finalize_handoffs_for_call(call_id, end_reason="runtime_failed")
+                await self._enqueue_offline_asr_if_recordings_closed(call_id)
         return result
 
     async def list_records(
@@ -233,15 +460,601 @@ class AiCallService:
             "total": len(rows),
         }
 
-    async def _mirror_runtime_events(self, call_id: str) -> None:
-        if self.record_service is None:
-            return
-        with_runtime_rows = self.orchestrator.event_store.list(call_id=call_id, limit=1000)
-        await self.record_service.mirror_runtime_events(with_runtime_rows)
+    async def get_recording(self, call_id: str) -> dict | None:
+        self._ensure_recording_service()
+        recording = await self.recording_service.get_recording(call_id)
+        if recording is None:
+            return None
+        return await self.recording_service.recording_to_dict(recording)
+
+    async def list_dialogue_preview(self, call_id: str) -> dict:
+        self._ensure_dialogue_service()
+        return await self.dialogue_service.list_preview_segments(call_id)
+
+    async def list_record_dialogue_segments(
+        self,
+        call_id: str,
+        *,
+        speaker_type: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        self._ensure_dialogue_service()
+        rows = await self.dialogue_service.list_persisted_segments(
+            call_id,
+            speaker_type=speaker_type,
+            limit=limit,
+        )
+        return {
+            "rows": [self.dialogue_service.segment_to_dict(row) for row in rows],
+            "total": len(rows),
+        }
+
+    async def create_handoff(
+        self,
+        *,
+        call_id: str,
+        source: str,
+        reason: str | None,
+        request_message: str | None,
+    ) -> dict:
+        self._ensure_handoff_service()
+        try:
+            session = await self.orchestrator.get_session(call_id)
+        except AiCallError as exc:
+            raise self._to_custom_exception(exc) from exc
+        handoff, created = await self.handoff_service.create_request(
+            call_id=call_id,
+            room_name=session.room_name,
+            source=source,
+            reason=reason,
+            request_message=request_message,
+        )
+        self._record_expired_handoff_events()
+        if created:
+            try:
+                await self.orchestrator.suspend_for_handoff(
+                    call_id=call_id,
+                    handoff_id=handoff.handoff_id,
+                    request_source=handoff.request_source,
+                    request_reason=handoff.request_reason,
+                )
+            except AiCallError as exc:
+                failed = await self.handoff_service.fail_request(
+                    handoff_id=handoff.handoff_id,
+                    failure_stage="agent_suspend",
+                    failure_message=exc.msg,
+                )
+                if failed is not None:
+                    self._trigger_handoff_exception_close(
+                        failed,
+                        call_end_reason="handoff_failed",
+                    )
+                raise self._to_custom_exception(exc) from exc
+            except Exception as exc:
+                failed = await self.handoff_service.fail_request(
+                    handoff_id=handoff.handoff_id,
+                    failure_stage="agent_suspend",
+                    failure_message="Agent 挂起失败",
+                )
+                if failed is not None:
+                    self._trigger_handoff_exception_close(
+                        failed,
+                        call_end_reason="handoff_failed",
+                    )
+                raise CustomException(
+                    msg="Agent 挂起失败",
+                    code=RET.ERROR.code,
+                    status_code=500,
+                ) from exc
+            refreshed = await self.handoff_service.get_current(call_id)
+            if refreshed is not None:
+                handoff = refreshed
+        self._schedule_handoff_timeout(handoff)
+        return self.handoff_service.handoff_to_dict(handoff)
+
+    async def get_current_handoff(self, call_id: str) -> dict | None:
+        self._ensure_handoff_service()
+        handoff = await self.handoff_service.get_current(call_id)
+        self._record_expired_handoff_events()
+        return self.handoff_service.handoff_to_dict(handoff) if handoff else None
+
+    async def list_handoffs(self, call_id: str) -> dict:
+        self._ensure_handoff_service()
+        rows = await self.handoff_service.list_handoffs(call_id)
+        return {
+            "rows": [self.handoff_service.handoff_to_dict(row) for row in rows],
+            "total": len(rows),
+        }
+
+    async def list_joinable_handoffs(self, *, limit: int = 50) -> dict:
+        self._ensure_handoff_service()
+        rows = await self.handoff_service.list_joinable_handoffs(limit=limit)
+        return {
+            "rows": [self.handoff_service.handoff_to_dict(row) for row in rows],
+            "total": len(rows),
+        }
+
+    async def accept_handoff(
+        self,
+        *,
+        handoff_id: str,
+        human_agent_identity: str,
+    ) -> dict:
+        self._ensure_handoff_service()
+        try:
+            handoff = await self.handoff_service.accept(
+                handoff_id=handoff_id,
+                human_agent_identity=human_agent_identity,
+            )
+        finally:
+            self._record_expired_handoff_events()
+        try:
+            token = self.orchestrator.issue_handoff_token(
+                call_id=handoff.call_id,
+                handoff_id=handoff.handoff_id,
+                human_agent_identity=human_agent_identity,
+            )
+        except AiCallError as exc:
+            failed = await self.handoff_service.fail_request(
+                handoff_id=handoff.handoff_id,
+                failure_stage="token_issue",
+                failure_message=exc.msg,
+            )
+            if failed is not None:
+                self._record_handoff_event_best_effort(
+                    call_id=failed.call_id,
+                    event_type="handoff_failed",
+                    handoff_id=failed.handoff_id,
+                    handoff_status=failed.status,
+                    payload={
+                        "failureStage": failed.failure_stage,
+                        "failureMessage": failed.failure_message,
+                    },
+                )
+                self._trigger_handoff_exception_close(
+                    failed,
+                    call_end_reason="handoff_failed",
+                )
+            raise self._to_custom_exception(exc) from exc
+        self._schedule_handoff_timeout(handoff)
+        return {
+            "handoff": self.handoff_service.handoff_to_dict(handoff),
+            "seatToken": {
+                "callId": token.call_id,
+                "handoffId": token.handoff_id,
+                "roomName": token.room_name,
+                "livekitUrl": token.livekit_url,
+                "participantToken": token.participant_token,
+                "participantIdentity": token.participant_identity,
+                "expiresInSeconds": token.expires_in_seconds,
+            },
+        }
+
+    async def mark_handoff_connected(self, handoff_id: str) -> dict:
+        self._ensure_handoff_service()
+        try:
+            handoff = await self.handoff_service.mark_connected(handoff_id)
+        finally:
+            self._record_expired_handoff_events()
+        self._record_handoff_event_best_effort(
+            call_id=handoff.call_id,
+            event_type="handoff_connected",
+            handoff_id=handoff.handoff_id,
+            handoff_status=handoff.status,
+            payload={"humanAgentIdentity": handoff.human_agent_identity},
+        )
+        if self.recording_service is not None:
+            await self.recording_service.start_human_agent_recording(
+                call_id=handoff.call_id,
+                room_name=handoff.room_name,
+                handoff_id=handoff.handoff_id,
+                participant_identity=f"human-agent-{handoff.handoff_id}",
+            )
+        self._cancel_handoff_timeout(handoff, reason="connected")
+        return self.handoff_service.handoff_to_dict(handoff)
+
+    async def complete_handoff(self, *, handoff_id: str, reason: str | None) -> dict:
+        self._ensure_handoff_service()
+        handoff = await self.handoff_service.complete(
+            handoff_id=handoff_id,
+            reason=reason,
+        )
+        self._record_handoff_event_best_effort(
+            call_id=handoff.call_id,
+            event_type="handoff_completed",
+            handoff_id=handoff.handoff_id,
+            handoff_status=handoff.status,
+            payload={"reason": handoff.end_reason},
+        )
+        self._cancel_handoff_timeout(handoff, reason="completed")
+        await self._end_running_session_after_handoff(handoff.call_id, handoff.end_reason)
+        return self.handoff_service.handoff_to_dict(handoff)
+
+    async def cancel_handoff(self, *, handoff_id: str, reason: str | None) -> dict:
+        self._ensure_handoff_service()
+        try:
+            handoff = await self.handoff_service.cancel(
+                handoff_id=handoff_id,
+                reason=reason,
+            )
+        finally:
+            self._record_expired_handoff_events()
+        self._record_handoff_event_best_effort(
+            call_id=handoff.call_id,
+            event_type="handoff_canceled",
+            handoff_id=handoff.handoff_id,
+            handoff_status=handoff.status,
+            payload={"reason": handoff.end_reason},
+        )
+        self._cancel_handoff_timeout(handoff, reason="canceled")
+        return self.handoff_service.handoff_to_dict(handoff)
+
+    async def fail_handoff(
+        self,
+        *,
+        handoff_id: str,
+        failure_stage: str,
+        failure_message: str | None,
+    ) -> dict:
+        self._ensure_handoff_service()
+        handoff = await self.handoff_service.fail(
+            handoff_id=handoff_id,
+            failure_stage=failure_stage,
+            failure_message=failure_message,
+        )
+        self._record_handoff_event_best_effort(
+            call_id=handoff.call_id,
+            event_type="handoff_failed",
+            handoff_id=handoff.handoff_id,
+            handoff_status=handoff.status,
+            payload={
+                "failureStage": handoff.failure_stage,
+                "failureMessage": handoff.failure_message,
+            },
+        )
+        self._trigger_handoff_exception_close(
+            handoff,
+            call_end_reason="handoff_failed",
+        )
+        return self.handoff_service.handoff_to_dict(handoff)
+
+    @staticmethod
+    def _event_rows_to_runtime_result(rows) -> EventListResult:
+        runtime_rows = [
+            AiCallEvent(
+                event_id=row.event_id,
+                call_id=row.call_id,
+                type=row.event_type,
+                timestamp=row.event_time,
+                source=row.source,
+                payload=row.payload,
+            )
+            for row in rows
+        ]
+        return EventListResult(rows=runtime_rows, total=len(runtime_rows))
+
+    @staticmethod
+    def _failure_stage_for_end_reason(end_reason: str) -> str:
+        return {
+            "agent_start_failed": "agent_start",
+            "room_create_failed": "room_create",
+            "provider_connect_failed": "provider_connect",
+        }.get(end_reason, end_reason)
 
     def _ensure_record_service(self) -> None:
         if self.record_service is None:
             raise CustomException(msg="通话记录服务未启用", code=RET.ERROR.code, status_code=500)
+
+    def _ensure_prompt_repository(self) -> AiCallRecordRepository:
+        if self.prompt_repository is None:
+            raise CustomException(msg="提示词配置服务未启用", code=RET.ERROR.code, status_code=500)
+        return self.prompt_repository
+
+    def _ensure_prompt_resolver(self) -> BusinessPromptResolver:
+        if self.prompt_resolver is None:
+            raise CustomException(msg="提示词解析服务未启用", code=RET.ERROR.code, status_code=500)
+        return self.prompt_resolver
+
+    def _ensure_prompt_composer(self) -> PromptComposer:
+        if self.prompt_composer is None:
+            raise CustomException(msg="提示词组装服务未启用", code=RET.ERROR.code, status_code=500)
+        return self.prompt_composer
+
+    async def _resolve_voice(self, voice: str | None) -> str | None:
+        normalized_voice = _strip_or_none(voice)
+        if not normalized_voice:
+            return None
+        repository = self._ensure_prompt_repository()
+        target_model = self.orchestrator.config.qwen_realtime_model
+        await self._ensure_builtin_voice_profiles(repository, target_model)
+        profile = await repository.get_voice_profile_by_voice(
+            voice=normalized_voice,
+            target_model=target_model,
+        )
+        if profile is None:
+            raise CustomException(
+                msg="音色不存在或不适用于当前模型",
+                code=RET.ERROR.code,
+                status_code=400,
+            )
+        return profile.voice
+
+    @staticmethod
+    async def _ensure_builtin_voice_profiles(
+        repository: AiCallRecordRepository,
+        target_model: str,
+    ) -> None:
+        await repository.ensure_builtin_voice_profiles(
+            target_model=target_model,
+            profiles=builtin_voice_profile_values(target_model),
+        )
+
+    def _normalize_voice_profile_values(self, values: dict) -> dict:
+        voice = _strip_or_none(values.get("voice"))
+        if not voice:
+            raise CustomException(msg="voice 不能为空", code=RET.ERROR.code, status_code=400)
+        display_name = _strip_or_none(values.get("display_name"))
+        if not display_name:
+            raise CustomException(msg="displayName 不能为空", code=RET.ERROR.code, status_code=400)
+        target_model = (
+            _strip_or_none(values.get("target_model"))
+            or self.orchestrator.config.qwen_realtime_model
+        )
+        gender = _strip_or_none(values.get("gender")) or VOICE_GENDER_UNKNOWN
+        if gender not in {VOICE_GENDER_UNKNOWN, VOICE_GENDER_FEMALE, VOICE_GENDER_MALE}:
+            raise CustomException(msg="gender 不合法", code=RET.ERROR.code, status_code=400)
+        sort_order = values.get("sort_order")
+        return {
+            "voice": voice,
+            "display_name": display_name,
+            "voice_type": VOICE_TYPE_CUSTOM_CLONE,
+            "gender": gender,
+            "target_model": target_model,
+            "description": _strip_or_none(values.get("description")),
+            "sort_order": int(sort_order) if sort_order is not None else 1000,
+            "remark": _strip_or_none(values.get("remark")),
+        }
+
+    @staticmethod
+    def _require_scene_code(scene_code: str | None) -> str:
+        normalized_scene_code = _strip_or_none(scene_code)
+        if not normalized_scene_code:
+            raise CustomException(msg="sceneCode 不能为空", code=RET.ERROR.code, status_code=400)
+        return normalize_scene_code(normalized_scene_code) or normalized_scene_code
+
+    async def _resolve_prompt_effective_config(
+        self,
+        *,
+        call_id: str,
+        business_id: str | None,
+        scene_code: str | None,
+        business_params: dict,
+        debug_prompt: str | None,
+    ) -> PromptEffectiveConfig | None:
+        if self.prompt_resolver is None or self.prompt_composer is None:
+            return None
+        prompt_result = await self.prompt_resolver.resolve(
+            PromptResolveContext(
+                call_id=call_id,
+                business_id=business_id,
+                scene_code=scene_code,
+                business_params=business_params,
+                debug_prompt=debug_prompt,
+            )
+        )
+        return self.prompt_composer.compose(prompt_result)
+
+    @staticmethod
+    def _normalize_prompt_profile_values(values: dict) -> dict:
+        normalized = {
+            "scene_code": (normalize_scene_code(str(values.get("scene_code") or "").strip()) or ""),
+            "name": str(values.get("name") or "").strip(),
+            "provider_key": str(
+                values.get("provider_key") or PROMPT_PROVIDER_STATIC_PROFILE
+            ).strip(),
+            "prompt_text": _strip_or_none(values.get("prompt_text")),
+            "opening_message": _strip_or_none(values.get("opening_message")),
+        }
+        if not normalized["scene_code"]:
+            raise CustomException(msg="sceneCode 不能为空", code=RET.ERROR.code, status_code=400)
+        if not normalized["name"]:
+            raise CustomException(msg="name 不能为空", code=RET.ERROR.code, status_code=400)
+        if (
+            normalized["provider_key"] == PROMPT_PROVIDER_STATIC_PROFILE
+            and not normalized["prompt_text"]
+        ):
+            raise CustomException(msg="固定提示词不能为空", code=RET.ERROR.code, status_code=400)
+        if (
+            normalized["provider_key"] == PROMPT_PROVIDER_STATIC_PROFILE
+            and not normalized["opening_message"]
+        ):
+            raise CustomException(msg="固定开场白不能为空", code=RET.ERROR.code, status_code=400)
+        return normalized
+
+    @staticmethod
+    async def _ensure_prompt_profile_unique(
+        repository: AiCallRecordRepository,
+        values: dict,
+        *,
+        current_id: int | None = None,
+    ) -> None:
+        existing_scene = await repository.get_prompt_profile_by_scene(
+            scene_code=values["scene_code"],
+        )
+        if existing_scene is not None and existing_scene.id != current_id:
+            raise CustomException(msg="场景编码已存在配置", code=RET.ERROR.code, status_code=409)
+
+    @staticmethod
+    def _prompt_profile_to_dict(profile) -> dict:
+        return {
+            "id": str(profile.id),
+            "sceneCode": profile.scene_code,
+            "name": profile.name,
+            "providerKey": profile.provider_key,
+            "promptText": profile.prompt_text,
+            "openingMessage": profile.opening_message,
+            "createdAt": profile.created_at,
+            "updatedAt": profile.updated_at,
+        }
+
+    @staticmethod
+    def _voice_profile_to_dict(profile) -> dict:
+        return {
+            "id": str(profile.id),
+            "voice": profile.voice,
+            "displayName": profile.display_name,
+            "voiceType": profile.voice_type,
+            "gender": profile.gender,
+            "targetModel": profile.target_model,
+            "description": profile.description,
+            "sortOrder": profile.sort_order,
+            "remark": profile.remark,
+            "createdAt": profile.created_at,
+            "updatedAt": profile.updated_at,
+        }
+
+    def _ensure_recording_service(self) -> None:
+        if self.recording_service is None:
+            raise CustomException(msg="通话录音服务未启用", code=RET.ERROR.code, status_code=500)
+
+    def _ensure_dialogue_service(self) -> None:
+        if self.dialogue_service is None:
+            raise CustomException(msg="对话文本服务未启用", code=RET.ERROR.code, status_code=500)
+
+    def _ensure_handoff_service(self) -> None:
+        if self.handoff_service is None:
+            raise CustomException(msg="转人工服务未启用", code=RET.ERROR.code, status_code=500)
+
+    async def _start_browser_ready_recording_tracks(self, call_id: str) -> None:
+        if self.recording_service is None:
+            return
+        session = await self.orchestrator.get_session(call_id)
+        if session.status not in RUNNING_STATUSES:
+            return
+        room_name = session.room_name
+        customer_participant_identity = f"browser-{call_id}"
+        if self.record_service is not None:
+            record = await self.record_service.get_record(call_id)
+            if record is not None:
+                room_name = record.room_name or room_name
+                customer_participant_identity = (
+                    record.participant_identity or customer_participant_identity
+                )
+        await self.recording_service.start_session_participant_recordings(
+            call_id=call_id,
+            room_name=room_name,
+            customer_participant_identity=customer_participant_identity,
+            ai_participant_identity=f"agent-{call_id}",
+        )
+
+    @staticmethod
+    def _enqueue_offline_asr(call_id: str) -> None:
+        enqueue_ai_call_offline_asr(call_id)
+
+    async def _enqueue_offline_asr_if_recordings_closed(self, call_id: str) -> None:
+        if self.recording_service is not None:
+            if not await self.recording_service.is_ready_for_offline_asr(call_id):
+                return
+        self._enqueue_offline_asr(call_id)
+
+    async def _end_running_session_after_handoff(
+        self,
+        call_id: str,
+        end_reason: str | None,
+    ) -> None:
+        try:
+            session = await self.orchestrator.get_session(call_id)
+        except AiCallError:
+            return
+        if session.status not in RUNNING_STATUSES:
+            return
+        await self.end_session(call_id, end_reason=end_reason or "agent_completed")
+
+    async def _finalize_handoffs_for_call(self, call_id: str, *, end_reason: str) -> None:
+        if self.handoff_service is None:
+            return
+        rows = await self.handoff_service.finalize_active_for_call(
+            call_id,
+            end_reason=end_reason,
+        )
+        for handoff in rows:
+            self._cancel_handoff_timeout(handoff, reason=end_reason)
+            event_type = (
+                "handoff_completed" if handoff.status == "completed" else "handoff_canceled"
+            )
+            self._record_handoff_event_best_effort(
+                call_id=handoff.call_id,
+                event_type=event_type,
+                handoff_id=handoff.handoff_id,
+                handoff_status=handoff.status,
+                payload={"reason": handoff.end_reason},
+            )
+
+    def _record_handoff_event_best_effort(
+        self,
+        *,
+        call_id: str,
+        event_type: str,
+        handoff_id: str,
+        handoff_status: str,
+        payload: dict | None = None,
+    ) -> None:
+        try:
+            self.orchestrator.record_handoff_event(
+                call_id=call_id,
+                event_type=event_type,
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                payload=payload,
+            )
+        except AiCallError:
+            return
+
+    def _record_expired_handoff_events(self) -> None:
+        if self.handoff_service is None:
+            return
+        for handoff in self.handoff_service.consume_expired_handoffs():
+            self._record_handoff_event_best_effort(
+                call_id=handoff.call_id,
+                event_type="handoff_expired",
+                handoff_id=handoff.handoff_id,
+                handoff_status=handoff.status,
+                payload={"reason": handoff.end_reason},
+            )
+            self._trigger_handoff_exception_close(
+                handoff,
+                call_end_reason="handoff_timeout",
+            )
+
+    def _schedule_handoff_timeout(self, handoff) -> None:
+        if self.handoff_exception_manager is None:
+            return
+        self.handoff_exception_manager.schedule_timeout(handoff)
+        self.handoff_exception_manager.start_waiting_tone(handoff)
+
+    def _cancel_handoff_timeout(self, handoff, *, reason: str) -> None:
+        if self.handoff_exception_manager is None:
+            return
+        self.handoff_exception_manager.cancel_timeout(
+            handoff.handoff_id,
+            call_id=handoff.call_id,
+            handoff_status=handoff.status,
+            reason=reason,
+        )
+        self.handoff_exception_manager.stop_waiting_tone(
+            handoff.handoff_id,
+            call_id=handoff.call_id,
+            handoff_status=handoff.status,
+            reason=reason,
+        )
+
+    def _trigger_handoff_exception_close(self, handoff, *, call_end_reason: str) -> None:
+        if self.handoff_exception_manager is None:
+            return
+        self.handoff_exception_manager.trigger_exception_close(
+            handoff,
+            call_end_reason=call_end_reason,
+        )
 
     @staticmethod
     def _to_custom_exception(exc: AiCallError) -> CustomException:
@@ -254,11 +1067,174 @@ class AiCallService:
 
 
 _default_orchestrator: AiCallOrchestrator | None = None
+_default_event_persistence_worker: AiCallEventPersistenceWorker | None = None
+_default_dialogue_runtime_store: AiCallDialogueRuntimeStore | None = None
+_default_dialogue_persistence_worker: AiCallDialoguePersistenceWorker | None = None
+_default_handoff_exception_manager: AiCallHandoffExceptionManager | None = None
+_default_handoff_trigger_worker: AiCallHandoffTriggerWorker | None = None
+_default_offline_asr_worker: AiCallOfflineAsrWorker | None = None
+
+
+def configure_ai_call_event_persistence(
+    worker: AiCallEventPersistenceWorker | None,
+) -> None:
+    global _default_event_persistence_worker
+    _default_event_persistence_worker = worker
+    if worker is not None and _default_orchestrator is not None:
+        worker.attach_event_store(_default_orchestrator.event_store)
+
+
+def configure_ai_call_dialogue_persistence(
+    worker: AiCallDialoguePersistenceWorker | None,
+) -> None:
+    global _default_dialogue_persistence_worker
+    runtime_store = _ensure_default_dialogue_runtime_store()
+    _default_dialogue_persistence_worker = worker
+    if worker is not None:
+        worker.attach_runtime_store(runtime_store)
+    if _default_orchestrator is not None:
+        runtime_store.attach_event_store(_default_orchestrator.event_store)
+
+
+def configure_ai_call_handoff_trigger(
+    worker: AiCallHandoffTriggerWorker | None,
+) -> None:
+    global _default_handoff_trigger_worker
+    _default_handoff_trigger_worker = worker
+    if worker is not None and _default_orchestrator is not None:
+        worker.attach_event_store(_default_orchestrator.event_store)
+
+
+def configure_ai_call_offline_asr(worker: AiCallOfflineAsrWorker | None) -> None:
+    global _default_offline_asr_worker
+    _default_offline_asr_worker = worker
+
+
+def enqueue_ai_call_offline_asr(call_id: str) -> None:
+    if _default_offline_asr_worker is not None:
+        _default_offline_asr_worker.enqueue(call_id)
 
 
 def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService:
     global _default_orchestrator
     if _default_orchestrator is None:
         _default_orchestrator = AiCallOrchestrator.from_settings(settings)
-    record_service = AiCallRecordService(AiCallRecordRepository(db)) if db is not None else None
-    return AiCallService(_default_orchestrator, record_service)
+        if _default_event_persistence_worker is not None:
+            _default_event_persistence_worker.attach_event_store(_default_orchestrator.event_store)
+        if _default_handoff_trigger_worker is not None:
+            _default_handoff_trigger_worker.attach_event_store(_default_orchestrator.event_store)
+    _ensure_default_dialogue_runtime_store().attach_event_store(_default_orchestrator.event_store)
+
+    if db is None:
+        return AiCallService(_default_orchestrator)
+
+    repository = AiCallRecordRepository(db)
+    record_service = AiCallRecordService(repository)
+    recording_service = _build_recording_service(repository)
+    handoff_exception_manager = _ensure_default_handoff_exception_manager(_default_orchestrator)
+    dialogue_service = AiCallDialogueService(
+        repository,
+        runtime_store=_ensure_default_dialogue_runtime_store(),
+    )
+    return AiCallService(
+        _default_orchestrator,
+        record_service,
+        recording_service=recording_service,
+        dialogue_service=dialogue_service,
+        handoff_service=AiCallHandoffService(
+            repository,
+            request_timeout_seconds=settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS,
+        ),
+        handoff_exception_manager=handoff_exception_manager,
+        prompt_repository=repository,
+        prompt_resolver=_build_prompt_resolver(repository, _default_orchestrator),
+        prompt_composer=_build_prompt_composer(_default_orchestrator),
+    )
+
+
+def _ensure_default_dialogue_runtime_store() -> AiCallDialogueRuntimeStore:
+    global _default_dialogue_runtime_store
+    if _default_dialogue_runtime_store is None:
+        _default_dialogue_runtime_store = AiCallDialogueRuntimeStore()
+        if _default_dialogue_persistence_worker is not None:
+            _default_dialogue_persistence_worker.attach_runtime_store(
+                _default_dialogue_runtime_store
+            )
+    return _default_dialogue_runtime_store
+
+
+def _build_recording_service(repository: AiCallRecordRepository) -> AiCallRecordingService:
+    manager: LiveKitEgressManager | None = None
+    if settings.AI_CALL_RECORDING_ENABLED:
+        manager = LiveKitEgressManager(
+            livekit_url=settings.LIVEKIT_URL,
+            api_key=settings.LIVEKIT_API_KEY,
+            api_secret=settings.LIVEKIT_API_SECRET,
+            timeout_seconds=settings.AI_CALL_EGRESS_TIMEOUT_SECONDS,
+            stop_timeout_seconds=settings.AI_CALL_EGRESS_STOP_TIMEOUT_SECONDS,
+            object_prefix=settings.AI_CALL_RECORDING_OBJECT_PREFIX,
+            file_type=settings.AI_CALL_RECORDING_FORMAT,
+            participant_file_type=settings.AI_CALL_PARTICIPANT_RECORDING_FORMAT,
+        )
+    return AiCallRecordingService(
+        repository,
+        enabled=settings.AI_CALL_RECORDING_ENABLED,
+        egress_manager=manager,
+        participant_recording_enabled=settings.AI_CALL_PARTICIPANT_RECORDING_ENABLED,
+        verify_deadline_seconds=settings.AI_CALL_RECORDING_VERIFY_DEADLINE_SECONDS,
+    )
+
+
+def _build_prompt_resolver(
+    repository: AiCallRecordRepository,
+    orchestrator: AiCallOrchestrator,
+) -> BusinessPromptResolver:
+    return BusinessPromptResolver(
+        repository=repository,
+        default_provider=DefaultPromptProvider(
+            default_prompt=orchestrator.config.default_prompt,
+            opening_message=orchestrator.config.opening_message,
+        ),
+        debug_provider=DebugPromptProvider(
+            opening_message=orchestrator.config.opening_message,
+        ),
+        timeout_seconds=settings.AI_CALL_PROMPT_RESOLVE_TIMEOUT_SECONDS,
+        debug_override_enabled=settings.AI_CALL_DEBUG_PROMPT_OVERRIDE_ENABLED,
+    )
+
+
+def _build_prompt_composer(orchestrator: AiCallOrchestrator) -> PromptComposer:
+    return PromptComposer(
+        handoff_component_enabled=orchestrator.config.handoff_prompt_constraint_enabled,
+    )
+
+
+def _ensure_default_handoff_exception_manager(
+    orchestrator: AiCallOrchestrator,
+) -> AiCallHandoffExceptionManager:
+    global _default_handoff_exception_manager
+    if _default_handoff_exception_manager is None:
+        prompt_player = LiveKitSystemPromptPlayer(
+            livekit_url=settings.LIVEKIT_URL,
+            api_key=settings.LIVEKIT_API_KEY,
+            api_secret=settings.LIVEKIT_API_SECRET,
+        )
+        _default_handoff_exception_manager = AiCallHandoffExceptionManager(
+            orchestrator=orchestrator,
+            session_factory=async_db_session,
+            recording_service_factory=_build_recording_service,
+            system_prompt_player=prompt_player,
+            timeout_seconds=settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS,
+            exception_close_enabled=settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED,
+            waiting_tone_enabled=settings.AI_CALL_HANDOFF_WAITING_TONE_ENABLED,
+            waiting_tone_audio_path=settings.AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH,
+            waiting_tone_interval_seconds=settings.AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS,
+        )
+    return _default_handoff_exception_manager
+
+
+def _strip_or_none(value) -> str | None:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped or None

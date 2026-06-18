@@ -1,5 +1,5 @@
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable
 
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.executors.pool import ProcessPoolExecutor, ThreadPoolExecutor
@@ -102,7 +102,7 @@ class SchedulerUtil:
         kwargs: dict | None = None,
         jobstore: str = "default",
         executor: str = "default",
-        **options
+        **options,
     ) -> Job:
         """
         添加任务到调度器
@@ -126,7 +126,7 @@ class SchedulerUtil:
             kwargs=kwargs or {},
             jobstore=jobstore,
             executor=executor,
-            **options
+            **options,
         )
         log.info(f"任务 {job_id} 添加成功")
         return job
@@ -201,7 +201,14 @@ class SchedulerUtil:
 
         second, minute, hour, day, month, day_of_week, year = tuple(parsed_fields)
 
-        if second == "*" and minute == "*" and hour == "*" and day == "*" and month == "*" and day_of_week in ("*", "?"):
+        if (
+            second == "*"
+            and minute == "*"
+            and hour == "*"
+            and day == "*"
+            and month == "*"
+            and day_of_week in ("*", "?")
+        ):
             raise ValueError("Cron表达式不允许每秒执行，请至少指定秒数")
 
         trigger = CronTrigger(

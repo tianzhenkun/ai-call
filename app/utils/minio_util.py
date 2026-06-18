@@ -1,10 +1,9 @@
 import hashlib
 import hmac
-import io
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -17,7 +16,7 @@ def _hmac_sha256(key: bytes, msg: str) -> bytes:
 
 
 def _signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:
-    k = _hmac_sha256(f"AWS4{secret_key}".encode("utf-8"), date_stamp)
+    k = _hmac_sha256(f"AWS4{secret_key}".encode(), date_stamp)
     k = _hmac_sha256(k, region)
     k = _hmac_sha256(k, "s3")
     return _hmac_sha256(k, "aws4_request")
@@ -51,8 +50,19 @@ class MinioUtil:
         endpoint = str(config["endpoint"]).strip().rstrip("/")
         return f"{protocol}://{endpoint}/{bucket}/{object_path}"
 
+    @staticmethod
+    def _endpoint_base_and_host(config: dict) -> tuple[str, str]:
+        protocol = "https" if config.get("is_https", "N") == "Y" else "http"
+        endpoint = str(config["endpoint"]).strip().rstrip("/")
+        if endpoint.startswith(("http://", "https://")):
+            parsed = urlparse(endpoint)
+            return endpoint, parsed.netloc
+        return f"{protocol}://{endpoint}", endpoint
+
     @classmethod
-    def upload(cls, config: dict, data: bytes, original_filename: str, content_type: str) -> tuple[str, str]:
+    def upload(
+        cls, config: dict, data: bytes, original_filename: str, content_type: str
+    ) -> tuple[str, str]:
         """
         通过 S3 API（AWS Signature V4）上传文件到 MinIO。
 
@@ -110,7 +120,9 @@ class MinioUtil:
             ])
 
             sig_key = _signing_key(secret_key, date_stamp, region)
-            signature = hmac.new(sig_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+            signature = hmac.new(
+                sig_key, string_to_sign.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
 
             authorization = (
                 f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
@@ -135,3 +147,66 @@ class MinioUtil:
             raise
         except Exception as e:
             raise CustomException(msg=f"MinIO上传失败: {e}", code=RET.SERVERERR.code)
+
+    @classmethod
+    async def head_object_size(
+        cls, config: dict, object_name: str, timeout: float = 5.0
+    ) -> int | None:
+        """通过 S3 HEAD 查询对象大小，用于登记外部组件已写入的文件。"""
+        endpoint_base, host = cls._endpoint_base_and_host(config)
+        bucket = str(config["bucket_name"]).strip("/")
+        access_key = config["access_key"]
+        secret_key = config["secret_key"]
+        region = (config.get("region") or "").strip() or "us-east-1"
+        object_path = object_name.lstrip("/")
+
+        now = datetime.now(timezone.utc)
+        date_stamp = now.strftime("%Y%m%d")
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        payload_hash = hashlib.sha256(b"").hexdigest()
+
+        signed_hdrs = {
+            "host": host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        canonical_headers = "".join(f"{k}:{v}\n" for k, v in sorted(signed_hdrs.items()))
+        signed_headers_str = ";".join(sorted(signed_hdrs.keys()))
+        canonical_uri = f"/{bucket}/{quote(object_path, safe='/')}"
+        canonical_request = "\n".join([
+            "HEAD",
+            canonical_uri,
+            "",
+            canonical_headers,
+            signed_headers_str,
+            payload_hash,
+        ])
+
+        credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+        string_to_sign = "\n".join([
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ])
+        sig_key = _signing_key(secret_key, date_stamp, region)
+        signature = hmac.new(sig_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        authorization = (
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+            f"SignedHeaders={signed_headers_str}, Signature={signature}"
+        )
+
+        url = f"{endpoint_base}/{bucket}/{quote(object_path, safe='/')}"
+        headers = {
+            "Authorization": authorization,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.head(url, headers=headers)
+            resp.raise_for_status()
+
+        content_length = resp.headers.get("content-length")
+        if not content_length:
+            return None
+        return int(content_length)

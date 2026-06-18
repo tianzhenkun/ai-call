@@ -1,5 +1,8 @@
+import asyncio
 import json
 from pathlib import Path
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
@@ -91,7 +94,9 @@ class OssService:
         return [OssOutSchema.model_validate(obj).model_dump(by_alias=True) for obj in oss_list]
 
     @classmethod
-    async def get_url_list_by_oss_ids_service(cls, auth: AuthSchema, oss_ids: list[int]) -> list[dict]:
+    async def get_url_list_by_oss_ids_service(
+        cls, auth: AuthSchema, oss_ids: list[int]
+    ) -> list[dict]:
         """
         根据oss_id列表批量获取URL信息（简化版，常用场景）
 
@@ -181,3 +186,81 @@ class OssService:
             )
             await db.commit()
             return oss_id
+
+    @classmethod
+    async def register_existing_object_service(
+        cls,
+        db: AsyncSession,
+        *,
+        object_name: str,
+        original_filename: str,
+        content_type: str,
+        file_size: int | None = None,
+    ) -> int:
+        """
+        登记已由外部组件写入对象存储的文件。
+
+        LiveKit Egress 直接写桶，业务服务不再二次下载上传，只补 sys_oss 索引。
+        """
+        config = cls._active_config
+        if not config:
+            raise CustomException(
+                msg="未找到可用的OSS配置，请检查 sys_oss_config 表中 status='0' 的记录",
+                code=RET.SERVERERR.code,
+            )
+
+        if not file_size or file_size <= 0:
+            file_size = await cls.resolve_existing_object_size(config, object_name)
+
+        oss_id = generate_snowflake_id()
+        url = cls.build_object_url(config, object_name)
+        auth = AuthSchema(user=None, check_data_scope=False, db=db)
+        oss = await OssCRUD(auth).create({
+            "oss_id": oss_id,
+            "file_name": object_name,
+            "original_name": original_filename,
+            "file_suffix": Path(original_filename).suffix.lower(),
+            "url": url,
+            "ext1": json.dumps(
+                {
+                    "fileSize": file_size,
+                    "contentType": content_type,
+                    "registeredFrom": "livekit_egress",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "create_dept": None,
+            "service": "minio",
+        })
+        return oss.oss_id
+
+    @classmethod
+    def active_config(cls) -> dict | None:
+        return dict(cls._active_config) if cls._active_config else None
+
+    @staticmethod
+    def build_object_url(config: dict, object_name: str) -> str:
+        return MinioUtil._build_url(config, object_name)
+
+    @classmethod
+    async def resolve_existing_object_size(cls, config: dict, object_name: str) -> int | None:
+        last_error: Exception | None = None
+        for attempt in range(5):
+            try:
+                size = await MinioUtil.head_object_size(config, object_name)
+                if size is not None:
+                    return size
+            except Exception as exc:
+                last_error = exc
+            if attempt < 4:
+                await asyncio.sleep(0.25 * (attempt + 1))
+
+        if last_error is not None:
+            log.warning(
+                "获取已存在OSS对象大小失败: objectName={}, errorType={}, message={}",
+                object_name,
+                type(last_error).__name__,
+                str(last_error),
+            )
+        return None

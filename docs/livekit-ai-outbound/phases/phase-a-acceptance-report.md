@@ -1,10 +1,12 @@
 # Phase A：Web 端到端核心引擎验收报告
 
-最后更新：2026-06-15
+最后更新：2026-06-16
 
 ## 1. 结论
 
 Phase A 实现已收尾，可以进入 Phase B 正式技术设计。
+
+补充说明：2026-06-16 的打断链路复盘发现，直接切换到 Qwen `semantic_vad + create_response=true + interrupt_response=true` 后，实际听感出现打断迟滞和普通回复不稳定。当前代码已回退到 Phase A 旧基线：`server_vad + create_response=false + interrupt_response=false`，由 Agent 采用“Provider 语音事件 + 有效转写确认 + 手动响应”的方式控制轮次。生产级打断能力后续应单独成阶段设计和验收。
 
 但这不是“已证明商用可用”的结论。Phase A 仍有两项补证项：一次修复后的 5 分钟真实多轮通话复测，以及该复测中的浏览器侧首包 `browser_first_audio_ms` p50/p90 数据。补证项不阻止 Phase B 设计，但不建议在补证前直接进入 Phase B 实现。
 
@@ -34,7 +36,7 @@ Browser
 | 模型 | `qwen3.5-omni-plus-realtime` |
 | 默认音色 | `Tina` |
 | 开场白 | 默认启用，内容来自服务端配置 |
-| VAD | `server_vad`，`threshold=0.5`，`silence_duration_ms=800` |
+| VAD | `server_vad`，`create_response=false`，`interrupt_response=false`，`threshold=0.5`，`silence_duration_ms=800` |
 | 浏览器音频约束 | `echoCancellation=true`、`noiseSuppression=true`、`autoGainControl=true` |
 | 事件存储 | 内存运行态存储 |
 
@@ -44,11 +46,11 @@ Browser
 
 | 命令 | 结果 |
 |---|---|
-| `node --check static/ai-call/phase-a.js` | 通过 |
+| `node --check static/ai-call/customer.js` | 通过 |
 | `ruff check app/api/v1/ai_call app/services/ai_call tests/test_ai_call_phase_a_core.py` | 通过 |
-| `pytest tests/test_ai_call_phase_a_core.py` | 通过，53 passed |
+| `pytest -q tests/test_ai_call_phase_a_core.py tests/test_ai_call_phase_b1_records.py` | 通过，85 passed |
 
-自动化测试覆盖 Session API、统一响应、事件查询、浏览器事件上报、指标计算、打断事件、资源释放和 Web 验证页关键脚本检查。
+自动化测试覆盖 Session API、统一响应、事件查询、浏览器事件上报、指标计算、自控打断候选/确认/忽略、资源释放和 Web 验证页关键脚本检查。当前 Web 验证页不主动上报浏览器本地说话候选，打断判断以供应商侧语音事件和有效转写为准。
 
 ## 5. 手工验证记录
 
@@ -75,7 +77,7 @@ Browser
 | 浏览器完成至少 5 分钟多轮端到端 S2S 对话 | 部分满足 | 已完成真实多轮通话，但已记录样本不足 5 分钟 |
 | `user_speech_stopped -> browser_first_ai_audio` p50 <= 1000ms，p90 <= 1500ms | 部分满足 | 模型侧首包达标；浏览器侧首包修复后需要重新采样 |
 | 用户真实打断后 AI 100-300ms 停播，旧音频队列不继续播放 | 部分满足 | 已验证一次真实打断和队列清理逻辑；仍需长通话复测补样本 |
-| 背景噪声、短促附和、AI 回声不会频繁误打断 | 待补证 | 代码已有基础防护，真实噪声样本不足 |
+| 背景噪声、短促附和、AI 回声不会频繁误打断 | 待补证 | 当前不做浏览器本地候选/文本过滤补丁；Web 外放回采需通过耳机、低外放或真实线路环境补证 |
 | 会话结束、浏览器断开、模型报错时 Room、Agent、模型连接能释放 | 基本满足 | 自动化测试覆盖释放逻辑；修复后烟测确认 Room 删除路径可走通 |
 | 每通会话可通过 `call_id` 查询状态、事件和指标 | 满足 | 状态、事件、指标接口可用，事件支持增量查询 |
 | 自动化测试和手工验收记录完成，并更新总纲当前状态 | 满足 | 本报告生成后，总纲同步更新 |
@@ -86,6 +88,7 @@ Browser
 
 1. 使用修复后的浏览器首包采集逻辑，完成一通至少 5 分钟真实多轮通话。
 2. 记录 `browser_first_audio_ms` p50、p90、max，并和模型侧首包一起对照。
+3. 使用耳机或低外放环境复测 Web 验证页，避免把本机外放回采误判为主链路问题。
 3. 在同一轮长通话中覆盖至少一次用户打断、一次短促附和、一次短暂停顿和一次结束会话。
 4. 记录是否出现半句中断、重复叠音、长尾音、误打断或旧音频继续播放。
 

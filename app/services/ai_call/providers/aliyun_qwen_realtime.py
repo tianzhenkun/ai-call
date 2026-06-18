@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
@@ -36,9 +36,60 @@ QWEN_SERVER_EVENT_MAPPING = {
     "response.audio.done": "model_audio_done",
     "response.audio_transcript.delta": "ai_transcript_delta",
     "response.audio_transcript.done": "ai_transcript_done",
+    "response.function_call_arguments.done": "tool_call_done",
     "response.done": "model_response_done",
     "error": "model_error",
 }
+
+
+SCHEDULE_CALL_END_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "schedule_call_end",
+        "description": (
+            "仅当上下文明确表明通话已适合结束时，用于安排当前通话在最后一句回复播放完成后结束。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "结束原因。customer_end 表示用户侧明确不再继续；"
+                        "task_completed 表示当前业务目标已完成且无需继续追问。"
+                    ),
+                    "enum": ["customer_end", "task_completed"],
+                },
+            },
+            "required": ["reason"],
+        },
+    },
+}
+
+
+REQUEST_HANDOFF_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "request_handoff",
+        "description": "当当前通话需要由人工坐席继续处理时，用于发起转人工请求。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "转人工原因。customer_request 表示用户侧明确要求人工接入；"
+                        "business_escalation 表示当前问题需要人工继续处理。"
+                    ),
+                    "enum": ["customer_request", "business_escalation"],
+                },
+            },
+            "required": ["reason"],
+        },
+    },
+}
+
+DEFAULT_REALTIME_TOOLS = [SCHEDULE_CALL_END_TOOL, REQUEST_HANDOFF_TOOL]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,29 +103,34 @@ class QwenRealtimeSessionConfig:
     vad_create_response: bool = False
     vad_interrupt_response: bool = False
     temperature: float = 0.7
+    tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, Any]:
+    session: dict[str, Any] = {
+        "modalities": ["text", "audio"],
+        "voice": config.voice,
+        "input_audio_format": "pcm",
+        "output_audio_format": "pcm",
+        "input_audio_transcription": {
+            "language": config.input_audio_language,
+        },
+        "instructions": config.instructions,
+        "turn_detection": {
+            "type": config.vad_type,
+            "threshold": config.vad_threshold,
+            "silence_duration_ms": config.vad_silence_duration_ms,
+            "create_response": config.vad_create_response,
+            "interrupt_response": config.vad_interrupt_response,
+        },
+        "temperature": config.temperature,
+    }
+    if config.tools:
+        session["tools"] = config.tools
+
     return {
         "type": "session.update",
-        "session": {
-            "modalities": ["text", "audio"],
-            "voice": config.voice,
-            "input_audio_format": "pcm",
-            "output_audio_format": "pcm",
-            "input_audio_transcription": {
-                "language": config.input_audio_language,
-            },
-            "instructions": config.instructions,
-            "turn_detection": {
-                "type": config.vad_type,
-                "threshold": config.vad_threshold,
-                "silence_duration_ms": config.vad_silence_duration_ms,
-                "create_response": config.vad_create_response,
-                "interrupt_response": config.vad_interrupt_response,
-            },
-            "temperature": config.temperature,
-        },
+        "session": session,
     }
 
 
@@ -98,10 +154,7 @@ def build_unmapped_provider_event(event: dict[str, Any]) -> ProviderEvent:
 
 def sanitize_qwen_event_payload(payload: Any) -> Any:
     if isinstance(payload, dict):
-        return {
-            str(key): _sanitize_qwen_value(str(key), value)
-            for key, value in payload.items()
-        }
+        return {str(key): _sanitize_qwen_value(str(key), value) for key, value in payload.items()}
     if isinstance(payload, list):
         return [sanitize_qwen_event_payload(value) for value in payload]
     if isinstance(payload, str):
@@ -153,25 +206,32 @@ class AliyunQwenRealtimeProvider:
         await self._send(build_session_update_event(config))
 
     async def send_audio(self, pcm_frame: bytes) -> None:
-        await self._send(
-            {
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(pcm_frame).decode("ascii"),
-            }
-        )
+        await self._send({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(pcm_frame).decode("ascii"),
+        })
 
     async def create_response(self, input_text: str | None = None) -> None:
         if input_text:
-            await self._send(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": input_text}],
-                    },
-                }
-            )
+            await self._send({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": input_text}],
+                },
+            })
+        await self._send({"type": "response.create"})
+
+    async def submit_tool_result(self, tool_call_id: str, output: str) -> None:
+        await self._send({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": tool_call_id,
+                "output": output,
+            },
+        })
         await self._send({"type": "response.create"})
 
     async def cancel_response(self) -> None:

@@ -45,6 +45,7 @@ ALLOWED_TRANSITIONS: dict[CallSessionStatus, set[CallSessionStatus]] = {
     CallSessionStatus.PREPARING: {CallSessionStatus.READY, CallSessionStatus.FAILED},
     CallSessionStatus.READY: {
         CallSessionStatus.CONNECTED,
+        CallSessionStatus.WAITING,
         CallSessionStatus.ENDING,
         CallSessionStatus.FAILED,
     },
@@ -78,6 +79,7 @@ ALLOWED_TRANSITIONS: dict[CallSessionStatus, set[CallSessionStatus]] = {
     CallSessionStatus.INTERRUPTED: {
         CallSessionStatus.USER_SPEAKING,
         CallSessionStatus.AI_THINKING,
+        CallSessionStatus.WAITING,
         CallSessionStatus.ENDING,
         CallSessionStatus.FAILED,
     },

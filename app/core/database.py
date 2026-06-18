@@ -45,14 +45,12 @@ def create_engine_and_session(
             "pool_recycle": settings.POOL_RECYCLE,
         }
         if settings.DATABASE_TYPE != "sqlite":
-            engine_kwargs.update(
-                {
-                    "pool_size": settings.POOL_SIZE,
-                    "max_overflow": settings.MAX_OVERFLOW,
-                    "pool_timeout": settings.POOL_TIMEOUT,
-                    "pool_use_lifo": settings.POOL_USE_LIFO,
-                }
-            )
+            engine_kwargs.update({
+                "pool_size": settings.POOL_SIZE,
+                "max_overflow": settings.MAX_OVERFLOW,
+                "pool_timeout": settings.POOL_TIMEOUT,
+                "pool_use_lifo": settings.POOL_USE_LIFO,
+            })
         engine: Engine = create_engine(**engine_kwargs)
     except Exception as e:
         log.error(f"❌ 数据库连接失败 {e}")

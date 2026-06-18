@@ -1,8 +1,7 @@
 from datetime import datetime
-from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import BigInteger, DateTime, String
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
 
@@ -25,33 +24,21 @@ class UserModel(MappedBase):
     tenant_id: Mapped[str] = mapped_column(
         String(20), nullable=False, default="000000", comment="租户编号"
     )
-    dept_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="部门ID"
-    )
-    user_name: Mapped[str] = mapped_column(
-        String(30), nullable=False, comment="用户账号"
-    )
-    nick_name: Mapped[str] = mapped_column(
-        String(30), nullable=False, comment="用户昵称"
-    )
+    dept_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="部门ID")
+    user_name: Mapped[str] = mapped_column(String(30), nullable=False, comment="用户账号")
+    nick_name: Mapped[str] = mapped_column(String(30), nullable=False, comment="用户昵称")
     user_type: Mapped[str] = mapped_column(
         String(10), nullable=False, default="sys_user", comment="用户类型"
     )
-    email: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="", comment="用户邮箱"
-    )
+    email: Mapped[str] = mapped_column(String(50), nullable=False, default="", comment="用户邮箱")
     phonenumber: Mapped[str] = mapped_column(
         String(11), nullable=False, default="", comment="手机号码"
     )
     sex: Mapped[str] = mapped_column(
         String(1), nullable=False, default="0", comment="用户性别（0男 1女 2未知）"
     )
-    avatar: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="头像地址"
-    )
-    password: Mapped[str] = mapped_column(
-        String(100), nullable=False, default="", comment="密码"
-    )
+    avatar: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="头像地址")
+    password: Mapped[str] = mapped_column(String(100), nullable=False, default="", comment="密码")
     status: Mapped[str] = mapped_column(
         String(1), nullable=False, default="0", comment="账号状态（0正常 1停用）"
     )
@@ -64,24 +51,16 @@ class UserModel(MappedBase):
     login_date: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="最后登陆时间"
     )
-    create_dept: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="创建部门"
-    )
-    create_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="创建者"
-    )
+    create_dept: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建部门")
+    create_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建者")
     create_time: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="创建时间"
     )
-    update_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="更新者"
-    )
+    update_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="更新者")
     update_time: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="更新时间"
     )
-    remark: Mapped[str | None] = mapped_column(
-        String(500), nullable=True, comment="备注"
-    )
+    remark: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="备注")
 
     @property
     def id(self) -> int:

@@ -49,8 +49,33 @@ class LiveKitRoomManager:
         )
 
     def issue_browser_token(self, room_name: str, participant_identity: str) -> BrowserRoomToken:
+        return self.issue_participant_token(
+            room_name,
+            participant_identity,
+            expires_in_seconds=self.browser_token_ttl_seconds,
+        )
+
+    def issue_handoff_token(
+        self,
+        room_name: str,
+        participant_identity: str,
+        expires_in_seconds: int | None = None,
+    ) -> BrowserRoomToken:
+        return self.issue_participant_token(
+            room_name,
+            participant_identity,
+            expires_in_seconds=expires_in_seconds or self.browser_token_ttl_seconds,
+        )
+
+    def issue_participant_token(
+        self,
+        room_name: str,
+        participant_identity: str,
+        *,
+        expires_in_seconds: int,
+    ) -> BrowserRoomToken:
         now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(seconds=self.browser_token_ttl_seconds)
+        expires_at = now + timedelta(seconds=expires_in_seconds)
         payload = {
             "iss": self.api_key,
             "sub": participant_identity,
@@ -69,7 +94,7 @@ class LiveKitRoomManager:
             livekit_url=self.livekit_url,
             participant_token=token,
             participant_identity=participant_identity,
-            expires_in_seconds=self.browser_token_ttl_seconds,
+            expires_in_seconds=expires_in_seconds,
         )
 
     async def _post_room_service(

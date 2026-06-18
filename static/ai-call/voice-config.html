@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>音色配置</title>
+    <link rel="icon" href="./icons/entry-voice.svg" />
+    <link rel="stylesheet" href="./ai-call.css?v=voice-config-custom-20260618" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div class="brand">
+          <img src="./icons/entry-voice.svg" alt="" />
+          <div>
+            <h1>音色配置</h1>
+            <p class="subtle">Qwen Omni Realtime 内置音色与已登记自定义复刻音色</p>
+          </div>
+        </div>
+        <button id="open-create-voice" class="primary" type="button">新增自定义音色</button>
+      </section>
+
+      <section class="panel voice-panel">
+        <div class="panel-header voice-panel-header">
+          <div>
+            <h2>音色列表</h2>
+            <p id="voice-count" class="subtle">0 个</p>
+          </div>
+          <div class="voice-toolbar" aria-label="音色列表操作">
+            <div class="segmented-control" aria-label="音色类型">
+              <button class="is-active" type="button" data-voice-type="">全部</button>
+              <button type="button" data-voice-type="内置">内置</button>
+              <button type="button" data-voice-type="自定义复刻">自定义</button>
+            </div>
+            <button id="refresh-voices" type="button">刷新</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="voice-list" class="voice-list">
+            <div class="subtle">暂无音色</div>
+          </div>
+        </div>
+      </section>
+
+      <div id="voice-modal" class="modal-backdrop" aria-hidden="true">
+        <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="voice-modal-title">
+          <div class="modal-header">
+            <h2 id="voice-modal-title">新增自定义音色</h2>
+            <button id="close-create-voice" type="button">关闭</button>
+          </div>
+          <form id="voice-form" class="modal-body form-grid">
+            <label>
+              voice
+              <input id="voice-input" required maxlength="128" placeholder="百炼返回的 voice" />
+            </label>
+            <label>
+              展示名
+              <input id="display-name-input" required maxlength="100" placeholder="例如：张总音色" />
+            </label>
+            <div class="form-two-cols">
+              <label>
+                性别
+                <select id="gender-select">
+                  <option value="未知">未知</option>
+                  <option value="女声">女声</option>
+                  <option value="男声">男声</option>
+                </select>
+              </label>
+              <label>
+                适用模型
+                <input
+                  id="target-model-input"
+                  maxlength="64"
+                  value="qwen3.5-omni-plus-realtime"
+                />
+              </label>
+            </div>
+            <label>
+              备注
+              <textarea id="remark-input" maxlength="500" rows="4" placeholder="可选"></textarea>
+            </label>
+            <p id="voice-form-message" class="form-message" aria-live="polite"></p>
+            <div class="modal-actions">
+              <button id="cancel-create-voice" type="button">取消</button>
+              <button class="primary" type="submit">保存</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </main>
+
+    <script src="./voice-config.js?v=voice-config-custom-20260618-2"></script>
+  </body>
+</html>

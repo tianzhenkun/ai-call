@@ -4,7 +4,6 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.api.v1.system.auth.schema import AuthSchema
-from app.api.v1.system.user.model import UserModel
 from app.common.enums import PermissionFilterStrategy
 
 
@@ -46,7 +45,9 @@ class Permission:
         if self.auth.user.is_superuser:
             return None
 
-        strategy = getattr(self.model, "__permission_strategy__", PermissionFilterStrategy.DATA_SCOPE)
+        strategy = getattr(
+            self.model, "__permission_strategy__", PermissionFilterStrategy.DATA_SCOPE
+        )
 
         if strategy == PermissionFilterStrategy.ROLE_BASED:
             return await self.__filter_by_role_based()

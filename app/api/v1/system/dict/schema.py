@@ -1,9 +1,8 @@
 from fastapi import Query
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from app.common.enums import QueueEnum
-from app.core.base_schema import BaseSchema
 from app.core.validator import DateTimeStr
 
 

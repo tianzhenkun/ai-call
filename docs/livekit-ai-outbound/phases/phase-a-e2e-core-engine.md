@@ -163,7 +163,7 @@ sequenceDiagram
 | 开场白 | 配置文件固定开场白，由同一个 Realtime 模型生成 | 与后续对话使用同一音色和同一上下文，不单独接 TTS |
 | 事件存储 | 内存为主，可选本地 JSONL | Phase A 不落正式表，只做延迟和稳定性验证 |
 | 浏览器音频处理 | 通过配置启用 WebRTC 原生回声消除、降噪、自动增益 | 降低回声和背景噪声对打断判断的干扰，不作为请求参数 |
-| VAD | 通过配置使用模型 `server_vad` | 少做自研判断，先验证模型侧打断和停顿能力，不作为请求参数 |
+| VAD | 通过配置使用模型 `server_vad` | 少做自研音频判断，先用供应商 VAD 产生语音边界；打断确认由 Agent 根据有效转写控制，不作为请求参数 |
 
 关键约束：
 
@@ -342,7 +342,7 @@ Phase A 必须支持 AI 主动开场，因为外呼场景通常不是等用户�
 默认固定开场白建议为：
 
 ```text
-您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？
+您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？
 ```
 
 规则：
@@ -416,8 +416,7 @@ GET /ai-call/sessions/{callId}
     "roomName": "ai-call-call_20260614_xxxxxx",
     "effectiveConfig": {
       "model": "qwen3.5-omni-plus-realtime",
-      "voice": "Tina",
-      "openingEnabled": true
+      "voice": "Tina"
     },
     "startedAt": "2026-06-14T10:00:00+08:00",
     "lastEventAt": "2026-06-14T10:00:05+08:00",
@@ -642,7 +641,7 @@ Qwen 服务端事件映射：
 
 注意：
 
-1. `semantic_vad` 可作为后续优化开关，不作为 Phase A 必须项。
+1. `semantic_vad` 和模型原生 `interrupt_response` 可作为后续生产级打断阶段的评估项，不作为当前 Phase A 基线。
 2. `enable_search` 和工具调用默认关闭，避免影响延迟和可控性。
 3. `input_audio_transcription.language` 固定为 `zh`，用于明确中文外呼输入语言，避免供应商侧按空语言配置处理。
 4. 模型输入转写仅用于调试和复盘，不能等同于模型真实理解。
@@ -656,28 +655,30 @@ Qwen 服务端事件映射：
 触发条件：
 
 1. AI 正在说话。
-2. 浏览器音量检测或 Qwen VAD 只先进入 `interrupt_candidate`。
+2. Qwen VAD 识别到用户开始说话后，先进入 `interrupt_candidate`。
 3. 出现有效用户转写或其他明确人声确认后，才写入 `interrupt_confirmed`。
-4. 不是短促弱反馈、背景噪声或明显 AI 回声。
+4. 不是只有背景噪声。
 
 处理动作：
 
 1. 候选打断只记录事件，不暂停 AI 音频，也不拦截后续音频。
 2. 确认真人说话后，向 Qwen 发送 `response.cancel`，但不立即清理用户当前输入音频。
-3. 对没有有效转写的噪声写入 `interrupt_ignored`，不创建下一轮回复。
-4. 写入 `interrupt_candidate`、`interrupt_confirmed` 和 `interrupt_stop_ms`。
+3. 用户说完且有有效转写后，由 Agent 发送普通轮次 `response.create`。
+4. 对没有有效转写的噪声写入 `interrupt_ignored`，不创建下一轮回复。
+5. 写入 `interrupt_candidate`、`interrupt_confirmed` 和 `interrupt_stop_ms`。
 
 ### 10.2 误打断防护
 
 Phase A 只做基础策略：
 
 1. 浏览器采集麦克风时按服务端返回的配置启用 `echoCancellation`、`noiseSuppression`、`autoGainControl`。
-2. 浏览器 RMS 音量检测不能直接确认打断，只能作为候选信号。
+2. Phase A 静态验证页不主动做浏览器本地 RMS 说话检测，也不主动上报 `browser_user_speech_started`。
 3. Qwen `turn_detection` 不自动创建回复，也不自动打断；是否回复由 Agent 状态机决定。
-4. AI 说话时，只有候选信号不改变播放链路，避免噪声造成半句静音。
-5. “嗯、好、对”等弱反馈不默认打断，先记录 `interrupt_ignored`。
+4. AI 说话时，是否进入打断候选以供应商侧 `user_speech_started` 为准，浏览器本地音量不作为服务端控制信号。
+5. “嗯、好、对”等短反馈只要被转写为有效文本，当前 Phase A 会按用户输入处理；更精细的附和词/背通道策略放入后续生产级打断阶段。
 6. 连续背景噪声只写 `interrupt_ignored`，不进入 `interrupted`。
-7. 如果误打断仍频繁，再调整 Qwen `turn_detection.threshold` 和 `silence_duration_ms`，或进入算法版 VAD/降噪增强。
+7. Web 外放测试中如果 AI 声音被麦克风回采并进入 Qwen ASR，应优先使用耳机、降低外放音量或调整测试环境；不在 Phase A 用关键词、相似文本或本地音量补丁规避。
+8. 如果真实线路或耳机环境下误打断仍频繁，再调整 Qwen `turn_detection.threshold` 和 `silence_duration_ms`，或进入算法版 VAD/降噪增强。
 
 ### 10.3 沉默和等待
 
@@ -734,7 +735,9 @@ Phase A 只做基础策略：
 16. `model_error`
 17. `participant_left`
 18. `session_completed`
-18. `session_failed`
+19. `session_failed`
+
+说明：本节“记录”指 Phase A 运行态事件，用于实时调试、指标计算和延迟验证。进入 B1 后，只有低频关键事件进入 `ai_call_event`；`model_audio_delta`、`ai_audio_published` 等高频音频事件不逐条写入业务事件表。
 
 指标口径：
 
@@ -762,7 +765,6 @@ Phase A 只做基础策略：
 | `DASHSCOPE_REALTIME_URL` | 是 | 默认 `wss://dashscope.aliyuncs.com/api-ws/v1/realtime` |
 | `QWEN_REALTIME_MODEL` | 否 | 固定模型，默认 `qwen3.5-omni-plus-realtime`；不作为前端参数 |
 | `QWEN_REALTIME_VOICE` | 否 | 默认音色，建议 `Tina`；前端可传 `voice` 覆盖 |
-| `AI_CALL_OPENING_ENABLED` | 否 | 是否启用固定开场白，默认 `true` |
 | `AI_CALL_OPENING_MESSAGE` | 否 | 固定开场白文本，不作为前端请求参数 |
 | `QWEN_REALTIME_TURN_DETECTION_TYPE` | 否 | 默认 `server_vad`；不作为前端请求参数 |
 | `QWEN_REALTIME_VAD_THRESHOLD` | 否 | 默认 `0.5`，用于判断用户开始说话 |
@@ -814,7 +816,7 @@ Phase A 需要一个最小 Web 验证页，用于建立通话、采集浏览器�
 3. 麦克风连接状态。
 4. 浏览器音频约束状态：回声消除、降噪、自动增益。
 5. 固定模型展示和音色下拉框。
-6. 开场白启用状态和开场白首包。
+6. 开场白首包。
 7. p50、p90、max、最近一轮首包。
 8. 打断停播耗时。
 9. 事件列表。

@@ -83,6 +83,8 @@ env/.env.prod
 
 # DevOps
 devops/nginx/ssl
+deploy/livekit-egress/livekit.yaml
+deploy/livekit-egress/egress.yaml
 
 # Local planning and temporary test files
 /agent.md

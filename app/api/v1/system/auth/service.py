@@ -43,6 +43,7 @@ CaptchaBase64 = NewType("CaptchaBase64", str)
 
 class OnlineOutSchema(BaseModel):
     """在线用户信息"""
+
     session_id: str
     user_id: int
     name: str
@@ -255,7 +256,7 @@ class LoginService:
         except json.JSONDecodeError:
             # 处理token
             session_info = eval(token_payload.sub)
-        
+
         session_id = session_info.get("session_id")
         user_id = session_info.get("user_id")
 
@@ -330,14 +331,14 @@ class LoginService:
         - CustomException: 令牌无效时抛出异常
         """
         payload: JWTPayloadSchema = decode_access_token(token=token.token)
-        
+
         # 处理session_info
         try:
             session_info = json.loads(payload.sub)
         except json.JSONDecodeError:
             # 处理token
             session_info = eval(payload.sub)
-        
+
         session_id = session_info.get("session_id")
 
         if not session_id:

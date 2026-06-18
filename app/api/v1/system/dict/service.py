@@ -53,9 +53,7 @@ class DictDataService:
         返回:
         - list[dict]: 数据字典数据详情字典列表
         """
-        obj_list = await DictDataCRUD(auth).get_obj_list_by_dict_type_crud(
-            dict_type=dict_type
-        )
+        obj_list = await DictDataCRUD(auth).get_obj_list_by_dict_type_crud(dict_type=dict_type)
         return [DictDataOutSchema.model_validate(obj).model_dump(by_alias=True) for obj in obj_list]
 
     @classmethod
@@ -148,9 +146,13 @@ class DictDataService:
         """
         try:
             if not force:
-                existing_keys = await RedisCURD(redis).get_keys(f"{RedisInitKeyConfig.SYSTEM_DICT.key}:*")
+                existing_keys = await RedisCURD(redis).get_keys(
+                    f"{RedisInitKeyConfig.SYSTEM_DICT.key}:*"
+                )
                 if existing_keys:
-                    log.info(f"✅ Redis 字典缓存已存在，跳过初始化（共 {len(existing_keys)} 个类型）")
+                    log.info(
+                        f"✅ Redis 字典缓存已存在，跳过初始化（共 {len(existing_keys)} 个类型）"
+                    )
                     return
 
             async with async_db_session() as session:

@@ -40,7 +40,13 @@ class RedisCURD:
         - list: 返回匹配的缓存键名列表,如果获取失败则返回空列表
         """
         try:
-            keys = await self.redis.keys(f"{pattern}")
+            keys = [
+                key
+                async for key in self.redis.scan_iter(
+                    match=f"{pattern}",
+                    count=1000,
+                )
+            ]
             return keys
         except Exception as e:
             log.error(f"获取缓存键名失败: {e!s}")

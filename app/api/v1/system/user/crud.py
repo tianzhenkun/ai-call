@@ -22,8 +22,7 @@ class UserCRUD(CRUDBase[UserModel, None, None]):
         - dict | None: 用户信息
         """
         return await self.raw_one(
-            "SELECT * FROM sys_user WHERE user_id = :user_id",
-            {"user_id": user_id}
+            "SELECT * FROM sys_user WHERE user_id = :user_id", {"user_id": user_id}
         )
 
     async def get_by_username_crud(self, username: str) -> dict | None:
@@ -37,8 +36,7 @@ class UserCRUD(CRUDBase[UserModel, None, None]):
         - dict | None: 用户信息
         """
         return await self.raw_one(
-            "SELECT * FROM sys_user WHERE user_name = :username",
-            {"username": username}
+            "SELECT * FROM sys_user WHERE user_name = :username", {"username": username}
         )
 
     async def get_by_mobile_crud(self, mobile: str) -> dict | None:
@@ -52,8 +50,7 @@ class UserCRUD(CRUDBase[UserModel, None, None]):
         - dict | None: 用户信息
         """
         return await self.raw_one(
-            "SELECT * FROM sys_user WHERE phonenumber = :mobile",
-            {"mobile": mobile}
+            "SELECT * FROM sys_user WHERE phonenumber = :mobile", {"mobile": mobile}
         )
 
     async def get_list_crud(
@@ -146,6 +143,6 @@ class UserCRUD(CRUDBase[UserModel, None, None]):
 
         await self.raw_execute(
             "UPDATE sys_user SET login_date = :login_date WHERE user_id = :user_id",
-            {"login_date": datetime.now(), "user_id": user_id}
+            {"login_date": datetime.now(), "user_id": user_id},
         )
         return await self.get_by_id_crud(user_id)

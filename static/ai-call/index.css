@@ -1,0 +1,206 @@
+.portal-shell {
+  width: min(1180px, calc(100vw - 40px));
+  padding-top: 44px;
+}
+
+.portal-shell .topbar {
+  margin-bottom: 28px;
+}
+
+.portal-shell .brand {
+  gap: 15px;
+}
+
+.portal-shell .brand img {
+  width: 56px;
+  height: 56px;
+  filter: drop-shadow(0 12px 24px rgba(15, 23, 42, 0.08));
+}
+
+.portal-shell h1 {
+  font-size: 28px;
+  letter-spacing: 0;
+}
+
+.portal-shell .subtle {
+  margin-top: 2px;
+  font-size: 14px;
+}
+
+.portal-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 16px;
+  align-items: stretch;
+}
+
+.portal-card {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  border-color: rgba(226, 232, 240, 0.86);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 14px 34px rgba(15, 23, 42, 0.06);
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease,
+    background 160ms ease;
+}
+
+.portal-card:hover {
+  border-color: rgba(203, 213, 225, 0.96);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.05),
+    0 18px 42px rgba(15, 23, 42, 0.09);
+  transform: translateY(-1px);
+}
+
+.portal-card-disabled,
+.portal-card-disabled:hover {
+  border-color: rgba(226, 232, 240, 0.86);
+  background: rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.03),
+    0 10px 26px rgba(15, 23, 42, 0.04);
+  transform: none;
+}
+
+.portal-card-body {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  gap: 18px;
+  min-height: 184px;
+  padding: 20px;
+}
+
+.portal-entry {
+  display: grid;
+  gap: 14px;
+  align-content: center;
+  justify-items: start;
+  min-width: 0;
+}
+
+.portal-entry h2 {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.portal-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.portal-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(241, 245, 249, 0.82);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.portal-status-poc {
+  border-color: rgba(176, 96, 0, 0.28);
+  background: rgba(255, 247, 237, 0.9);
+  color: var(--warn);
+}
+
+.portal-icon {
+  width: 68px;
+  height: 68px;
+  display: block;
+  filter: drop-shadow(0 8px 18px rgba(15, 23, 42, 0.06));
+}
+
+.portal-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgba(209, 213, 219, 0.92);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  font-weight: 650;
+  text-decoration: none;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+
+.portal-link:hover {
+  border-color: rgba(156, 163, 175, 0.86);
+  background: rgba(248, 250, 252, 0.96);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  color: var(--text);
+}
+
+.portal-link:active {
+  background: rgba(241, 245, 249, 0.96);
+  transform: scale(0.99);
+}
+
+.portal-link:focus-visible {
+  outline: 3px solid rgba(17, 24, 39, 0.12);
+  outline-offset: 2px;
+}
+
+.portal-link-disabled {
+  border-color: rgba(226, 232, 240, 0.9);
+  background: var(--surface-muted);
+  color: var(--muted);
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+@media (max-width: 1180px) {
+  .portal-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .portal-shell {
+    width: min(100vw - 24px, 720px);
+    padding-top: 20px;
+  }
+
+  .portal-shell .topbar {
+    margin-bottom: 22px;
+  }
+
+  .portal-shell .brand img {
+    width: 48px;
+    height: 48px;
+  }
+
+  .portal-shell h1 {
+    font-size: 24px;
+  }
+
+  .portal-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .portal-card-body {
+    min-height: 168px;
+  }
+}

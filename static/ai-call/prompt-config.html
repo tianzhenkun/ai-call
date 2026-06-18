@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>提示词配置</title>
+    <link rel="icon" href="./icons/entry-prompt.svg" />
+    <link rel="stylesheet" href="./ai-call.css?v=prompt-layout-20260618-12" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div class="brand">
+          <img src="./icons/entry-prompt.svg" alt="" />
+          <div>
+            <h1>提示词配置</h1>
+            <p class="subtle">业务场景提示词、开场白、提示词结构</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="prompt-config-grid">
+        <aside class="panel prompt-profile-panel">
+          <div class="panel-header">
+            <h2>场景配置</h2>
+            <button id="refresh-profiles" type="button">刷新列表</button>
+          </div>
+          <div class="panel-body">
+            <div id="profile-list" class="profile-list">
+              <div class="subtle">暂无配置</div>
+            </div>
+          </div>
+        </aside>
+
+        <section class="panel prompt-editor-panel">
+          <div class="panel-header">
+            <h2>配置内容</h2>
+            <div class="panel-actions">
+              <button id="new-profile" type="button">新建</button>
+              <button id="save-profile" class="primary" type="button">保存</button>
+            </div>
+          </div>
+          <div class="panel-body form-grid">
+            <div class="prompt-meta-grid">
+              <label>
+                名称
+                <input id="profile-name-input" maxlength="100" />
+              </label>
+              <label>
+                场景编码
+                <input id="profile-scene-code-input" maxlength="64" />
+              </label>
+              <label>
+                提示词来源
+                <select id="profile-provider-key-select">
+                  <option value="static_profile">固定配置</option>
+                  <option value="business_query">业务查询</option>
+                </select>
+              </label>
+            </div>
+            <label class="prompt-opening-field">
+              开场白
+              <textarea id="profile-opening-message-input" rows="3" spellcheck="false"></textarea>
+            </label>
+            <label class="prompt-text-field">
+              提示词
+              <textarea id="profile-prompt-text-input" rows="8" spellcheck="false"></textarea>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel prompt-structure-panel">
+          <div class="panel-header">
+            <h2>提示词结构</h2>
+            <button id="refresh-components" type="button">刷新结构</button>
+          </div>
+          <div class="panel-body">
+            <div id="component-list" class="component-list">
+              <div class="subtle">暂无结构</div>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./prompt-config.js?v=prompt-layout-20260618-12"></script>
+  </body>
+</html>

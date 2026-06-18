@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title">
+  <title id="title">Voice config</title>
+  <defs>
+    <linearGradient id="g" x1="20" x2="76" y1="14" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" />
+      <stop offset="1" stop-color="#f3f4f6" />
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="72" height="72" rx="22" fill="url(#g)" />
+  <rect x="12.5" y="12.5" width="71" height="71" rx="21.5" fill="none" stroke="#e5e7eb" />
+  <rect x="37" y="24" width="22" height="36" rx="11" fill="none" stroke="#111827" stroke-width="4.2" />
+  <path d="M30 45v3a18 18 0 0 0 36 0v-3" fill="none" stroke="#111827" stroke-linecap="round" stroke-width="4.2" />
+  <path d="M48 66v9" fill="none" stroke="#111827" stroke-linecap="round" stroke-width="4.2" />
+  <path d="M39 75h18" fill="none" stroke="#111827" stroke-linecap="round" stroke-width="4.2" />
+  <path d="M25 39c-1.8 2.6-2.7 5.6-2.7 9s.9 6.4 2.7 9" fill="none" stroke="#9ca3af" stroke-linecap="round" stroke-width="3.8" />
+  <path d="M71 39c1.8 2.6 2.7 5.6 2.7 9s-.9 6.4-2.7 9" fill="none" stroke="#9ca3af" stroke-linecap="round" stroke-width="3.8" />
+</svg>

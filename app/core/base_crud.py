@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
-from sqlalchemy import Select, asc, delete, desc, func, select, text, update
+from sqlalchemy import Select, delete, select, text
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.engine import Result, Row
-from sqlalchemy.orm import selectinload
-from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.engine import Result
 from sqlalchemy.sql.elements import TextClause
 
 from app.api.v1.system.auth.schema import AuthSchema
@@ -25,7 +22,7 @@ UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
 class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
     """
     CRUD 基类
-    
+
     写操作使用 ORM（自动填充审计字段）
     查询操作使用原生 SQL（性能更高）
     """
@@ -137,7 +134,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
             pk_cols = list(getattr(mapper, "primary_key", []))
             if not pk_cols:
                 return None
-            
+
             sql = select(self.model).where(pk_cols[0] == id)
             sql = await self._filter_permissions(sql)
             result: Result = await self.auth.db.execute(sql)
@@ -164,8 +161,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
 
         示例:
         >>> users = await crud.raw_dicts(
-        ...     "SELECT user_id, user_name FROM sys_user WHERE status = :status",
-        ...     {"status": "0"}
+        ...     "SELECT user_id, user_name FROM sys_user WHERE status = :status", {"status": "0"}
         ... )
         """
         try:
@@ -193,8 +189,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
 
         示例:
         >>> user = await crud.raw_one(
-        ...     "SELECT user_id, user_name FROM sys_user WHERE user_id = :id",
-        ...     {"id": 1}
+        ...     "SELECT user_id, user_name FROM sys_user WHERE user_id = :id", {"id": 1}
         ... )
         """
         try:
@@ -222,8 +217,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
 
         示例:
         >>> count = await crud.raw_scalar(
-        ...     "SELECT COUNT(*) FROM sys_user WHERE status = :status",
-        ...     {"status": "0"}
+        ...     "SELECT COUNT(*) FROM sys_user WHERE status = :status", {"status": "0"}
         ... )
         """
         try:
@@ -257,11 +251,10 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         ...     "SELECT * FROM sys_user WHERE status = :status",
         ...     {"status": "0"},
         ...     page_num=1,
-        ...     page_size=10
+        ...     page_size=10,
         ... )
         """
         try:
-            stmt = text(sql) if isinstance(sql, str) else sql
             offset = (page_num - 1) * page_size
 
             count_sql = f"SELECT COUNT(*) as total FROM ({sql}) as _count_query"
@@ -298,7 +291,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         示例:
         >>> result = await crud.raw_execute(
         ...     "UPDATE sys_user SET status = :status WHERE dept_id = :dept_id",
-        ...     {"status": "1", "dept_id": 10}
+        ...     {"status": "1", "dept_id": 10},
         ... )
         >>> print(f"影响行数: {result.rowcount}")
         """
@@ -325,7 +318,7 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         # 获取上下文信息
         user_id = -1
         tenant_id = "000000"
-        
+
         if self.auth and self.auth.user:
             user_id = getattr(self.auth.user, "id", -1) or -1
             tenant_id = getattr(self.auth.user, "tenant_id", "000000") or "000000"

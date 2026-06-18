@@ -15,7 +15,7 @@ class PaginationQueryParam:
         orderBy: str | None = Query(
             default=None,
             description="排序字段,格式:[{'field1': 'asc'}, {'field2': 'desc'}]",
-            alias="orderBy"
+            alias="orderBy",
         ),
     ) -> None:
         """

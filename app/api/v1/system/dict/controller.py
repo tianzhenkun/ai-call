@@ -14,7 +14,6 @@ from app.core.router_class import OperationLogRoute
 from .schema import (
     DictDataOutSchema,
     DictDataQueryParam,
-    DictLabelValueSchema,
 )
 from .service import DictDataService
 
@@ -90,8 +89,7 @@ async def get_data_by_type_controller(
     response_model=ResponseSchema[list[DictDataOutSchema]],
 )
 async def get_init_dict_data_controller(
-    dict_type: str,
-    redis: Annotated[Redis, Depends(redis_getter)]
+    dict_type: str, redis: Annotated[Redis, Depends(redis_getter)]
 ) -> JSONResponse:
     """
     根据字典类型获取数据（从缓存）

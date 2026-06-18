@@ -8,13 +8,14 @@ OSS 上传功能集成测试脚本（HTTP 接口版）
 
 执行命令: uv run python tests/test_oss_upload.py
 """
+
 import json
 import sys
 
 import httpx
 
 BASE_URL = "http://127.0.0.1:19010"
-API_PREFIX = "/recov-admin-api/v1"
+API_PREFIX = "/ai-call-api/v1"
 UPLOAD_URL = f"{BASE_URL}{API_PREFIX}/system/oss/upload"
 GET_URL = f"{BASE_URL}{API_PREFIX}/system/oss"
 
@@ -33,7 +34,7 @@ def test_oss_upload() -> None:
     content_type = "text/plain"
 
     # ---- Step 1: 上传 ----
-    print(f"\n[1] 上传文件")
+    print("\n[1] 上传文件")
     print(f"    文件名: {original_filename}")
     print(f"    大小:   {len(test_content)} bytes")
 
@@ -52,7 +53,7 @@ def test_oss_upload() -> None:
     print(f"    oss_id: {oss_id}  ✓")
 
     # ---- Step 2: 验证 DB 记录 ----
-    print(f"\n[2] 验证数据库记录")
+    print("\n[2] 验证数据库记录")
     resp2 = httpx.get(f"{GET_URL}/{oss_id}", timeout=10)
     assert resp2.status_code == 200, f"查询失败: {resp2.text}"
 
@@ -64,12 +65,12 @@ def test_oss_upload() -> None:
     print(f"    service:      {record['service']}")
 
     # ---- Step 3: 断言 ----
-    print(f"\n[3] 断言")
+    print("\n[3] 断言")
     assert record["originalName"] == original_filename, "originalName 不匹配"
     assert record["fileSuffix"] == ".txt", "fileSuffix 不匹配"
     assert record["service"] == "minio", "service 不匹配"
     assert record["url"].endswith(".txt"), "url 后缀不匹配"
-    print(f"    所有断言通过  ✓")
+    print("    所有断言通过  ✓")
 
     print_section("测试通过")
 

@@ -1,0 +1,39 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ai-call-livekit-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: ai-call-livekit-server
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      NODE_IP: 127.0.0.1
+    depends_on:
+      - redis
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  egress:
+    image: livekit/egress:latest
+    container_name: ai-call-livekit-egress
+    depends_on:
+      - livekit
+      - redis
+    cap_add:
+      - SYS_ADMIN
+    shm_size: "1gb"
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
+    volumes:
+      - ./egress.yaml:/etc/egress.yaml:ro
+
+volumes:
+  redis-data:

@@ -35,9 +35,7 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
 
         return await self.raw_dicts(sql, params)
 
-    async def get_obj_list_by_dict_type_crud(
-        self, dict_type: str
-    ) -> list[dict]:
+    async def get_obj_list_by_dict_type_crud(self, dict_type: str) -> list[dict]:
         """
         根据字典类型获取字典数据列表
 
@@ -54,9 +52,7 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
 
         return await self.raw_dicts(sql, params)
 
-    async def get_dict_label_by_value(
-        self, dict_type: str, dict_value: str
-    ) -> str | None:
+    async def get_dict_label_by_value(self, dict_type: str, dict_value: str) -> str | None:
         """
         根据字典类型和字典值获取字典标签
 
@@ -69,16 +65,14 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
         """
         result = await self.raw_one(
             """
-            SELECT dict_label FROM sys_dict_data 
+            SELECT dict_label FROM sys_dict_data
             WHERE dict_type = :dict_type AND dict_value = :dict_value
             """,
-            {"dict_type": dict_type, "dict_value": dict_value}
+            {"dict_type": dict_type, "dict_value": dict_value},
         )
         return result.get("dict_label") if result else None
 
-    async def get_dict_value_by_label(
-        self, dict_type: str, dict_label: str
-    ) -> str | None:
+    async def get_dict_value_by_label(self, dict_type: str, dict_label: str) -> str | None:
         """
         根据字典类型和字典标签获取字典值
 
@@ -91,10 +85,10 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
         """
         result = await self.raw_one(
             """
-            SELECT dict_value FROM sys_dict_data 
+            SELECT dict_value FROM sys_dict_data
             WHERE dict_type = :dict_type AND dict_label = :dict_label
             """,
-            {"dict_type": dict_type, "dict_label": dict_label}
+            {"dict_type": dict_type, "dict_label": dict_label},
         )
         return result.get("dict_value") if result else None
 
@@ -121,10 +115,10 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
 
         results = await self.raw_dicts(
             f"""
-            SELECT dict_value, dict_label FROM sys_dict_data 
+            SELECT dict_value, dict_label FROM sys_dict_data
             WHERE dict_type = :dict_type AND dict_value IN ({placeholders})
             """,
-            params
+            params,
         )
         return {r["dict_value"]: r["dict_label"] for r in results}
 
@@ -151,9 +145,9 @@ class DictDataCRUD(CRUDBase[DictDataModel, None, None]):
 
         results = await self.raw_dicts(
             f"""
-            SELECT dict_label, dict_value FROM sys_dict_data 
+            SELECT dict_label, dict_value FROM sys_dict_data
             WHERE dict_type = :dict_type AND dict_label IN ({placeholders})
             """,
-            params
+            params,
         )
         return {r["dict_label"]: r["dict_value"] for r in results}

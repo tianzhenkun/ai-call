@@ -28,10 +28,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     返回:
     - AsyncGenerator[Any, Any]: 生命周期上下文生成器。
     """
+    ai_call_event_worker = await _start_ai_call_event_worker()
+    ai_call_dialogue_worker = await _start_ai_call_dialogue_worker()
+    ai_call_offline_asr_worker = await _start_ai_call_offline_asr_worker()
+    ai_call_recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
+    ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
     if settings.AI_CALL_STANDALONE_ENABLE:
-        log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
-        yield
-        log.info("✅ AI Call standalone 模式关闭")
+        try:
+            log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
+            yield
+            log.info("✅ AI Call standalone 模式关闭")
+        finally:
+            await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
+            await _stop_ai_call_event_worker(ai_call_event_worker)
+            await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
+            await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+            await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
         return
 
     from app.api.v1.system.dict.service import DictDataService
@@ -60,10 +72,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         )
 
     except Exception as e:
+        await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
+        await _stop_ai_call_event_worker(ai_call_event_worker)
+        await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
+        await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+        await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
         log.error(f"❌ 应用初始化失败: {e!s}")
         raise SystemExit(1)
 
-    yield
+    try:
+        yield
+    finally:
+        await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
+        await _stop_ai_call_event_worker(ai_call_event_worker)
+        await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
+        await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+        await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
 
     try:
         await import_modules_async(
@@ -76,6 +100,186 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
 
     except Exception as e:
         log.error(f"❌ 应用关闭过程中发生错误: {e!s}")
+
+
+async def _start_ai_call_event_worker():
+    if not settings.SQL_DB_ENABLE:
+        return None
+    from app.api.v1.ai_call.service import configure_ai_call_event_persistence
+    from app.core.database import async_db_session
+    from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
+
+    worker = AiCallEventPersistenceWorker(async_db_session)
+    await worker.start()
+    configure_ai_call_event_persistence(worker)
+    log.info("✅ AI Call 事件后台持久化 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_event_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_event_persistence
+
+    configure_ai_call_event_persistence(None)
+    if worker is None:
+        return
+    worker.detach_all()
+    await worker.stop()
+    log.info("✅ AI Call 事件后台持久化 worker 已关闭")
+
+
+async def _start_ai_call_dialogue_worker():
+    if not settings.SQL_DB_ENABLE:
+        return None
+    from app.api.v1.ai_call.service import configure_ai_call_dialogue_persistence
+    from app.core.database import async_db_session
+    from app.services.ai_call.dialogue_service import AiCallDialoguePersistenceWorker
+
+    worker = AiCallDialoguePersistenceWorker(async_db_session)
+    await worker.start()
+    configure_ai_call_dialogue_persistence(worker)
+    log.info("✅ AI Call 对话文本后台持久化 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_dialogue_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_dialogue_persistence
+
+    configure_ai_call_dialogue_persistence(None)
+    if worker is None:
+        return
+    worker.detach_all()
+    await worker.stop()
+    log.info("✅ AI Call 对话文本后台持久化 worker 已关闭")
+
+
+async def _start_ai_call_handoff_trigger_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED:
+        return None
+    from app.api.v1.ai_call.service import (
+        configure_ai_call_handoff_trigger,
+        get_default_ai_call_service,
+    )
+    from app.core.database import async_db_session
+    from app.services.ai_call.handoff_trigger_service import (
+        AiCallHandoffTriggerService,
+        AiCallHandoffTriggerWorker,
+        build_default_handoff_intent_classifier,
+    )
+
+    classifier = build_default_handoff_intent_classifier(
+        base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+        api_key=settings.EFFECTIVE_LLM_API_KEY,
+        model=settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus",
+        timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
+    )
+    trigger_service = AiCallHandoffTriggerService(
+        async_db_session,
+        get_default_ai_call_service,
+        classifier,
+        enabled=settings.AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED,
+        customer_intent_enabled=settings.AI_CALL_HANDOFF_CUSTOMER_INTENT_ENABLED,
+        threshold=settings.AI_CALL_HANDOFF_INTENT_THRESHOLD,
+        timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    configure_ai_call_handoff_trigger(worker)
+    log.info("✅ AI Call 转人工自动触发 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_handoff_trigger_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_handoff_trigger
+
+    configure_ai_call_handoff_trigger(None)
+    if worker is None:
+        return
+    worker.detach_all()
+    await worker.stop()
+    log.info("✅ AI Call 转人工自动触发 worker 已关闭")
+
+
+async def _start_ai_call_offline_asr_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_OFFLINE_ASR_ENABLED:
+        return None
+    from app.api.v1.ai_call.service import configure_ai_call_offline_asr
+    from app.core.database import async_db_session
+    from app.services.ai_call.offline_asr_service import (
+        AiCallOfflineAsrWorker,
+        DashScopeParaformerAsrProvider,
+        parse_language_hints,
+    )
+
+    provider = DashScopeParaformerAsrProvider(
+        api_key=settings.EFFECTIVE_ASR_API_KEY,
+        model=settings.AI_CALL_OFFLINE_ASR_MODEL or settings.ASR_MODEL or "paraformer-v2",
+        language_hints=parse_language_hints(settings.AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS),
+        timeout_seconds=settings.AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS,
+        poll_interval_seconds=settings.AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS,
+    )
+    worker = AiCallOfflineAsrWorker(
+        async_db_session,
+        provider=provider,
+        enabled=settings.AI_CALL_OFFLINE_ASR_ENABLED,
+        queue_max_size=settings.AI_CALL_OFFLINE_ASR_QUEUE_MAX_SIZE,
+    )
+    await worker.start()
+    configure_ai_call_offline_asr(worker)
+    log.info("✅ AI Call 离线 ASR worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_offline_asr_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_offline_asr
+
+    configure_ai_call_offline_asr(None)
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 离线 ASR worker 已关闭")
+
+
+async def _start_ai_call_recording_reconcile_worker():
+    if (
+        not settings.SQL_DB_ENABLE
+        or not settings.AI_CALL_RECORDING_ENABLED
+        or not settings.AI_CALL_RECORDING_RECONCILE_ENABLED
+    ):
+        return None
+    from app.api.v1.ai_call.crud import AiCallRecordRepository
+    from app.api.v1.ai_call.service import enqueue_ai_call_offline_asr
+    from app.core.database import async_db_session
+    from app.services.ai_call.recording_service import (
+        AiCallRecordingReconcileWorker,
+        AiCallRecordingService,
+    )
+
+    def service_factory(repository: AiCallRecordRepository) -> AiCallRecordingService:
+        return AiCallRecordingService(
+            repository,
+            enabled=settings.AI_CALL_RECORDING_ENABLED,
+            participant_recording_enabled=settings.AI_CALL_PARTICIPANT_RECORDING_ENABLED,
+            verify_deadline_seconds=settings.AI_CALL_RECORDING_VERIFY_DEADLINE_SECONDS,
+        )
+
+    worker = AiCallRecordingReconcileWorker(
+        async_db_session,
+        service_factory,
+        enabled=settings.AI_CALL_RECORDING_RECONCILE_ENABLED,
+        interval_seconds=settings.AI_CALL_RECORDING_RECONCILE_INTERVAL_SECONDS,
+        batch_size=settings.AI_CALL_RECORDING_RECONCILE_BATCH_SIZE,
+        on_call_ready_for_asr=enqueue_ai_call_offline_asr,
+    )
+    await worker.start()
+    log.info("✅ AI Call 录音对账 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_recording_reconcile_worker(worker) -> None:
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 录音对账 worker 已关闭")
 
 
 def register_middlewares(app: FastAPI) -> None:

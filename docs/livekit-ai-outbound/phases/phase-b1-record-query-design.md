@@ -1,6 +1,6 @@
 # Phase B1：记录与查询正式技术设计
 
-最后更新：2026-06-15
+最后更新：2026-06-16
 
 ## 1. 文档定位
 
@@ -22,8 +22,10 @@ Phase B1 新增的是数据与查询闭环：
 
 ```text
 Call Session
-  -> Call Record
-  -> Call Event
+  -> Call Record（同步主状态）
+  -> Runtime Event Store（实时运行态事件）
+  -> Event Persistence Worker（后台队列）
+  -> Call Event（低频关键事件）
   -> Result Query API
 ```
 
@@ -54,7 +56,7 @@ Phase A 补证项不阻塞 Phase B1 设计。
 Phase B1 必须做到：
 
 1. 创建 Web 会话时持久化通话记录。
-2. 通话过程中持久化关键事件。
+2. 通话过程中通过后台队列持久化关键事件，实时音频链路不等待 `ai_call_event` 写入。
 3. 会话结束或失败后，可以按 `call_id` 查询通话摘要和事件时间线。
 4. 失败会话可以看到失败阶段、失败原因和最后关键事件。
 
@@ -76,22 +78,24 @@ Phase B1 不做：
 Phase B1 完成必须同时满足：
 
 1. 一通 Web 会话创建后，数据库中存在一条 `ai_call_record`。
-2. 该通会话的关键状态事件、浏览器事件、模型错误、打断事件可按顺序查询。
+2. 该通会话的关键状态事件、浏览器事件、模型错误、打断事件可按顺序查询；实时会话事件来自运行态事件，历史记录事件来自 `ai_call_event`。
 3. 正常结束会话最终状态为 `completed`，失败会话最终状态为 `failed`。
 4. 查询接口返回的 `bigint` 主键或业务 ID 均为字符串。
 5. 自动化测试覆盖正常完成、失败、事件顺序、bigint 字符串输出和无物理外键。
 
 ## 4. 当前代码事实
 
-Phase A 当前事实：
+当前代码事实：
 
 1. `call_id` 由 `call_` 加雪花 ID 组成，例如 `call_324827628607397888`。
 2. 当前会话注册表是 `InMemorySessionRegistry`，不支持进程重启后的会话追溯。
-3. 当前事件存储是 `InMemoryEventStore`，不承诺进程重启后的追溯。
+3. 当前运行态事件存储是 `InMemoryEventStore`，不承诺进程重启后的追溯。
 4. 当前指标是 `CallMetrics` 内存快照，B1 不把它固化为业务表。
 5. 当前 AI Call API 已有创建会话、重新签发 Token、查询会话、查询事件、上报浏览器事件和结束会话。
 6. 当前 Python 仓库没有 `TenantEntity` 类名；现有模型使用 `MappedBase`。
 7. 当前 `ai_call` 路由没有接入 `get_current_user`，B1 明确暂不强制登录态。
+8. 当前事件明细持久化由 `AiCallEventPersistenceWorker` 后台完成；它是进程内有界队列，不是 MQ 级强可靠事件总线。
+9. 当前 `/ai-call/sessions/{callId}/events` 是实时会话事件查询，优先读取运行态事件；`/ai-call/records/{callId}/events` 是历史记录事件查询，读取 `ai_call_event`。
 
 设计推论：
 
@@ -99,6 +103,7 @@ Phase A 当前事实：
 2. B1 的持久化层必须贴合现有 SQLAlchemy 2.0 `Mapped` / `mapped_column` 写法。
 3. B1 先通过 `business_type + business_id` 关联上游业务，不提前引入租户字段。
 4. B1 的 standalone 本地验证允许不传业务 ID，但该模式不能作为生产业务归属验收依据。
+5. `ai_call_record` 主状态同步写入，`ai_call_event` 明细采用后台最终一致，避免数据库慢查询或锁等待进入实时音频路径。
 
 ## 5. 表设计原则
 
@@ -203,7 +208,7 @@ B1 推荐落库事件：
 | `opening_started` | 是 | 开场白触发 |
 | `user_speech_started` | 是 | 用户开始说话，来自供应商事件 |
 | `user_speech_stopped` | 是 | 用户停止说话，来自供应商事件 |
-| `browser_user_speech_started` | 是 | 浏览器侧检测到用户开始说话 |
+| `browser_user_speech_started` | 是 | 兼容浏览器侧用户说话候选事件；当前 Phase A 静态验证页不主动上报，不作为服务端打断确认依据 |
 | `model_response_started` | 是 | 模型开始响应 |
 | `model_response_done` | 是 | 模型响应完成 |
 | `model_error` | 是 | 模型错误 |
@@ -338,10 +343,10 @@ B1 沿用 Phase A 状态，不新增旧状态兼容：
 | 方法 | 路径 | B1 行为 |
 |---|---|---|
 | `POST` | `/ai-call/sessions` | 创建运行态会话，同时创建通话记录 |
-| `POST` | `/ai-call/sessions/{callId}/token` | 重新签发浏览器 Token，同时写入关键事件 |
+| `POST` | `/ai-call/sessions/{callId}/token` | 重新签发浏览器 Token，并把签发事件交给后台队列持久化 |
 | `GET` | `/ai-call/sessions/{callId}` | 查询运行态状态；B1 可叠加持久化兜底 |
-| `GET` | `/ai-call/sessions/{callId}/events` | 查询当前会话事件；B1 改为优先查持久化事件 |
-| `POST` | `/ai-call/sessions/{callId}/browser-events` | 上报浏览器事件，同时写入关键事件 |
+| `GET` | `/ai-call/sessions/{callId}/events` | 查询当前运行态事件；运行态不存在时可兜底读取历史持久化事件 |
+| `POST` | `/ai-call/sessions/{callId}/browser-events` | 上报浏览器事件，并把低频关键事件交给后台队列持久化 |
 | `POST` | `/ai-call/sessions/{callId}/end` | 结束会话，同时更新记录终态 |
 
 ### 9.3 新增记录查询 API
@@ -472,8 +477,9 @@ GET /ai-call/records/{callId}/events
 
 实现说明：
 
-1. `/ai-call/records/{callId}/events` 是历史记录详情入口。
-2. 现有 `/ai-call/sessions/{callId}/events` 可继续保留，但必须复用同一个事件查询服务，不能重复实现两套事件查询逻辑。
+1. `/ai-call/records/{callId}/events` 是历史记录详情入口，读取 `ai_call_event`。
+2. 现有 `/ai-call/sessions/{callId}/events` 是实时调试和前端轮询入口，读取运行态事件；运行态不存在时可以兜底读取历史事件。
+3. 两个接口共享事件输出字段，但查询来源不同；不能让实时轮询接口承担事件落库职责。
 
 ## 10. 模块设计
 
@@ -488,8 +494,9 @@ app/api/v1/ai_call/
   crud.py
 
 app/services/ai_call/
+  event_store.py
+  event_persistence.py
   record_service.py
-  persistent_event_store.py
 ```
 
 职责：
@@ -502,7 +509,8 @@ app/services/ai_call/
 | `controller.py` | 暴露 records 查询 API，不直接拼 SQL |
 | `service.py` | 编排查询结果，保持统一响应 |
 | `record_service.py` | 创建和更新通话记录、终态 |
-| `persistent_event_store.py` | 在关键事件产生时写入 DB |
+| `event_store.py` | 保存当前进程运行态事件，并通知监听器 |
+| `event_persistence.py` | 用进程内有界队列后台批量持久化低频关键事件 |
 
 设计规则：
 
@@ -522,36 +530,43 @@ sequenceDiagram
   participant B as Browser
   participant API as ai_call API
   participant O as Orchestrator
+  participant ES as EventStore
+  participant W as Event Worker
   participant DB as DB
   participant LK as LiveKit
   participant A as Agent
 
   B->>API: POST /ai-call/sessions
-  API->>O: create_web_session(request)
-  O->>DB: insert ai_call_record(created)
-  O->>DB: insert event session_created
+  API->>DB: insert ai_call_record(created)
+  API->>O: create_web_session(request, call_id)
+  O->>ES: append session_created / session_preparing
+  ES-->>W: enqueue persistable events
   O->>LK: create room
-  O->>DB: update record preparing / room_created event
+  O->>ES: append room_created
   O->>LK: issue browser token
-  O->>DB: insert browser_token_issued event
+  O->>ES: append browser_token_issued
   O->>A: start agent
-  O->>DB: insert agent_started / session_ready event
-  O->>DB: update record ready
+  O->>ES: append agent_started / session_ready
+  API->>DB: update ai_call_record(status)
   API-->>B: call_id, room, token, status
+  Note over W,DB: 后台异步执行，API 不等待
+  W-->>DB: batch upsert ai_call_event
 ```
 
 写入规则：
 
 1. DB 记录创建失败时，不继续创建 Room 和 Agent。
-2. Room 或 Agent 创建失败时，必须更新 `ai_call_record.status=failed`，并写入失败事件。
+2. Room 或 Agent 创建失败时，必须同步更新 `ai_call_record.status=failed`，失败事件进入后台持久化队列。
 3. Token 不入库，只记录签发事件和过期秒数。
+4. `ai_call_event` 写入失败必须记录服务端错误日志，但不能阻断实时通话主路径。
 
 ### 11.2 通话中事件
 
-1. 状态类、错误类和低频业务关键事件写入 DB。
-2. 高频音频帧事件不逐条写入 DB。
-3. 终态和失败事件写入失败时必须记录服务端错误日志。
-4. 普通通话中事件写入不能让实时音频链路长时间阻塞；实现时应控制短超时，必要时可后台补写。
+1. 状态类、错误类和低频业务关键事件先写入运行态事件，再非阻塞入队。
+2. 后台 worker 批量写入 `ai_call_event`，并使用 `event_id` 做幂等去重。
+3. 高频音频帧事件不逐条写入 DB。
+4. 终态和失败事件写入失败时必须记录服务端错误日志。
+5. 事件队列满时允许丢弃事件并记录告警，以保护实时通话；强可靠事件投递留到后续生产加固阶段评估。
 
 ### 11.3 结束会话
 
@@ -559,16 +574,22 @@ sequenceDiagram
 sequenceDiagram
   participant API as ai_call API
   participant O as Orchestrator
+  participant ES as EventStore
+  participant W as Event Worker
   participant A as Agent
   participant LK as LiveKit
   participant DB as DB
 
   API->>O: end_session(call_id)
-  O->>DB: insert session_ending event
+  O->>ES: append session_ending
+  ES-->>W: enqueue session_ending
   O->>A: stop
   O->>LK: delete room
-  O->>DB: update record completed / failed
-  O->>DB: insert terminal event
+  O->>ES: append terminal event
+  ES-->>W: enqueue terminal event
+  API->>DB: update ai_call_record(completed / failed)
+  Note over W,DB: 后台异步执行，API 不等待
+  W-->>DB: batch upsert ai_call_event
 ```
 
 结束规则：
@@ -660,9 +681,9 @@ Phase B1 数据库不能保存：
 必须新增测试覆盖：
 
 1. 创建会话成功后创建 `ai_call_record`。
-2. `session_created -> session_ready` 关键事件可按写入顺序查询。
+2. `session_created -> session_ready` 关键事件经后台 worker flush 后可按写入顺序查询。
 3. Agent 启动失败时记录状态为 `failed`，写入 `agent_start_failed` 和 `session_failed`。
-4. 浏览器上报事件后写入 `ai_call_event`。
+4. 浏览器上报事件后先进入运行态事件，再由后台 worker 写入 `ai_call_event`。
 5. 结束会话后记录 `ended_at`、`duration_ms`、`status=completed`。
 6. Web 用户主动结束时记录 `completed + web_user_end`。
 7. 浏览器断开时记录 `completed + browser_disconnect`。
@@ -671,6 +692,9 @@ Phase B1 数据库不能保存：
 10. `call_id` 全局唯一。
 11. API 输出的 `BigInteger` ID 是字符串。
 12. SQLAlchemy 模型不声明 `ForeignKey` 和 `relationship`。
+13. 高频 `model_audio_delta`、`ai_audio_published` 不进入 `ai_call_event`。
+14. 后台事件队列满或落库失败不阻塞实时 API 主路径，并产生服务端日志或计数。
+15. `/sessions/{callId}/events` 查询运行态事件，`/records/{callId}/events` 查询持久化事件。
 
 ### 15.2 手工验收
 
@@ -692,11 +716,13 @@ Phase B1 数据库不能保存：
 1. 新增 B1 SQLAlchemy 模型和 schema。
 2. 新增 `ai_call` CRUD。
 3. 在创建会话链路写入 `ai_call_record`。
-4. 新增持久化事件写入封装，先覆盖低频关键事件。
-5. 在结束和失败链路更新终态和结束原因。
-6. 新增 `/ai-call/records` 查询接口。
-7. 补齐 BigInt 字符串输出、业务反查和无外键测试。
-8. 手工跑一通 Web 会话，更新 B1 验收记录。
+4. 在 `event_store.py` 增加事件监听能力。
+5. 新增 `event_persistence.py`，通过进程内有界队列后台持久化低频关键事件。
+6. 从实时 API 热路径移除同步事件明细落库，只保留 `ai_call_record` 主状态同步更新。
+7. 在结束和失败链路更新终态和结束原因。
+8. 新增 `/ai-call/records` 查询接口。
+9. 补齐 BigInt 字符串输出、业务反查、无外键、后台 worker 和事件过滤测试。
+10. 手工跑一通 Web 会话，更新 B1 验收记录。
 
 ## 17. 延后到 B2/B3 的内容
 
@@ -711,6 +737,8 @@ B1 只预留边界，不实现：
 | 通话摘要和质检 | 需要通话后转写或额外模型任务 |
 | 并发容量统计 | 属于 Phase C |
 
+B2 录音闭环已单独形成正式设计，见 [phase-b2-recording-closure-design.md](phase-b2-recording-closure-design.md)。B1 实现不回填录音字段，后续按 B2 文档新增独立录音业务表和 OSS 索引关联。
+
 ## 18. 已确认结论
 
 ### 18.1 已确认
@@ -722,3 +750,6 @@ B1 只预留边界，不实现：
 3. 结束原因按 8.2 的 `end_reason` 表执行，`browser_disconnect` 在 B1 默认归为 `completed`。
 4. 上游业务接入时 `business_type` 由调用方直接传入，B1 不建枚举表、不建配置表。
 5. 后端查询详情同时返回 `failure_stage` 和 `failure_message`；前端可按页面需要决定展示粒度，后端不裁掉排障字段。
+6. `ai_call_record` 是同步主状态，`ai_call_event` 是后台最终一致的事件明细。
+7. `/sessions/{callId}/events` 服务当前运行态调试，`/records/{callId}/events` 服务历史记录复盘。
+8. 当前后台队列是进程内轻量方案，不承诺 MQ 级强可靠；是否引入外部消息队列留到生产加固阶段结合压测和故障目标判断。

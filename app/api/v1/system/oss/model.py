@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, String, DateTime
+from sqlalchemy import BigInteger, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -31,24 +31,14 @@ class OssModel(MappedBase):
     file_suffix: Mapped[str] = mapped_column(
         String(10), nullable=False, default="", comment="文件后缀名"
     )
-    url: Mapped[str] = mapped_column(
-        String(500), nullable=False, default="", comment="URL地址"
-    )
-    ext1: Mapped[str | None] = mapped_column(
-        String(500), nullable=True, comment="扩展字段"
-    )
-    create_dept: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="创建部门"
-    )
-    create_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="上传人"
-    )
+    url: Mapped[str] = mapped_column(String(500), nullable=False, default="", comment="URL地址")
+    ext1: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="扩展字段")
+    create_dept: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建部门")
+    create_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="上传人")
     create_time: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="创建时间"
     )
-    update_by: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="更新者"
-    )
+    update_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="更新者")
     update_time: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="更新时间"
     )

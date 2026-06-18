@@ -11,9 +11,9 @@ from fastapi.testclient import TestClient
 
 def test_check_health(test_client: TestClient) -> None:
     """测试健康检查接口"""
-    response = test_client.get("/common/health")
+    response = test_client.get("/ai-call/health")
     assert response.status_code == 200
-    assert response.json() == {"msg": "Healthy"}
+    assert response.json() == {"status": "ok"}
 
 
 # 运行所有测试

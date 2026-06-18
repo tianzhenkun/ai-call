@@ -73,12 +73,12 @@ async def get_obj_list_controller(
         dept_id=dept_id,
         keyword=keyword,
     )
-    
+
     rows = [
         UserOutSchema.model_validate(user).model_dump(by_alias=True)
         for user in result.get("rows", [])
     ]
-    
+
     log.info("查询用户成功")
     return TableResponse(rows=rows, total=result.get("total", 0), msg="查询成功")
 

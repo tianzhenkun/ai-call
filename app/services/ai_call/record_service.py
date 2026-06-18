@@ -24,6 +24,71 @@ SENSITIVE_PAYLOAD_KEYS = {
     "token",
 }
 
+# B1 只持久化可复盘的低频关键事件，高频音频帧事件保留在运行态。
+PERSISTED_EVENT_TYPES = frozenset({
+    "agent_error",
+    "agent_start_failed",
+    "agent_started",
+    "browser_disconnect",
+    "browser_first_audio",
+    "browser_ready",
+    "browser_token_issued",
+    "browser_user_speech_started",
+    "call_end_auto_failed",
+    "call_end_scheduled",
+    "call_end_tool_ignored",
+    "call_end_tool_requested",
+    "agent_suspended_for_handoff",
+    "handoff_accepted",
+    "handoff_canceled",
+    "handoff_completed",
+    "handoff_connected",
+    "handoff_expired",
+    "handoff_failed",
+    "handoff_auto_end_scheduled",
+    "handoff_auto_ended",
+    "handoff_auto_trigger_failed",
+    "handoff_auto_triggered",
+    "handoff_intent_detected",
+    "handoff_intent_ignored",
+    "handoff_tool_ignored",
+    "handoff_tool_requested",
+    "handoff_prompt_cleanup_failed",
+    "handoff_prompt_done",
+    "handoff_prompt_failed",
+    "handoff_prompt_started",
+    "handoff_requested",
+    "handoff_timeout_task_canceled",
+    "handoff_timeout_task_started",
+    "handoff_waiting_tone_failed",
+    "handoff_waiting_tone_started",
+    "handoff_waiting_tone_stopped",
+    "input_audio_cleared",
+    "input_audio_committed",
+    "interrupt_candidate",
+    "interrupt_cleanup_failed",
+    "interrupt_confirmed",
+    "interrupt_ignored",
+    "model_audio_done",
+    "model_error",
+    "model_response_done",
+    "model_response_started",
+    "model_session_started",
+    "model_session_updated",
+    "opening_started",
+    "provider_event_unmapped",
+    "room_created",
+    "session_completed",
+    "session_created",
+    "session_failed",
+    "session_preparing",
+    "session_ready",
+    "session_ending",
+    "user_speech_started",
+    "user_speech_stopped",
+    "user_transcript_failed",
+})
+
 
 class AiCallRecordService:
     """B1 通话记录和关键事件持久化服务。"""
@@ -35,11 +100,11 @@ class AiCallRecordService:
         self,
         *,
         call_id: str,
-        business_type: str | None,
         business_id: str | None,
         room_name: str,
         participant_identity: str,
         started_at: datetime | None = None,
+        business_type: str | None = None,
     ) -> AiCallRecordModel:
         return await self.repository.create_record(
             call_id=call_id,
@@ -112,9 +177,16 @@ class AiCallRecordService:
 
     async def mirror_runtime_events(self, events: list[AiCallEvent]) -> list[AiCallEventModel]:
         persisted: list[AiCallEventModel] = []
-        for event in events:
-            persisted.append(
-                await self.repository.append_event(
+        persistable_events = [event for event in events if self.should_persist_event(event)]
+        for call_id, call_events in self._group_events_by_call(persistable_events).items():
+            existing_event_ids = await self.repository.list_existing_event_ids(
+                call_id=call_id,
+                event_ids=[event.event_id for event in call_events],
+            )
+            for event in call_events:
+                if event.event_id in existing_event_ids:
+                    continue
+                persisted_event = await self.repository.append_event(
                     event_id=event.event_id,
                     call_id=event.call_id,
                     event_type=event.type,
@@ -122,28 +194,13 @@ class AiCallRecordService:
                     event_time=event.timestamp,
                     payload_json=self._payload_to_json(event.payload),
                 )
-            )
+                persisted.append(persisted_event)
+                existing_event_ids.add(event.event_id)
         return persisted
 
-    async def append_terminal_event(
-        self,
-        *,
-        call_id: str,
-        event_type: str,
-        source: str,
-        payload: dict[str, Any],
-        event_time: datetime | None = None,
-    ) -> AiCallEventModel:
-        from app.utils.id_util import generate_snowflake_id
-
-        return await self.repository.append_event(
-            event_id=f"evt_{generate_snowflake_id()}",
-            call_id=call_id,
-            event_type=event_type,
-            source=source,
-            event_time=event_time or utc_now(),
-            payload_json=self._payload_to_json(payload),
-        )
+    @staticmethod
+    def should_persist_event(event: AiCallEvent) -> bool:
+        return event.type in PERSISTED_EVENT_TYPES
 
     async def get_record(self, call_id: str) -> AiCallRecordModel | None:
         return await self.repository.get_record(call_id)
@@ -257,6 +314,13 @@ class AiCallRecordService:
         if not sanitized:
             return None
         return json.dumps(sanitized, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _group_events_by_call(events: list[AiCallEvent]) -> dict[str, list[AiCallEvent]]:
+        grouped: dict[str, list[AiCallEvent]] = {}
+        for event in events:
+            grouped.setdefault(event.call_id, []).append(event)
+        return grouped
 
     @classmethod
     def _sanitize_payload(cls, value: Any) -> Any:

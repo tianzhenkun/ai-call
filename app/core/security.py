@@ -98,7 +98,9 @@ class CustomOAuth2PasswordRequestForm(OAuth2PasswordRequestForm):
 
 
 # OAuth2认证配置
-OAuth2Schema = CustomOAuth2PasswordBearer(token_url="system/auth/login", description="认证", auto_error=False)
+OAuth2Schema = CustomOAuth2PasswordBearer(
+    token_url="system/auth/login", description="认证", auto_error=False
+)
 
 
 def create_access_token(payload: "JWTPayloadSchema") -> str:

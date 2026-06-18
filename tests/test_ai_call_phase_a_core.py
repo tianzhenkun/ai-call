@@ -1,7 +1,8 @@
 import asyncio
 import base64
+import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +25,9 @@ from app.services.ai_call.livekit_room import BrowserRoomToken
 from app.services.ai_call.metrics import CallMetrics
 from app.services.ai_call.orchestrator import AiCallOrchestrator, AiCallRuntimeConfig
 from app.services.ai_call.providers.aliyun_qwen_realtime import (
+    DEFAULT_REALTIME_TOOLS,
+    REQUEST_HANDOFF_TOOL,
+    SCHEDULE_CALL_END_TOOL,
     AliyunQwenRealtimeProvider,
     QwenRealtimeSessionConfig,
     build_session_update_event,
@@ -100,6 +104,7 @@ class FakeRealtimeProvider:
         self.cancelled_response_count = 0
         self.cleared_input_count = 0
         self.created_responses: list[str | None] = []
+        self.submitted_tool_results: list[tuple[str, str]] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -118,6 +123,9 @@ class FakeRealtimeProvider:
 
     async def create_response(self, input_text: str | None = None) -> None:
         self.created_responses.append(input_text)
+
+    async def submit_tool_result(self, tool_call_id: str, output: str) -> None:
+        self.submitted_tool_results.append((tool_call_id, output))
 
     async def receive_events(self):
         for event in self.events:
@@ -359,8 +367,7 @@ def build_orchestrator() -> tuple[AiCallOrchestrator, FakeLiveKitRoomManager, Fa
             qwen_realtime_model="qwen3.5-omni-plus-realtime",
             qwen_realtime_voice="Tina",
             default_prompt="你是一个电话外呼助手，回答要简短自然。",
-            opening_enabled=True,
-            opening_message="您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            opening_message="您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
             web_audio_echo_cancellation=True,
             web_audio_noise_suppression=True,
             web_audio_auto_gain_control=True,
@@ -376,6 +383,14 @@ def build_orchestrator() -> tuple[AiCallOrchestrator, FakeLiveKitRoomManager, Fa
     return orchestrator, livekit, agent
 
 
+def test_ai_call_runtime_config_defaults_to_server_vad(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("QWEN_REALTIME_TURN_DETECTION_TYPE", raising=False)
+
+    runtime_config = AiCallRuntimeConfig.from_settings(Settings(_env_file=None))
+
+    assert runtime_config.vad_type == "server_vad"
+
+
 def test_orchestrator_default_agent_runner_uses_realtime_qwen_livekit_stack() -> None:
     metrics_by_call_id: dict[str, CallMetrics] = {}
     orchestrator = AiCallOrchestrator(
@@ -389,8 +404,7 @@ def test_orchestrator_default_agent_runner_uses_realtime_qwen_livekit_stack() ->
             qwen_realtime_model="qwen3.5-omni-plus-realtime",
             qwen_realtime_voice="Tina",
             default_prompt="你是一个电话外呼助手，回答要简短自然。",
-            opening_enabled=True,
-            opening_message="您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            opening_message="您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
             web_audio_echo_cancellation=True,
             web_audio_noise_suppression=True,
             web_audio_auto_gain_control=True,
@@ -424,7 +438,6 @@ async def test_create_session_uses_defaults_and_keeps_secrets_out_of_browser_res
     assert result.status == CallSessionStatus.READY
     assert result.effective_config.model == "qwen3.5-omni-plus-realtime"
     assert result.effective_config.voice == "Tina"
-    assert result.effective_config.opening_enabled is True
     assert result.effective_config.prompt_hash.startswith("sha256:")
     assert result.effective_config.opening_message_hash.startswith("sha256:")
     assert livekit.created_rooms == [result.room_name]
@@ -442,6 +455,18 @@ async def test_create_session_uses_defaults_and_keeps_secrets_out_of_browser_res
 
 
 @pytest.mark.anyio
+async def test_create_session_rejects_empty_opening_message_before_room_create() -> None:
+    orchestrator, livekit, _agent = build_orchestrator()
+    orchestrator.config = replace(orchestrator.config, opening_message=" ")
+
+    with pytest.raises(AiCallError) as exc_info:
+        await orchestrator.create_web_session(voice=None, prompt=None)
+
+    assert exc_info.value.error_id == "opening_message_empty"
+    assert livekit.created_rooms == []
+
+
+@pytest.mark.anyio
 async def test_create_session_cleans_up_room_and_marks_failed_when_agent_start_fails() -> None:
     livekit = FakeLiveKitRoomManager()
     agent = FailingAgentRunner()
@@ -456,8 +481,7 @@ async def test_create_session_cleans_up_room_and_marks_failed_when_agent_start_f
             qwen_realtime_model="qwen3.5-omni-plus-realtime",
             qwen_realtime_voice="Tina",
             default_prompt="你是一个电话外呼助手，回答要简短自然。",
-            opening_enabled=True,
-            opening_message="您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            opening_message="您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
             web_audio_echo_cancellation=True,
             web_audio_noise_suppression=True,
             web_audio_auto_gain_control=True,
@@ -518,6 +542,54 @@ async def test_end_failed_session_still_cleans_up_agent_and_room() -> None:
     assert ended.status == CallSessionStatus.FAILED
     assert agent.stopped_call_ids == [created.call_id]
     assert livekit.deleted_rooms == [created.room_name]
+
+
+@pytest.mark.anyio
+async def test_orchestrator_auto_end_session_completes_with_model_reason() -> None:
+    orchestrator, livekit, agent = build_orchestrator()
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    orchestrator._schedule_auto_end_session(created.call_id, "customer_end")
+
+    await asyncio.wait_for(
+        _wait_until(
+            lambda: orchestrator.registry.get(created.call_id).status == CallSessionStatus.COMPLETED
+        ),
+        timeout=1,
+    )
+    events = await orchestrator.list_events(created.call_id)
+
+    assert agent.stopped_call_ids == [created.call_id]
+    assert livekit.deleted_rooms == [created.room_name]
+    assert events.rows[-1].type == "session_completed"
+    assert events.rows[-1].payload == {"endReason": "customer_end"}
+
+
+@pytest.mark.anyio
+async def test_orchestrator_auto_end_session_cleans_room_on_model_error() -> None:
+    orchestrator, livekit, _agent = build_orchestrator()
+    provider = QueueRealtimeProvider()
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=orchestrator.registry,
+        event_store=orchestrator.event_store,
+        call_end_scheduler=orchestrator._schedule_auto_end_session,
+    )
+    orchestrator.agent_runner = runner
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    await provider.emit(
+        ProviderEvent(
+            type="model_error",
+            payload={"error": {"message": "insufficient balance"}},
+        )
+    )
+    await _wait_until(lambda: livekit.deleted_rooms == [created.room_name])
+
+    assert orchestrator.registry.get(created.call_id).status == CallSessionStatus.FAILED
+    assert provider.closed is True
+    events = await orchestrator.list_events(created.call_id)
+    assert "session_failed" in [event.type for event in events.rows]
 
 
 def test_event_store_returns_sorted_limited_incremental_events() -> None:
@@ -644,10 +716,11 @@ async def test_browser_user_speech_started_records_candidate_while_ai_speaking()
         timestamp=reported_at,
     )
 
-    assert agent.browser_speech_candidates == [(created.call_id, reported_at)]
     events = await orchestrator.list_events(created.call_id)
     assert events.rows[-1].type == "browser_user_speech_started"
     assert events.rows[-1].source == "browser"
+    assert agent.browser_speech_candidates == [(created.call_id, events.rows[-1].timestamp)]
+    assert events.rows[-1].payload["reportedAt"] == reported_at.isoformat()
 
 
 @pytest.mark.anyio
@@ -663,10 +736,11 @@ async def test_browser_user_speech_started_is_forwarded_as_candidate() -> None:
         timestamp=reported_at,
     )
 
-    assert agent.browser_speech_candidates == [(created.call_id, reported_at)]
     events = await orchestrator.list_events(created.call_id)
     assert events.rows[-1].type == "browser_user_speech_started"
     assert events.rows[-1].source == "browser"
+    assert agent.browser_speech_candidates == [(created.call_id, events.rows[-1].timestamp)]
+    assert events.rows[-1].payload["reportedAt"] == reported_at.isoformat()
 
 
 def test_audio_bridge_downsamples_48k_mono_pcm_to_16k_20ms_frame() -> None:
@@ -815,7 +889,9 @@ async def test_livekit_room_audio_transport_adds_short_fade_out_when_stopping_au
 
 
 @pytest.mark.anyio
-async def test_livekit_room_audio_transport_stop_audio_keeps_clear_when_fade_capture_fails() -> None:
+async def test_livekit_room_audio_transport_stop_audio_keeps_clear_when_fade_capture_fails() -> (
+    None
+):
     room = FakeLiveKitRoom()
     transport = LiveKitRoomAudioTransport(
         livekit_url="wss://livekit.test",
@@ -899,8 +975,26 @@ def test_qwen_session_update_and_server_event_mapping() -> None:
         "create_response": False,
         "interrupt_response": False,
     }
+    assert "tools" not in payload["session"]
+
+    tool_payload = build_session_update_event(
+        QwenRealtimeSessionConfig(
+            voice="Tina",
+            instructions="你是一个电话外呼助手，回答要简短自然。",
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+            tools=DEFAULT_REALTIME_TOOLS,
+        )
+    )
+    assert tool_payload["session"]["tools"] == DEFAULT_REALTIME_TOOLS
+    assert SCHEDULE_CALL_END_TOOL in DEFAULT_REALTIME_TOOLS
+    assert REQUEST_HANDOFF_TOOL in DEFAULT_REALTIME_TOOLS
 
     assert map_qwen_server_event({"type": "response.audio.delta"}) == "model_audio_delta"
+    assert map_qwen_server_event({"type": "response.function_call_arguments.done"}) == (
+        "tool_call_done"
+    )
     assert map_qwen_server_event({"type": "input_audio_buffer.speech_stopped"}) == (
         "user_speech_stopped"
     )
@@ -910,9 +1004,10 @@ def test_qwen_session_update_and_server_event_mapping() -> None:
     assert map_qwen_server_event({"type": "input_audio_buffer.committed"}) == (
         "input_audio_committed"
     )
-    assert map_qwen_server_event(
-        {"type": "conversation.item.input_audio_transcription.failed"}
-    ) == "user_transcript_failed"
+    assert (
+        map_qwen_server_event({"type": "conversation.item.input_audio_transcription.failed"})
+        == "user_transcript_failed"
+    )
     assert map_qwen_server_event({"type": "unknown.event"}) is None
 
 
@@ -968,6 +1063,7 @@ async def test_qwen_provider_connects_and_sends_protocol_events() -> None:
     await provider.create_response("请说一句开场白")
     await provider.cancel_response()
     await provider.clear_input_audio()
+    await provider.submit_tool_result("call_tool_1", "ok")
     await provider.close()
 
     assert captured["url"] == (
@@ -1000,6 +1096,15 @@ async def test_qwen_provider_connects_and_sends_protocol_events() -> None:
         {"type": "response.create"},
         {"type": "response.cancel"},
         {"type": "input_audio_buffer.clear"},
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_tool_1",
+                "output": "ok",
+            },
+        },
+        {"type": "response.create"},
     ]
     assert sockets[0].closed is True
 
@@ -1012,6 +1117,12 @@ async def test_qwen_provider_receives_mapped_events_and_preserves_payload() -> N
             {"type": "response.audio.delta", "delta": "AAAA"},
             {"type": "conversation.item.created", "item": {"id": "item_1"}},
             {"type": "input_audio_buffer.committed", "item_id": "item_1"},
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_tool_1",
+                "name": "schedule_call_end",
+                "arguments": '{"reason":"customer_end"}',
+            },
             {
                 "type": "conversation.item.input_audio_transcription.failed",
                 "error": {"code": "asr_failed", "message": "no speech"},
@@ -1046,12 +1157,19 @@ async def test_qwen_provider_receives_mapped_events_and_preserves_payload() -> N
         "model_audio_delta",
         "conversation_item_created",
         "input_audio_committed",
+        "tool_call_done",
         "user_transcript_failed",
         "provider_event_unmapped",
     ]
     assert events[0].payload == {"type": "session.created", "session": {"id": "sess_1"}}
     assert events[1].payload == {"type": "response.audio.delta", "delta": "AAAA"}
-    assert events[5].payload == {
+    assert events[4].payload == {
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_tool_1",
+        "name": "schedule_call_end",
+        "arguments": '{"reason":"customer_end"}',
+    }
+    assert events[6].payload == {
         "rawType": "unknown.event",
         "raw": {
             "type": "unknown.event",
@@ -1068,16 +1186,14 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     metrics = CallMetrics()
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(type="model_audio_delta", payload={"delta": "AAAA"}),
-            ProviderEvent(type="model_response_done", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="model_audio_delta", payload={"delta": "AAAA"}),
+        ProviderEvent(type="model_response_done", payload={}),
+    ])
     session = CallSession(
         call_id="call_1",
         room_name="ai-call-call_1",
@@ -1098,21 +1214,22 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
         registry=registry,
         event_store=store,
         metrics_by_call_id={"call_1": metrics},
+        user_turn_stability_delay_seconds=0,
     )
 
     await runner.start(session)
     await runner.wait("call_1")
 
     assert provider.connected is True
-    assert provider.session_updates == [
-        QwenRealtimeSessionConfig(
-            voice="Tina",
-            instructions="你是一个电话外呼助手，回答要简短自然。",
-            vad_type="server_vad",
-            vad_threshold=0.5,
-            vad_silence_duration_ms=800,
-        )
-    ]
+    assert len(provider.session_updates) == 1
+    session_update = provider.session_updates[0]
+    assert session_update.voice == "Tina"
+    assert "你是一个电话外呼助手，回答要简短自然。" in session_update.instructions
+    assert "schedule_call_end" in session_update.instructions
+    assert session_update.vad_type == "server_vad"
+    assert session_update.vad_threshold == 0.5
+    assert session_update.vad_silence_duration_ms == 800
+    assert session_update.tools == DEFAULT_REALTIME_TOOLS
     assert registry.get("call_1").status == CallSessionStatus.CONNECTED
     assert metrics.snapshot()["lastModelFirstAudioMs"] is not None
     assert [event.type for event in store.list("call_1")] == [
@@ -1126,24 +1243,383 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_schedules_end_on_model_error() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    session = CallSession(
+        call_id="call_model_error",
+        room_name="ai-call-call_model_error",
+        participant_identity="browser-call_model_error",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await provider.emit(ProviderEvent(type="model_session_started", payload={}))
+    await provider.emit(
+        ProviderEvent(
+            type="model_error",
+            payload={"error": {"message": "insufficient balance"}},
+        )
+    )
+    await _wait_until(lambda: bool(scheduler_calls))
+
+    assert registry.get("call_model_error").status == CallSessionStatus.FAILED
+    assert scheduler_calls == [("call_model_error", "model_error")]
+    session_failed = [
+        event for event in store.list("call_model_error") if event.type == "session_failed"
+    ]
+    assert session_failed[-1].payload == {
+        "endReason": "model_error",
+        "failureStage": "model",
+        "failureMessage": "insufficient balance",
+    }
+
+    await runner.stop("call_model_error")
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_schedules_end_when_model_response_create_fails() -> None:
+    class FailingCreateResponseProvider(QueueRealtimeProvider):
+        async def create_response(self, input_text: str | None = None) -> None:
+            _ = input_text
+            raise RuntimeError("quota exceeded")
+
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FailingCreateResponseProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    session = CallSession(
+        call_id="call_response_create_failed",
+        room_name="ai-call-call_response_create_failed",
+        participant_identity="browser-call_response_create_failed",
+        status=CallSessionStatus.CONNECTED,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "opening_message": "您好",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await runner.start_opening("call_response_create_failed")
+
+    assert registry.get("call_response_create_failed").status == CallSessionStatus.FAILED
+    assert scheduler_calls == [("call_response_create_failed", "model_error")]
+    session_failed = [
+        event
+        for event in store.list("call_response_create_failed")
+        if event.type == "session_failed"
+    ]
+    assert session_failed[-1].payload["failureStage"] == "model_response_create"
+    assert "quota exceeded" in session_failed[-1].payload["failureMessage"]
+
+    await runner.stop("call_response_create_failed")
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_schedules_end_when_provider_event_stream_fails() -> None:
+    class FailingReceiveProvider(FakeRealtimeProvider):
+        async def receive_events(self):
+            yield ProviderEvent(type="model_session_started", payload={})
+            raise RuntimeError("websocket closed")
+
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FailingReceiveProvider([])
+    scheduler_calls: list[tuple[str, str]] = []
+    session = CallSession(
+        call_id="call_provider_stream_failed",
+        room_name="ai-call-call_provider_stream_failed",
+        participant_identity="browser-call_provider_stream_failed",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await _wait_until(lambda: bool(scheduler_calls))
+    await runner.wait("call_provider_stream_failed")
+
+    assert registry.get("call_provider_stream_failed").status == CallSessionStatus.FAILED
+    assert scheduler_calls == [("call_provider_stream_failed", "model_error")]
+    session_failed = [
+        event
+        for event in store.list("call_provider_stream_failed")
+        if event.type == "session_failed"
+    ]
+    assert session_failed[-1].payload["failureStage"] == "provider_event_stream"
+    assert "websocket closed" in session_failed[-1].payload["failureMessage"]
+
+    await runner.stop("call_provider_stream_failed")
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_playout() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = ImmediatePlayoutAudioPublisher()
+    scheduler_calls: list[tuple[str, str]] = []
+    output_pcm = b"\x01\x02" * 240
+    session = CallSession(
+        call_id="call_end_tool",
+        room_name="ai-call-call_end_tool",
+        participant_identity="browser-call_end_tool",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        ai_speaking_tail_grace_seconds=0,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="tool_call_done",
+            payload={
+                "call_id": "tool_1",
+                "name": "schedule_call_end",
+                "arguments": json.dumps({"reason": "customer_end"}),
+            },
+        )
+    )
+    await asyncio.wait_for(
+        _wait_until(lambda: provider.submitted_tool_results),
+        timeout=1,
+    )
+    assert scheduler_calls == []
+
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await asyncio.sleep(0)
+    assert scheduler_calls == []
+
+    await provider.emit(ProviderEvent(type="model_response_started", payload={}))
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await asyncio.wait_for(
+        _wait_until(lambda: scheduler_calls == [("call_end_tool", "customer_end")]),
+        timeout=1,
+    )
+    await provider.close_events()
+    await runner.wait("call_end_tool")
+
+    assert provider.submitted_tool_results[0][0] == "tool_1"
+    assert "不要继续提出新问题" in provider.submitted_tool_results[0][1]
+    assert len(publisher.published) == 1
+    assert [event.type for event in store.list("call_end_tool")] == [
+        "model_session_started",
+        "tool_call_done",
+        "call_end_tool_requested",
+        "model_response_done",
+        "model_response_started",
+        "model_audio_delta",
+        "ai_audio_published",
+        "model_response_done",
+        "call_end_scheduled",
+    ]
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_maps_task_completed_call_end_reason() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    session = CallSession(
+        call_id="call_task_completed",
+        room_name="ai-call-call_task_completed",
+        participant_identity="browser-call_task_completed",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="tool_call_done",
+            payload={
+                "call_id": "tool_2",
+                "name": "schedule_call_end",
+                "arguments": json.dumps({"reason": "task_completed"}),
+            },
+        )
+    )
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.emit(ProviderEvent(type="model_response_started", payload={}))
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await asyncio.wait_for(
+        _wait_until(lambda: scheduler_calls == [("call_task_completed", "normal_completed")]),
+        timeout=1,
+    )
+    await provider.close_events()
+    await runner.wait("call_task_completed")
+
+    assert provider.submitted_tool_results[0][0] == "tool_2"
+    assert "call_end_scheduled" in [event.type for event in store.list("call_task_completed")]
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_records_handoff_tool_request() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    session = CallSession(
+        call_id="call_handoff_tool",
+        room_name="ai-call-call_handoff_tool",
+        participant_identity="browser-call_handoff_tool",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="tool_call_done",
+            payload={
+                "call_id": "handoff_tool_1",
+                "name": "request_handoff",
+                "arguments": json.dumps({"reason": "customer_request"}),
+            },
+        )
+    )
+    await asyncio.wait_for(
+        _wait_until(
+            lambda: any(
+                event.type == "handoff_tool_requested" for event in store.list("call_handoff_tool")
+            )
+        ),
+        timeout=1,
+    )
+    await provider.close_events()
+    await runner.wait("call_handoff_tool")
+
+    assert provider.submitted_tool_results == []
+    assert provider.created_responses == []
+    event_types = [event.type for event in store.list("call_handoff_tool")]
+    assert event_types == [
+        "model_session_started",
+        "tool_call_done",
+        "handoff_tool_requested",
+    ]
+    handoff_event = store.list("call_handoff_tool")[-1]
+    assert handoff_event.payload == {
+        "toolCallId": "handoff_tool_1",
+        "reason": "customer_request",
+    }
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_uses_qwen_text_stash_transcript_preview() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(
-                type="user_transcript_delta",
-                payload={"text": "", "stash": "今天"},
-            ),
-            ProviderEvent(
-                type="user_transcript_delta",
-                payload={"text": "今天", "stash": "天气怎么样"},
-            ),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(
+            type="user_transcript_delta",
+            payload={"text": "", "stash": "今天"},
+        ),
+        ProviderEvent(
+            type="user_transcript_delta",
+            payload={"text": "今天", "stash": "天气怎么样"},
+        ),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+    ])
     session = CallSession(
         call_id="call_qwen_transcript",
         room_name="ai-call-call_qwen_transcript",
@@ -1171,7 +1647,9 @@ async def test_realtime_agent_runner_uses_qwen_text_stash_transcript_preview() -
     assert provider.created_responses == [None]
     assert registry.get("call_qwen_transcript").status == CallSessionStatus.AI_THINKING
     transcript_events = [
-        event for event in store.list("call_qwen_transcript") if event.type == "user_transcript_delta"
+        event
+        for event in store.list("call_qwen_transcript")
+        if event.type == "user_transcript_delta"
     ]
     assert transcript_events[-1].payload == {"text": "今天", "stash": "天气怎么样"}
 
@@ -1180,17 +1658,15 @@ async def test_realtime_agent_runner_uses_qwen_text_stash_transcript_preview() -
 async def test_realtime_agent_runner_records_transcription_failure_without_reply() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(
-                type="user_transcript_failed",
-                payload={"error": {"code": "asr_failed", "message": "no speech"}},
-            ),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(
+            type="user_transcript_failed",
+            payload={"error": {"code": "asr_failed", "message": "no speech"}},
+        ),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+    ])
     session = CallSession(
         call_id="call_transcript_failed",
         room_name="ai-call-call_transcript_failed",
@@ -1231,17 +1707,15 @@ async def test_realtime_agent_runner_publishes_model_audio_delta_to_audio_sink()
     store = InMemoryEventStore()
     metrics = CallMetrics()
     output_pcm = b"\x01\x02" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+    ])
     publisher = FakeAudioPublisher()
     session = CallSession(
         call_id="call_publish",
@@ -1284,17 +1758,15 @@ async def test_realtime_agent_runner_splits_large_model_audio_delta_before_publi
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     output_pcm = b"\x01\x02" * 7680
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+    ])
     publisher = FakeAudioPublisher()
     session = CallSession(
         call_id="call_split_publish",
@@ -1316,6 +1788,7 @@ async def test_realtime_agent_runner_splits_large_model_audio_delta_before_publi
         registry=registry,
         event_store=store,
         audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
     )
 
     await runner.start(session)
@@ -1334,15 +1807,13 @@ async def test_realtime_agent_runner_tracks_opening_audio_metrics_and_state() ->
     metrics = CallMetrics()
     metrics.mark_model_response_requested(datetime.now(timezone.utc))
     output_pcm = b"\x03\x04" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="model_response_done", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+        ProviderEvent(type="model_response_done", payload={}),
+    ])
     publisher = FakeAudioPublisher()
     session = CallSession(
         call_id="call_opening_audio",
@@ -1385,21 +1856,19 @@ async def test_realtime_agent_runner_tracks_opening_audio_metrics_and_state() ->
 async def test_realtime_agent_runner_redacts_provider_session_instructions_in_events() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(
-                type="model_session_updated",
-                payload={
-                    "type": "session.updated",
-                    "session": {
-                        "id": "sess_1",
-                        "instructions": "不要把完整 prompt 暴露给前端",
-                        "voice": "Tina",
-                    },
+    provider = FakeRealtimeProvider([
+        ProviderEvent(
+            type="model_session_updated",
+            payload={
+                "type": "session.updated",
+                "session": {
+                    "id": "sess_1",
+                    "instructions": "不要把完整 prompt 暴露给前端",
+                    "voice": "Tina",
                 },
-            ),
-        ]
-    )
+            },
+        ),
+    ])
     session = CallSession(
         call_id="call_redact",
         room_name="ai-call-call_redact",
@@ -1434,17 +1903,15 @@ async def test_realtime_agent_runner_redacts_provider_audio_delta_in_events() ->
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     raw_delta = base64.b64encode(b"\x00\x01\x02\x03").decode()
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={
-                    "type": "response.audio.delta",
-                    "delta": raw_delta,
-                },
-            ),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={
+                "type": "response.audio.delta",
+                "delta": raw_delta,
+            },
+        ),
+    ])
     session = CallSession(
         call_id="call_audio_redact",
         room_name="ai-call-call_audio_redact",
@@ -1487,8 +1954,7 @@ async def test_realtime_agent_runner_starts_opening_response_with_configured_mes
         effective_config={
             "voice": "Tina",
             "prompt": "简短回答",
-            "opening_enabled": True,
-            "opening_message": "您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            "opening_message": "您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
             "vad_type": "server_vad",
             "vad_threshold": 0.5,
             "vad_silence_duration_ms": 800,
@@ -1506,9 +1972,47 @@ async def test_realtime_agent_runner_starts_opening_response_with_configured_mes
     await runner.start_opening("call_opening")
 
     assert provider.created_responses == [
-        "请主动说出开场白：您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？"
+        "请主动说出开场白：您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？"
     ]
-    assert "您好，我是凌辰智能助手" in provider.session_updates[0].instructions
+    assert "您好，我是灵宸智能助手" in provider.session_updates[0].instructions
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_prepends_fixed_handoff_capability_prompt() -> None:
+    registry = InMemorySessionRegistry()
+    provider = QueueRealtimeProvider()
+    session = CallSession(
+        call_id="call_handoff_prompt_constraint",
+        room_name="ai-call-call_handoff_prompt_constraint",
+        participant_identity="browser-call_handoff_prompt_constraint",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "只用一句话回答用户问题。",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=InMemoryEventStore(),
+        handoff_prompt_constraint_enabled=True,
+    )
+
+    await runner.start(session)
+    await provider.close_events()
+    await runner.wait("call_handoff_prompt_constraint")
+
+    instructions = provider.session_updates[0].instructions
+    assert instructions.startswith("系统固定转人工能力约束")
+    assert "request_handoff" in instructions
+    assert "不要声称自己已经是人工客服" in instructions
+    assert "业务话术：" in instructions
+    assert "只用一句话回答用户问题。" in instructions
 
 
 @pytest.mark.anyio
@@ -1516,20 +2020,18 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     output_pcm = b"\x01\x02" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+    ])
     publisher = FakeAudioPublisher()
     session = CallSession(
         call_id="call_interrupt",
@@ -1551,6 +2053,7 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
         registry=registry,
         event_store=store,
         audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
     )
 
     await runner.start(session)
@@ -1572,21 +2075,19 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     output_pcm = b"\x01\x02" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="model_response_done", payload={}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+        ProviderEvent(type="model_response_done", payload={}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+    ])
     publisher = WaitingAudioPublisher()
     session = CallSession(
         call_id="call_playout_interrupt",
@@ -1608,6 +2109,7 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
         registry=registry,
         event_store=store,
         audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
     )
 
     await runner.start(session)
@@ -1629,21 +2131,19 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     output_pcm = b"\x01\x02" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="model_response_done", payload={}),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-        ]
-    )
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        ),
+        ProviderEvent(type="model_response_done", payload={}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+    ])
     publisher = ImmediatePlayoutAudioPublisher()
     session = CallSession(
         call_id="call_tail_interrupt",
@@ -1680,31 +2180,16 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_continues_ai_audio_for_noise_without_transcript() -> None:
+async def test_realtime_agent_runner_soft_stops_audio_on_browser_candidate() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
-    output_pcm = b"\x01\x02" * 240
-    provider = FakeRealtimeProvider(
-        [
-            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="user_speech_started", payload={}),
-            ProviderEvent(type="user_speech_stopped", payload={}),
-            ProviderEvent(
-                type="model_audio_delta",
-                payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
-            ),
-            ProviderEvent(type="model_response_done", payload={}),
-        ]
-    )
+    provider = QueueRealtimeProvider()
     publisher = FakeAudioPublisher()
+    output_pcm = b"\x01\x02" * 240
     session = CallSession(
-        call_id="call_noise",
-        room_name="ai-call-call_noise",
-        participant_identity="browser-call_noise",
+        call_id="call_browser_candidate",
+        room_name="ai-call-call_browser_candidate",
+        participant_identity="browser-call_browser_candidate",
         status=CallSessionStatus.READY,
         effective_config={
             "voice": "Tina",
@@ -1724,21 +2209,44 @@ async def test_realtime_agent_runner_continues_ai_audio_for_noise_without_transc
     )
 
     await runner.start(session)
-    await runner.wait("call_noise")
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+    accepted = await runner.record_browser_speech_candidate(
+        "call_browser_candidate",
+        datetime.now(timezone.utc),
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.close_events()
+    await runner.wait("call_browser_candidate")
 
+    assert accepted is True
     assert provider.cancelled_response_count == 0
+    assert provider.cleared_input_count == 0
     assert provider.created_responses == []
-    assert publisher.stopped_call_ids == []
-    assert len(publisher.published) == 2
-    assert registry.get("call_noise").status == CallSessionStatus.CONNECTED
-    event_types = [event.type for event in store.list("call_noise")]
+    assert publisher.stopped_call_ids == ["call_browser_candidate"]
+    assert len(publisher.published) == 1
+    assert registry.get("call_browser_candidate").status == CallSessionStatus.CONNECTED
+    event_types = [event.type for event in store.list("call_browser_candidate")]
     assert "interrupt_candidate" in event_types
-    assert "interrupt_ignored" in event_types
     assert "interrupt_confirmed" not in event_types
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_transcript() -> None:
+async def test_realtime_agent_runner_does_not_cancel_opening_on_browser_candidate() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -1752,8 +2260,7 @@ async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_tr
         effective_config={
             "voice": "Tina",
             "prompt": "简短回答",
-            "opening_enabled": True,
-            "opening_message": "您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？",
+            "opening_message": "您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
             "vad_type": "server_vad",
             "vad_threshold": 0.5,
             "vad_silence_duration_ms": 800,
@@ -1769,7 +2276,9 @@ async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_tr
     )
 
     await runner.start(session)
-    await provider.emit(ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}))
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
     await runner.start_opening("call_opening_noise")
     await provider.emit(
         ProviderEvent(
@@ -1777,8 +2286,11 @@ async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_tr
             payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
         )
     )
-    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
-    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+    accepted = await runner.record_browser_speech_candidate(
+        "call_opening_noise",
+        datetime.now(timezone.utc),
+    )
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -1789,20 +2301,21 @@ async def test_realtime_agent_runner_does_not_pause_opening_for_noise_without_tr
     await provider.close_events()
     await runner.wait("call_opening_noise")
 
+    assert accepted is True
     assert provider.cancelled_response_count == 0
+    assert provider.cleared_input_count == 0
     assert provider.created_responses == [
-        "请主动说出开场白：您好，我是凌辰智能助手，请问现在方便简单沟通一下吗？"
+        "请主动说出开场白：您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？"
     ]
-    assert publisher.stopped_call_ids == []
-    assert len(publisher.published) == 2
+    assert publisher.stopped_call_ids == ["call_opening_noise"]
+    assert len(publisher.published) == 1
     event_types = [event.type for event in store.list("call_opening_noise")]
     assert "interrupt_candidate" in event_types
-    assert "interrupt_ignored" in event_types
     assert "interrupt_confirmed" not in event_types
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_records_browser_interrupt_candidate_while_ai_speaking() -> None:
+async def test_realtime_agent_runner_soft_stops_browser_interrupt_while_ai_speaking() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = FakeRealtimeProvider([])
@@ -1832,27 +2345,26 @@ async def test_realtime_agent_runner_records_browser_interrupt_candidate_while_a
     await runner.start(session)
     registry.transition("call_browser_interrupt", CallSessionStatus.CONNECTED)
     registry.transition("call_browser_interrupt", CallSessionStatus.AI_SPEAKING)
-    confirmed = await runner.record_browser_speech_candidate(
+    accepted = await runner.record_browser_speech_candidate(
         "call_browser_interrupt",
         datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
     )
 
-    assert confirmed is False
+    assert accepted is True
     assert provider.cancelled_response_count == 0
     assert provider.cleared_input_count == 0
-    assert publisher.stopped_call_ids == []
+    assert publisher.stopped_call_ids == ["call_browser_interrupt"]
     assert registry.get("call_browser_interrupt").status == CallSessionStatus.AI_SPEAKING
-    candidate_event = [
-        event for event in store.list("call_browser_interrupt") if event.type == "interrupt_candidate"
-    ][-1]
-    assert candidate_event.payload == {
-        "source": "browser",
-        "reason": "browser_user_speech_started_during_ai_audio"
-    }
+    assert "interrupt_candidate" in [event.type for event in store.list("call_browser_interrupt")]
+    assert "interrupt_confirmed" not in [
+        event.type for event in store.list("call_browser_interrupt")
+    ]
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_records_browser_candidate_after_recent_ai_audio() -> None:
+async def test_realtime_agent_runner_does_not_confirm_browser_interrupt_after_recent_ai_audio() -> (
+    None
+):
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -1881,7 +2393,9 @@ async def test_realtime_agent_runner_records_browser_candidate_after_recent_ai_a
     )
 
     await runner.start(session)
-    await provider.emit(ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}))
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -1891,20 +2405,74 @@ async def test_realtime_agent_runner_records_browser_candidate_after_recent_ai_a
     await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
     registry.transition("call_recent_audio_interrupt", CallSessionStatus.CONNECTED)
 
-    confirmed = await runner.record_browser_speech_candidate(
+    accepted = await runner.record_browser_speech_candidate(
         "call_recent_audio_interrupt",
         datetime.now(timezone.utc),
     )
     await provider.close_events()
     await runner.wait("call_recent_audio_interrupt")
 
-    assert confirmed is False
+    assert accepted is True
     assert provider.cancelled_response_count == 0
-    assert publisher.stopped_call_ids == []
-    assert registry.get("call_recent_audio_interrupt").status == CallSessionStatus.CONNECTED
+    assert provider.cleared_input_count == 0
+    assert publisher.stopped_call_ids == ["call_recent_audio_interrupt"]
+    assert registry.get("call_recent_audio_interrupt").status == CallSessionStatus.AI_SPEAKING
     assert "interrupt_candidate" in [
         event.type for event in store.list("call_recent_audio_interrupt")
     ]
+    assert "interrupt_confirmed" not in [
+        event.type for event in store.list("call_recent_audio_interrupt")
+    ]
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_confirms_browser_candidate_after_provider_transcript() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
+    session = CallSession(
+        call_id="call_browser_text_alone",
+        room_name="ai-call-call_browser_text_alone",
+        participant_identity="browser-call_browser_text_alone",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+    )
+
+    await runner.start(session)
+    registry.transition("call_browser_text_alone", CallSessionStatus.CONNECTED)
+    registry.transition("call_browser_text_alone", CallSessionStatus.AI_SPEAKING)
+    accepted = await runner.record_browser_speech_candidate(
+        "call_browser_text_alone",
+        datetime.now(timezone.utc),
+    )
+    await provider.emit(
+        ProviderEvent(type="user_transcript_done", payload={"transcript": "凌晨。"})
+    )
+    await provider.close_events()
+    await runner.wait("call_browser_text_alone")
+
+    assert accepted is True
+    assert provider.cancelled_response_count == 1
+    assert publisher.stopped_call_ids == [
+        "call_browser_text_alone",
+        "call_browser_text_alone",
+    ]
+    assert "interrupt_confirmed" in [event.type for event in store.list("call_browser_text_alone")]
 
 
 @pytest.mark.anyio
@@ -1985,7 +2553,9 @@ async def test_realtime_agent_runner_ignores_stale_audio_after_confirmed_interru
     )
 
     await runner.start(session)
-    await provider.emit(ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}))
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -2007,12 +2577,129 @@ async def test_realtime_agent_runner_ignores_stale_audio_after_confirmed_interru
 
     assert provider.cancelled_response_count == 1
     assert len(publisher.published) == 1
+    assert "interrupt_confirmed" in [event.type for event in store.list("call_stale_audio")]
+    assert [event.type for event in store.list("call_stale_audio")].count("ai_audio_published") == 1
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_queues_response_until_cancelled_response_done() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
+    output_pcm = b"\x01\x02" * 240
+    session = CallSession(
+        call_id="call_single_flight_response",
+        room_name="ai-call-call_single_flight_response",
+        participant_identity="browser-call_single_flight_response",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(type="model_response_started", payload={"response_id": "resp_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
+        )
+    )
+    await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}))
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.wait_for(
+        _wait_until(lambda: provider.cancelled_response_count == 1),
+        timeout=1,
+    )
+
+    assert provider.created_responses == []
+
+    await provider.emit(
+        ProviderEvent(
+            type="model_response_done",
+            payload={"response": {"id": "resp_1", "status": "cancelled"}},
+        )
+    )
+    await asyncio.sleep(0.06)
+    assert provider.created_responses == [None]
+    await provider.close_events()
+    await runner.wait("call_single_flight_response")
+
+    assert provider.cancelled_response_count == 1
     assert "interrupt_confirmed" in [
-        event.type for event in store.list("call_stale_audio")
+        event.type for event in store.list("call_single_flight_response")
     ]
-    assert [event.type for event in store.list("call_stale_audio")].count(
-        "ai_audio_published"
-    ) == 1
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_waits_for_stable_user_turn_before_response() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    session = CallSession(
+        call_id="call_stable_user_turn",
+        room_name="ai-call-call_stable_user_turn",
+        participant_identity="browser-call_stable_user_turn",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        user_turn_stability_delay_seconds=0.05,
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "嗯。"}))
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.sleep(0.01)
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await asyncio.sleep(0.06)
+    assert provider.created_responses == []
+
+    await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你是谁？"}))
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.sleep(0.06)
+    assert provider.created_responses == [None]
+    await provider.close_events()
+    await runner.wait("call_stable_user_turn")
+
+    assert provider.created_responses == [None]
 
 
 @pytest.mark.anyio
@@ -2045,7 +2732,9 @@ async def test_realtime_agent_runner_confirms_interrupt_after_inflight_audio_pub
     )
 
     await runner.start(session)
-    await provider.emit(ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}))
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -2147,16 +2836,14 @@ async def test_realtime_agent_runner_forwards_room_audio_frames_to_provider() ->
     provider = FakeRealtimeProvider([])
     input_samples = list(range(960))
     input_pcm = struct.pack("<" + "h" * len(input_samples), *input_samples)
-    transport = FakeRoomAudioTransport(
-        [
-            PcmAudioFrame(
-                data=input_pcm,
-                sample_rate_hz=48000,
-                channels=1,
-                sample_width_bytes=2,
-            )
-        ]
-    )
+    transport = FakeRoomAudioTransport([
+        PcmAudioFrame(
+            data=input_pcm,
+            sample_rate_hz=48000,
+            channels=1,
+            sample_width_bytes=2,
+        )
+    ])
     session = CallSession(
         call_id="call_room_audio",
         room_name="ai-call-call_room_audio",
@@ -2189,6 +2876,86 @@ async def test_realtime_agent_runner_forwards_room_audio_frames_to_provider() ->
     assert len(provider.sent_audio[0]) == 640
 
 
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_play_fixed_handoff_prompt_before_stop() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = ImmediatePlayoutAudioPublisher()
+    session = CallSession(
+        call_id="call_handoff_prompt",
+        room_name="ai-call-call_handoff_prompt",
+        participant_identity="browser-call_handoff_prompt",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+    )
+
+    await runner.start(session)
+    await runner.suspend_for_handoff("call_handoff_prompt")
+
+    assert publisher.stopped_call_ids == ["call_handoff_prompt"]
+    assert publisher.published == []
+    assert provider.cancelled_response_count == 1
+    assert provider.cleared_input_count == 1
+    assert provider.closed is True
+    event_types = [event.type for event in store.list("call_handoff_prompt")]
+    assert "handoff_prompt_started" not in event_types
+    assert "handoff_prompt_done" not in event_types
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_skips_model_handoff_prompt_before_stop() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = ImmediatePlayoutAudioPublisher()
+    session = CallSession(
+        call_id="call_handoff_no_model_prompt",
+        room_name="ai-call-call_handoff_no_model_prompt",
+        participant_identity="browser-call_handoff_no_model_prompt",
+        status=CallSessionStatus.CONNECTED,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        ai_speaking_tail_grace_seconds=0,
+    )
+
+    await runner.start(session)
+    await runner.suspend_for_handoff("call_handoff_no_model_prompt")
+
+    assert provider.closed is True
+    assert publisher.published == []
+    assert provider.created_responses == []
+    event_types = [event.type for event in store.list("call_handoff_no_model_prompt")]
+    assert "handoff_model_prompt_started" not in event_types
+    assert "handoff_model_prompt_done" not in event_types
+    assert "handoff_prompt_started" not in event_types
+
+
 def test_session_api_returns_unified_camel_case_response() -> None:
     orchestrator, _livekit, _agent = build_orchestrator()
     app = FastAPI()
@@ -2196,7 +2963,10 @@ def test_session_api_returns_unified_camel_case_response() -> None:
     app.dependency_overrides[get_ai_call_service] = lambda: AiCallService(orchestrator)
 
     with TestClient(app) as client:
-        create_response = client.post("/ai-call/sessions", json={"voice": "Cindy"})
+        create_response = client.post(
+            "/ai-call/sessions",
+            json={"voice": "Cindy", "sceneCode": "debt_promise_repay_reminder"},
+        )
         assert create_response.status_code == 200
         create_body = create_response.json()
         assert create_body["code"] == 200
@@ -2224,39 +2994,73 @@ def test_session_api_returns_unified_camel_case_response() -> None:
         assert end_body["data"]["status"] == "completed"
 
 
-def read_phase_a_web_asset(name: str) -> str:
-    return (Path(__file__).parents[1] / "static/ai-call" / name).read_text(
-        encoding="utf-8"
-    )
+def read_ai_call_web_asset(name: str) -> str:
+    return (Path(__file__).parents[1] / "static/ai-call" / name).read_text(encoding="utf-8")
 
 
 def test_phase_a_web_probe_page_wires_core_session_endpoints() -> None:
-    html = read_phase_a_web_asset("phase-a.html")
-    script = read_phase_a_web_asset("phase-a.js")
+    html = read_ai_call_web_asset("customer.html")
+    css = read_ai_call_web_asset("ai-call.css")
+    script = read_ai_call_web_asset("customer.js")
 
     assert 'id="create-session"' in html
     assert 'rel="icon"' in html
-    assert (
-        'href="/static/ai-call/phase-a.css"' in html
-        or 'href="./phase-a.css"' in html
-    )
-    assert (
-        'src="/static/ai-call/phase-a.js"' in html
-        or 'src="./phase-a.js"' in html
-    )
+    assert 'href="/static/ai-call/ai-call.css' in html or 'href="./ai-call.css' in html
+    assert 'src="/static/ai-call/customer.js' in html or 'src="./customer.js' in html
+    assert 'id="status-pill"' not in html
     assert 'id="end-session"' in html
     assert 'id="metric-model-stats"' in html
     assert 'id="metric-browser-stats"' in html
+    assert 'class="control-actions"' in html
+    assert html.count('id="request-handoff"') == 1
+    assert "主动转人工" in html
+    assert "发起转人工" not in html
+    assert "麦克风：关" in html
+    create_index = html.index('id="create-session"')
+    request_handoff_index = html.index('id="request-handoff"')
+    mute_index = html.index('id="mute-room"')
+    handoff_state_index = html.index('id="handoff-state"')
+    assert create_index < request_handoff_index < mute_index < handoff_state_index
+    assert "转人工状态" in html
+    assert "转人工闭环" not in html
+    assert '<div id="recording-state" class="recording-box">' in html
+    assert '<div id="handoff-state" class="handoff-box">' in html
+    assert '<div class="subtle">等待创建会话</div>' in html
+    assert '<span class="constraint">等待创建会话</span>' not in html
+    overview_index = html.index("overview-metrics-panel")
+    log_index = html.index('id="log"')
+    latency_index = html.index("latency-panel")
+    recording_index = html.index("recording-panel")
+    dialogue_index = html.index("dialogue-panel")
+    assert overview_index < log_index < latency_index < recording_index < handoff_state_index
+    assert handoff_state_index < dialogue_index
+    assert ".overview-log .log" in css
+    assert "max-height: 420px" in css
+    assert "height: clamp(260px" in css
+    assert "@media (min-width: 981px)" in css
+    assert "height: clamp(420px, calc(100vh - 300px), 520px)" in css
+    assert "min-height: 420px" in css
+    assert "max-height: 520px" in css
+    assert ".main-stack {\n  grid-template-columns: 1fr;" in css
+    assert ".control-actions" in css
     assert "/ai-call/sessions" in script
     assert "/browser-events" in script
     assert "browser_ready" in script
     assert "browser_first_audio" in script
-    assert "browser_user_speech_started" in script
+    assert "browser_disconnect" in script
+    assert "navigator.sendBeacon" in script
+    assert 'window.addEventListener("pagehide"' in script
+    assert "suppressDisconnectReport" in script
+    assert "if (!el.statusPill) return;" in script
+    assert '"麦克风：开"' in script
+    assert '"麦克风：关"' in script
+    assert "暂无转人工记录" in script
+    assert "暂无转人工请求" in script
     assert "LivekitClient" in script
 
 
 def test_phase_a_web_probe_requests_microphone_before_joining_room() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+    script = read_ai_call_web_asset("customer.js")
 
     local_track_index = script.index("audioTrack = await createLocalAudioTrack")
     room_connect_index = script.index("await room.connect")
@@ -2267,30 +3071,44 @@ def test_phase_a_web_probe_requests_microphone_before_joining_room() -> None:
     assert catch_index < disconnect_index
 
 
-def test_phase_a_web_probe_reports_local_speech_for_fast_barge_in() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+def test_phase_a_web_probe_reports_local_speech_candidates() -> None:
+    script = read_ai_call_web_asset("customer.js")
 
-    assert "startLocalSpeechMonitor(audioTrack)" in script
-    assert "stopLocalSpeechMonitor()" in script
-    assert "createMediaStreamSource" in script
-    assert "getByteTimeDomainData" in script
+    assert "startLocalSpeechMonitor" in script
+    assert "stopLocalSpeechMonitor" in script
+    assert "checkLocalSpeechLevel" in script
+    assert "reportBrowserUserSpeechStarted" in script
     assert 'type: "browser_user_speech_started"' in script
+    assert "state.remoteAudioActive" in script
+
+
+def test_customer_web_probe_normalizes_audio_connect_errors() -> None:
+    script = read_ai_call_web_asset("customer.js")
+
+    assert "microphoneErrorMessage" in script
+    assert "浏览器麦克风权限被拒绝" in script
+    assert "没有检测到可用麦克风" in script
+    assert "连接 LiveKit 房间失败" in script
+    assert "发布麦克风到 LiveKit 房间失败" in script
+    assert "麦克风已连接，但上报浏览器就绪失败" in script
+    assert 'actionErrorMessage(error, "连接麦克风失败")' in script
 
 
 def test_phase_a_web_probe_reports_browser_first_audio_from_remote_audio_level() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+    script = read_ai_call_web_asset("customer.js")
 
     assert "startRemoteAudioMonitor(track)" in script
     assert "REMOTE_AUDIO_START_RMS = 0.015" in script
     assert "pendingBrowserFirstAudioTurnId" in script
-    assert 'event.type === "opening_started"' in script
-    assert 'event.type === "user_speech_stopped"' in script
+    assert "const eventType = getEventType(event)" in script
+    assert 'eventType === "opening_started"' in script
+    assert 'eventType === "user_speech_stopped"' in script
     assert 'type: "browser_first_audio"' in script
     assert "media.onplaying" not in script
 
 
 def test_phase_a_web_probe_fetches_events_incrementally() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+    script = read_ai_call_web_asset("customer.js")
 
     assert "EVENT_RENDER_LIMIT = 300" in script
     assert "state.lastEventId = event.eventId" in script
@@ -2299,7 +3117,7 @@ def test_phase_a_web_probe_fetches_events_incrementally() -> None:
 
 
 def test_phase_a_web_probe_stops_polling_on_terminal_status() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+    script = read_ai_call_web_asset("customer.js")
 
     assert 'return status === "completed" || status === "failed"' in script
     assert "stopPolling()" in script
@@ -2307,14 +3125,13 @@ def test_phase_a_web_probe_stops_polling_on_terminal_status() -> None:
     assert "disableSessionControls()" in script
 
 
-def test_phase_a_web_probe_debounces_local_speech_before_reporting_barge_in() -> None:
-    script = read_phase_a_web_asset("phase-a.js")
+def test_phase_a_web_probe_does_not_duck_remote_audio_for_local_speech() -> None:
+    script = read_ai_call_web_asset("customer.js")
 
-    assert "BROWSER_SPEECH_START_RMS = 0.055" in script
-    assert "BROWSER_SPEECH_START_TICKS = 4" in script
-    assert "BROWSER_SPEECH_RELEASE_TICKS = 8" in script
-    assert "state.browserSpeechHotTicks >= BROWSER_SPEECH_START_TICKS" in script
-    assert "state.browserSpeechQuietTicks >= BROWSER_SPEECH_RELEASE_TICKS" in script
+    assert "BROWSER_SPEECH_" not in script
+    assert "duckRemoteAudioBriefly" not in script
+    assert "restoreRemoteAudioDuck" not in script
+    assert "REMOTE_AUDIO_DUCK_" not in script
 
 
 @pytest.mark.anyio

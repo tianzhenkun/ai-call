@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>客户通话</title>
+    <link rel="icon" href="./icons/entry-customer-call.svg" />
+    <script src="../vendor/livekit-client.umd.min.js"></script>
+    <link rel="stylesheet" href="./ai-call.css?v=customer-dialogue-clean-20260618" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div class="brand">
+          <img src="./icons/entry-customer-call.svg" alt="" />
+          <div>
+            <h1>客户通话</h1>
+            <p class="subtle">LiveKit 房间 + Qwen Realtime 核心链路验收入口</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="layout">
+        <section class="top-grid">
+          <aside class="panel control-panel">
+            <div class="panel-header">
+              <h2>会话控制</h2>
+            </div>
+            <div class="panel-body form-grid">
+              <label>
+                音色
+                <select id="voice-select">
+                  <option value="Tina">甜甜 Tina</option>
+                </select>
+              </label>
+              <label>
+                业务场景
+                <select id="scene-code-input">
+                  <option value="">加载业务场景中...</option>
+                </select>
+              </label>
+              <label>
+                业务ID
+                <input id="business-id-input" maxlength="64" placeholder="可选" />
+              </label>
+              <label>
+                业务参数
+                <textarea
+                  id="business-params-input"
+                  rows="4"
+                  spellcheck="false"
+                  placeholder="可选，JSON object"
+                >{
+  "customerName": "张总"
+}</textarea>
+              </label>
+              <div class="control-actions">
+                <div class="button-row">
+                  <button id="create-session" class="primary" type="button">创建会话</button>
+                  <button id="connect-room" type="button" disabled>连接麦克风</button>
+                </div>
+                <div class="button-row">
+                  <button id="request-handoff" type="button" disabled>主动转人工</button>
+                  <button id="mute-room" type="button" disabled>麦克风：关</button>
+                </div>
+                <div class="button-row single">
+                  <button id="end-session" class="danger" type="button" disabled>结束会话</button>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          <section class="panel metrics-panel overview-metrics-panel">
+            <div class="panel-header">
+              <h2>运行态概览</h2>
+              <button id="refresh-status" type="button" disabled>刷新</button>
+            </div>
+            <div class="panel-body overview-metrics-body">
+              <div class="facts">
+                <div class="fact">
+                  <span>通话ID</span>
+                  <span id="call-id" class="mono">-</span>
+                </div>
+                <div class="fact">
+                  <span>房间</span>
+                  <span id="room-name" class="mono">-</span>
+                </div>
+                <div class="fact">
+                  <span>模型</span>
+                  <span id="model-name" class="mono">-</span>
+                </div>
+                <div class="fact">
+                  <span>会话状态</span>
+                  <span id="session-status">未创建</span>
+                </div>
+                <div class="fact">
+                  <span>麦克风</span>
+                  <span id="mic-state">未连接</span>
+                </div>
+              </div>
+              <div class="overview-log">
+                <div class="overview-log-title">运行日志</div>
+                <div id="log" class="log"></div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="main-stack">
+          <section class="panel latency-panel">
+            <div class="panel-header">
+              <h2>延迟指标</h2>
+            </div>
+            <div class="panel-body">
+              <div class="metric-grid">
+                <div class="metric">
+                  <div class="label">最近模型首包</div>
+                  <div id="metric-model-first" class="value">-</div>
+                </div>
+                <div class="metric">
+                  <div class="label">模型首包统计</div>
+                  <div id="metric-model-stats" class="value value-small">-</div>
+                </div>
+                <div class="metric">
+                  <div class="label">最近浏览器首包</div>
+                  <div id="metric-browser-first" class="value">-</div>
+                </div>
+                <div class="metric">
+                  <div class="label">浏览器首包统计</div>
+                  <div id="metric-browser-stats" class="value value-small">-</div>
+                </div>
+                <div class="metric">
+                  <div class="label">打断停播</div>
+                  <div id="metric-interrupt" class="value">-</div>
+                </div>
+                <div class="metric">
+                  <div class="label">音频队列</div>
+                  <div id="metric-queue" class="value">-</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel recording-panel">
+            <div class="panel-header">
+              <h2>录音闭环</h2>
+              <button id="refresh-recording" type="button" disabled>刷新录音</button>
+            </div>
+            <div class="panel-body">
+              <div id="recording-state" class="recording-box">
+                <div class="subtle">等待创建会话</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel handoff-panel">
+            <div class="panel-header">
+              <h2>转人工状态</h2>
+              <button id="refresh-handoff" type="button" disabled>刷新状态</button>
+            </div>
+            <div class="panel-body handoff-body">
+              <div id="handoff-state" class="handoff-box">
+                <div class="subtle">等待创建会话</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel dialogue-panel">
+            <div class="panel-header">
+              <h2>通话文本</h2>
+              <button id="refresh-dialogue" type="button" disabled>刷新文本</button>
+            </div>
+            <div class="panel-body">
+              <div id="dialogue-list" class="dialogue-list">
+                <div class="subtle">暂无文本</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel events-panel">
+            <div class="panel-header">
+              <h2>事件列表</h2>
+              <button id="refresh-events" type="button" disabled>刷新事件</button>
+            </div>
+            <div class="panel-body">
+              <div id="event-list" class="event-list">
+                <div class="subtle">暂无事件</div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <div id="loading-mask" class="loading-mask" aria-hidden="true">
+      <div class="loading-card" role="status">
+        <div class="loading-spinner"></div>
+        <div id="loading-title" class="loading-title">处理中</div>
+        <div id="loading-desc" class="loading-desc">请稍候...</div>
+      </div>
+    </div>
+
+    <script src="./customer.js?v=customer-handoff-click-20260618"></script>
+  </body>
+</html>

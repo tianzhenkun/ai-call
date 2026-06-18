@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>人工接管</title>
+    <link rel="icon" href="./icons/entry-handoff.svg" />
+    <script src="../vendor/livekit-client.umd.min.js"></script>
+    <link rel="stylesheet" href="./ai-call.css" />
+    <link rel="stylesheet" href="./agent.css?v=agent-layout-20260618-2" />
+  </head>
+  <body>
+    <main class="shell agent-shell">
+      <section class="topbar">
+        <div class="brand">
+          <img src="./icons/entry-handoff.svg" alt="" />
+          <div>
+            <h1>人工接管</h1>
+            <p class="subtle">LiveKit 人工接管链路测试入口</p>
+          </div>
+        </div>
+        <div id="status-pill" class="status-pill">未接入</div>
+      </section>
+
+      <section class="agent-test-notice" aria-label="人工接管能力边界">
+        <div>
+          <div class="agent-notice-title">POC</div>
+          <p>
+            当前页面只用于验证转人工请求、坐席接入 LiveKit 房间、坐席麦克风通话这条链路；完整坐席系统能力待实现。
+          </p>
+        </div>
+      </section>
+
+      <section class="agent-grid">
+        <section class="panel agent-main-panel agent-list-panel">
+          <div class="panel-header">
+            <h2>可接入列表</h2>
+            <button id="refresh-list" type="button">刷新</button>
+          </div>
+          <div class="panel-body">
+            <label class="agent-identity-field">
+              <span>坐席标识</span>
+              <input
+                id="agent-identity"
+                aria-describedby="agent-identity-hint"
+                maxlength="128"
+                value="agent-debug-001"
+                placeholder="agent-debug-001"
+              />
+              <span id="agent-identity-hint" class="field-hint">
+                用于记录哪位人工坐席接入，客户不可见；本地测试可保持默认。
+              </span>
+            </label>
+            <div id="handoff-list" class="agent-list"></div>
+          </div>
+        </section>
+
+        <section class="panel agent-main-panel agent-control-panel">
+          <div class="panel-header">
+            <h2>接入状态</h2>
+          </div>
+          <div class="panel-body agent-status-stack">
+            <div id="active-handoff" class="handoff-box">
+              <div class="subtle">暂无接入</div>
+            </div>
+            <div class="button-row">
+              <button id="join-handoff" class="primary" type="button" disabled>接入</button>
+              <button id="mute-agent" type="button" disabled>麦克风关</button>
+            </div>
+            <div class="button-row single">
+              <button id="disconnect-agent" class="danger" type="button" disabled>断开坐席</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel log-panel">
+          <div class="panel-header">
+            <h2>运行日志</h2>
+          </div>
+          <div class="panel-body">
+            <div id="log" class="log"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./agent.js?v=agent-layout-20260618-2"></script>
+  </body>
+</html>

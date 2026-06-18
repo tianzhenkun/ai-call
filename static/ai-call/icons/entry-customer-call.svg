@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title">
+  <title id="title">Customer call</title>
+  <defs>
+    <linearGradient id="g" x1="20" x2="76" y1="14" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" />
+      <stop offset="1" stop-color="#f3f4f6" />
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="72" height="72" rx="24" fill="url(#g)" />
+  <rect x="12.5" y="12.5" width="71" height="71" rx="23.5" fill="none" stroke="#e5e7eb" />
+  <path d="M36 31c7.3-4 17.1-4 24.4 0" fill="none" stroke="#9ca3af" stroke-linecap="round" stroke-width="3.6" />
+  <path
+    d="M30.8 39.2c4.8 11.4 14.6 21.2 26 26 2.7 1.1 5.8.3 7.6-2l3.2-4.1c1.1-1.4.8-3.4-.6-4.5l-5.6-4.2c-1.3-1-3.1-.8-4.2.3l-3.6 3.6a32.2 32.2 0 0 1-12-12l3.6-3.6c1.1-1.1 1.3-2.9.3-4.2L41.3 29c-1.1-1.4-3.1-1.7-4.5-.6l-4.1 3.2c-2.3 1.8-3.1 4.9-1.9 7.6Z"
+    fill="none"
+    stroke="#111827"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="4.2"
+  />
+</svg>

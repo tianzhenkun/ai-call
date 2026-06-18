@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 外呼工作台</title>
+    <link rel="icon" href="./ai-call-mark.svg?v=portal-mark-20260618" />
+    <link rel="stylesheet" href="./ai-call.css" />
+    <link rel="stylesheet" href="./index.css?v=portal-header-20260618" />
+  </head>
+  <body>
+    <main class="shell portal-shell">
+      <section class="topbar">
+        <div class="brand">
+          <img src="./ai-call-mark.svg?v=portal-mark-20260618" alt="" />
+          <div>
+            <h1>AI 外呼工作台</h1>
+            <p class="subtle">客户通话、人工接管、提示词配置、音色配置、语义分析统一入口</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="portal-grid" aria-label="AI 外呼页面入口">
+        <article class="panel portal-card">
+          <div class="panel-body portal-card-body">
+            <div class="portal-entry">
+              <img class="portal-icon" src="./icons/entry-customer-call.svg" alt="" />
+              <h2>客户通话</h2>
+            </div>
+            <a class="portal-link" href="./customer.html" target="_blank" rel="noopener noreferrer">
+              打开
+            </a>
+          </div>
+        </article>
+
+        <article class="panel portal-card">
+          <div class="panel-body portal-card-body">
+            <div class="portal-entry">
+              <img class="portal-icon" src="./icons/entry-handoff.svg" alt="" />
+              <div class="portal-title-row">
+                <h2>人工接管</h2>
+                <span class="portal-status portal-status-poc">POC</span>
+              </div>
+            </div>
+            <a class="portal-link" href="./agent.html" target="_blank" rel="noopener noreferrer">
+              打开
+            </a>
+          </div>
+        </article>
+
+        <article class="panel portal-card">
+          <div class="panel-body portal-card-body">
+            <div class="portal-entry">
+              <img class="portal-icon" src="./icons/entry-prompt.svg" alt="" />
+              <h2>提示词配置</h2>
+            </div>
+            <a class="portal-link" href="./prompt-config.html" target="_blank" rel="noopener noreferrer">
+              打开
+            </a>
+          </div>
+        </article>
+
+        <article class="panel portal-card">
+          <div class="panel-body portal-card-body">
+            <div class="portal-entry">
+              <img class="portal-icon" src="./icons/entry-voice.svg" alt="" />
+              <h2>音色配置</h2>
+            </div>
+            <a class="portal-link" href="./voice-config.html" target="_blank" rel="noopener noreferrer">
+              打开
+            </a>
+          </div>
+        </article>
+
+        <article class="panel portal-card portal-card-disabled">
+          <div class="panel-body portal-card-body">
+            <div class="portal-entry">
+              <img class="portal-icon" src="./icons/entry-semantic-analysis.svg" alt="" />
+              <div class="portal-title-row">
+                <h2>语义分析</h2>
+                <span class="portal-status">未实现</span>
+              </div>
+            </div>
+            <div class="portal-link portal-link-disabled" aria-disabled="true">未实现</div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>

@@ -241,15 +241,18 @@ async def auto_login_controller(
     summary="验证Token并获取用户信息",
     description="验证Token并从上下文中获取用户信息",
 )
-async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_user)):
+async def verify_token(
+    request: Request,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+):
     """
     验证Token并从上下文中获取用户信息
-    
+
     测试步骤：
     1. 通过Postman发送GET请求到 /api/v1/system/auth/test/token/verify
     2. 在请求头中添加 Authorization: Bearer <token>
     3. token 为 JWT Token
-    
+
     返回：
     - 从上下文中获取的用户信息
     - 从AuthSchema中获取的用户信息
@@ -260,7 +263,7 @@ async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_
     context_tenant_id = request.scope.get("tenant_id")
     context_dept_id = request.scope.get("dept_id")
     context_name = request.scope.get("name")  # 获取昵称
-    
+
     # 从AuthSchema获取用户信息
     auth_user_id = auth.user.id if auth.user else None
     auth_username = auth.user.username if auth.user else None
@@ -268,7 +271,7 @@ async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_
     auth_nickname = auth.user.nick_name if auth.user else None  # 获取昵称
     auth_tenant_id = auth.user.tenant_id if auth.user else None
     auth_dept_id = auth.user.dept_id if auth.user else None
-    
+
     return SuccessResponse(
         data={
             "message": "Token验证成功",
@@ -277,7 +280,7 @@ async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_
                 "username": context_username,
                 "name": context_name,
                 "tenant_id": context_tenant_id,
-                "dept_id": context_dept_id
+                "dept_id": context_dept_id,
             },
             "auth_user_info": {
                 "user_id": auth_user_id,
@@ -285,11 +288,11 @@ async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_
                 "name": auth_name,
                 "nickname": auth_nickname,  # 添加昵称
                 "tenant_id": auth_tenant_id,
-                "dept_id": auth_dept_id
+                "dept_id": auth_dept_id,
             },
-            "token_type": "JWT"
+            "token_type": "JWT",
         },
-        msg="Token验证成功"
+        msg="Token验证成功",
     )
 
 
@@ -302,12 +305,12 @@ async def verify_token(request: Request, auth: AuthSchema = Depends(get_current_
 async def get_context_info(request: Request):
     """
     仅从上下文中获取用户信息（需要先通过认证中间件）
-    
+
     测试步骤：
     1. 通过Postman发送GET请求到 /api/v1/system/auth/test/token/context
     2. 在请求头中添加 Authorization: Bearer <token>
     3. token 为 JWT Token
-    
+
     返回：
     - 从上下文中获取的用户信息
     """
@@ -316,10 +319,10 @@ async def get_context_info(request: Request):
     username = request.scope.get("user_username")
     tenant_id = request.scope.get("tenant_id")
     dept_id = request.scope.get("dept_id")
-    
+
     if not user_id or not username:
         return ErrorResponse(msg="未认证或上下文信息缺失")
-    
+
     return SuccessResponse(
         data={
             "message": "从上下文获取用户信息成功",
@@ -327,9 +330,9 @@ async def get_context_info(request: Request):
                 "user_id": user_id,
                 "username": username,
                 "tenant_id": tenant_id,
-                "dept_id": dept_id
+                "dept_id": dept_id,
             },
-            "status": "success"
+            "status": "success",
         },
-        msg="获取用户信息成功"
+        msg="获取用户信息成功",
     )

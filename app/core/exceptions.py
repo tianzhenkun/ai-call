@@ -188,7 +188,7 @@ def handle_exception(app: FastAPI) -> None:
         return ErrorResponse(
             msg=f"{error_msg}: {exc_type}",
             status_code=status.HTTP_400_BAD_REQUEST,
-            data=str(exc),
+            data=None,
         )
 
     @app.exception_handler(ValueError)

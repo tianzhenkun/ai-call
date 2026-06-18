@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 from app.services.ai_call.session_registry import CallSessionStatus
@@ -16,10 +17,15 @@ class AiCallBaseSchema(BaseModel):
 
 
 class CreateWebSessionRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
     voice: str | None = Field(default=None, description="Qwen Realtime voice 参数")
-    prompt: str | None = Field(default=None, description="本通会话的模型指令")
-    business_type: str | None = Field(default=None, description="上游业务类型")
     business_id: str | None = Field(default=None, description="上游业务ID")
+    scene_code: str = Field(description="业务场景编码")
+    business_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="业务侧上下文参数",
+    )
 
 
 class BrowserEventReportRequest(AiCallBaseSchema):
@@ -31,8 +37,8 @@ class EffectiveConfigOut(AiCallBaseSchema):
     model: str
     voice: str
     prompt_hash: str
-    opening_enabled: bool
     opening_message_hash: str
+    prompt_source_key: str
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
@@ -93,6 +99,73 @@ class EndSessionOut(AiCallBaseSchema):
     status: CallSessionStatus
 
 
+class CreateHandoffRequest(AiCallBaseSchema):
+    source: str = Field(default="operator", description="转人工请求来源")
+    reason: str | None = Field(default=None, max_length=64, description="转人工请求原因")
+    request_message: str | None = Field(
+        default=None,
+        max_length=500,
+        description="转人工请求摘要",
+    )
+
+
+class AcceptHandoffRequest(AiCallBaseSchema):
+    human_agent_identity: str = Field(
+        min_length=1,
+        max_length=128,
+        description="接管人工身份",
+    )
+
+
+class FinishHandoffRequest(AiCallBaseSchema):
+    reason: str | None = Field(default=None, max_length=64, description="终态原因")
+
+
+class FailHandoffRequest(AiCallBaseSchema):
+    failure_stage: str = Field(min_length=1, max_length=64, description="失败阶段")
+    failure_message: str | None = Field(default=None, max_length=500, description="失败摘要")
+
+
+class HandoffOut(AiCallBaseSchema):
+    id: str
+    handoff_id: str
+    call_id: str
+    room_name: str
+    status: str
+    request_source: str
+    request_reason: str | None = None
+    request_message: str | None = None
+    human_agent_identity: str | None = None
+    requested_at: datetime
+    accepted_at: datetime | None = None
+    connected_at: datetime | None = None
+    ended_at: datetime | None = None
+    expires_at: datetime | None = None
+    end_reason: str | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+
+
+class HandoffTokenOut(AiCallBaseSchema):
+    call_id: str
+    handoff_id: str
+    room_name: str
+    livekit_url: str
+    participant_token: str
+    participant_identity: str
+    expires_in_seconds: int
+
+
+class AcceptHandoffOut(AiCallBaseSchema):
+    handoff: HandoffOut
+    seat_token: HandoffTokenOut
+
+
+class HandoffListOut(AiCallBaseSchema):
+    rows: list[HandoffOut]
+    total: int
+
+
 class RecordOut(AiCallBaseSchema):
     id: str
     call_id: str
@@ -129,3 +202,198 @@ class RecordDetailOut(AiCallBaseSchema):
 class RecordEventListOut(AiCallBaseSchema):
     rows: list[RecordEventOut]
     total: int
+
+
+class RecordingTrackOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    room_name: str
+    track_role: str
+    participant_identity: str
+    handoff_id: str | None = None
+    status: str
+    egress_id: str | None = None
+    oss_id: str | None = None
+    object_name: str | None = None
+    play_url: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+    stop_requested_at: datetime | None = None
+    verify_attempts: int | None = None
+    next_verify_at: datetime | None = None
+    verify_deadline_at: datetime | None = None
+    last_verify_at: datetime | None = None
+    last_verify_error: str | None = None
+
+
+class AsrJobOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    track_id: str
+    track_role: str
+    participant_identity: str
+    provider: str
+    model: str
+    status: str
+    task_id: str | None = None
+    source_url: str | None = None
+    transcription_url: str | None = None
+    submitted_at: datetime | None = None
+    completed_at: datetime | None = None
+    segment_count: int | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+
+
+class RecordingOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    room_name: str
+    status: str
+    egress_id: str | None = None
+    oss_id: str | None = None
+    object_name: str | None = None
+    play_url: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+    stop_requested_at: datetime | None = None
+    verify_attempts: int | None = None
+    next_verify_at: datetime | None = None
+    verify_deadline_at: datetime | None = None
+    last_verify_at: datetime | None = None
+    last_verify_error: str | None = None
+    tracks: list[RecordingTrackOut] = Field(default_factory=list)
+    asr_jobs: list[AsrJobOut] = Field(default_factory=list)
+
+
+class DialogueSegmentOut(AiCallBaseSchema):
+    id: str | None = None
+    call_id: str
+    segment_no: int
+    speaker_type: str
+    speaker_identity: str | None = None
+    source: str
+    source_segment_id: str
+    text: str
+    segment_status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    audio_start_ms: int | None = None
+    audio_end_ms: int | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+
+
+class DialogueSegmentListOut(AiCallBaseSchema):
+    rows: list[DialogueSegmentOut]
+    total: int
+
+
+PROMPT_PROVIDER_STATIC_PROFILE = "static_profile"
+
+
+class PromptProfileBaseRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    scene_code: str = Field(min_length=1, max_length=64, description="业务场景编码")
+    name: str = Field(min_length=1, max_length=100, description="配置名称")
+    provider_key: str = Field(
+        default=PROMPT_PROVIDER_STATIC_PROFILE,
+        min_length=1,
+        max_length=64,
+        description="提示词来源模式",
+    )
+    prompt_text: str | None = Field(default=None, description="固定提示词")
+    opening_message: str | None = Field(default=None, max_length=1000, description="固定开场白")
+
+    @model_validator(mode="after")
+    def validate_static_content(self) -> "PromptProfileBaseRequest":
+        if (
+            self.provider_key == PROMPT_PROVIDER_STATIC_PROFILE
+            and not (self.prompt_text or "").strip()
+        ):
+            raise ValueError("固定提示词不能为空")
+        if (
+            self.provider_key == PROMPT_PROVIDER_STATIC_PROFILE
+            and not (self.opening_message or "").strip()
+        ):
+            raise ValueError("固定开场白不能为空")
+        return self
+
+
+class PromptProfileCreateRequest(PromptProfileBaseRequest):
+    pass
+
+
+class PromptProfileUpdateRequest(PromptProfileBaseRequest):
+    pass
+
+
+class PromptProfileOut(AiCallBaseSchema):
+    id: str
+    scene_code: str
+    name: str
+    provider_key: str
+    prompt_text: str | None = None
+    opening_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VoiceProfileCreateRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    voice: str = Field(min_length=1, max_length=128, description="百炼返回的 voice 参数")
+    display_name: str = Field(min_length=1, max_length=100, description="音色展示名")
+    gender: str = Field(default="未知", max_length=16, description="音色性别")
+    target_model: str | None = Field(
+        default=None,
+        max_length=64,
+        description="适用 Qwen Omni Realtime 模型，默认使用当前运行模型",
+    )
+    description: str | None = Field(default=None, max_length=500, description="音色说明")
+    sort_order: int = Field(default=1000, ge=0, le=999999, description="排序")
+    remark: str | None = Field(default=None, max_length=500, description="备注")
+
+
+class VoiceProfileOut(AiCallBaseSchema):
+    id: str
+    voice: str
+    display_name: str
+    voice_type: str
+    gender: str
+    target_model: str
+    description: str | None = None
+    sort_order: int
+    remark: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptComponentOut(AiCallBaseSchema):
+    component_key: str
+    name: str
+    content: str
+
+
+class PromptProfilePreviewRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    business_id: str | None = Field(default=None, description="业务ID")
+    scene_code: str = Field(description="业务场景编码")
+    business_params: dict[str, Any] = Field(default_factory=dict, description="业务侧上下文参数")
+
+
+class PromptProfilePreviewOut(AiCallBaseSchema):
+    instructions: str
+    opening_message: str
+    prompt_hash: str
+    opening_message_hash: str
+    prompt_source_key: str
