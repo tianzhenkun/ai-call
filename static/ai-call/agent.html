@@ -7,7 +7,7 @@
     <link rel="icon" href="./icons/entry-handoff.svg" />
     <script src="../vendor/livekit-client.umd.min.js"></script>
     <link rel="stylesheet" href="./ai-call.css" />
-    <link rel="stylesheet" href="./agent.css?v=agent-layout-20260618-2" />
+    <link rel="stylesheet" href="./agent.css?v=agent-handoff-p0-agent-preflight-20260623" />
   </head>
   <body>
     <main class="shell agent-shell">
@@ -16,18 +16,23 @@
           <img src="./icons/entry-handoff.svg" alt="" />
           <div>
             <h1>人工接管</h1>
-            <p class="subtle">LiveKit 人工接管链路测试入口</p>
+            <p class="subtle">LiveKit 人工接管</p>
           </div>
         </div>
         <div id="status-pill" class="status-pill">未接入</div>
       </section>
 
-      <section class="agent-test-notice" aria-label="人工接管能力边界">
+      <section class="agent-status-card" aria-label="坐席在线状态">
         <div>
-          <div class="agent-notice-title">POC</div>
-          <p>
-            当前页面只用于验证转人工请求、坐席接入 LiveKit 房间、坐席麦克风通话这条链路；完整坐席系统能力待实现。
-          </p>
+          <div class="agent-status-title">坐席状态</div>
+          <div id="agent-status-text" class="agent-status-text">未同步</div>
+        </div>
+        <div class="agent-status-actions">
+          <select id="agent-presence">
+            <option value="online">在线</option>
+            <option value="offline">离线</option>
+          </select>
+          <button id="save-agent-status" type="button">保存</button>
         </div>
       </section>
 
@@ -84,6 +89,6 @@
       </section>
     </main>
 
-    <script src="./agent.js?v=agent-layout-20260618-2"></script>
+    <script src="./agent.js?v=agent-handoff-p0-agent-preflight-20260623"></script>
   </body>
 </html>

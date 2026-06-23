@@ -7,11 +7,17 @@ const state = {
   localMuted: false,
   remoteAudioElements: [],
   pollTimer: null,
+  agentStatus: null,
 };
+
+const MIN_ACCEPT_REMAINING_MS = 3000;
 
 const el = {
   statusPill: document.querySelector("#status-pill"),
   refreshList: document.querySelector("#refresh-list"),
+  agentPresence: document.querySelector("#agent-presence"),
+  agentStatusText: document.querySelector("#agent-status-text"),
+  saveAgentStatus: document.querySelector("#save-agent-status"),
   handoffList: document.querySelector("#handoff-list"),
   agentIdentity: document.querySelector("#agent-identity"),
   activeHandoff: document.querySelector("#active-handoff"),
@@ -80,6 +86,25 @@ function formatRemaining(expiresAt) {
   return `${Math.ceil(remaining / 1000)}s`;
 }
 
+function handoffHasAcceptWindow(handoff) {
+  if (!handoff?.expiresAt) return true;
+  return new Date(handoff.expiresAt).getTime() - Date.now() > MIN_ACCEPT_REMAINING_MS;
+}
+
+async function ensureAgentMediaPreflight() {
+  if (!window.isSecureContext) {
+    throw new Error(
+      "当前页面无法使用麦克风：请使用 HTTPS，或在接听电脑上把当前地址加入浏览器安全来源白名单。",
+    );
+  }
+  if (
+    !navigator.mediaDevices ||
+    typeof navigator.mediaDevices.getUserMedia !== "function"
+  ) {
+    throw new Error("当前页面无法使用麦克风：浏览器未开放 getUserMedia。");
+  }
+}
+
 const HANDOFF_STATUS_LABELS = {
   requested: "等待坐席接入",
   accepted: "坐席已接管",
@@ -88,6 +113,12 @@ const HANDOFF_STATUS_LABELS = {
   canceled: "已取消",
   failed: "转人工失败",
   expired: "接入超时",
+};
+
+const AGENT_STATUS_LABELS = {
+  online: "在线",
+  busy: "通话中",
+  offline: "离线",
 };
 
 function formatLabel(value, labels = {}) {
@@ -105,6 +136,41 @@ function titleAttr(rawValue, displayValue) {
 function setStatus(text, mode = "") {
   el.statusPill.textContent = text;
   el.statusPill.className = `status-pill ${mode}`.trim();
+}
+
+function currentAgentIdentity() {
+  return el.agentIdentity.value.trim() || "agent-debug-001";
+}
+
+function renderAgentStatus() {
+  const status = state.agentStatus?.status || "offline";
+  const label = formatLabel(status, AGENT_STATUS_LABELS);
+  const active = state.agentStatus?.activeHandoffId;
+  el.agentStatusText.textContent = active ? `${label} · ${active}` : label;
+  if (status !== "busy") {
+    el.agentPresence.value = status === "online" ? "online" : "offline";
+  }
+  el.agentPresence.disabled = status === "busy";
+  el.saveAgentStatus.disabled = status === "busy";
+}
+
+async function fetchAgentStatus() {
+  const identity = encodeURIComponent(currentAgentIdentity());
+  state.agentStatus = await api(`/ai-call/handoff-agents/${identity}`);
+  renderAgentStatus();
+  renderActiveHandoff();
+  return state.agentStatus;
+}
+
+async function setAgentPresence(status) {
+  const identity = encodeURIComponent(currentAgentIdentity());
+  state.agentStatus = await api(`/ai-call/handoff-agents/${identity}/status`, {
+    method: "POST",
+    body: JSON.stringify({ status, skillGroup: "default" }),
+  });
+  renderAgentStatus();
+  renderActiveHandoff();
+  return state.agentStatus;
 }
 
 function renderList() {
@@ -181,7 +247,11 @@ function renderActiveHandoff() {
     )
     .join("");
 
-  el.joinHandoff.disabled = Boolean(state.room) || handoff.status !== "requested";
+  el.joinHandoff.disabled =
+    Boolean(state.room) ||
+    handoff.status !== "requested" ||
+    !handoffHasAcceptWindow(handoff) ||
+    state.agentStatus?.status !== "online";
   el.disconnectAgent.disabled = !state.room;
   updateMicButton();
 }
@@ -190,6 +260,12 @@ function selectHandoff(handoff) {
   state.selectedHandoff = handoff;
   renderList();
   renderActiveHandoff();
+}
+
+function selectFirstJoinableHandoffWhenIdle() {
+  if (!state.room && !state.selectedHandoff && state.handoffs.length) {
+    state.selectedHandoff = state.handoffs[0];
+  }
 }
 
 async function refreshJoinableHandoffs() {
@@ -201,20 +277,24 @@ async function refreshJoinableHandoffs() {
     );
     if (refreshed) {
       state.selectedHandoff = refreshed;
+    } else if (!state.room) {
+      state.selectedHandoff = null;
     }
   }
+  selectFirstJoinableHandoffWhenIdle();
   renderList();
   renderActiveHandoff();
 }
 
 async function acceptHandoff(handoff) {
-  const humanAgentIdentity = el.agentIdentity.value.trim() || "agent-debug-001";
+  const humanAgentIdentity = currentAgentIdentity();
   const result = await api(`/ai-call/handoffs/${handoff.handoffId}/accept`, {
     method: "POST",
     body: JSON.stringify({ humanAgentIdentity }),
   });
   state.selectedHandoff = result.handoff;
   state.seatToken = result.seatToken;
+  await fetchAgentStatus();
   renderActiveHandoff();
   log("坐席令牌已签发");
 }
@@ -224,12 +304,25 @@ async function joinSelectedHandoff() {
   if (!window.LivekitClient) {
     throw new Error("LiveKit Web SDK 未加载");
   }
-  await acceptHandoff(state.selectedHandoff);
-  await connectRoom();
-  await markConnected();
-  setStatus("通话中", "is-ready");
-  log("坐席已接入房间，可开始通话");
-  await refreshJoinableHandoffs();
+  const agentStatus = await fetchAgentStatus();
+  if (agentStatus.status !== "online") {
+    throw new Error("坐席不在线，不能接入");
+  }
+  if (!handoffHasAcceptWindow(state.selectedHandoff)) {
+    throw new Error("转人工请求即将超时，请刷新后重新发起");
+  }
+  await ensureAgentMediaPreflight();
+  try {
+    await acceptHandoff(state.selectedHandoff);
+    await connectRoom();
+    await markConnected();
+    setStatus("通话中", "is-ready");
+    log("坐席已接入房间，可开始通话");
+    await refreshJoinableHandoffs();
+  } catch (error) {
+    await failAcceptedHandoff("agent_connect", error.message);
+    throw error;
+  }
 }
 
 async function connectRoom() {
@@ -280,6 +373,7 @@ async function markConnected() {
     method: "POST",
   });
   state.selectedHandoff = handoff;
+  await fetchAgentStatus();
   renderActiveHandoff();
 }
 
@@ -289,7 +383,22 @@ async function completeHandoff() {
     body: JSON.stringify({ reason: "agent_completed" }),
   });
   state.selectedHandoff = handoff;
+  await fetchAgentStatus();
   renderActiveHandoff();
+}
+
+async function failAcceptedHandoff(failureStage, failureMessage) {
+  const handoff = state.selectedHandoff;
+  if (!handoff || !["accepted", "connected"].includes(handoff.status)) return;
+  try {
+    state.selectedHandoff = await api(`/ai-call/handoffs/${handoff.handoffId}/fail`, {
+      method: "POST",
+      body: JSON.stringify({ failureStage, failureMessage }),
+    });
+    await fetchAgentStatus();
+  } catch (error) {
+    log(`标记转人工失败失败：${error.message}`);
+  }
 }
 
 function updateMicButton() {
@@ -341,10 +450,22 @@ async function disconnectAgent({ complete = false } = {}) {
   if (complete) {
     await completeConnectedHandoff();
   }
+  await fetchAgentStatus().catch((error) => log(error.message));
   renderActiveHandoff();
 }
 
 function bindActions() {
+  el.agentIdentity.addEventListener("change", () => {
+    fetchAgentStatus().catch((error) => log(error.message));
+  });
+  el.saveAgentStatus.addEventListener("click", () => {
+    setAgentPresence(el.agentPresence.value)
+      .then(() => notify("坐席状态已保存"))
+      .catch((error) => {
+        log(error.message);
+        notify(error.message || "保存失败", "error");
+      });
+  });
   el.refreshList.addEventListener("click", () => {
     refreshJoinableHandoffs()
       .then(() => notify("可接入列表已刷新"))
@@ -392,5 +513,7 @@ window.addEventListener("pagehide", () => {
 
 document.documentElement.dataset.livekitReady = String(Boolean(window.LivekitClient));
 bindActions();
-refreshJoinableHandoffs().catch((error) => log(error.message));
+fetchAgentStatus()
+  .then(() => refreshJoinableHandoffs())
+  .catch((error) => log(error.message));
 startPolling();

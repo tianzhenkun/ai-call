@@ -9,29 +9,41 @@
   align-items: stretch;
 }
 
-.agent-test-notice {
+.agent-status-card {
   display: grid;
-  gap: 4px;
-  align-items: start;
-  border: 1px solid rgba(176, 96, 0, 0.22);
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   margin-bottom: 16px;
   padding: 12px 14px;
-  background: rgba(255, 247, 237, 0.76);
+  background: var(--surface);
   color: var(--muted-strong);
 }
 
-.agent-notice-title {
-  color: var(--warn);
+.agent-status-title {
+  color: var(--text);
   font-size: 13px;
   font-weight: 650;
   line-height: 1.35;
 }
 
-.agent-test-notice p {
-  margin-top: 2px;
+.agent-status-text {
+  margin-top: 3px;
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.35;
+}
+
+.agent-status-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.agent-status-actions select {
+  min-width: 104px;
+  height: 36px;
 }
 
 .agent-main-panel {
@@ -138,6 +150,19 @@
 
   .agent-grid {
     grid-template-columns: 1fr;
+  }
+
+  .agent-status-card {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-status-actions {
+    justify-content: stretch;
+  }
+
+  .agent-status-actions select,
+  .agent-status-actions button {
+    flex: 1;
   }
 }
 

@@ -591,20 +591,32 @@ def test_prompt_config_page_and_customer_page_use_business_fields() -> None:
     assert ".toast-stack" in ai_call_css
     assert "坐席标识" in agent_html
     assert "客户不可见" in agent_html
-    assert "POC" in agent_html
+    assert "坐席状态" in agent_html
+    assert 'id="agent-presence"' in agent_html
+    assert 'id="save-agent-status"' in agent_html
     assert "仅测试" not in agent_html
-    assert "LiveKit 人工接管链路测试入口" in agent_html
-    assert "当前页面只用于验证转人工请求" in agent_html
-    assert "完整坐席系统能力待实现" in agent_html
     assert "坐席创建与管理" not in agent_html
-    assert "坐席在线状态" not in agent_html
     assert "排队与分配策略" not in agent_html
     assert "技能组路由" not in agent_html
     assert "接入弹屏" not in agent_html
     assert "会话工单" not in agent_html
-    assert ".agent-test-notice" in agent_css
+    assert ".agent-status-card" in agent_css
     assert ".agent-pending-list" not in agent_css
-    assert "agent-layout-20260618-2" in agent_html
+    assert "agent-handoff-p0-agent-preflight-20260623" in agent_html
+    assert "/ai-call/handoff-agents/" in agent_js
+    assert "setAgentPresence(\"online\")" not in agent_js
+    assert "fetchAgentStatus()" in agent_js
+    assert "MIN_ACCEPT_REMAINING_MS" in agent_js
+    assert "function ensureAgentMediaPreflight" in agent_js
+    assert "当前页面无法使用麦克风" in agent_js
+    assert agent_js.index("await ensureAgentMediaPreflight();") < agent_js.index(
+        "await acceptHandoff("
+    )
+    assert "function selectFirstJoinableHandoffWhenIdle" in agent_js
+    assert "selectFirstJoinableHandoffWhenIdle();" in agent_js
+    assert "state.selectedHandoff = state.handoffs[0]" in agent_js
+    assert 'state.selectedHandoff.status === "requested"' not in agent_js
+    assert "failAcceptedHandoff" in agent_js
     assert "align-items: stretch" in agent_css
     assert ".agent-main-panel" in agent_css
     assert "function notify" in customer_js
