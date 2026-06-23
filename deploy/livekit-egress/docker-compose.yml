@@ -11,7 +11,7 @@ services:
     container_name: ai-call-livekit-server
     command: ["--config", "/etc/livekit.yaml"]
     environment:
-      NODE_IP: 127.0.0.1
+      NODE_IP: ${LIVEKIT_NODE_IP:-127.0.0.1}
     depends_on:
       - redis
     ports:
