@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -232,7 +233,6 @@ class AliyunQwenRealtimeProvider:
                 "output": output,
             },
         })
-        await self._send({"type": "response.create"})
 
     async def cancel_response(self) -> None:
         await self._send({"type": "response.cancel"})
@@ -281,10 +281,19 @@ async def _default_websocket_factory(
     except ImportError as exc:
         raise RuntimeError("缺少 websockets 依赖，无法连接 Qwen Realtime WebSocket") from exc
 
+    connect_kwargs: dict[str, Any] = {"additional_headers": headers}
     try:
-        websocket = await websockets.connect(url, additional_headers=headers)
+        if "proxy" in inspect.signature(websockets.connect).parameters:
+            connect_kwargs["proxy"] = None
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        websocket = await websockets.connect(url, **connect_kwargs)
     except TypeError:
-        websocket = await websockets.connect(url, extra_headers=headers)
+        connect_kwargs.pop("additional_headers", None)
+        connect_kwargs["extra_headers"] = headers
+        websocket = await websockets.connect(url, **connect_kwargs)
     return _WebsocketsJsonConnection(websocket)
 
 

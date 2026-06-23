@@ -24,10 +24,16 @@ const state = {
   localAudioAnalyser: null,
   localAudioSamples: null,
   localSpeechHotTicks: 0,
+  localSpeechQuietTicks: 0,
   localSpeechBaselineRms: 0.006,
-  localSpeechCooldownUntil: 0,
   localSpeechReportInFlight: false,
+  localSpeechSegmentId: null,
+  localSpeechSegmentStartedAt: 0,
+  localSpeechSegmentHotFrameCount: 0,
+  localSpeechSegmentPeakRms: 0,
+  localSpeechSegmentLastReportAt: 0,
   remoteAudioElements: [],
+  remoteAudioRms: 0,
   // 程序主动断开时不写 browser_disconnect，避免把正常重置误判成用户离开。
   suppressDisconnectReport: false,
   disconnectReportedFor: null,
@@ -48,8 +54,10 @@ const LOCAL_SPEECH_MIN_RMS = 0.012;
 const LOCAL_SPEECH_DELTA_RMS = 0.012;
 const LOCAL_SPEECH_BASELINE_MULTIPLIER = 2.2;
 const LOCAL_SPEECH_START_TICKS = 3;
-const LOCAL_SPEECH_COOLDOWN_MS = 1200;
 const LOCAL_SPEECH_BASELINE_ALPHA = 0.06;
+const LOCAL_SPEECH_END_TICKS = 4;
+const LOCAL_SPEECH_SEGMENT_UPDATE_MS = 160;
+const MIN_RMS_FOR_DBFS = 0.000001;
 
 const el = {
   statusPill: document.querySelector("#status-pill"),
@@ -387,6 +395,7 @@ const EVENT_TYPE_LABELS = {
   session_completed: "会话已完成",
   browser_first_audio: "浏览器收到首包音频",
   browser_disconnect: "浏览器断开",
+  browser_user_speech_segment: "浏览器检测到用户语音段",
   browser_user_speech_started: "浏览器检测到用户说话",
   user_speech_started: "用户开始说话",
   user_speech_stopped: "用户停止说话",
@@ -1004,9 +1013,10 @@ function startLocalSpeechMonitor(track) {
   state.localAudioAnalyser = analyser;
   state.localAudioSamples = new Uint8Array(analyser.fftSize);
   state.localSpeechHotTicks = 0;
+  state.localSpeechQuietTicks = 0;
   state.localSpeechBaselineRms = 0.006;
-  state.localSpeechCooldownUntil = 0;
   state.localSpeechReportInFlight = false;
+  clearLocalSpeechSegment();
   state.localAudioMonitorTimer = window.setInterval(
     checkLocalSpeechLevel,
     LOCAL_SPEECH_POLL_MS,
@@ -1025,8 +1035,9 @@ function stopLocalSpeechMonitor() {
   state.localAudioAnalyser = null;
   state.localAudioSamples = null;
   state.localSpeechHotTicks = 0;
-  state.localSpeechCooldownUntil = 0;
+  state.localSpeechQuietTicks = 0;
   state.localSpeechReportInFlight = false;
+  clearLocalSpeechSegment();
 }
 
 function checkLocalSpeechLevel() {
@@ -1042,10 +1053,15 @@ function checkLocalSpeechLevel() {
   const rms = Math.sqrt(sumSquares / state.localAudioSamples.length);
 
   if (!state.remoteAudioActive) {
+    if (state.localSpeechSegmentId) {
+      reportBrowserSpeechSegment("ended", rms).catch((error) => log(error.message));
+      clearLocalSpeechSegment();
+    }
     state.localSpeechBaselineRms =
       state.localSpeechBaselineRms * (1 - LOCAL_SPEECH_BASELINE_ALPHA) +
       rms * LOCAL_SPEECH_BASELINE_ALPHA;
     state.localSpeechHotTicks = 0;
+    state.localSpeechQuietTicks = 0;
     return;
   }
 
@@ -1054,17 +1070,32 @@ function checkLocalSpeechLevel() {
     state.localSpeechBaselineRms * LOCAL_SPEECH_BASELINE_MULTIPLIER +
       LOCAL_SPEECH_DELTA_RMS,
   );
-  if (Date.now() < state.localSpeechCooldownUntil || rms < threshold) {
+  if (rms < threshold) {
     state.localSpeechHotTicks = 0;
+    if (state.localSpeechSegmentId) {
+      state.localSpeechQuietTicks += 1;
+      if (state.localSpeechQuietTicks >= LOCAL_SPEECH_END_TICKS) {
+        reportBrowserSpeechSegment("ended", rms).catch((error) => log(error.message));
+        clearLocalSpeechSegment();
+      }
+    }
     return;
   }
 
   state.localSpeechHotTicks += 1;
-  if (state.localSpeechHotTicks < LOCAL_SPEECH_START_TICKS) return;
+  state.localSpeechQuietTicks = 0;
+  if (!state.localSpeechSegmentId) {
+    if (state.localSpeechHotTicks < LOCAL_SPEECH_START_TICKS) return;
+    startLocalSpeechSegment(rms);
+    reportBrowserSpeechSegment("started", rms).catch((error) => log(error.message));
+    return;
+  }
 
-  state.localSpeechHotTicks = 0;
-  state.localSpeechCooldownUntil = Date.now() + LOCAL_SPEECH_COOLDOWN_MS;
-  reportBrowserUserSpeechStarted().catch((error) => log(error.message));
+  state.localSpeechSegmentHotFrameCount += 1;
+  state.localSpeechSegmentPeakRms = Math.max(state.localSpeechSegmentPeakRms, rms);
+  if (Date.now() - state.localSpeechSegmentLastReportAt >= LOCAL_SPEECH_SEGMENT_UPDATE_MS) {
+    reportBrowserSpeechSegment("updated", rms).catch((error) => log(error.message));
+  }
 }
 
 function startRemoteAudioMonitor(track) {
@@ -1087,6 +1118,7 @@ function startRemoteAudioMonitor(track) {
   state.remoteAudioActive = false;
   state.remoteAudioHotTicks = 0;
   state.remoteAudioQuietTicks = 0;
+  state.remoteAudioRms = 0;
   state.remoteAudioMonitorTimer = window.setInterval(
     checkRemoteAudioLevel,
     REMOTE_AUDIO_POLL_MS,
@@ -1107,6 +1139,7 @@ function stopRemoteAudioMonitor() {
   state.remoteAudioActive = false;
   state.remoteAudioHotTicks = 0;
   state.remoteAudioQuietTicks = 0;
+  state.remoteAudioRms = 0;
 }
 
 function checkRemoteAudioLevel() {
@@ -1119,6 +1152,7 @@ function checkRemoteAudioLevel() {
     sumSquares += centered * centered;
   }
   const rms = Math.sqrt(sumSquares / state.remoteAudioSamples.length);
+  state.remoteAudioRms = rms;
   const audioStarted = rms >= REMOTE_AUDIO_START_RMS;
   const audioReleased = rms <= REMOTE_AUDIO_RELEASE_RMS;
 
@@ -1175,18 +1209,63 @@ async function reportBrowserFirstAudio() {
   await refreshEvents();
 }
 
-async function reportBrowserUserSpeechStarted() {
+function startLocalSpeechSegment(rms) {
+  const now = Date.now();
+  state.localSpeechSegmentId = `browser-${now}-${Math.random().toString(36).slice(2, 8)}`;
+  state.localSpeechSegmentStartedAt =
+    now - (LOCAL_SPEECH_START_TICKS - 1) * LOCAL_SPEECH_POLL_MS;
+  state.localSpeechSegmentHotFrameCount = state.localSpeechHotTicks;
+  state.localSpeechSegmentPeakRms = rms;
+  state.localSpeechSegmentLastReportAt = 0;
+}
+
+function clearLocalSpeechSegment() {
+  state.localSpeechSegmentId = null;
+  state.localSpeechSegmentStartedAt = 0;
+  state.localSpeechSegmentHotFrameCount = 0;
+  state.localSpeechSegmentPeakRms = 0;
+  state.localSpeechSegmentLastReportAt = 0;
+}
+
+function localSpeechSegmentDurationMs() {
+  if (!state.localSpeechSegmentStartedAt) return 0;
+  return Math.max(0, Date.now() - state.localSpeechSegmentStartedAt);
+}
+
+function rmsToDbfs(rms) {
+  return 20 * Math.log10(Math.max(rms, MIN_RMS_FOR_DBFS));
+}
+
+function roundAudioMetric(value) {
+  return Math.round(value * 10) / 10;
+}
+
+async function reportBrowserSpeechSegment(phase, rms) {
   if (!state.session || state.localSpeechReportInFlight) return;
+  if (!state.localSpeechSegmentId) return;
   state.localSpeechReportInFlight = true;
   try {
+    const noiseFloorRms = Math.max(state.localSpeechBaselineRms, MIN_RMS_FOR_DBFS);
+    const rmsDbfs = rmsToDbfs(Math.max(rms, state.localSpeechSegmentPeakRms));
+    const noiseFloorDbfs = rmsToDbfs(noiseFloorRms);
     await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
       method: "POST",
       body: JSON.stringify({
-        type: "browser_user_speech_started",
+        type: "browser_user_speech_segment",
         timestamp: new Date().toISOString(),
+        segmentId: state.localSpeechSegmentId,
+        phase,
+        durationMs: localSpeechSegmentDurationMs(),
+        rmsDbfs: roundAudioMetric(rmsDbfs),
+        noiseFloorDbfs: roundAudioMetric(noiseFloorDbfs),
+        snrDb: roundAudioMetric(rmsDbfs - noiseFloorDbfs),
+        hotFrameCount: state.localSpeechSegmentHotFrameCount,
+        remoteAudioActive: state.remoteAudioActive,
+        remoteAudioRmsDbfs: roundAudioMetric(rmsToDbfs(state.remoteAudioRms)),
       }),
     });
-    log("已上报 browser_user_speech_started");
+    state.localSpeechSegmentLastReportAt = Date.now();
+    log(`已上报 browser_user_speech_segment:${phase}`);
     await refreshStatus();
     await refreshEvents();
   } finally {

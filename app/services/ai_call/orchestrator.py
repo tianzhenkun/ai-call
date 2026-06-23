@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from fastapi import status
 
 from app.config.setting import Settings
+from app.core.logger import log
 from app.services.ai_call.agent_runner import RealtimeCallAgentRunner
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
@@ -55,6 +56,13 @@ class RealtimeAgentRunnerProtocol(Protocol):
         self,
         call_id: str,
         trigger_timestamp: datetime,
+    ) -> bool: ...
+
+    async def record_browser_speech_segment(
+        self,
+        call_id: str,
+        trigger_timestamp: datetime,
+        payload: dict[str, Any],
     ) -> bool: ...
 
     async def suspend_for_handoff(self, call_id: str) -> None: ...
@@ -357,11 +365,25 @@ class AiCallOrchestrator:
         room_name: str,
         exc: Exception,
     ) -> None:
+        error_payload: dict[str, Any] = {
+            "errorType": type(exc).__name__,
+            "errorMessage": str(exc),
+        }
+        if exc.__cause__ is not None:
+            error_payload["causeType"] = type(exc.__cause__).__name__
+            error_payload["causeMessage"] = str(exc.__cause__)
+        log.error(
+            "AI Call Agent 启动失败 call_id={} room_name={} error_type={} error_message={}",
+            call_id,
+            room_name,
+            error_payload["errorType"],
+            error_payload["errorMessage"],
+        )
         self._append_event(
             call_id,
             "agent_start_failed",
             "agent",
-            {"errorType": type(exc).__name__},
+            error_payload,
         )
         self._append_failed_terminal_event(
             call_id,
@@ -621,6 +643,7 @@ class AiCallOrchestrator:
         call_id: str,
         event_type: str,
         timestamp: datetime | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> BrowserEventReportResult:
         session = self.registry.get(call_id)
         if session.status not in RUNNING_STATUSES:
@@ -630,14 +653,17 @@ class AiCallOrchestrator:
                 status_code=status.HTTP_409_CONFLICT,
             )
         reported_at = timestamp or utc_now()
+        event_payload = dict(payload or {})
+        event_payload["reportedAt"] = reported_at.isoformat()
         should_start_opening = False
         should_record_browser_speech_candidate = False
+        should_record_browser_speech_segment = False
         if event_type == "browser_disconnect":
             event = self.event_store.append(
                 call_id=call_id,
                 type=event_type,
                 source="browser",
-                payload={"reportedAt": reported_at.isoformat()},
+                payload=event_payload,
             )
             session.last_event_at = event.timestamp
             await self.end_session(call_id, end_reason="browser_disconnect")
@@ -661,6 +687,8 @@ class AiCallOrchestrator:
                 )
         elif event_type == "browser_user_speech_started":
             should_record_browser_speech_candidate = True
+        elif event_type == "browser_user_speech_segment":
+            should_record_browser_speech_segment = True
         else:
             raise AiCallError(
                 error_id="unsupported_browser_event",
@@ -672,11 +700,17 @@ class AiCallOrchestrator:
             call_id=call_id,
             type=event_type,
             source="browser",
-            payload={"reportedAt": reported_at.isoformat()},
+            payload=event_payload,
         )
         session.last_event_at = event.timestamp
         if should_record_browser_speech_candidate:
             await self.agent_runner.record_browser_speech_candidate(call_id, event.timestamp)
+        if should_record_browser_speech_segment:
+            await self.agent_runner.record_browser_speech_segment(
+                call_id,
+                event.timestamp,
+                event.payload,
+            )
         if should_start_opening:
             opening_started_at = self._append_event(
                 call_id,
