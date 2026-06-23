@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
@@ -31,6 +31,18 @@ class CreateWebSessionRequest(AiCallBaseSchema):
 class BrowserEventReportRequest(AiCallBaseSchema):
     type: str = Field(description="浏览器事件类型")
     timestamp: datetime | None = Field(default=None, description="浏览器侧事件时间")
+    segment_id: str | None = Field(default=None, description="浏览器语音段 ID")
+    phase: Literal["started", "updated", "ended"] | None = Field(
+        default=None,
+        description="浏览器语音段阶段",
+    )
+    duration_ms: int | None = Field(default=None, ge=0, description="语音段持续毫秒数")
+    rms_dbfs: float | None = Field(default=None, description="麦克风 RMS dBFS")
+    noise_floor_dbfs: float | None = Field(default=None, description="本地底噪 dBFS")
+    snr_db: float | None = Field(default=None, description="语音段相对底噪的信噪比")
+    hot_frame_count: int | None = Field(default=None, ge=0, description="连续命中语音帧数")
+    remote_audio_active: bool | None = Field(default=None, description="远端 AI 音频是否活跃")
+    remote_audio_rms_dbfs: float | None = Field(default=None, description="远端音频 RMS dBFS")
 
 
 class EffectiveConfigOut(AiCallBaseSchema):
@@ -117,6 +129,15 @@ class AcceptHandoffRequest(AiCallBaseSchema):
     )
 
 
+class HandoffAgentStatusRequest(AiCallBaseSchema):
+    status: Literal["online", "offline"] = Field(description="坐席人工可用状态")
+    skill_group: str | None = Field(
+        default=None,
+        max_length=64,
+        description="坐席技能组，当前默认 default",
+    )
+
+
 class FinishHandoffRequest(AiCallBaseSchema):
     reason: str | None = Field(default=None, max_length=64, description="终态原因")
 
@@ -161,6 +182,16 @@ class AcceptHandoffOut(AiCallBaseSchema):
     seat_token: HandoffTokenOut
 
 
+class HandoffAgentOut(AiCallBaseSchema):
+    id: str | None = None
+    human_agent_identity: str
+    skill_group: str
+    status: str
+    active_handoff_id: str | None = None
+    last_seen_at: datetime | None = None
+    status_updated_at: datetime | None = None
+
+
 class HandoffListOut(AiCallBaseSchema):
     rows: list[HandoffOut]
     total: int
@@ -202,6 +233,23 @@ class RecordDetailOut(AiCallBaseSchema):
 class RecordEventListOut(AiCallBaseSchema):
     rows: list[RecordEventOut]
     total: int
+
+
+class InterruptSummaryOut(AiCallBaseSchema):
+    call_id: str
+    interrupt_candidate_count: int
+    interrupt_confirmed_count: int
+    candidate_not_confirmed_count: int
+    browser_to_provider_ms: int | None = None
+    provider_to_confirmed_ms: int | None = None
+    browser_to_confirmed_ms: int | None = None
+    stale_audio_dropped_count: int
+    stale_audio_dropped_bytes: int
+    playout_flush_count: int
+    duplicate_end_request: bool
+    agent_start_failed: bool
+    verdict: str
+    issues: list[str]
 
 
 class RecordingTrackOut(AiCallBaseSchema):

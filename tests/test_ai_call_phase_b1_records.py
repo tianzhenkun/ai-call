@@ -7,23 +7,31 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 import pytest
+from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
+from fastapi.testclient import TestClient
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordingModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
     AiCallVoiceProfileModel,
 )
+from app.api.v1.ai_call.schema import HandoffListOut
 from app.api.v1.ai_call.service import AiCallService, configure_ai_call_offline_asr
 from app.api.v1.system.oss.service import OssService
+from app.config.setting import Settings
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.dialogue_service import (
@@ -34,12 +42,15 @@ from app.services.ai_call.dialogue_service import (
 )
 from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
 from app.services.ai_call.event_store import InMemoryEventStore
+from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
 from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.handoff_trigger_service import (
     AiCallHandoffTriggerService,
     AiCallHandoffTriggerWorker,
+    CompositeHandoffIntentClassifier,
     HandoffIntentResult,
+    RuleBasedHandoffIntentClassifier,
 )
 from app.services.ai_call.livekit_egress import (
     LiveKitEgressManager,
@@ -147,6 +158,24 @@ class BlockingSystemPromptPlayer(FakeSystemPromptPlayer):
             raise
 
 
+class SecondPromptBlockingSystemPromptPlayer(FakeSystemPromptPlayer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def play(self, *, call_id: str, room_name: str, audio_path) -> None:
+        self.played.append((call_id, room_name, str(audio_path)))
+        if len(self.played) != 2:
+            return
+        self.second_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 class FakeHandoffIntentClassifier:
     def __init__(self, result: HandoffIntentResult) -> None:
         self.result = result
@@ -155,6 +184,63 @@ class FakeHandoffIntentClassifier:
     async def classify(self, *, transcript: str) -> HandoffIntentResult:
         self.transcripts.append(transcript)
         return self.result
+
+
+@pytest.mark.anyio
+async def test_rule_based_handoff_classifier_matches_customer_manager_request() -> None:
+    classifier = RuleBasedHandoffIntentClassifier()
+
+    matched = await classifier.classify(transcript="给我找你们客户经理。")
+    owner_matched = await classifier.classify(transcript="帮我转给负责人。")
+    customer_manager_question = await classifier.classify(transcript="客户经理是做什么的？")
+    customer_manager_name_question = await classifier.classify(transcript="客户经理叫什么？")
+    ai_concept_question = await classifier.classify(transcript="人工智能是什么意思？")
+
+    assert matched.matched is True
+    assert matched.reason == "customer_request"
+    assert matched.source == "rule_fallback"
+    assert owner_matched.matched is True
+    assert customer_manager_question.matched is False
+    assert customer_manager_name_question.matched is False
+    assert ai_concept_question.matched is False
+
+
+@pytest.mark.anyio
+async def test_composite_handoff_classifier_uses_strong_rule_before_primary() -> None:
+    primary = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.4,
+            reason="not_handoff",
+            summary="主分类器未识别",
+            source="test_primary",
+        )
+    )
+    classifier = CompositeHandoffIntentClassifier(
+        primary=primary,
+        fallback=RuleBasedHandoffIntentClassifier(),
+    )
+
+    result = await classifier.classify(transcript="麻烦给我找你们客户经理。")
+
+    assert result.matched is True
+    assert result.source == "rule_fallback"
+    assert primary.transcripts == []
+
+
+@pytest.mark.anyio
+async def test_app_handoff_trigger_worker_enables_transcript_trigger(monkeypatch) -> None:
+    from app.plugin import init_app
+
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED", True)
+
+    worker = await init_app._start_ai_call_handoff_trigger_worker()
+    try:
+        assert worker is not None
+        assert worker.transcript_trigger_enabled is True
+    finally:
+        await init_app._stop_ai_call_handoff_trigger_worker(worker)
 
 
 class FailingAgentRunner(FakeAgentRunner):
@@ -450,6 +536,25 @@ async def wait_until(predicate, *, attempts: int = 40, delay_seconds: float = 0.
     raise AssertionError("condition was not met in time")
 
 
+async def append_record_event(
+    record_service: AiCallRecordService,
+    *,
+    call_id: str,
+    event_type: str,
+    event_time: datetime,
+    source: str = "agent",
+    payload: dict | None = None,
+) -> None:
+    await record_service.repository.append_event(
+        event_id=f"evt_{call_id}_{event_type}_{event_time.timestamp()}",
+        call_id=call_id,
+        event_type=event_type,
+        source=source,
+        event_time=event_time,
+        payload_json=json.dumps(payload, ensure_ascii=False) if payload else None,
+    )
+
+
 @pytest.fixture
 async def b1_service():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -502,6 +607,7 @@ def test_phase_b1_models_do_not_use_physical_foreign_keys_or_relationships() -> 
     assert not AiCallDialogueSegmentModel.__table__.foreign_keys
     assert not AiCallAsrJobModel.__table__.foreign_keys
     assert not AiCallHandoffModel.__table__.foreign_keys
+    assert not AiCallHandoffAgentModel.__table__.foreign_keys
     assert not AiCallVoiceProfileModel.__table__.foreign_keys
     assert not sa_inspect(AiCallRecordModel).relationships
     assert not sa_inspect(AiCallEventModel).relationships
@@ -510,7 +616,14 @@ def test_phase_b1_models_do_not_use_physical_foreign_keys_or_relationships() -> 
     assert not sa_inspect(AiCallDialogueSegmentModel).relationships
     assert not sa_inspect(AiCallAsrJobModel).relationships
     assert not sa_inspect(AiCallHandoffModel).relationships
+    assert not sa_inspect(AiCallHandoffAgentModel).relationships
     assert not sa_inspect(AiCallVoiceProfileModel).relationships
+
+
+def test_handoff_timeout_default_is_commercial_wait_window() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS == 30
 
 
 def test_livekit_egress_uses_ogg_participant_format_when_mp3_is_requested() -> None:
@@ -925,7 +1038,7 @@ async def test_handoff_trigger_worker_creates_customer_handoff_from_tool_request
             source="agent",
             payload={
                 "toolCallId": "handoff_tool_1",
-                "reason": "business_escalation",
+                "reason": "customer_request",
             },
         )
 
@@ -933,9 +1046,9 @@ async def test_handoff_trigger_worker_creates_customer_handoff_from_tool_request
         handoffs = await service.list_handoffs(result.call_id)
         assert handoffs["total"] == 1
         assert handoffs["rows"][0]["requestSource"] == "customer"
-        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
+        assert handoffs["rows"][0]["requestReason"] == "customer_request"
         assert handoffs["rows"][0]["status"] == "requested"
-        assert handoffs["rows"][0]["requestMessage"] == "模型判断当前问题需要人工继续处理"
+        assert handoffs["rows"][0]["requestMessage"] == "模型判断用户需要转人工"
         assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
         assert classifier.transcripts == []
 
@@ -947,6 +1060,229 @@ async def test_handoff_trigger_worker_creates_customer_handoff_from_tool_request
         assert "handoff_intent_detected" in event_types
         assert "handoff_auto_triggered" in event_types
         assert "handoff_requested" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_trigger_worker_waits_for_confirmation_on_business_escalation_tool_request(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_business",
+                "reason": "business_escalation",
+            },
+        )
+
+        await worker.flush_pending()
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs == {"rows": [], "total": 0}
+        assert b1_service.agent_runner.suspended_call_ids == []
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_tool_requested" in event_types
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_auto_triggered" not in event_types
+        assert "handoff_requested" not in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_trigger_worker_creates_business_escalation_after_user_confirms(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_business_confirm",
+                "reason": "business_escalation",
+            },
+        )
+        await worker.flush_pending()
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={"item_id": "item_confirm_handoff", "transcript": "可以，转吧。"},
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["requestSource"] == "customer"
+        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
+        assert handoffs["rows"][0]["status"] == "requested"
+        assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_confirmation_confirmed" in event_types
+        assert "handoff_auto_triggered" in event_types
+        assert "handoff_requested" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_trigger_worker_declines_business_escalation_confirmation(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_business_decline",
+                "reason": "business_escalation",
+            },
+        )
+        await worker.flush_pending()
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={"item_id": "item_decline_handoff", "transcript": "不用了，继续说。"},
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs == {"rows": [], "total": 0}
+        assert b1_service.agent_runner.suspended_call_ids == []
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_confirmation_declined" in event_types
+        assert "handoff_auto_triggered" not in event_types
+        assert "handoff_requested" not in event_types
     finally:
         worker.detach_all()
         await worker.stop()
@@ -1163,6 +1499,10 @@ async def test_joinable_handoffs_only_return_requested_unexpired_rows(b1_service
     assert joinable["total"] == 1
     assert joinable["rows"][0]["handoffId"] == first_handoff["handoffId"]
 
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
     await service.accept_handoff(
         handoff_id=first_handoff["handoffId"],
         human_agent_identity="agent-debug-001",
@@ -1191,6 +1531,35 @@ async def test_joinable_handoffs_only_return_requested_unexpired_rows(b1_service
 
 
 @pytest.mark.anyio
+async def test_handoff_joinable_timestamps_serialize_with_utc_offset(b1_service) -> None:
+    service, _record_service = b1_service
+    session = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=session.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    requested_at = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
+    expires_at = requested_at + timedelta(seconds=90)
+    await service.handoff_service.repository.update_handoff(
+        handoff["handoffId"],
+        requested_at=requested_at,
+        expires_at=expires_at,
+    )
+
+    joinable = await service.list_joinable_handoffs()
+    encoded = jsonable_encoder(HandoffListOut.model_validate(joinable), by_alias=True)
+
+    assert encoded["rows"][0]["requestedAt"].endswith(("Z", "+00:00"))
+    assert encoded["rows"][0]["expiresAt"].endswith(("Z", "+00:00"))
+
+
+@pytest.mark.anyio
 async def test_handoff_accept_connect_and_complete_flow(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
@@ -1203,6 +1572,10 @@ async def test_handoff_accept_connect_and_complete_flow(b1_service) -> None:
         source="operator",
         reason="customer_request",
         request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
     )
 
     accepted = await service.accept_handoff(
@@ -1247,6 +1620,191 @@ async def test_handoff_accept_connect_and_complete_flow(b1_service) -> None:
     assert "handoff_completed" in event_types
     assert "session_completed" in event_types
     assert event_types.index("handoff_completed") < event_types.index("session_completed")
+
+
+@pytest.mark.anyio
+async def test_handoff_accept_requires_existing_agent_status(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+
+    with pytest.raises(CustomException) as missing_agent_exc:
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+    assert missing_agent_exc.value.status_code == 409
+
+    history = await service.list_handoffs(result.call_id)
+    assert history["rows"][0]["status"] == "requested"
+
+
+@pytest.mark.anyio
+async def test_handoff_accept_requires_available_agent_and_marks_busy(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+
+    offline = await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="offline",
+    )
+    assert offline["status"] == "offline"
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+    assert exc_info.value.status_code == 409
+
+    online = await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    assert online["status"] == "online"
+
+    accepted = await service.accept_handoff(
+        handoff_id=handoff["handoffId"],
+        human_agent_identity="agent-debug-001",
+    )
+    assert accepted["handoff"]["status"] == "accepted"
+
+    busy = await service.get_handoff_agent_status("agent-debug-001")
+    assert busy["status"] == "busy"
+    assert busy["activeHandoffId"] == handoff["handoffId"]
+
+
+@pytest.mark.anyio
+async def test_handoff_accept_rejects_request_too_close_to_expiry(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    await service.handoff_service.repository.update_handoff(
+        handoff["handoffId"],
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+
+    assert exc_info.value.status_code == 409
+    history = await service.list_handoffs(result.call_id)
+    assert history["rows"][0]["status"] == "requested"
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+    assert agent["status"] == "online"
+    assert agent["activeHandoffId"] is None
+
+
+@pytest.mark.anyio
+async def test_handoff_complete_releases_busy_agent(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    await service.accept_handoff(
+        handoff_id=handoff["handoffId"],
+        human_agent_identity="agent-debug-001",
+    )
+    await service.mark_handoff_connected(handoff["handoffId"])
+
+    await service.complete_handoff(
+        handoff_id=handoff["handoffId"],
+        reason="agent_completed",
+    )
+
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+    assert agent["status"] == "online"
+    assert agent["activeHandoffId"] is None
+
+
+@pytest.mark.anyio
+async def test_handoff_accept_token_failure_releases_busy_agent(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+
+    def fail_issue_handoff_token(*_args, **_kwargs):
+        raise AiCallError(
+            error_id="handoff_token_failed",
+            msg="坐席令牌签发失败",
+            status_code=503,
+        )
+
+    b1_service.room_manager.issue_handoff_token = fail_issue_handoff_token
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+
+    assert exc_info.value.status_code == 503
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+    assert agent["status"] == "online"
+    assert agent["activeHandoffId"] is None
+    history = await service.list_handoffs(result.call_id)
+    assert history["rows"][0]["status"] == "failed"
+    assert history["rows"][0]["failureStage"] == "token_issue"
 
 
 @pytest.mark.anyio
@@ -1303,8 +1861,9 @@ async def test_handoff_lazy_expire_records_expired_event(b1_service) -> None:
 
 
 @pytest.mark.anyio
-async def test_handoff_timeout_auto_ends_without_unavailable_prompt(
+async def test_handoff_timeout_plays_unavailable_prompt_before_auto_end(
     b1_service,
+    tmp_path,
 ) -> None:
     service, record_service = b1_service
     prompt_player = FakeSystemPromptPlayer()
@@ -1314,6 +1873,7 @@ async def test_handoff_timeout_auto_ends_without_unavailable_prompt(
         recording_service_factory=lambda _repository: None,
         system_prompt_player=prompt_player,
         timeout_seconds=1,
+        unavailable_prompt_audio_path=tmp_path / "handoff-unavailable.wav",
     )
     service.handoff_exception_manager = manager
     service.handoff_service.request_timeout_seconds = 1
@@ -1352,7 +1912,9 @@ async def test_handoff_timeout_auto_ends_without_unavailable_prompt(
         assert record.end_reason == "handoff_timeout"
         assert history["rows"][0]["handoffId"] == handoff["handoffId"]
         assert history["rows"][0]["status"] == "expired"
-        assert prompt_player.played == []
+        assert prompt_player.played == [
+            (result.call_id, result.room_name, str(tmp_path / "handoff-unavailable.wav"))
+        ]
         assert b1_service.room_manager.deleted_rooms == [result.room_name]
 
         await b1_service.flush_events()
@@ -1360,8 +1922,11 @@ async def test_handoff_timeout_auto_ends_without_unavailable_prompt(
             event.event_type for event in await record_service.list_events(result.call_id)
         ]
         assert "handoff_expired" in event_types
-        assert "handoff_unavailable_prompt_started" not in event_types
-        assert "handoff_unavailable_prompt_done" not in event_types
+        assert "handoff_unavailable_prompt_started" in event_types
+        assert "handoff_unavailable_prompt_done" in event_types
+        assert event_types.index("handoff_unavailable_prompt_done") < event_types.index(
+            "handoff_auto_ended"
+        )
         assert "handoff_auto_ended" in event_types
     finally:
         await manager.shutdown()
@@ -1381,7 +1946,7 @@ async def test_handoff_connected_cancels_timeout_auto_end(
         timeout_seconds=1,
     )
     service.handoff_exception_manager = manager
-    service.handoff_service.request_timeout_seconds = 1
+    service.handoff_service.request_timeout_seconds = 4
     try:
         result = await service.create_web_session(
             voice=None,
@@ -1394,13 +1959,17 @@ async def test_handoff_connected_cancels_timeout_auto_end(
             reason="customer_request",
             request_message=None,
         )
+        await service.set_handoff_agent_status(
+            human_agent_identity="agent-debug-001",
+            status="online",
+        )
         await service.accept_handoff(
             handoff_id=handoff["handoffId"],
             human_agent_identity="agent-debug-001",
         )
         connected = await service.mark_handoff_connected(handoff["handoffId"])
 
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(4.2)
         assert connected["status"] == "connected"
         assert (
             service.orchestrator.registry.get(result.call_id).status != CallSessionStatus.COMPLETED
@@ -1446,6 +2015,10 @@ async def test_handoff_waiting_tone_stops_when_agent_connected(
             (result.call_id, result.room_name, str(tmp_path / "handoff-ringback.wav"))
         ]
 
+        await service.set_handoff_agent_status(
+            human_agent_identity="agent-debug-001",
+            status="online",
+        )
         await service.accept_handoff(
             handoff_id=handoff["handoffId"],
             human_agent_identity="agent-debug-001",
@@ -1464,8 +2037,72 @@ async def test_handoff_waiting_tone_stops_when_agent_connected(
 
 
 @pytest.mark.anyio
-async def test_handoff_fail_auto_ends_without_unavailable_prompt(
+async def test_handoff_prompt_plays_before_waiting_tone_and_stops_when_agent_connected(
     b1_service,
+    tmp_path,
+) -> None:
+    service, record_service = b1_service
+    prompt_player = SecondPromptBlockingSystemPromptPlayer()
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        recording_service_factory=lambda _repository: None,
+        system_prompt_player=prompt_player,
+        timeout_seconds=30,
+        waiting_tone_enabled=True,
+        waiting_prompt_audio_path=tmp_path / "handoff-waiting.wav",
+        waiting_tone_audio_path=tmp_path / "handoff-ringback.wav",
+    )
+    service.handoff_exception_manager = manager
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        handoff = await service.create_handoff(
+            call_id=result.call_id,
+            source="operator",
+            reason="customer_request",
+            request_message=None,
+        )
+
+        await wait_until(lambda: prompt_player.second_started.is_set())
+        assert prompt_player.played == [
+            (result.call_id, result.room_name, str(tmp_path / "handoff-waiting.wav")),
+            (result.call_id, result.room_name, str(tmp_path / "handoff-ringback.wav")),
+        ]
+
+        await service.set_handoff_agent_status(
+            human_agent_identity="agent-debug-001",
+            status="online",
+        )
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+        await service.mark_handoff_connected(handoff["handoffId"])
+        await wait_until(lambda: prompt_player.cancelled.is_set())
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_prompt_started" in event_types
+        assert "handoff_prompt_done" in event_types
+        assert "handoff_waiting_tone_started" in event_types
+        assert event_types.index("handoff_prompt_done") < event_types.index(
+            "handoff_waiting_tone_started"
+        )
+        assert "handoff_waiting_tone_stopped" in event_types
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_handoff_fail_plays_unavailable_prompt_before_auto_end(
+    b1_service,
+    tmp_path,
 ) -> None:
     service, record_service = b1_service
     prompt_player = FakeSystemPromptPlayer()
@@ -1475,6 +2112,7 @@ async def test_handoff_fail_auto_ends_without_unavailable_prompt(
         recording_service_factory=lambda _repository: None,
         system_prompt_player=prompt_player,
         timeout_seconds=30,
+        unavailable_prompt_audio_path=tmp_path / "handoff-unavailable.wav",
     )
     service.handoff_exception_manager = manager
     try:
@@ -1511,15 +2149,20 @@ async def test_handoff_fail_auto_ends_without_unavailable_prompt(
         assert record is not None
         assert record.status == "completed"
         assert record.end_reason == "handoff_failed"
-        assert prompt_player.played == []
+        assert prompt_player.played == [
+            (result.call_id, result.room_name, str(tmp_path / "handoff-unavailable.wav"))
+        ]
 
         await b1_service.flush_events()
         event_types = [
             event.event_type for event in await record_service.list_events(result.call_id)
         ]
         assert "handoff_failed" in event_types
-        assert "handoff_unavailable_prompt_started" not in event_types
-        assert "handoff_unavailable_prompt_done" not in event_types
+        assert "handoff_unavailable_prompt_started" in event_types
+        assert "handoff_unavailable_prompt_done" in event_types
+        assert event_types.index("handoff_unavailable_prompt_done") < event_types.index(
+            "handoff_auto_ended"
+        )
         assert "handoff_auto_ended" in event_types
     finally:
         await manager.shutdown()
@@ -1552,6 +2195,280 @@ async def test_append_event_is_idempotent_by_event_id(b1_service) -> None:
     assert first.id == second.id == rows[0].id
     assert rows[0].event_type == "provider_event"
     assert rows[0].payload == {"sequence": 1}
+
+
+def test_record_service_persists_promoted_browser_interrupt_candidate() -> None:
+    event = InMemoryEventStore().append(
+        call_id="call_browser_promoted",
+        type="browser_interrupt_candidate_promoted",
+        source="agent",
+    )
+
+    assert AiCallRecordService.should_persist_event(event) is True
+
+
+def test_record_service_persists_browser_speech_segment() -> None:
+    event = InMemoryEventStore().append(
+        call_id="call_browser_segment",
+        type="browser_user_speech_segment",
+        source="browser",
+        payload={
+            "segmentId": "browser-seg-1",
+            "phase": "updated",
+            "durationMs": 440,
+            "snrDb": 15.0,
+            "hotFrameCount": 11,
+        },
+    )
+
+    assert AiCallRecordService.should_persist_event(event) is True
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_reports_normal_interrupt_metrics(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 22, 4, 0, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="browser_user_speech_started",
+        event_time=base,
+        source="browser",
+        payload={"reportedAt": base.isoformat()},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base + timedelta(milliseconds=1),
+        payload={"source": "browser", "reason": "browser_user_speech_started_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_pending",
+        event_time=base + timedelta(milliseconds=2),
+        payload={"source": "browser", "suppressMs": 600},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="stale_audio_dropped",
+        event_time=base + timedelta(milliseconds=20),
+        payload={"reason": "interrupt_pending", "deltaBytes": 15360},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="stale_audio_dropped",
+        event_time=base + timedelta(milliseconds=40),
+        payload={"reason": "interrupt_pending", "deltaBytes": 3840},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="user_speech_started",
+        event_time=base + timedelta(milliseconds=100),
+        source="provider",
+        payload={"audio_start_ms": 1000},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_audio_stop_requested",
+        event_time=base + timedelta(milliseconds=105),
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="playout_queue_flushed",
+        event_time=base + timedelta(milliseconds=110),
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_audio_stop_completed",
+        event_time=base + timedelta(milliseconds=125),
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_confirmed",
+        event_time=base + timedelta(milliseconds=230),
+        payload={"reason": "user_speech_started_during_ai_audio"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["callId"] == result.call_id
+    assert summary["interruptCandidateCount"] == 1
+    assert summary["interruptConfirmedCount"] == 1
+    assert summary["candidateNotConfirmedCount"] == 0
+    assert summary["browserToProviderMs"] == 100
+    assert summary["providerToConfirmedMs"] == 130
+    assert summary["browserToConfirmedMs"] == 230
+    assert summary["staleAudioDroppedCount"] == 2
+    assert summary["staleAudioDroppedBytes"] == 19200
+    assert summary["playoutFlushCount"] == 1
+    assert summary["duplicateEndRequest"] is False
+    assert summary["agentStartFailed"] is False
+    assert summary["verdict"] == "normal"
+    assert summary["issues"] == []
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_flags_candidate_without_confirm(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 22, 4, 1, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="browser_user_speech_started",
+        event_time=base,
+        source="browser",
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base + timedelta(milliseconds=1),
+        payload={"source": "browser"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["interruptCandidateCount"] == 1
+    assert summary["interruptConfirmedCount"] == 0
+    assert summary["candidateNotConfirmedCount"] == 1
+    assert summary["verdict"] == "candidate_not_confirmed"
+    assert summary["issues"] == ["candidate_not_confirmed"]
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_flags_slow_confirm(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 22, 4, 2, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="browser_user_speech_started",
+        event_time=base,
+        source="browser",
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base + timedelta(milliseconds=1),
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="user_speech_started",
+        event_time=base + timedelta(milliseconds=100),
+        source="provider",
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_confirmed",
+        event_time=base + timedelta(milliseconds=1100),
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["browserToProviderMs"] == 100
+    assert summary["providerToConfirmedMs"] == 1000
+    assert summary["browserToConfirmedMs"] == 1100
+    assert summary["verdict"] == "slow_confirm"
+    assert summary["issues"] == ["slow_confirm"]
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_flags_agent_start_failure(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 22, 4, 3, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="agent_start_failed",
+        event_time=base,
+        payload={"errorType": "ImportError", "errorMessage": "python-socks is required"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="session_failed",
+        event_time=base + timedelta(milliseconds=1),
+        payload={"endReason": "agent_start_failed"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["agentStartFailed"] is True
+    assert summary["verdict"] == "session_failed"
+    assert summary["issues"] == ["agent_start_failed", "session_failed"]
+
+
+def test_interrupt_summary_api_returns_camel_case_response() -> None:
+    class FakeInterruptSummaryService:
+        async def get_record_interrupt_summary(self, call_id: str) -> dict:
+            return {
+                "callId": call_id,
+                "interruptCandidateCount": 1,
+                "interruptConfirmedCount": 1,
+                "candidateNotConfirmedCount": 0,
+                "browserToProviderMs": 120,
+                "providerToConfirmedMs": 180,
+                "browserToConfirmedMs": 300,
+                "staleAudioDroppedCount": 2,
+                "staleAudioDroppedBytes": 6400,
+                "playoutFlushCount": 1,
+                "duplicateEndRequest": False,
+                "agentStartFailed": False,
+                "verdict": "normal",
+                "issues": [],
+            }
+
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: FakeInterruptSummaryService()
+
+    with TestClient(app) as client:
+        response = client.get("/ai-call/records/call_interrupt/interrupt-summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    assert body["msg"] == "查询成功"
+    assert body["data"] == {
+        "callId": "call_interrupt",
+        "interruptCandidateCount": 1,
+        "interruptConfirmedCount": 1,
+        "candidateNotConfirmedCount": 0,
+        "browserToProviderMs": 120,
+        "providerToConfirmedMs": 180,
+        "browserToConfirmedMs": 300,
+        "staleAudioDroppedCount": 2,
+        "staleAudioDroppedBytes": 6400,
+        "playoutFlushCount": 1,
+        "duplicateEndRequest": False,
+        "agentStartFailed": False,
+        "verdict": "normal",
+        "issues": [],
+    }
 
 
 @pytest.mark.anyio
@@ -2040,6 +2957,10 @@ async def test_handoff_connected_starts_human_agent_participant_recording(monkey
             source="operator",
             reason="customer_request",
             request_message=None,
+        )
+        await service.set_handoff_agent_status(
+            human_agent_identity="agent-debug-001",
+            status="online",
         )
         accepted = await service.accept_handoff(
             handoff_id=handoff["handoffId"],
@@ -3430,6 +4351,153 @@ async def test_dialogue_query_hides_duplicate_offline_asr_segment() -> None:
     await engine.dispose()
 
 
+@pytest.mark.anyio
+async def test_dialogue_query_hides_duplicate_realtime_ai_segment() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallDialogueService(repository)
+        started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+        opening = "您好张总，我是灵宸智能助手，想简单介绍一下GEO生成式引擎优化服务，请问现在方便吗？"
+
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_dialogue_duplicate_ai_opening",
+                segment_no=1,
+                speaker_type="ai",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_opening_audio",
+                text=opening,
+                segment_status="final",
+                started_at=started_at,
+                ended_at=started_at + timedelta(seconds=29),
+                duration_ms=29000,
+            )
+        )
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_dialogue_duplicate_ai_opening",
+                segment_no=2,
+                speaker_type="ai",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_opening_done",
+                text="您好张总，我是灵宸智能助手，想简单介绍一下 GEO 生成式引擎优化服务，请问现在方便吗？",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=8),
+                ended_at=started_at + timedelta(seconds=8),
+                duration_ms=0,
+            )
+        )
+
+        raw_rows = await repository.list_dialogue_segments("call_dialogue_duplicate_ai_opening")
+        rows = await service.list_persisted_segments("call_dialogue_duplicate_ai_opening")
+
+        assert len(raw_rows) == 2
+        assert len(rows) == 1
+        assert rows[0].source_segment_id == "item_opening_audio"
+        assert rows[0].segment_text == opening
+        assert rows[0].duration_ms == 29000
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_dialogue_query_hides_only_obvious_short_realtime_asr_noise() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallDialogueService(repository)
+        started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+
+        snapshots = [
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=1,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_noise",
+                text="嘿嘿。",
+                segment_status="final",
+                started_at=started_at,
+                ended_at=started_at + timedelta(milliseconds=1),
+                duration_ms=1,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=2,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_ack",
+                text="嗯。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=1),
+                ended_at=started_at + timedelta(seconds=1, milliseconds=1),
+                duration_ms=1,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=3,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_sentence",
+                text="你好，我是林晨晨。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=2),
+                ended_at=started_at + timedelta(seconds=2),
+                duration_ms=0,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=4,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_normal_short",
+                text="对呀。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=3),
+                ended_at=started_at + timedelta(seconds=3, milliseconds=667),
+                duration_ms=667,
+            ),
+        ]
+        for snapshot in snapshots:
+            await service.persist_snapshot(snapshot)
+
+        raw_rows = await repository.list_dialogue_segments("call_short_asr_noise")
+        rows = await service.list_persisted_segments("call_short_asr_noise")
+
+        assert len(raw_rows) == 4
+        assert [row.source_segment_id for row in rows] == [
+            "item_ack",
+            "item_sentence",
+            "item_normal_short",
+        ]
+        assert [row.segment_text for row in rows] == [
+            "嗯。",
+            "你好，我是林晨晨。",
+            "对呀。",
+        ]
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
 def test_dialogue_runtime_merges_adjacent_customer_fragments() -> None:
     runtime_store = AiCallDialogueRuntimeStore()
     event_store = InMemoryEventStore()
@@ -3542,3 +4610,43 @@ def test_dialogue_runtime_suppresses_interrupted_ai_done_duplicate() -> None:
     assert preview[0].segment_status == "interrupted"
     assert preview[0].text == "您好，我是灵宸智能助手。"
     assert len(persisted) == 1
+
+
+def test_dialogue_runtime_marks_late_ai_done_for_invalidated_response_interrupted() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    persisted: list[DialogueSegmentSnapshot] = []
+    runtime_store.add_persist_listener(persisted.append)
+    call_id = "call_late_ai_done_after_interrupt"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+
+    event_store.append(
+        call_id=call_id,
+        type="response_generation_invalidated",
+        source="agent",
+        payload={"responseId": "resp_interrupted"},
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="interrupt_confirmed",
+        source="agent",
+        payload={},
+        timestamp=started_at + timedelta(milliseconds=300),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_done",
+        source="provider",
+        payload={"response_id": "resp_interrupted", "transcript": "这个是被打断的旧回答。"},
+        timestamp=started_at + timedelta(milliseconds=800),
+    )
+
+    preview = runtime_store.list_preview(call_id)
+    assert len(preview) == 1
+    assert preview[0].source_segment_id == "resp_interrupted"
+    assert preview[0].segment_status == "interrupted"
+    assert preview[0].text == "这个是被打断的旧回答。"
+    assert len(persisted) == 1
+    assert persisted[0].segment_status == "interrupted"

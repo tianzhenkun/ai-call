@@ -583,6 +583,57 @@ class AiCallHandoffModel(MappedBase):
     )
 
 
+class AiCallHandoffAgentModel(MappedBase):
+    """AI Call 最小人工坐席状态表。"""
+
+    __tablename__ = "ai_call_handoff_agent"
+    __table_args__ = (
+        UniqueConstraint("agent_identity", name="uk_ai_call_handoff_agent_identity"),
+        Index("idx_ai_call_handoff_agent_status", "status", "skill_group"),
+        Index("idx_ai_call_handoff_agent_active", "active_handoff_id"),
+        {"comment": "AI Call 人工坐席状态表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        comment="雪花主键",
+    )
+    agent_identity: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment="坐席身份",
+    )
+    skill_group: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="default",
+        comment="技能组",
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="坐席状态",
+    )
+    active_handoff_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="当前接管转人工ID",
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="最近心跳时间",
+    )
+    status_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="状态更新时间",
+    )
+
+
 class AiCallPromptProfileModel(MappedBase):
     """AI Call B4 业务提示词配置表。"""
 

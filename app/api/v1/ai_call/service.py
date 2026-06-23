@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,7 @@ from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
 from app.services.ai_call.handoff_service import AiCallHandoffService
+from app.services.ai_call.interrupt_summary import build_interrupt_summary
 from app.services.ai_call.livekit_egress import LiveKitEgressManager
 from app.services.ai_call.orchestrator import (
     AiCallOrchestrator,
@@ -332,6 +333,7 @@ class AiCallService:
         call_id: str,
         event_type: str,
         timestamp: datetime | None,
+        payload: dict[str, Any] | None = None,
     ) -> BrowserEventReportResult:
         try:
             if event_type == "browser_disconnect" and self.recording_service is not None:
@@ -343,6 +345,7 @@ class AiCallService:
                 call_id=call_id,
                 event_type=event_type,
                 timestamp=timestamp,
+                payload=payload,
             )
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
@@ -460,6 +463,17 @@ class AiCallService:
             "total": len(rows),
         }
 
+    async def get_record_interrupt_summary(self, call_id: str) -> dict:
+        self._ensure_record_service()
+        record = await self.record_service.get_record(call_id)
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        rows = await self.record_service.list_events(call_id, limit=1000)
+        return build_interrupt_summary(
+            call_id,
+            [self.record_service.event_to_dict(row) for row in rows],
+        )
+
     async def get_recording(self, call_id: str) -> dict | None:
         self._ensure_recording_service()
         recording = await self.recording_service.get_recording(call_id)
@@ -574,6 +588,28 @@ class AiCallService:
             "total": len(rows),
         }
 
+    async def get_handoff_agent_status(self, human_agent_identity: str) -> dict:
+        self._ensure_handoff_service()
+        agent = await self.handoff_service.get_agent_status(human_agent_identity)
+        if agent is None:
+            return self.handoff_service.default_handoff_agent_to_dict(human_agent_identity)
+        return self.handoff_service.handoff_agent_to_dict(agent)
+
+    async def set_handoff_agent_status(
+        self,
+        *,
+        human_agent_identity: str,
+        status: str,
+        skill_group: str | None = None,
+    ) -> dict:
+        self._ensure_handoff_service()
+        agent = await self.handoff_service.set_agent_status(
+            human_agent_identity=human_agent_identity,
+            agent_status=status,
+            skill_group=skill_group,
+        )
+        return self.handoff_service.handoff_agent_to_dict(agent)
+
     async def accept_handoff(
         self,
         *,
@@ -616,6 +652,10 @@ class AiCallService:
                     call_end_reason="handoff_failed",
                 )
             raise self._to_custom_exception(exc) from exc
+        handoff = await self.handoff_service.confirm_accepted(
+            handoff_id=handoff.handoff_id,
+            human_agent_identity=human_agent_identity,
+        )
         self._schedule_handoff_timeout(handoff)
         return {
             "handoff": self.handoff_service.handoff_to_dict(handoff),
@@ -1226,9 +1266,15 @@ def _ensure_default_handoff_exception_manager(
             system_prompt_player=prompt_player,
             timeout_seconds=settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS,
             exception_close_enabled=settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED,
+            waiting_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH
+            ),
             waiting_tone_enabled=settings.AI_CALL_HANDOFF_WAITING_TONE_ENABLED,
             waiting_tone_audio_path=settings.AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH,
             waiting_tone_interval_seconds=settings.AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS,
+            unavailable_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH
+            ),
         )
     return _default_handoff_exception_manager
 

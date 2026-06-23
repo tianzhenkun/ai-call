@@ -38,7 +38,16 @@ HANDOFF_EXPIRABLE_STATUSES = {
 HANDOFF_JOINABLE_STATUSES = {
     HANDOFF_STATUS_REQUESTED,
 }
+HANDOFF_ACCEPT_MIN_REMAINING_SECONDS = 3
 VALID_HANDOFF_SOURCES = {"operator", "system", "customer"}
+HANDOFF_AGENT_STATUS_ONLINE = "online"
+HANDOFF_AGENT_STATUS_BUSY = "busy"
+HANDOFF_AGENT_STATUS_OFFLINE = "offline"
+VALID_MANUAL_HANDOFF_AGENT_STATUSES = {
+    HANDOFF_AGENT_STATUS_ONLINE,
+    HANDOFF_AGENT_STATUS_OFFLINE,
+}
+DEFAULT_HANDOFF_SKILL_GROUP = "default"
 CALL_TERMINAL_STATUSES = {
     CallSessionStatus.COMPLETED.value,
     CallSessionStatus.FAILED.value,
@@ -107,9 +116,39 @@ class AiCallHandoffService:
     async def list_joinable_handoffs(self, *, limit: int = 50) -> list[AiCallHandoffModel]:
         return await self.repository.list_joinable_handoffs(
             statuses=HANDOFF_JOINABLE_STATUSES,
-            now=utc_now(),
+            now=utc_now() + timedelta(seconds=HANDOFF_ACCEPT_MIN_REMAINING_SECONDS),
             limit=limit,
         )
+
+    async def set_agent_status(
+        self,
+        *,
+        human_agent_identity: str,
+        agent_status: str,
+        skill_group: str | None = None,
+    ):
+        identity = self._normalize_agent_identity(human_agent_identity)
+        target_status = self._validate_manual_agent_status(agent_status)
+        existing = await self.repository.get_handoff_agent(identity)
+        if (
+            existing is not None
+            and existing.status == HANDOFF_AGENT_STATUS_BUSY
+            and existing.active_handoff_id
+        ):
+            self._raise_invalid_status("坐席正在通话中，不能手动切换状态")
+        now = utc_now()
+        return await self.repository.upsert_handoff_agent(
+            agent_identity=identity,
+            skill_group=self._normalize_skill_group(skill_group),
+            status=target_status,
+            active_handoff_id=None,
+            last_seen_at=now,
+            status_updated_at=now,
+        )
+
+    async def get_agent_status(self, human_agent_identity: str):
+        identity = self._normalize_agent_identity(human_agent_identity)
+        return await self.repository.get_handoff_agent(identity)
 
     async def accept(
         self,
@@ -117,18 +156,23 @@ class AiCallHandoffService:
         handoff_id: str,
         human_agent_identity: str,
     ) -> AiCallHandoffModel:
+        agent_identity = self._normalize_agent_identity(human_agent_identity)
         handoff = await self._get_required(handoff_id)
         handoff = await self._expire_if_needed(handoff)
         if handoff is None:
             self._raise_invalid_status("当前转人工状态不允许接管")
         if handoff.status != HANDOFF_STATUS_REQUESTED:
             self._raise_invalid_status("当前转人工状态不允许接管")
-        return await self._update_required(
+        self._ensure_accept_window(handoff)
+        await self._ensure_agent_can_accept(agent_identity)
+        accepted = await self._update_required(
             handoff.handoff_id,
             status=HANDOFF_STATUS_ACCEPTED,
-            human_agent_identity=human_agent_identity,
+            human_agent_identity=agent_identity,
             accepted_at=utc_now(),
         )
+        await self._mark_agent_busy(agent_identity, accepted.handoff_id)
+        return accepted
 
     async def mark_connected(self, handoff_id: str) -> AiCallHandoffModel:
         handoff = await self._get_required(handoff_id)
@@ -142,6 +186,28 @@ class AiCallHandoffService:
             status=HANDOFF_STATUS_CONNECTED,
             connected_at=utc_now(),
         )
+
+    async def confirm_accepted(
+        self,
+        *,
+        handoff_id: str,
+        human_agent_identity: str,
+    ) -> AiCallHandoffModel:
+        agent_identity = self._normalize_agent_identity(human_agent_identity)
+        handoff = await self._get_required(handoff_id)
+        handoff = await self._expire_if_needed(handoff)
+        if handoff is None:
+            self._raise_invalid_status("当前转人工状态不允许确认接管")
+        if handoff.status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
+            self._raise_invalid_status("当前转人工状态不允许确认接管")
+        accepted = await self._update_required(
+            handoff.handoff_id,
+            status=HANDOFF_STATUS_ACCEPTED,
+            human_agent_identity=agent_identity,
+            accepted_at=handoff.accepted_at or utc_now(),
+        )
+        await self._mark_agent_busy(agent_identity, accepted.handoff_id)
+        return accepted
 
     async def complete(
         self,
@@ -258,14 +324,37 @@ class AiCallHandoffService:
             "requestReason": handoff.request_reason,
             "requestMessage": handoff.request_message,
             "humanAgentIdentity": handoff.human_agent_identity,
-            "requestedAt": handoff.requested_at,
-            "acceptedAt": handoff.accepted_at,
-            "connectedAt": handoff.connected_at,
-            "endedAt": handoff.ended_at,
-            "expiresAt": handoff.expires_at,
+            "requestedAt": self._api_datetime(handoff.requested_at),
+            "acceptedAt": self._api_datetime(handoff.accepted_at),
+            "connectedAt": self._api_datetime(handoff.connected_at),
+            "endedAt": self._api_datetime(handoff.ended_at),
+            "expiresAt": self._api_datetime(handoff.expires_at),
             "endReason": handoff.end_reason,
             "failureStage": handoff.failure_stage,
             "failureMessage": handoff.failure_message,
+        }
+
+    def handoff_agent_to_dict(self, agent) -> dict[str, Any]:
+        return {
+            "id": str(agent.id),
+            "humanAgentIdentity": agent.agent_identity,
+            "skillGroup": agent.skill_group,
+            "status": agent.status,
+            "activeHandoffId": agent.active_handoff_id,
+            "lastSeenAt": agent.last_seen_at,
+            "statusUpdatedAt": agent.status_updated_at,
+        }
+
+    def default_handoff_agent_to_dict(self, human_agent_identity: str) -> dict[str, Any]:
+        identity = self._normalize_agent_identity(human_agent_identity)
+        return {
+            "id": None,
+            "humanAgentIdentity": identity,
+            "skillGroup": DEFAULT_HANDOFF_SKILL_GROUP,
+            "status": HANDOFF_AGENT_STATUS_OFFLINE,
+            "activeHandoffId": None,
+            "lastSeenAt": None,
+            "statusUpdatedAt": None,
         }
 
     def consume_expired_handoffs(self) -> list[AiCallHandoffModel]:
@@ -334,7 +423,7 @@ class AiCallHandoffService:
         failure_stage: str | None = None,
         failure_message: str | None = None,
     ) -> AiCallHandoffModel:
-        return await self._update_required(
+        finished = await self._update_required(
             handoff.handoff_id,
             status=status,
             ended_at=handoff.ended_at or utc_now(),
@@ -342,6 +431,8 @@ class AiCallHandoffService:
             failure_stage=failure_stage,
             failure_message=failure_message,
         )
+        await self._release_agent_if_current(finished)
+        return finished
 
     async def _update_required(self, handoff_id: str, **values) -> AiCallHandoffModel:
         handoff = await self.repository.update_handoff(handoff_id, **values)
@@ -353,6 +444,48 @@ class AiCallHandoffService:
             )
         return handoff
 
+    async def _ensure_agent_can_accept(self, human_agent_identity: str) -> None:
+        agent = await self.repository.get_handoff_agent(human_agent_identity)
+        if agent is None:
+            self._raise_invalid_status("坐席未上线，不能接管转人工")
+        if agent.status != HANDOFF_AGENT_STATUS_ONLINE or agent.active_handoff_id:
+            self._raise_invalid_status("坐席当前不可接管转人工")
+
+    def _ensure_accept_window(self, handoff: AiCallHandoffModel) -> None:
+        if handoff.expires_at is None:
+            return
+        remaining = self._ensure_utc(handoff.expires_at) - utc_now()
+        if remaining <= timedelta(seconds=HANDOFF_ACCEPT_MIN_REMAINING_SECONDS):
+            self._raise_invalid_status("转人工请求即将超时，请重新发起")
+
+    async def _mark_agent_busy(self, human_agent_identity: str, handoff_id: str) -> None:
+        existing = await self.repository.get_handoff_agent(human_agent_identity)
+        now = utc_now()
+        await self.repository.upsert_handoff_agent(
+            agent_identity=human_agent_identity,
+            skill_group=existing.skill_group if existing is not None else DEFAULT_HANDOFF_SKILL_GROUP,
+            status=HANDOFF_AGENT_STATUS_BUSY,
+            active_handoff_id=handoff_id,
+            last_seen_at=now,
+            status_updated_at=now,
+        )
+
+    async def _release_agent_if_current(self, handoff: AiCallHandoffModel) -> None:
+        if not handoff.human_agent_identity:
+            return
+        agent = await self.repository.get_handoff_agent(handoff.human_agent_identity)
+        if agent is None or agent.active_handoff_id != handoff.handoff_id:
+            return
+        now = utc_now()
+        await self.repository.upsert_handoff_agent(
+            agent_identity=agent.agent_identity,
+            skill_group=agent.skill_group,
+            status=HANDOFF_AGENT_STATUS_ONLINE,
+            active_handoff_id=None,
+            last_seen_at=now,
+            status_updated_at=now,
+        )
+
     @staticmethod
     def _validate_source(source: str) -> str:
         value = (source or "operator").strip().lower()
@@ -363,6 +496,32 @@ class AiCallHandoffService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         return value
+
+    @classmethod
+    def _validate_manual_agent_status(cls, agent_status: str) -> str:
+        value = (agent_status or "").strip().lower()
+        if value not in VALID_MANUAL_HANDOFF_AGENT_STATUSES:
+            raise CustomException(
+                msg="不支持的坐席状态",
+                code=RET.ERROR.code,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return value
+
+    @staticmethod
+    def _normalize_agent_identity(human_agent_identity: str) -> str:
+        value = (human_agent_identity or "").strip()
+        if not value:
+            raise CustomException(
+                msg="坐席标识不能为空",
+                code=RET.ERROR.code,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return value
+
+    @staticmethod
+    def _normalize_skill_group(skill_group: str | None) -> str:
+        return (skill_group or DEFAULT_HANDOFF_SKILL_GROUP).strip() or DEFAULT_HANDOFF_SKILL_GROUP
 
     @staticmethod
     def _raise_invalid_status(msg: str) -> None:
@@ -377,3 +536,9 @@ class AiCallHandoffService:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _api_datetime(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return cls._ensure_utc(value)

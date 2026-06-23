@@ -21,8 +21,11 @@ from .schema import (
     EventOut,
     FailHandoffRequest,
     FinishHandoffRequest,
+    HandoffAgentOut,
+    HandoffAgentStatusRequest,
     HandoffListOut,
     HandoffOut,
+    InterruptSummaryOut,
     PromptComponentOut,
     PromptProfileCreateRequest,
     PromptProfileOut,
@@ -273,6 +276,19 @@ async def list_record_events_controller(
 
 
 @AiCallRouter.get(
+    "/records/{callId}/interrupt-summary",
+    summary="查询通话打断摘要",
+    response_model=ResponseSchema[InterruptSummaryOut],
+)
+async def get_record_interrupt_summary_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.get_record_interrupt_summary(call_id)
+    return SuccessResponse(data=InterruptSummaryOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.get(
     "/records/{callId}/recording",
     summary="查询通话录音",
     response_model=ResponseSchema[RecordingOut | None],
@@ -427,6 +443,11 @@ async def report_browser_event_controller(
         call_id=call_id,
         event_type=request.type,
         timestamp=request.timestamp,
+        payload=request.model_dump(
+            by_alias=True,
+            exclude={"type", "timestamp"},
+            exclude_none=True,
+        ),
     )
     return SuccessResponse(data=EventOut.model_validate(result), msg="上报成功")
 
@@ -455,6 +476,37 @@ async def list_joinable_handoffs_controller(
 ) -> JSONResponse:
     result = await service.list_joinable_handoffs(limit=limit)
     return SuccessResponse(data=HandoffListOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/handoff-agents/{agentIdentity}",
+    summary="查询坐席状态",
+    response_model=ResponseSchema[HandoffAgentOut],
+)
+async def get_handoff_agent_controller(
+    agent_identity: Annotated[str, Path(alias="agentIdentity")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.get_handoff_agent_status(agent_identity)
+    return SuccessResponse(data=HandoffAgentOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.post(
+    "/handoff-agents/{agentIdentity}/status",
+    summary="更新坐席状态",
+    response_model=ResponseSchema[HandoffAgentOut],
+)
+async def update_handoff_agent_status_controller(
+    agent_identity: Annotated[str, Path(alias="agentIdentity")],
+    request: HandoffAgentStatusRequest,
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.set_handoff_agent_status(
+        human_agent_identity=agent_identity,
+        status=request.status,
+        skill_group=request.skill_group,
+    )
+    return SuccessResponse(data=HandoffAgentOut.model_validate(result), msg="保存成功")
 
 
 @AiCallRouter.post(

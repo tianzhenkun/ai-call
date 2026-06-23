@@ -38,6 +38,23 @@ class RuleBasedHandoffIntentClassifier:
         "你是人工",
         "你是真人",
     )
+    ROLE_QUESTION_HINTS = (
+        "客户经理是做什么",
+        "客户经理是什么",
+        "什么是客户经理",
+        "客户经理职责",
+        "客户经理负责什么",
+        "客户经理能做什么",
+        "客户经理叫什么",
+        "客户顾问叫什么",
+        "销售顾问叫什么",
+        "业务经理叫什么",
+        "负责人是做什么",
+        "负责人是什么",
+        "什么是负责人",
+        "负责人叫什么",
+        "专人叫什么",
+    )
     STRONG_PATTERNS = (
         "转人工",
         "转接人工",
@@ -65,6 +82,34 @@ class RuleBasedHandoffIntentClassifier:
         "真人聊",
         "人来接",
     )
+    HUMAN_ROLE_TERMS = (
+        "客户经理",
+        "客户顾问",
+        "人工顾问",
+        "销售顾问",
+        "业务经理",
+        "负责人",
+        "专人",
+    )
+    ROLE_REQUEST_PREFIXES = (
+        "找",
+        "接",
+        "转",
+        "换",
+        "联系",
+        "叫",
+        "安排",
+    )
+    ROLE_REQUEST_CONNECTORS = ("", "你们", "你", "给", "一下", "下", "个", "一个", "一位")
+    ROLE_REQUEST_SUFFIXES = (
+        "联系我",
+        "回电",
+        "给我回电",
+        "来接",
+        "接一下",
+        "跟我聊",
+        "过来",
+    )
 
     async def classify(self, *, transcript: str) -> HandoffIntentResult:
         normalized = self._normalize(transcript)
@@ -84,12 +129,28 @@ class RuleBasedHandoffIntentClassifier:
                 summary="用户只是提到人工相关概念",
                 source="rule_fallback",
             )
+        if any(hint in normalized for hint in self.ROLE_QUESTION_HINTS):
+            return HandoffIntentResult(
+                matched=False,
+                confidence=0.95,
+                reason="not_handoff",
+                summary="用户只是询问人工角色概念",
+                source="rule_fallback",
+            )
         if any(pattern in normalized for pattern in self.STRONG_PATTERNS):
             return HandoffIntentResult(
                 matched=True,
                 confidence=0.95,
                 reason="customer_request",
                 summary="用户明确要求转人工",
+                source="rule_fallback",
+            )
+        if self._matches_human_role_request(normalized):
+            return HandoffIntentResult(
+                matched=True,
+                confidence=0.95,
+                reason="customer_request",
+                summary="用户明确要求联系人工角色",
                 source="rule_fallback",
             )
         return HandoffIntentResult(
@@ -106,14 +167,28 @@ class RuleBasedHandoffIntentClassifier:
             char.lower() for char in text.strip() if char not in " \t\r\n，。！？,.!?；;：:、"
         )
 
+    @classmethod
+    def _matches_human_role_request(cls, normalized: str) -> bool:
+        for role in cls.HUMAN_ROLE_TERMS:
+            if role not in normalized:
+                continue
+            for prefix in cls.ROLE_REQUEST_PREFIXES:
+                for connector in cls.ROLE_REQUEST_CONNECTORS:
+                    if f"{prefix}{connector}{role}" in normalized:
+                        return True
+            if any(f"{role}{suffix}" in normalized for suffix in cls.ROLE_REQUEST_SUFFIXES):
+                return True
+        return False
+
 
 class OpenAICompatibleHandoffIntentClassifier:
     """通过 OpenAI-compatible chat completions 做轻量语义分类。"""
 
     SYSTEM_PROMPT = (
-        "你是通话转人工意图分类器，只判断用户是否明确希望转人工、找真人、找客服或不想继续和AI沟通。"
+        "你是通话转人工意图分类器，只判断用户是否明确希望转人工、找真人、找客服、找客户经理、"
+        "找负责人、找销售顾问、找专人或不想继续和AI沟通。"
         "不要受业务话术影响。"
-        "如果用户只是提到人工智能、人工审核、人工处理、询问你是否真人，不算转人工。"
+        "如果用户只是提到人工智能、人工审核、人工处理、询问你是否真人、询问客户经理职责，不算转人工。"
         "只返回JSON，字段为 matched(boolean), confidence(number 0-1), reason(string), summary(string)。"
     )
 
@@ -198,6 +273,9 @@ class CompositeHandoffIntentClassifier:
         self.fallback = fallback
 
     async def classify(self, *, transcript: str) -> HandoffIntentResult:
+        fallback_result = await self.fallback.classify(transcript=transcript)
+        if fallback_result.confidence >= 0.9:
+            return fallback_result
         if self.primary is not None:
             try:
                 return await self.primary.classify(transcript=transcript)
@@ -207,7 +285,7 @@ class CompositeHandoffIntentClassifier:
                     type(exc).__name__,
                     str(exc),
                 )
-        return await self.fallback.classify(transcript=transcript)
+        return fallback_result
 
 
 def build_default_handoff_intent_classifier(
@@ -245,7 +323,44 @@ class QueuedHandoffTriggerEvent:
     attempts: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class PendingHandoffConfirmation:
+    reason: str
+    request_message: str
+    tool_call_id: str | None = None
+
+
 class AiCallHandoffTriggerService:
+    CONFIRMATION_ACCEPT_PATTERNS = (
+        "可以",
+        "行",
+        "好的",
+        "好",
+        "嗯",
+        "转吧",
+        "帮我转",
+        "给我转",
+        "那转",
+        "可以转",
+        "转人工吧",
+    )
+    CONFIRMATION_DECLINE_PATTERNS = (
+        "不可以",
+        "不行",
+        "不好",
+        "不用",
+        "不用了",
+        "不要",
+        "不了",
+        "不需要",
+        "算了",
+        "别转",
+        "不转",
+        "不要转",
+        "先不用",
+        "继续说",
+    )
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -264,6 +379,7 @@ class AiCallHandoffTriggerService:
         self.customer_intent_enabled = customer_intent_enabled
         self.threshold = max(0.0, min(threshold, 1.0))
         self.timeout_seconds = max(0.2, timeout_seconds)
+        self._pending_confirmations: dict[str, PendingHandoffConfirmation] = {}
 
     async def handle_event(
         self,
@@ -288,11 +404,21 @@ class AiCallHandoffTriggerService:
         if not transcript:
             return
         if await self._has_active_handoff(event.call_id):
+            self._pending_confirmations.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
                 reason="active_handoff_exists",
                 transcript=transcript,
+            )
+            return
+        pending_confirmation = self._pending_confirmations.get(event.call_id)
+        if pending_confirmation is not None:
+            await self._handle_confirmation_transcript(
+                event=event,
+                event_store=event_store,
+                transcript=transcript,
+                confirmation=pending_confirmation,
             )
             return
         try:
@@ -392,12 +518,35 @@ class AiCallHandoffTriggerService:
             )
             return
         if await self._has_active_handoff(event.call_id):
+            self._pending_confirmations.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
                 reason="active_handoff_exists",
                 transcript=request_message,
                 classifier_source="realtime_tool",
+            )
+            return
+
+        if reason == "business_escalation":
+            tool_call_id = event.payload.get("toolCallId")
+            self._pending_confirmations[event.call_id] = PendingHandoffConfirmation(
+                reason=reason,
+                request_message=request_message,
+                tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
+            )
+            event_store.append(
+                event.call_id,
+                "handoff_confirmation_requested",
+                "handoff",
+                {
+                    "source": "customer",
+                    "reason": reason,
+                    "confidence": 1.0,
+                    "classifierSource": "realtime_tool",
+                    "summary": self._truncate(request_message, 200),
+                    "toolCallId": tool_call_id,
+                },
             )
             return
 
@@ -443,6 +592,101 @@ class AiCallHandoffTriggerService:
                 "confidence": 1.0,
                 "classifierSource": "realtime_tool",
                 "toolCallId": event.payload.get("toolCallId"),
+            },
+        )
+
+    async def _handle_confirmation_transcript(
+        self,
+        *,
+        event: AiCallEvent,
+        event_store: InMemoryEventStore,
+        transcript: str,
+        confirmation: PendingHandoffConfirmation,
+    ) -> None:
+        normalized = self._normalize(transcript)
+        if self._is_confirmation_declined(normalized):
+            self._pending_confirmations.pop(event.call_id, None)
+            event_store.append(
+                event.call_id,
+                "handoff_confirmation_declined",
+                "handoff",
+                {
+                    "source": "customer",
+                    "reason": confirmation.reason,
+                    "toolCallId": confirmation.tool_call_id,
+                    "transcriptPreview": self._truncate(transcript, 120),
+                },
+            )
+            return
+
+        if not self._is_confirmation_accepted(normalized):
+            self._pending_confirmations.pop(event.call_id, None)
+            self._append_ignored(
+                event_store,
+                event.call_id,
+                reason="handoff_confirmation_unresolved",
+                transcript=transcript,
+                confidence=1.0,
+                classifier_source="confirmation_gate",
+            )
+            return
+
+        self._pending_confirmations.pop(event.call_id, None)
+        event_store.append(
+            event.call_id,
+            "handoff_confirmation_confirmed",
+            "handoff",
+            {
+                "source": "customer",
+                "reason": confirmation.reason,
+                "toolCallId": confirmation.tool_call_id,
+                "transcriptPreview": self._truncate(transcript, 120),
+            },
+        )
+        event_store.append(
+            event.call_id,
+            "handoff_intent_detected",
+            "handoff",
+            {
+                "source": "customer",
+                "reason": confirmation.reason,
+                "confidence": 1.0,
+                "classifierSource": "confirmation_gate",
+                "summary": self._truncate(confirmation.request_message, 200),
+                "toolCallId": confirmation.tool_call_id,
+                "transcriptPreview": self._truncate(transcript, 120),
+            },
+        )
+        try:
+            handoff = await self._create_handoff(
+                call_id=event.call_id,
+                reason=confirmation.reason,
+                request_message=self._truncate(confirmation.request_message, 500),
+            )
+        except Exception as exc:
+            self._append_failed(
+                event_store,
+                event.call_id,
+                stage="create_handoff",
+                message=str(exc),
+                error_type=type(exc).__name__,
+                transcript=transcript,
+            )
+            return
+
+        event_store.append(
+            event.call_id,
+            "handoff_auto_triggered",
+            "handoff",
+            {
+                "handoffId": handoff.get("handoffId"),
+                "status": handoff.get("status"),
+                "source": "customer",
+                "reason": confirmation.reason,
+                "confidence": 1.0,
+                "classifierSource": "confirmation_gate",
+                "toolCallId": confirmation.tool_call_id,
+                "transcriptPreview": self._truncate(transcript, 120),
             },
         )
 
@@ -534,6 +778,20 @@ class AiCallHandoffTriggerService:
             "customer_request": "模型判断用户需要转人工",
             "business_escalation": "模型判断当前问题需要人工继续处理",
         }.get(reason, "模型发起转人工请求")
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return "".join(
+            char.lower() for char in text.strip() if char not in " \t\r\n，。！？,.!?；;：:、"
+        )
+
+    @classmethod
+    def _is_confirmation_accepted(cls, normalized: str) -> bool:
+        return any(pattern in normalized for pattern in cls.CONFIRMATION_ACCEPT_PATTERNS)
+
+    @classmethod
+    def _is_confirmation_declined(cls, normalized: str) -> bool:
+        return any(pattern in normalized for pattern in cls.CONFIRMATION_DECLINE_PATTERNS)
 
     @staticmethod
     def _truncate(value: str, limit: int) -> str:

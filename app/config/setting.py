@@ -159,11 +159,17 @@ class Settings(BaseSettings):
     AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS: float = 2.0
     AI_CALL_OFFLINE_ASR_QUEUE_MAX_SIZE: int = 1000
     AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS: float = 0.35
+    AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-waiting.wav"
+    )
     AI_CALL_HANDOFF_WAITING_TONE_ENABLED: bool = True
     AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH: str = str(
         BASE_DIR / "static/ai-call/audio/handoff-ringback.wav"
     )
     AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS: float = 0.0
+    AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-unavailable.wav"
+    )
     AI_CALL_HANDOFF_TIMEOUT_SECONDS: int = 30
     AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED: bool = True
     AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED: bool = True

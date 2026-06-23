@@ -181,7 +181,7 @@ async def _start_ai_call_handoff_trigger_worker():
         threshold=settings.AI_CALL_HANDOFF_INTENT_THRESHOLD,
         timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
     )
-    worker = AiCallHandoffTriggerWorker(trigger_service)
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
     await worker.start()
     configure_ai_call_handoff_trigger(worker)
     log.info("✅ AI Call 转人工自动触发 worker 已启动")

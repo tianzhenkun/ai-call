@@ -48,9 +48,11 @@ class AiCallHandoffExceptionManager:
         system_prompt_player: SystemPromptPlayerProtocol | None = None,
         timeout_seconds: int = 30,
         exception_close_enabled: bool = True,
+        waiting_prompt_audio_path: str | Path | None = None,
         waiting_tone_enabled: bool = False,
         waiting_tone_audio_path: str | Path | None = None,
         waiting_tone_interval_seconds: float = 0.0,
+        unavailable_prompt_audio_path: str | Path | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.session_factory = session_factory
@@ -58,11 +60,19 @@ class AiCallHandoffExceptionManager:
         self.system_prompt_player = system_prompt_player
         self.timeout_seconds = max(1, timeout_seconds)
         self.exception_close_enabled = exception_close_enabled
+        self.waiting_prompt_audio_path = (
+            Path(waiting_prompt_audio_path).expanduser() if waiting_prompt_audio_path else None
+        )
         self.waiting_tone_enabled = waiting_tone_enabled
         self.waiting_tone_audio_path = (
             Path(waiting_tone_audio_path).expanduser() if waiting_tone_audio_path else None
         )
         self.waiting_tone_interval_seconds = max(0.0, waiting_tone_interval_seconds)
+        self.unavailable_prompt_audio_path = (
+            Path(unavailable_prompt_audio_path).expanduser()
+            if unavailable_prompt_audio_path
+            else None
+        )
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._closure_tasks: dict[str, asyncio.Task] = {}
         self._waiting_tone_tasks: dict[str, asyncio.Task] = {}
@@ -102,10 +112,9 @@ class AiCallHandoffExceptionManager:
         )
 
     def start_waiting_tone(self, handoff: AiCallHandoffModel) -> None:
-        if (
-            not self.waiting_tone_enabled
-            or self.system_prompt_player is None
-            or self.waiting_tone_audio_path is None
+        has_waiting_tone = self.waiting_tone_enabled and self.waiting_tone_audio_path is not None
+        if self.system_prompt_player is None or (
+            self.waiting_prompt_audio_path is None and not has_waiting_tone
         ):
             return
         if handoff.status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
@@ -113,14 +122,6 @@ class AiCallHandoffExceptionManager:
         existing = self._waiting_tone_tasks.get(handoff.handoff_id)
         if existing is not None and not existing.done():
             return
-        self._record_handoff_event(
-            call_id=handoff.call_id,
-            event_type="handoff_waiting_tone_started",
-            handoff_id=handoff.handoff_id,
-            handoff_status=handoff.status,
-            payload={"audioFile": self.waiting_tone_audio_path.name},
-            source="system",
-        )
         try:
             task = asyncio.create_task(
                 self._waiting_tone_worker(
@@ -226,6 +227,7 @@ class AiCallHandoffExceptionManager:
                 self._close_after_exception(
                     handoff_id=handoff.handoff_id,
                     call_id=handoff.call_id,
+                    room_name=handoff.room_name,
                     handoff_status=handoff.status,
                     call_end_reason=call_end_reason,
                 )
@@ -300,8 +302,26 @@ class AiCallHandoffExceptionManager:
         handoff_status: str,
     ) -> None:
         assert self.system_prompt_player is not None
-        assert self.waiting_tone_audio_path is not None
         try:
+            if self.waiting_prompt_audio_path is not None:
+                await self._play_prompt_audio(
+                    call_id=call_id,
+                    room_name=room_name,
+                    handoff_id=handoff_id,
+                    handoff_status=handoff_status,
+                    audio_path=self.waiting_prompt_audio_path,
+                    event_prefix="handoff_prompt",
+                )
+            if not self.waiting_tone_enabled or self.waiting_tone_audio_path is None:
+                return
+            self._record_handoff_event(
+                call_id=call_id,
+                event_type="handoff_waiting_tone_started",
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                payload={"audioFile": self.waiting_tone_audio_path.name},
+                source="system",
+            )
             while True:
                 try:
                     await self.system_prompt_player.play(
@@ -352,9 +372,16 @@ class AiCallHandoffExceptionManager:
         *,
         handoff_id: str,
         call_id: str,
+        room_name: str,
         handoff_status: str,
         call_end_reason: str,
     ) -> None:
+        await self._play_unavailable_prompt(
+            call_id=call_id,
+            room_name=room_name,
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+        )
         async with self.session_factory() as db:
             async with db.begin():
                 repository = AiCallRecordRepository(db)
@@ -386,6 +413,76 @@ class AiCallHandoffExceptionManager:
             handoff_id=handoff_id,
             handoff_status=handoff_status,
             payload={"reason": call_end_reason},
+        )
+
+    async def _play_unavailable_prompt(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        handoff_id: str,
+        handoff_status: str,
+    ) -> None:
+        if self.unavailable_prompt_audio_path is None:
+            return
+        await self._play_prompt_audio(
+            call_id=call_id,
+            room_name=room_name,
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            audio_path=self.unavailable_prompt_audio_path,
+            event_prefix="handoff_unavailable_prompt",
+        )
+
+    async def _play_prompt_audio(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        handoff_id: str,
+        handoff_status: str,
+        audio_path: Path,
+        event_prefix: str,
+    ) -> None:
+        if self.system_prompt_player is None:
+            return
+        self._record_handoff_event(
+            call_id=call_id,
+            event_type=f"{event_prefix}_started",
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            payload={"audioFile": audio_path.name},
+            source="system",
+        )
+        try:
+            await self.system_prompt_player.play(
+                call_id=call_id,
+                room_name=room_name,
+                audio_path=audio_path,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_handoff_event(
+                call_id=call_id,
+                event_type=f"{event_prefix}_failed",
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                payload={
+                    "audioFile": audio_path.name,
+                    "errorType": type(exc).__name__,
+                    "message": str(exc),
+                },
+                source="system",
+            )
+            return
+        self._record_handoff_event(
+            call_id=call_id,
+            event_type=f"{event_prefix}_done",
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            payload={"audioFile": audio_path.name},
+            source="system",
         )
 
     def _record_handoff_event(

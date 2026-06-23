@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
+    AiCallHandoffAgentModel,
     AiCallEventModel,
     AiCallHandoffModel,
     AiCallPromptProfileModel,
@@ -843,6 +844,52 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(handoff)
         return handoff
+
+    async def get_handoff_agent(
+        self,
+        agent_identity: str,
+    ) -> AiCallHandoffAgentModel | None:
+        result = await self.db.execute(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.agent_identity == agent_identity
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert_handoff_agent(
+        self,
+        *,
+        agent_identity: str,
+        skill_group: str,
+        status: str,
+        active_handoff_id: str | None,
+        last_seen_at: datetime | None,
+        status_updated_at: datetime,
+    ) -> AiCallHandoffAgentModel:
+        agent = await self.get_handoff_agent(agent_identity)
+        values = {
+            "skill_group": skill_group,
+            "status": status,
+            "active_handoff_id": active_handoff_id,
+            "last_seen_at": last_seen_at,
+            "status_updated_at": status_updated_at,
+        }
+        if agent is not None:
+            for key, value in values.items():
+                setattr(agent, key, value)
+            await self.db.flush()
+            await self.db.refresh(agent)
+            return agent
+
+        agent = AiCallHandoffAgentModel(
+            id=generate_snowflake_id(),
+            agent_identity=agent_identity,
+            **values,
+        )
+        self.db.add(agent)
+        await self.db.flush()
+        await self.db.refresh(agent)
+        return agent
 
     async def list_active_handoffs_for_call(
         self,
