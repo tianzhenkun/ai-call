@@ -1,12 +1,12 @@
 # Phase B3.1：转人工异常闭环验收报告
 
-最后更新：2026-06-17
+最后更新：2026-06-24
 
 ## 1. 验收结论
 
 Phase B3.1 已完成代码实现，并通过本地自动化验证。
 
-当前仍需在真实 Web 通话中做一次手工验收，重点确认等待回铃声是否正常、30 秒超时是否直接自动结束通话、前端状态文案是否符合预期。
+2026-06-24 已补充 Web/LAN 真实通话手工验收，确认等待回铃声、30 秒超时自动结束、坐席接入后取消超时任务、客户主动挂断和坐席主动断开均可按状态闭环收口。样本与证据见 [phase-b3-handoff-live-closure-acceptance-report.md](phase-b3-handoff-live-closure-acceptance-report.md)。
 
 ## 2. 已实现范围
 
@@ -68,7 +68,9 @@ GET /ai-call-api/v1/ai-call/health
 GET /ai-call-api/v1/static/ai-call/audio/handoff-ringback.wav
 ```
 
-## 6. 手工验收建议
+## 6. 手工验收建议与状态
+
+以下手工验收项已在 2026-06-24 Web/LAN 样本中补证。SIP 真实线路和商用并发仍需后续独立验收。
 
 ### 6.1 超时自动结束
 

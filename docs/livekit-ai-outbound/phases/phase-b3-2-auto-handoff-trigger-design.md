@@ -481,7 +481,7 @@ B3.2 通过验收需要满足：
 
 ## 17. 实现状态
 
-当前状态：已实现，待真实通话手工验收。
+当前状态：已实现，并已在 2026-06-24 Web/LAN 真实通话中补充手工验收。用户说“转人工”后自动进入 handoff，后续无人接听、坐席接入、客户主动挂断和坐席主动断开样本均已收口；证据见 [phase-b3-handoff-live-closure-acceptance-report.md](phase-b3-handoff-live-closure-acceptance-report.md)。
 
 本次落地范围：
 
