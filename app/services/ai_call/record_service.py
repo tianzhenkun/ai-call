@@ -31,15 +31,29 @@ PERSISTED_EVENT_TYPES = frozenset({
     "agent_started",
     "browser_disconnect",
     "browser_first_audio",
+    "browser_audio_hold_completed",
+    "browser_audio_hold_confirmed",
+    "browser_audio_hold_expired",
+    "browser_audio_hold_rejected_echo",
+    "browser_audio_hold_requested",
+    "browser_audio_input_diagnostics",
     "browser_interrupt_candidate_deferred",
     "browser_interrupt_candidate_promoted",
+    "browser_pre_stop_completed",
+    "browser_pre_stop_confirmed",
+    "browser_pre_stop_expired",
+    "browser_pre_stop_rejected_echo",
+    "browser_pre_stop_requested",
+    "browser_pre_stop_skipped",
     "browser_ready",
     "browser_token_issued",
     "browser_user_speech_segment",
     "browser_user_speech_started",
     "call_end_auto_failed",
+    "call_end_intent_detected",
     "call_end_interrupted",
     "call_end_scheduled",
+    "call_end_tool_missing",
     "call_end_tool_ignored",
     "call_end_tool_requested",
     "agent_suspended_for_handoff",
@@ -102,6 +116,7 @@ PERSISTED_EVENT_TYPES = frozenset({
     "user_speech_started",
     "user_speech_stopped",
     "user_transcript_failed",
+    "user_transcript_semantic_rejected",
     "stale_audio_dropped",
 })
 
@@ -309,6 +324,8 @@ class AiCallRecordService:
         record = await self.repository.get_record(call_id)
         if record is None:
             return None
+        if record.ended_at is not None:
+            return record
         final_ended_at = ended_at or utc_now()
         duration_start = record.answered_at or record.started_at
         final_ended_at = self._ensure_utc(final_ended_at)

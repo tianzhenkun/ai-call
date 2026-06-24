@@ -820,6 +820,37 @@ async def test_end_session_updates_record_terminal_state_and_reason(b1_service) 
 
 
 @pytest.mark.anyio
+async def test_repeated_end_session_preserves_first_terminal_reason(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    await service.report_browser_event(
+        call_id=result.call_id,
+        event_type="browser_ready",
+        timestamp=None,
+    )
+
+    await service.end_session(result.call_id, end_reason="handoff_timeout")
+    first_record = await record_service.get_record(result.call_id)
+    assert first_record is not None
+    assert first_record.end_reason == "handoff_timeout"
+    first_ended_at = first_record.ended_at
+    first_duration_ms = first_record.duration_ms
+
+    await service.end_session(result.call_id)
+
+    record = await record_service.get_record(result.call_id)
+    assert record is not None
+    assert record.status == CallSessionStatus.COMPLETED.value
+    assert record.end_reason == "handoff_timeout"
+    assert record.ended_at == first_ended_at
+    assert record.duration_ms == first_duration_ms
+
+
+@pytest.mark.anyio
 async def test_browser_disconnect_completes_record_with_disconnect_reason(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
@@ -1213,6 +1244,163 @@ async def test_handoff_trigger_worker_creates_business_escalation_after_user_con
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("transcript", ["转啊。", "你不转。"])
+async def test_handoff_trigger_worker_treats_transfer_urge_as_confirmation(
+    b1_service,
+    transcript: str,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_business_urge",
+                "reason": "business_escalation",
+            },
+        )
+        await worker.flush_pending()
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={"item_id": "item_urge_handoff", "transcript": transcript},
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
+        assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_confirmation_confirmed" in event_types
+        assert "handoff_confirmation_declined" not in event_types
+        assert "handoff_auto_triggered" in event_types
+        assert "handoff_requested" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_trigger_worker_uses_recent_affirmation_for_late_business_escalation_tool(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={"item_id": "item_recent_handoff_yes", "transcript": "好的。"},
+        )
+        await worker.flush_pending()
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_business_late",
+                "reason": "business_escalation",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
+        assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
+        assert classifier.transcripts == ["好的。"]
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_confirmation_confirmed" in event_types
+        assert "handoff_auto_triggered" in event_types
+        assert "handoff_requested" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
 async def test_handoff_trigger_worker_declines_business_escalation_confirmation(
     b1_service,
 ) -> None:
@@ -1408,6 +1596,76 @@ async def test_handoff_trigger_worker_ignores_low_confidence_text(b1_service) ->
         ]
         assert "handoff_intent_ignored" in event_types
         assert "handoff_requested" not in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_trigger_worker_skips_semantically_rejected_transcript(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=True,
+            confidence=0.95,
+            reason="customer_request",
+            summary="用户明确要求转人工",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={
+                "item_id": "item_rejected_handoff",
+                "transcript": "帮我转人工",
+                "transcriptTrust": "low_confidence",
+                "semanticAction": "reject",
+                "semanticRejectReason": "opening_double_talk_low_confidence_transcript",
+            },
+        )
+
+        await worker.flush_pending()
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs == {"rows": [], "total": 0}
+        assert b1_service.agent_runner.suspended_call_ids == []
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        events = await record_service.list_events(result.call_id)
+        event_types = [event.event_type for event in events]
+        assert "handoff_intent_ignored" in event_types
+        assert "handoff_requested" not in event_types
+        ignored = next(event for event in events if event.event_type == "handoff_intent_ignored")
+        assert ignored.payload["reason"] == "low_confidence_transcript"
     finally:
         worker.detach_all()
         await worker.stop()
@@ -2169,6 +2427,74 @@ async def test_handoff_fail_plays_unavailable_prompt_before_auto_end(
 
 
 @pytest.mark.anyio
+async def test_handoff_cancel_plays_unavailable_prompt_before_auto_end(
+    b1_service,
+    tmp_path,
+) -> None:
+    service, record_service = b1_service
+    prompt_player = FakeSystemPromptPlayer()
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        recording_service_factory=lambda _repository: None,
+        system_prompt_player=prompt_player,
+        timeout_seconds=30,
+        unavailable_prompt_audio_path=tmp_path / "handoff-unavailable.wav",
+    )
+    service.handoff_exception_manager = manager
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        handoff = await service.create_handoff(
+            call_id=result.call_id,
+            source="operator",
+            reason="customer_request",
+            request_message=None,
+        )
+
+        canceled = await service.cancel_handoff(
+            handoff_id=handoff["handoffId"],
+            reason="operator_cancelled",
+        )
+        assert canceled["status"] == "canceled"
+
+        await wait_until(
+            lambda: (
+                service.orchestrator.registry.get(result.call_id).status
+                == CallSessionStatus.COMPLETED
+            ),
+            attempts=40,
+            delay_seconds=0.05,
+        )
+        record_service.repository.db.expire_all()
+        record = await record_service.get_record(result.call_id)
+
+        assert record is not None
+        assert record.status == "completed"
+        assert record.end_reason == "operator_cancelled"
+        assert prompt_player.played == [
+            (result.call_id, result.room_name, str(tmp_path / "handoff-unavailable.wav"))
+        ]
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_canceled" in event_types
+        assert "handoff_unavailable_prompt_started" in event_types
+        assert "handoff_unavailable_prompt_done" in event_types
+        assert event_types.index("handoff_unavailable_prompt_done") < event_types.index(
+            "handoff_auto_ended"
+        )
+        assert "handoff_auto_ended" in event_types
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.anyio
 async def test_append_event_is_idempotent_by_event_id(b1_service) -> None:
     _service, record_service = b1_service
     event_time = datetime.now(timezone.utc)
@@ -2207,6 +2533,32 @@ def test_record_service_persists_promoted_browser_interrupt_candidate() -> None:
     assert AiCallRecordService.should_persist_event(event) is True
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "browser_pre_stop_requested",
+        "browser_pre_stop_completed",
+        "browser_pre_stop_confirmed",
+        "browser_pre_stop_expired",
+        "browser_pre_stop_rejected_echo",
+        "browser_pre_stop_skipped",
+        "browser_audio_hold_requested",
+        "browser_audio_hold_completed",
+        "browser_audio_hold_confirmed",
+        "browser_audio_hold_expired",
+        "browser_audio_hold_rejected_echo",
+    ],
+)
+def test_record_service_persists_browser_pre_stop_diagnostics(event_type: str) -> None:
+    event = InMemoryEventStore().append(
+        call_id="call_browser_pre_stop_persist",
+        type=event_type,
+        source="agent",
+    )
+
+    assert AiCallRecordService.should_persist_event(event) is True
+
+
 def test_record_service_persists_browser_speech_segment() -> None:
     event = InMemoryEventStore().append(
         call_id="call_browser_segment",
@@ -2218,6 +2570,20 @@ def test_record_service_persists_browser_speech_segment() -> None:
             "durationMs": 440,
             "snrDb": 15.0,
             "hotFrameCount": 11,
+        },
+    )
+
+    assert AiCallRecordService.should_persist_event(event) is True
+
+
+def test_record_service_persists_browser_audio_input_diagnostics() -> None:
+    event = InMemoryEventStore().append(
+        call_id="call_browser_audio_input",
+        type="browser_audio_input_diagnostics",
+        source="browser",
+        payload={
+            "diagnosticsVersion": "browser-audio-input-v1",
+            "trackSettings": {"echoCancellation": True},
         },
     )
 
@@ -4352,6 +4718,66 @@ async def test_dialogue_query_hides_duplicate_offline_asr_segment() -> None:
 
 
 @pytest.mark.anyio
+async def test_dialogue_query_hides_realtime_customer_prefix_fragment() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallDialogueService(repository)
+        started_at = datetime(2026, 6, 24, 7, 26, 45, tzinfo=timezone.utc)
+
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_realtime_customer_prefix",
+                segment_no=1,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_prefix",
+                text="没有啊。",
+                segment_status="final",
+                started_at=started_at,
+                ended_at=started_at + timedelta(minutes=1),
+                duration_ms=60000,
+                audio_start_ms=25280,
+                audio_end_ms=None,
+            )
+        )
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_realtime_customer_prefix",
+                segment_no=2,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_full",
+                text="没有啊，我不知道啊。",
+                segment_status="final",
+                started_at=started_at + timedelta(milliseconds=990),
+                ended_at=started_at + timedelta(milliseconds=1750),
+                duration_ms=760,
+                audio_start_ms=None,
+                audio_end_ms=26980,
+            )
+        )
+
+        raw_rows = await repository.list_dialogue_segments("call_realtime_customer_prefix")
+        rows = await service.list_persisted_segments("call_realtime_customer_prefix")
+
+        assert len(raw_rows) == 2
+        assert [(row.source_segment_id, row.segment_text) for row in rows] == [
+            ("item_full", "没有啊，我不知道啊。")
+        ]
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_dialogue_query_hides_duplicate_realtime_ai_segment() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
@@ -4403,6 +4829,58 @@ async def test_dialogue_query_hides_duplicate_realtime_ai_segment() -> None:
         assert rows[0].source_segment_id == "item_opening_audio"
         assert rows[0].segment_text == opening
         assert rows[0].duration_ms == 29000
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_dialogue_preview_hides_duplicate_realtime_ai_segment() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    call_id = "call_dialogue_preview_duplicate_ai"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+    message = (
+        "我是灵宸智能助手，主要负责协助确认款项的归还安排。"
+        "请问您现在方便沟通一下预计什么时候可以归还吗？"
+        "如果暂时不确定，也可以告诉我一个大概的时间范围。"
+    )
+
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_delta",
+        source="provider",
+        payload={"item_id": "item_ai_audio", "delta": message},
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="model_response_done",
+        source="provider",
+        payload={"response": {"id": "item_ai_audio", "status": "completed"}},
+        timestamp=started_at + timedelta(seconds=29),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_done",
+        source="provider",
+        payload={"item_id": "item_ai_done", "transcript": message},
+        timestamp=started_at + timedelta(seconds=8),
+    )
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        service = AiCallDialogueService(AiCallRecordRepository(db), runtime_store)
+        preview = await service.list_preview_segments(call_id)
+
+        assert preview["total"] == 1
+        assert preview["rows"][0]["sourceSegmentId"] == "item_ai_audio"
+        assert preview["rows"][0]["text"] == message
 
     async with engine.begin() as conn:
         await conn.run_sync(MappedBase.metadata.drop_all)
@@ -4474,6 +4952,36 @@ async def test_dialogue_query_hides_only_obvious_short_realtime_asr_noise() -> N
                 ended_at=started_at + timedelta(seconds=3, milliseconds=667),
                 duration_ms=667,
             ),
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=5,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_late_noise",
+                text="法人。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=4),
+                ended_at=started_at + timedelta(minutes=1),
+                duration_ms=56000,
+                audio_start_ms=30060,
+                audio_end_ms=None,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_short_asr_noise",
+                segment_no=6,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_greeting_with_audio_span",
+                text="你好。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=5),
+                ended_at=started_at + timedelta(seconds=5),
+                duration_ms=0,
+                audio_start_ms=2440,
+                audio_end_ms=3300,
+            ),
         ]
         for snapshot in snapshots:
             await service.persist_snapshot(snapshot)
@@ -4481,16 +4989,199 @@ async def test_dialogue_query_hides_only_obvious_short_realtime_asr_noise() -> N
         raw_rows = await repository.list_dialogue_segments("call_short_asr_noise")
         rows = await service.list_persisted_segments("call_short_asr_noise")
 
-        assert len(raw_rows) == 4
+        assert len(raw_rows) == 6
         assert [row.source_segment_id for row in rows] == [
             "item_ack",
             "item_sentence",
             "item_normal_short",
+            "item_greeting_with_audio_span",
         ]
         assert [row.segment_text for row in rows] == [
             "嗯。",
             "你好，我是林晨晨。",
             "对呀。",
+            "你好。",
+        ]
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_dialogue_query_hides_double_talk_single_char_realtime_asr() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallDialogueService(repository)
+        started_at = datetime(2026, 6, 24, 6, 37, 16, tzinfo=timezone.utc)
+        opening = "您好，我是灵宸智能助手，想和您确认一下当前款项的归还安排，请问您现在方便简单沟通一下吗？"
+
+        snapshots = [
+            DialogueSegmentSnapshot(
+                call_id="call_double_talk_short_asr",
+                segment_no=1,
+                speaker_type="ai",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_opening",
+                text=opening,
+                segment_status="final",
+                started_at=started_at,
+                ended_at=started_at + timedelta(seconds=8),
+                duration_ms=8000,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_double_talk_short_asr",
+                segment_no=2,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_misheard_ack",
+                text="对。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=6),
+                ended_at=started_at + timedelta(seconds=8),
+                duration_ms=2320,
+                audio_start_ms=1300,
+                audio_end_ms=1920,
+            ),
+            DialogueSegmentSnapshot(
+                call_id="call_double_talk_short_asr",
+                segment_no=3,
+                speaker_type="customer",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_real_greeting",
+                text="你好。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=8),
+                ended_at=started_at + timedelta(seconds=8),
+                duration_ms=0,
+            ),
+        ]
+        for snapshot in snapshots:
+            await service.persist_snapshot(snapshot)
+
+        raw_rows = await repository.list_dialogue_segments("call_double_talk_short_asr")
+        rows = await service.list_persisted_segments("call_double_talk_short_asr")
+
+        assert len(raw_rows) == 3
+        assert [(row.speaker_type, row.segment_text) for row in rows] == [
+            ("ai", opening),
+            ("customer", "你好。"),
+        ]
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_dialogue_preview_hides_semantically_rejected_customer_transcript() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    call_id = "call_dialogue_rejected_transcript"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+
+    event_store.append(
+        call_id=call_id,
+        type="user_speech_started",
+        source="provider",
+        payload={"item_id": "item_rejected", "audio_start_ms": 1400},
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="user_transcript_done",
+        source="provider",
+        payload={
+            "item_id": "item_rejected",
+            "transcript": "我。",
+            "transcriptTrust": "low_confidence",
+            "semanticAction": "reject",
+            "semanticRejectReason": "opening_double_talk_low_confidence_transcript",
+        },
+        timestamp=started_at + timedelta(milliseconds=640),
+    )
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        service = AiCallDialogueService(AiCallRecordRepository(db), runtime_store)
+        preview = await service.list_preview_segments(call_id)
+
+        assert preview == {"rows": [], "total": 0}
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_dialogue_query_keeps_interrupted_realtime_ai_segment() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallDialogueService(repository)
+        started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_interrupted_ai_text",
+                segment_no=1,
+                speaker_type="ai",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_ai_interrupted",
+                text="归还呢？如果暂时不方便确定具体时间",
+                segment_status="interrupted",
+                started_at=started_at,
+                ended_at=started_at + timedelta(milliseconds=200),
+                duration_ms=200,
+            )
+        )
+        await service.persist_snapshot(
+            DialogueSegmentSnapshot(
+                call_id="call_interrupted_ai_text",
+                segment_no=2,
+                speaker_type="ai",
+                speaker_identity=None,
+                source="qwen_realtime",
+                source_segment_id="item_ai_final",
+                text="我这边预计大概下周内可以安排归还，如果时间有变化我再提前跟您说。",
+                segment_status="final",
+                started_at=started_at + timedelta(seconds=2),
+                ended_at=started_at + timedelta(seconds=6),
+                duration_ms=4000,
+            )
+        )
+
+        raw_rows = await repository.list_dialogue_segments("call_interrupted_ai_text")
+        rows = await service.list_persisted_segments("call_interrupted_ai_text")
+
+        assert len(raw_rows) == 2
+        assert [(row.source_segment_id, row.segment_status, row.segment_text) for row in rows] == [
+            (
+                "item_ai_interrupted",
+                "interrupted",
+                "归还呢？如果暂时不方便确定具体时间",
+            ),
+            (
+                "item_ai_final",
+                "final",
+                "我这边预计大概下周内可以安排归还，如果时间有变化我再提前跟您说。",
+            )
         ]
 
     async with engine.begin() as conn:
@@ -4650,3 +5341,124 @@ def test_dialogue_runtime_marks_late_ai_done_for_invalidated_response_interrupte
     assert preview[0].text == "这个是被打断的旧回答。"
     assert len(persisted) == 1
     assert persisted[0].segment_status == "interrupted"
+
+
+def test_dialogue_runtime_suppresses_late_ai_done_when_response_item_changes() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    persisted: list[DialogueSegmentSnapshot] = []
+    runtime_store.add_persist_listener(persisted.append)
+    call_id = "call_late_ai_done_item_changed_after_interrupt"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_delta",
+        source="provider",
+        payload={
+            "item_id": "item_ai_old",
+            "response_id": "resp_interrupted",
+            "delta": "谢谢张总。我简单说一下，GEO主要是帮助品牌和产品。",
+        },
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="response_generation_invalidated",
+        source="provider",
+        payload={"responseId": "resp_interrupted"},
+        timestamp=started_at + timedelta(milliseconds=300),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_done",
+        source="provider",
+        payload={
+            "item_id": "item_ai_new",
+            "response_id": "resp_interrupted",
+            "transcript": "谢谢张总。我简单说一下，GEO主要是帮助品牌和产品。",
+        },
+        timestamp=started_at + timedelta(milliseconds=800),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="interrupt_confirmed",
+        source="agent",
+        payload={},
+        timestamp=started_at + timedelta(milliseconds=850),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="session_completed",
+        source="orchestrator",
+        payload={},
+        timestamp=started_at + timedelta(seconds=10),
+    )
+
+    preview = runtime_store.list_preview(call_id)
+    assert len(preview) == 1
+    assert preview[0].source_segment_id == "item_ai_old"
+    assert preview[0].segment_status == "interrupted"
+    assert preview[0].text == "谢谢张总。我简单说一下，GEO主要是帮助品牌和产品。"
+    assert len(persisted) == 1
+    assert persisted[0].segment_status == "interrupted"
+
+
+def test_dialogue_runtime_marks_finalized_ai_interrupted_when_invalidation_arrives_late() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    persisted_statuses: list[str] = []
+    runtime_store.add_persist_listener(
+        lambda snapshot: persisted_statuses.append(snapshot.segment_status)
+    )
+    call_id = "call_invalidation_after_model_done"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+    transcript = "好的张总，那我再跟您具体说说。GEO的核心就是让品牌被更准确地引用。"
+
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_delta",
+        source="provider",
+        payload={
+            "item_id": "item_ai_interrupted",
+            "response_id": "resp_interrupted",
+            "delta": transcript,
+        },
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="model_response_done",
+        source="provider",
+        payload={
+            "response": {
+                "id": "resp_interrupted",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "item_ai_interrupted",
+                        "role": "assistant",
+                        "type": "message",
+                        "content": [{"type": "audio", "transcript": transcript}],
+                    }
+                ],
+            }
+        },
+        timestamp=started_at + timedelta(milliseconds=700),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="response_generation_invalidated",
+        source="provider",
+        payload={"responseId": "resp_interrupted"},
+        timestamp=started_at + timedelta(milliseconds=720),
+    )
+
+    preview = runtime_store.list_preview(call_id)
+    assert len(preview) == 1
+    assert preview[0].source_segment_id == "item_ai_interrupted"
+    assert preview[0].segment_status == "interrupted"
+    assert preview[0].text == transcript
+    assert persisted_statuses == ["final", "interrupted"]

@@ -727,6 +727,16 @@ class AiCallService:
             payload={"reason": handoff.end_reason},
         )
         self._cancel_handoff_timeout(handoff, reason="canceled")
+        if handoff.connected_at is None:
+            self._trigger_handoff_exception_close(
+                handoff,
+                call_end_reason=handoff.end_reason or "handoff_canceled",
+            )
+        else:
+            await self._end_running_session_after_handoff(
+                handoff.call_id,
+                handoff.end_reason,
+            )
         return self.handoff_service.handoff_to_dict(handoff)
 
     async def fail_handoff(

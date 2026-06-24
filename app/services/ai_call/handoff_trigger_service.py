@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 import httpx
@@ -11,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.logger import log
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
+from app.services.ai_call.transcript_trust import (
+    is_realtime_transcript_semantically_rejected,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +334,14 @@ class PendingHandoffConfirmation:
     tool_call_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RecentHandoffConfirmationCandidate:
+    transcript: str
+    timestamp: datetime
+
+
 class AiCallHandoffTriggerService:
+    RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
     CONFIRMATION_ACCEPT_PATTERNS = (
         "可以",
         "行",
@@ -344,6 +355,24 @@ class AiCallHandoffTriggerService:
         "可以转",
         "转人工吧",
     )
+    CONFIRMATION_TRANSFER_URGE_PATTERNS = (
+        "转啊",
+        "快转",
+        "赶紧转",
+        "马上转",
+        "现在转",
+        "直接转",
+        "那就转",
+        "你转",
+        "帮我转",
+        "给我转",
+        "怎么还不转",
+        "怎么不转",
+        "还没转",
+        "你不转",
+        "你怎么不转",
+        "为什么不转",
+    )
     CONFIRMATION_DECLINE_PATTERNS = (
         "不可以",
         "不行",
@@ -355,7 +384,8 @@ class AiCallHandoffTriggerService:
         "不需要",
         "算了",
         "别转",
-        "不转",
+        "不用转",
+        "不转了",
         "不要转",
         "先不用",
         "继续说",
@@ -380,6 +410,9 @@ class AiCallHandoffTriggerService:
         self.threshold = max(0.0, min(threshold, 1.0))
         self.timeout_seconds = max(0.2, timeout_seconds)
         self._pending_confirmations: dict[str, PendingHandoffConfirmation] = {}
+        self._recent_confirmation_candidates: dict[
+            str, RecentHandoffConfirmationCandidate
+        ] = {}
 
     async def handle_event(
         self,
@@ -403,8 +436,19 @@ class AiCallHandoffTriggerService:
         transcript = self._transcript_text(event)
         if not transcript:
             return
+        if is_realtime_transcript_semantically_rejected(event.payload):
+            self._append_ignored(
+                event_store,
+                event.call_id,
+                reason="low_confidence_transcript",
+                transcript=transcript,
+                confidence=0.0,
+                classifier_source="transcript_trust",
+            )
+            return
         if await self._has_active_handoff(event.call_id):
             self._pending_confirmations.pop(event.call_id, None)
+            self._recent_confirmation_candidates.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
@@ -421,6 +465,7 @@ class AiCallHandoffTriggerService:
                 confirmation=pending_confirmation,
             )
             return
+        self._remember_confirmation_candidate(event, transcript)
         try:
             result = await asyncio.wait_for(
                 self.classifier.classify(transcript=transcript),
@@ -519,6 +564,7 @@ class AiCallHandoffTriggerService:
             return
         if await self._has_active_handoff(event.call_id):
             self._pending_confirmations.pop(event.call_id, None)
+            self._recent_confirmation_candidates.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
@@ -530,7 +576,7 @@ class AiCallHandoffTriggerService:
 
         if reason == "business_escalation":
             tool_call_id = event.payload.get("toolCallId")
-            self._pending_confirmations[event.call_id] = PendingHandoffConfirmation(
+            confirmation = PendingHandoffConfirmation(
                 reason=reason,
                 request_message=request_message,
                 tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
@@ -548,6 +594,17 @@ class AiCallHandoffTriggerService:
                     "toolCallId": tool_call_id,
                 },
             )
+            recent_confirmation = self._pop_recent_confirmation_candidate(event)
+            if recent_confirmation is not None:
+                await self._confirm_handoff(
+                    event=event,
+                    event_store=event_store,
+                    transcript=recent_confirmation.transcript,
+                    confirmation=confirmation,
+                    classifier_source="recent_confirmation",
+                )
+                return
+            self._pending_confirmations[event.call_id] = confirmation
             return
 
         event_store.append(
@@ -606,6 +663,7 @@ class AiCallHandoffTriggerService:
         normalized = self._normalize(transcript)
         if self._is_confirmation_declined(normalized):
             self._pending_confirmations.pop(event.call_id, None)
+            self._recent_confirmation_candidates.pop(event.call_id, None)
             event_store.append(
                 event.call_id,
                 "handoff_confirmation_declined",
@@ -621,6 +679,7 @@ class AiCallHandoffTriggerService:
 
         if not self._is_confirmation_accepted(normalized):
             self._pending_confirmations.pop(event.call_id, None)
+            self._recent_confirmation_candidates.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
@@ -632,6 +691,24 @@ class AiCallHandoffTriggerService:
             return
 
         self._pending_confirmations.pop(event.call_id, None)
+        await self._confirm_handoff(
+            event=event,
+            event_store=event_store,
+            transcript=transcript,
+            confirmation=confirmation,
+            classifier_source="confirmation_gate",
+        )
+
+    async def _confirm_handoff(
+        self,
+        *,
+        event: AiCallEvent,
+        event_store: InMemoryEventStore,
+        transcript: str,
+        confirmation: PendingHandoffConfirmation,
+        classifier_source: str,
+    ) -> None:
+        self._recent_confirmation_candidates.pop(event.call_id, None)
         event_store.append(
             event.call_id,
             "handoff_confirmation_confirmed",
@@ -651,7 +728,7 @@ class AiCallHandoffTriggerService:
                 "source": "customer",
                 "reason": confirmation.reason,
                 "confidence": 1.0,
-                "classifierSource": "confirmation_gate",
+                "classifierSource": classifier_source,
                 "summary": self._truncate(confirmation.request_message, 200),
                 "toolCallId": confirmation.tool_call_id,
                 "transcriptPreview": self._truncate(transcript, 120),
@@ -684,7 +761,7 @@ class AiCallHandoffTriggerService:
                 "source": "customer",
                 "reason": confirmation.reason,
                 "confidence": 1.0,
-                "classifierSource": "confirmation_gate",
+                "classifierSource": classifier_source,
                 "toolCallId": confirmation.tool_call_id,
                 "transcriptPreview": self._truncate(transcript, 120),
             },
@@ -764,6 +841,37 @@ class AiCallHandoffTriggerService:
         )
         return value.strip() if isinstance(value, str) else ""
 
+    def _remember_confirmation_candidate(
+        self,
+        event: AiCallEvent,
+        transcript: str,
+    ) -> None:
+        normalized = self._normalize(transcript)
+        if self._is_confirmation_declined(normalized):
+            self._recent_confirmation_candidates.pop(event.call_id, None)
+            return
+        if self._is_confirmation_accepted(normalized):
+            self._recent_confirmation_candidates[event.call_id] = (
+                RecentHandoffConfirmationCandidate(
+                    transcript=transcript,
+                    timestamp=event.timestamp,
+                )
+            )
+            return
+        self._recent_confirmation_candidates.pop(event.call_id, None)
+
+    def _pop_recent_confirmation_candidate(
+        self,
+        event: AiCallEvent,
+    ) -> RecentHandoffConfirmationCandidate | None:
+        candidate = self._recent_confirmation_candidates.pop(event.call_id, None)
+        if candidate is None:
+            return None
+        age_seconds = (event.timestamp - candidate.timestamp).total_seconds()
+        if 0 <= age_seconds <= self.RECENT_CONFIRMATION_WINDOW_SECONDS:
+            return candidate
+        return None
+
     @staticmethod
     def _tool_request_reason(event: AiCallEvent) -> str:
         reason = event.payload.get("reason")
@@ -787,10 +895,18 @@ class AiCallHandoffTriggerService:
 
     @classmethod
     def _is_confirmation_accepted(cls, normalized: str) -> bool:
-        return any(pattern in normalized for pattern in cls.CONFIRMATION_ACCEPT_PATTERNS)
+        return any(
+            pattern in normalized
+            for pattern in (
+                cls.CONFIRMATION_ACCEPT_PATTERNS
+                + cls.CONFIRMATION_TRANSFER_URGE_PATTERNS
+            )
+        )
 
     @classmethod
     def _is_confirmation_declined(cls, normalized: str) -> bool:
+        if any(pattern in normalized for pattern in cls.CONFIRMATION_TRANSFER_URGE_PATTERNS):
+            return False
         return any(pattern in normalized for pattern in cls.CONFIRMATION_DECLINE_PATTERNS)
 
     @staticmethod

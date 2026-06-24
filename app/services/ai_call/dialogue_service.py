@@ -18,10 +18,15 @@ from app.services.ai_call.dialogue_merge import (
     normalize_dialogue_text,
 )
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
+from app.services.ai_call.transcript_trust import (
+    is_realtime_transcript_semantically_rejected,
+)
 
 PERSISTED_DIALOGUE_STATUSES = frozenset({"final", "interrupted", "failed"})
 SHORT_ASR_NOISE_MAX_DURATION_MS = 100
 SHORT_ASR_NOISE_MAX_TEXT_LENGTH = 2
+SHORT_ASR_REAL_AUDIO_MIN_SPAN_MS = 300
+REALTIME_ASR_PREFIX_DUPLICATE_START_GAP_MS = 1500
 VALID_SHORT_CUSTOMER_UTTERANCES = frozenset({
     "嗯",
     "好",
@@ -36,6 +41,7 @@ VALID_SHORT_CUSTOMER_UTTERANCES = frozenset({
     "不行",
     "不要",
     "不用",
+    "你好",
 })
 
 
@@ -97,6 +103,8 @@ class AiCallDialogueRuntimeStore:
         self._active_key_by_call_speaker: dict[tuple[str, str], tuple[str, str, str]] = {}
         self._merged_key_targets: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         self._interrupted_ai_source_ids_by_call: dict[str, set[str]] = {}
+        self._interrupted_ai_response_ids_by_call: dict[str, set[str]] = {}
+        self._ai_source_ids_by_response_id: dict[str, dict[str, set[str]]] = {}
         self._next_no_by_call: dict[str, int] = {}
         self._persist_listeners: list[Callable[[DialogueSegmentSnapshot], None]] = []
         self._attached_stores: dict[int, InMemoryEventStore] = {}
@@ -180,9 +188,14 @@ class AiCallDialogueRuntimeStore:
         elif event.type == "model_response_done":
             self._finalize_stable_customer_turn(event.call_id, event.timestamp)
             if not self._should_ignore_model_response_done(event):
-                self._finalize_event_pending(event, "ai", "final")
+                status = (
+                    "interrupted" if self._is_interrupted_ai_source_event(event) else "final"
+                )
+                self._finalize_event_pending(event, "ai", status)
         elif event.type == "response_generation_invalidated":
             self._mark_interrupted_ai_source(event)
+            self._mark_finalized_interrupted_ai_sources(event)
+            self._finalize_interrupted_ai_pending(event)
         elif event.type == "interrupt_confirmed":
             self._finalize_pending(event.call_id, "ai", event.timestamp, "interrupted")
         elif event.type in {"session_completed", "session_failed"}:
@@ -330,6 +343,7 @@ class AiCallDialogueRuntimeStore:
                     "audio_start_ms",
                 )
             self._active_key_by_call_speaker[(event.call_id, speaker_type)] = key
+            self._remember_ai_response_source(event, speaker_type, source_segment_id)
             return pending
 
         segment_no = self._next_segment_no(event.call_id)
@@ -350,6 +364,7 @@ class AiCallDialogueRuntimeStore:
         self._segments_by_source_key[key] = pending
         self._active_key_by_call_speaker[(event.call_id, speaker_type)] = key
         self._segments_by_call.setdefault(event.call_id, []).append(snapshot)
+        self._remember_ai_response_source(event, speaker_type, source_segment_id)
         return pending
 
     def _mark_speech_stopped(self, event: AiCallEvent) -> None:
@@ -547,6 +562,8 @@ class AiCallDialogueRuntimeStore:
 
     @staticmethod
     def _user_transcript_text(payload: dict[str, Any], *, event_type: str) -> str:
+        if is_realtime_transcript_semantically_rejected(payload):
+            return ""
         if event_type == "user_transcript_done":
             value = payload.get("transcript") or payload.get("text") or payload.get("delta")
             return value.strip() if isinstance(value, str) else ""
@@ -587,15 +604,84 @@ class AiCallDialogueRuntimeStore:
             self._interrupted_ai_source_ids_by_call.setdefault(event.call_id, set()).add(
                 source_segment_id
             )
+        response_id = self._response_id(event)
+        if response_id:
+            self._interrupted_ai_response_ids_by_call.setdefault(event.call_id, set()).add(
+                response_id
+            )
+            source_ids = self._ai_source_ids_by_response_id.get(event.call_id, {}).get(
+                response_id,
+                set(),
+            )
+            self._interrupted_ai_source_ids_by_call.setdefault(event.call_id, set()).update(
+                source_ids
+            )
+
+    def _finalize_interrupted_ai_pending(self, event: AiCallEvent) -> None:
+        key = self._active_key_by_call_speaker.get((event.call_id, "ai"))
+        if key is None:
+            return
+        pending = self._pending_for_key(key)
+        if pending is None or pending.finalized:
+            return
+        response_id = self._response_id(event)
+        mapped_source_ids = (
+            self._ai_source_ids_by_response_id.get(event.call_id, {}).get(response_id, set())
+            if response_id
+            else set()
+        )
+        source_id = pending.snapshot.source_segment_id
+        if mapped_source_ids and source_id not in mapped_source_ids:
+            return
+        self._finalize_segment(pending, event.timestamp, "interrupted")
+
+    def _mark_finalized_interrupted_ai_sources(self, event: AiCallEvent) -> None:
+        source_ids = self._interrupted_ai_source_ids_by_call.get(event.call_id, set())
+        if not source_ids:
+            return
+        for source_id in tuple(source_ids):
+            pending = self._pending_for_key((event.call_id, "ai", source_id))
+            if pending is None or not pending.finalized or pending.suppress_persist:
+                continue
+            snapshot = pending.snapshot
+            if snapshot.segment_status == "interrupted":
+                continue
+            snapshot.segment_status = "interrupted"
+            self._notify_persist(snapshot)
 
     def _is_interrupted_ai_source_event(self, event: AiCallEvent) -> bool:
         source_segment_id = self._source_segment_id(event)
-        if not source_segment_id:
+        if source_segment_id and self._is_interrupted_ai_source_id(
+            event.call_id,
+            source_segment_id,
+        ):
+            return True
+        response_id = self._response_id(event)
+        if not response_id:
             return False
-        return self._is_interrupted_ai_source_id(event.call_id, source_segment_id)
+        return response_id in self._interrupted_ai_response_ids_by_call.get(
+            event.call_id,
+            set(),
+        )
 
     def _is_interrupted_ai_source_id(self, call_id: str, source_segment_id: str) -> bool:
         return source_segment_id in self._interrupted_ai_source_ids_by_call.get(call_id, set())
+
+    def _remember_ai_response_source(
+        self,
+        event: AiCallEvent,
+        speaker_type: str,
+        source_segment_id: str | None,
+    ) -> None:
+        if speaker_type != "ai" or not source_segment_id:
+            return
+        response_id = self._response_id(event)
+        if not response_id:
+            return
+        self._ai_source_ids_by_response_id.setdefault(event.call_id, {}).setdefault(
+            response_id,
+            set(),
+        ).add(source_segment_id)
 
     @staticmethod
     def _source_segment_id(event: AiCallEvent) -> str | None:
@@ -616,6 +702,18 @@ class AiCallDialogueRuntimeStore:
                         return str(item["id"])[:128]
             if response.get("id"):
                 return str(response["id"])[:128]
+        return None
+
+    @staticmethod
+    def _response_id(event: AiCallEvent) -> str | None:
+        payload = event.payload
+        for key in ("response_id", "responseId"):
+            value = payload.get(key)
+            if value:
+                return str(value)[:128]
+        response = payload.get("response")
+        if isinstance(response, dict) and response.get("id"):
+            return str(response["id"])[:128]
         return None
 
     @staticmethod
@@ -808,6 +906,7 @@ class AiCallDialogueService:
         if self.runtime_store is not None:
             rows = self.runtime_store.list_preview(call_id)
             if rows:
+                rows = self._canonical_preview_segments(rows)
                 return {
                     "rows": [row.as_dict() for row in rows],
                     "total": len(rows),
@@ -861,7 +960,15 @@ class AiCallDialogueService:
         realtime_rows = [row for row in rows if row.source == QWEN_REALTIME_SOURCE]
         canonical: list[AiCallDialogueSegmentModel] = []
         for row in rows:
-            if AiCallDialogueService._is_obvious_short_realtime_asr_noise(row):
+            if AiCallDialogueService._is_obvious_short_realtime_asr_noise(
+                row
+            ) or AiCallDialogueService._is_double_talk_single_char_customer_asr(
+                row,
+                rows,
+            ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
+                row,
+                rows,
+            ):
                 continue
             if row.source == QWEN_REALTIME_SOURCE and row.speaker_type == "ai" and any(
                 candidate.source == QWEN_REALTIME_SOURCE
@@ -896,15 +1003,184 @@ class AiCallDialogueService:
         return canonical
 
     @staticmethod
-    def _is_obvious_short_realtime_asr_noise(row: AiCallDialogueSegmentModel) -> bool:
+    def _canonical_preview_segments(
+        rows: list[DialogueSegmentSnapshot],
+    ) -> list[DialogueSegmentSnapshot]:
+        realtime_rows = [row for row in rows if row.source == QWEN_REALTIME_SOURCE]
+        canonical: list[DialogueSegmentSnapshot] = []
+        for row in rows:
+            if AiCallDialogueService._is_obvious_short_realtime_asr_noise(
+                row
+            ) or AiCallDialogueService._is_double_talk_single_char_customer_asr(
+                row,
+                rows,
+            ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
+                row,
+                rows,
+            ):
+                continue
+            if row.source == QWEN_REALTIME_SOURCE and row.speaker_type == "ai" and any(
+                candidate.source == QWEN_REALTIME_SOURCE
+                and is_duplicate_dialogue_segment(
+                    speaker_type=row.speaker_type,
+                    text=AiCallDialogueService._dialogue_text(row),
+                    started_at=row.started_at,
+                    ended_at=row.ended_at,
+                    candidate_speaker_type=candidate.speaker_type,
+                    candidate_text=AiCallDialogueService._dialogue_text(candidate),
+                    candidate_started_at=candidate.started_at,
+                    candidate_ended_at=candidate.ended_at,
+                )
+                for candidate in canonical
+            ):
+                continue
+            if row.source == OFFLINE_ASR_SOURCE and any(
+                is_duplicate_dialogue_segment(
+                    speaker_type=row.speaker_type,
+                    text=AiCallDialogueService._dialogue_text(row),
+                    started_at=row.started_at,
+                    ended_at=row.ended_at,
+                    candidate_speaker_type=candidate.speaker_type,
+                    candidate_text=AiCallDialogueService._dialogue_text(candidate),
+                    candidate_started_at=candidate.started_at,
+                    candidate_ended_at=candidate.ended_at,
+                )
+                for candidate in realtime_rows
+            ):
+                continue
+            canonical.append(row)
+        return canonical
+
+    @staticmethod
+    def _is_obvious_short_realtime_asr_noise(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+    ) -> bool:
         if row.source != QWEN_REALTIME_SOURCE or row.speaker_type != "customer":
             return False
-        if row.duration_ms is None or row.duration_ms > SHORT_ASR_NOISE_MAX_DURATION_MS:
+        if row.audio_start_ms is not None and row.audio_end_ms is not None:
+            audio_span_ms = row.audio_end_ms - row.audio_start_ms
+            if audio_span_ms >= SHORT_ASR_REAL_AUDIO_MIN_SPAN_MS:
+                return False
+        if row.duration_ms is None:
             return False
-        normalized_text = normalize_dialogue_text(row.segment_text)
+        if (
+            row.audio_end_ms is not None
+            and row.duration_ms > SHORT_ASR_NOISE_MAX_DURATION_MS
+        ):
+            return False
+        normalized_text = normalize_dialogue_text(AiCallDialogueService._dialogue_text(row))
         if not normalized_text or normalized_text in VALID_SHORT_CUSTOMER_UTTERANCES:
             return False
-        return len(normalized_text) <= SHORT_ASR_NOISE_MAX_TEXT_LENGTH
+        if len(normalized_text) > SHORT_ASR_NOISE_MAX_TEXT_LENGTH:
+            return False
+        return row.audio_end_ms is None or row.duration_ms <= SHORT_ASR_NOISE_MAX_DURATION_MS
+
+    @staticmethod
+    def _is_double_talk_single_char_customer_asr(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        rows: list[AiCallDialogueSegmentModel] | list[DialogueSegmentSnapshot],
+    ) -> bool:
+        if row.source != QWEN_REALTIME_SOURCE or row.speaker_type != "customer":
+            return False
+        normalized_text = normalize_dialogue_text(AiCallDialogueService._dialogue_text(row))
+        if len(normalized_text) != 1:
+            return False
+        return any(
+            candidate.source == QWEN_REALTIME_SOURCE
+            and candidate.speaker_type == "ai"
+            and not AiCallDialogueService._is_interrupted_realtime_ai_fragment(candidate)
+            and AiCallDialogueService._time_ranges_overlap(row, candidate)
+            for candidate in rows
+        )
+
+    @staticmethod
+    def _is_realtime_customer_prefix_fragment(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        rows: list[AiCallDialogueSegmentModel] | list[DialogueSegmentSnapshot],
+    ) -> bool:
+        if row.source != QWEN_REALTIME_SOURCE or row.speaker_type != "customer":
+            return False
+        normalized_text = normalize_dialogue_text(AiCallDialogueService._dialogue_text(row))
+        if len(normalized_text) < 2:
+            return False
+        for candidate in rows:
+            if candidate is row:
+                continue
+            if (
+                candidate.source != QWEN_REALTIME_SOURCE
+                or candidate.speaker_type != "customer"
+            ):
+                continue
+            candidate_text = normalize_dialogue_text(
+                AiCallDialogueService._dialogue_text(candidate)
+            )
+            if len(candidate_text) <= len(normalized_text):
+                continue
+            if not candidate_text.startswith(normalized_text):
+                continue
+            start_gap_ms = AiCallDialogueService._absolute_start_gap_ms(row, candidate)
+            if (
+                start_gap_ms is not None
+                and start_gap_ms <= REALTIME_ASR_PREFIX_DUPLICATE_START_GAP_MS
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _is_interrupted_realtime_ai_fragment(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+    ) -> bool:
+        return (
+            row.source == QWEN_REALTIME_SOURCE
+            and row.speaker_type == "ai"
+            and row.segment_status == "interrupted"
+        )
+
+    @staticmethod
+    def _dialogue_text(row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot) -> str:
+        if isinstance(row, DialogueSegmentSnapshot):
+            return row.text
+        return row.segment_text
+
+    @staticmethod
+    def _time_ranges_overlap(
+        left: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        right: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+    ) -> bool:
+        left_start = left.started_at
+        left_end = left.ended_at or left.started_at
+        right_start = right.started_at
+        right_end = right.ended_at or right.started_at
+        if not all((left_start, left_end, right_start, right_end)):
+            return False
+        assert left_start is not None
+        assert left_end is not None
+        assert right_start is not None
+        assert right_end is not None
+        if left_start > left_end:
+            left_start, left_end = left_end, left_start
+        if right_start > right_end:
+            right_start, right_end = right_end, right_start
+        return left_start <= right_end and right_start <= left_end
+
+    @staticmethod
+    def _absolute_start_gap_ms(
+        left: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        right: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+    ) -> int | None:
+        if left.started_at is None or right.started_at is None:
+            return None
+        left_start = (
+            left.started_at
+            if left.started_at.tzinfo
+            else left.started_at.replace(tzinfo=timezone.utc)
+        )
+        right_start = (
+            right.started_at
+            if right.started_at.tzinfo
+            else right.started_at.replace(tzinfo=timezone.utc)
+        )
+        return abs(int((right_start - left_start).total_seconds() * 1000))
 
     @staticmethod
     def segment_to_dict(segment: AiCallDialogueSegmentModel) -> dict[str, Any]:
