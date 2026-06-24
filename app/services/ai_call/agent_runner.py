@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from app.services.ai_call.audio_bridge import PcmAudioBridge, PcmAudioFrame
+from app.services.ai_call.call_end_decision_service import (
+    CallEndDecision,
+    RuleBasedCallEndDecisionService,
+)
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.metrics import CallMetrics
 from app.services.ai_call.prompt_config import (
@@ -25,6 +31,10 @@ from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
     InMemorySessionRegistry,
+)
+from app.services.ai_call.transcript_trust import (
+    decide_realtime_transcript_trust,
+    is_realtime_transcript_semantically_rejected,
 )
 
 
@@ -92,13 +102,57 @@ BROWSER_SPEECH_SEGMENT_MIN_STOP_HOT_FRAMES = 8
 BROWSER_SPEECH_SEGMENT_SHORT_STOP_DURATION_MS = 300
 BROWSER_SPEECH_SEGMENT_SHORT_STOP_SNR_DB = 20.0
 BROWSER_SPEECH_SEGMENT_SHORT_STOP_HOT_FRAMES = 5
+BROWSER_AUDIO_HOLD_TIMEOUT_SECONDS = 0.75
+BROWSER_AUDIO_HOLD_MIN_DURATION_MS = 280
+BROWSER_AUDIO_HOLD_MIN_SNR_DB = 20.0
+BROWSER_AUDIO_HOLD_MIN_HOT_FRAMES = 7
+BROWSER_AUDIO_HOLD_MIN_RMS_DBFS = -30.0
+BROWSER_AUDIO_HOLD_LOW_SNR_MIN_DURATION_MS = 400
+BROWSER_AUDIO_HOLD_LOW_SNR_MIN_SNR_DB = 17.5
+BROWSER_AUDIO_HOLD_LOW_SNR_MIN_HOT_FRAMES = 9
+BROWSER_AUDIO_HOLD_LOW_SNR_MIN_RMS_DBFS = -22.0
+BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_DURATION_MS = 400
+BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_SNR_DB = 17.5
+BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_HOT_FRAMES = 8
+BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_RMS_DBFS = -18.0
+BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_DURATION_MS = 480
+BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_SNR_DB = 20.0
+BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_HOT_FRAMES = 10
+BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_RMS_DBFS = -24.0
+BROWSER_AUDIO_HOLD_DOUBLE_TALK_MAX_REMOTE_DOMINANCE_DB = 10.0
 BROWSER_PRE_STOP_MIN_DURATION_MS = 480
 BROWSER_PRE_STOP_MIN_SNR_DB = 24.0
 BROWSER_PRE_STOP_MIN_HOT_FRAMES = 10
 BROWSER_PRE_STOP_MIN_RMS_DBFS = -30.0
 BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB = 6.0
+AGENT_RUNNER_DIAGNOSTICS_VERSION = "interrupt-diagnostics-v1"
 InterruptSource = Literal["browser", "provider"]
-InterruptAction = Literal["ignore", "candidate", "stop_only", "confirm"]
+InterruptAction = Literal["ignore", "candidate", "hold_audio", "pre_stop", "stop_only", "confirm"]
+
+
+def _agent_runner_runtime_diagnostics() -> dict[str, object]:
+    source_path = Path(__file__).resolve()
+    diagnostics: dict[str, object] = {
+        "diagnosticsVersion": AGENT_RUNNER_DIAGNOSTICS_VERSION,
+        "runnerModule": __name__,
+        "runnerSourceFile": str(source_path),
+    }
+    try:
+        source = source_path.read_bytes()
+        stat = source_path.stat()
+    except OSError as exc:
+        diagnostics["runnerSourceError"] = f"{type(exc).__name__}: {exc}"
+        return diagnostics
+
+    diagnostics.update({
+        "runnerSourceHash": f"sha256:{hashlib.sha256(source).hexdigest()}",
+        "runnerSourceMtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        "runnerSourceSize": stat.st_size,
+    })
+    return diagnostics
+
+
+AGENT_RUNNER_RUNTIME_DIAGNOSTICS = _agent_runner_runtime_diagnostics()
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +169,9 @@ class InterruptDecisionContext:
     browser_segment_duration_ms: int | None = None
     browser_segment_snr_db: float | None = None
     browser_segment_hot_frame_count: int | None = None
+    browser_segment_rms_dbfs: float | None = None
+    browser_segment_remote_audio_active: bool | None = None
+    browser_segment_remote_audio_rms_dbfs: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +241,26 @@ class InterruptDecisionPolicy:
             )
         return InterruptDecision("ignore", "not_interrupt")
 
+    def decide_browser_audio_hold(self, context: InterruptDecisionContext) -> InterruptDecision:
+        if not self._is_audio_hold_browser_speech_segment(context):
+            return InterruptDecision("ignore", "browser_audio_hold_not_eligible")
+        if self._is_remote_audio_dominating(
+            context,
+            margin_db=BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB,
+        ) and not self._is_sustained_double_talk_browser_segment(context):
+            return InterruptDecision("ignore", "remote_audio_dominates")
+        return InterruptDecision("hold_audio", "browser_audio_hold_medium_speech_segment")
+
+    def decide_browser_pre_stop(self, context: InterruptDecisionContext) -> InterruptDecision:
+        if not self._is_pre_stop_browser_speech_segment(context):
+            return InterruptDecision("ignore", self._browser_pre_stop_skip_reason(context))
+        if self._is_remote_audio_dominating(
+            context,
+            margin_db=BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB,
+        ):
+            return InterruptDecision("ignore", "remote_audio_dominates")
+        return InterruptDecision("pre_stop", "browser_pre_stop_strong_speech_segment")
+
     @staticmethod
     def _is_strong_browser_speech_segment(context: InterruptDecisionContext) -> bool:
         phase_allows_stop = context.browser_segment_phase in {"started", "updated", "ended"}
@@ -206,6 +283,94 @@ class InterruptDecisionPolicy:
             and context.browser_segment_phase in {"updated", "ended"}
         )
 
+    @staticmethod
+    def _is_audio_hold_browser_speech_segment(context: InterruptDecisionContext) -> bool:
+        duration_ms = context.browser_segment_duration_ms or 0
+        snr_db = context.browser_segment_snr_db or 0.0
+        hot_frames = context.browser_segment_hot_frame_count or 0
+        rms_dbfs = context.browser_segment_rms_dbfs
+        if context.browser_segment_phase not in {"updated", "ended"} or rms_dbfs is None:
+            return False
+        standard_hold = (
+            duration_ms >= BROWSER_AUDIO_HOLD_MIN_DURATION_MS
+            and snr_db >= BROWSER_AUDIO_HOLD_MIN_SNR_DB
+            and hot_frames >= BROWSER_AUDIO_HOLD_MIN_HOT_FRAMES
+            and rms_dbfs >= BROWSER_AUDIO_HOLD_MIN_RMS_DBFS
+        )
+        low_snr_sustained_hold = (
+            duration_ms >= BROWSER_AUDIO_HOLD_LOW_SNR_MIN_DURATION_MS
+            and snr_db >= BROWSER_AUDIO_HOLD_LOW_SNR_MIN_SNR_DB
+            and hot_frames >= BROWSER_AUDIO_HOLD_LOW_SNR_MIN_HOT_FRAMES
+            and rms_dbfs >= BROWSER_AUDIO_HOLD_LOW_SNR_MIN_RMS_DBFS
+        )
+        near_speech_hold = (
+            duration_ms >= BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_DURATION_MS
+            and snr_db >= BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_SNR_DB
+            and hot_frames >= BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_HOT_FRAMES
+            and rms_dbfs >= BROWSER_AUDIO_HOLD_NEAR_SPEECH_MIN_RMS_DBFS
+        )
+        return standard_hold or low_snr_sustained_hold or near_speech_hold
+
+    @staticmethod
+    def _is_sustained_double_talk_browser_segment(context: InterruptDecisionContext) -> bool:
+        local_rms = context.browser_segment_rms_dbfs
+        remote_rms = context.browser_segment_remote_audio_rms_dbfs
+        if local_rms is None or remote_rms is None:
+            return False
+        remote_dominance_db = remote_rms - local_rms
+        return (
+            (context.browser_segment_duration_ms or 0)
+            >= BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_DURATION_MS
+            and (context.browser_segment_snr_db or 0.0)
+            >= BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_SNR_DB
+            and (context.browser_segment_hot_frame_count or 0)
+            >= BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_HOT_FRAMES
+            and local_rms >= BROWSER_AUDIO_HOLD_DOUBLE_TALK_MIN_RMS_DBFS
+            and remote_dominance_db <= BROWSER_AUDIO_HOLD_DOUBLE_TALK_MAX_REMOTE_DOMINANCE_DB
+        )
+
+    @staticmethod
+    def _is_pre_stop_browser_speech_segment(context: InterruptDecisionContext) -> bool:
+        return (
+            context.browser_segment_phase in {"updated", "ended"}
+            and (context.browser_segment_duration_ms or 0) >= BROWSER_PRE_STOP_MIN_DURATION_MS
+            and (context.browser_segment_snr_db or 0.0) >= BROWSER_PRE_STOP_MIN_SNR_DB
+            and (context.browser_segment_hot_frame_count or 0)
+            >= BROWSER_PRE_STOP_MIN_HOT_FRAMES
+            and context.browser_segment_rms_dbfs is not None
+            and context.browser_segment_rms_dbfs >= BROWSER_PRE_STOP_MIN_RMS_DBFS
+        )
+
+    @staticmethod
+    def _browser_pre_stop_skip_reason(context: InterruptDecisionContext) -> str:
+        if context.browser_segment_phase not in {"updated", "ended"}:
+            return "phase_not_final_enough"
+        if (context.browser_segment_duration_ms or 0) < BROWSER_PRE_STOP_MIN_DURATION_MS:
+            return "below_min_duration"
+        if (context.browser_segment_snr_db or 0.0) < BROWSER_PRE_STOP_MIN_SNR_DB:
+            return "below_min_snr"
+        if (context.browser_segment_hot_frame_count or 0) < BROWSER_PRE_STOP_MIN_HOT_FRAMES:
+            return "below_min_hot_frames"
+        if context.browser_segment_rms_dbfs is None:
+            return "missing_rms"
+        if context.browser_segment_rms_dbfs < BROWSER_PRE_STOP_MIN_RMS_DBFS:
+            return "below_min_rms"
+        return "not_eligible"
+
+    @staticmethod
+    def _is_remote_audio_dominating(
+        context: InterruptDecisionContext,
+        *,
+        margin_db: float,
+    ) -> bool:
+        if context.browser_segment_remote_audio_active is not True:
+            return False
+        local_rms = context.browser_segment_rms_dbfs
+        remote_rms = context.browser_segment_remote_audio_rms_dbfs
+        if local_rms is None or remote_rms is None:
+            return False
+        return local_rms + margin_db < remote_rms
+
 
 @dataclass(slots=True)
 class PendingUserTurn:
@@ -221,9 +386,19 @@ class PendingUserTurn:
     browser_candidate_first_at: datetime | None = None
     browser_candidate_count: int = 0
     browser_candidate_promoted: bool = False
+    browser_audio_hold_requested: bool = False
+    browser_audio_hold_confirmed: bool = False
+    browser_audio_hold_expires_at: datetime | None = None
     browser_pre_stop_requested: bool = False
     browser_pre_stop_confirmed: bool = False
     browser_pre_stop_expires_at: datetime | None = None
+    browser_segment_phase: str | None = None
+    browser_segment_duration_ms: int | None = None
+    browser_segment_snr_db: float | None = None
+    browser_segment_hot_frame_count: int | None = None
+    browser_segment_rms_dbfs: float | None = None
+    browser_segment_remote_audio_active: bool | None = None
+    browser_segment_remote_audio_rms_dbfs: float | None = None
 
     @property
     def transcript(self) -> str:
@@ -262,6 +437,15 @@ class PendingCallEnd:
     scheduled: bool = False
 
 
+@dataclass(slots=True)
+class PendingCallEndIntent:
+    transcript: str
+    reason: str
+    summary: str
+    source: str
+    confidence: float
+
+
 class RealtimeCallAgentRunner:
     def __init__(
         self,
@@ -275,9 +459,11 @@ class RealtimeCallAgentRunner:
         ai_speaking_tail_grace_seconds: float = 0.6,
         browser_interrupt_recent_audio_seconds: float = 1.5,
         browser_interrupt_audio_suppress_seconds: float = 1.5,
+        browser_audio_hold_timeout_seconds: float = BROWSER_AUDIO_HOLD_TIMEOUT_SECONDS,
         browser_pre_stop_timeout_seconds: float = BROWSER_INTERRUPT_PROVIDER_UPGRADE_GRACE_SECONDS,
         user_turn_stability_delay_seconds: float = 0.35,
         handoff_prompt_constraint_enabled: bool = False,
+        call_end_decision_service: RuleBasedCallEndDecisionService | None = None,
         call_end_scheduler: CallEndScheduler | None = None,
     ) -> None:
         self.provider_factory = provider_factory
@@ -293,9 +479,13 @@ class RealtimeCallAgentRunner:
             0.0,
             browser_interrupt_audio_suppress_seconds,
         )
+        self.browser_audio_hold_timeout_seconds = max(0.0, browser_audio_hold_timeout_seconds)
         self.browser_pre_stop_timeout_seconds = max(0.0, browser_pre_stop_timeout_seconds)
         self.user_turn_stability_delay_seconds = max(0.0, user_turn_stability_delay_seconds)
         self.handoff_prompt_constraint_enabled = handoff_prompt_constraint_enabled
+        self.call_end_decision_service = (
+            call_end_decision_service or RuleBasedCallEndDecisionService()
+        )
         self.call_end_scheduler = call_end_scheduler
         self._interrupt_policy = InterruptDecisionPolicy()
         self._providers: dict[str, RealtimeProviderProtocol] = {}
@@ -308,7 +498,12 @@ class RealtimeCallAgentRunner:
         self._response_lifecycles: dict[str, ResponseLifecycle] = {}
         self._playback_guards: dict[str, PlaybackGuard] = {}
         self._pending_call_ends: dict[str, PendingCallEnd] = {}
+        self._pending_call_end_intents: dict[str, PendingCallEndIntent] = {}
+        self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def runtime_diagnostics(self) -> dict[str, object]:
+        return dict(AGENT_RUNNER_RUNTIME_DIAGNOSTICS)
 
     async def start(self, session: CallSession) -> None:
         provider = self.provider_factory(session)
@@ -327,6 +522,7 @@ class RealtimeCallAgentRunner:
     async def stop(self, call_id: str) -> None:
         await self._cancel_playout_task(call_id)
         await self._cancel_turn_response_task(call_id)
+        await self._cancel_browser_audio_hold_task(call_id)
         await self._cancel_browser_pre_stop_task(call_id)
 
         audio_task = self._audio_tasks.pop(call_id, None)
@@ -355,6 +551,7 @@ class RealtimeCallAgentRunner:
         self._response_lifecycles.pop(call_id, None)
         self._playback_guards.pop(call_id, None)
         self._pending_call_ends.pop(call_id, None)
+        self._pending_call_end_intents.pop(call_id, None)
 
     async def suspend_for_handoff(self, call_id: str) -> None:
         await self._cancel_playout_task(call_id)
@@ -428,34 +625,47 @@ class RealtimeCallAgentRunner:
     ) -> None:
         try:
             async for provider_event in provider.receive_events():
+                event_payload = self._event_payload(provider_event.type, provider_event.payload)
+                handler_event = provider_event
+                if provider_event.type == "user_transcript_done":
+                    trust_decision = self._decide_realtime_transcript_trust(
+                        call_id,
+                        provider_event,
+                    )
+                    trust_payload = trust_decision.as_payload()
+                    event_payload.update(trust_payload)
+                    handler_event = ProviderEvent(
+                        type=provider_event.type,
+                        payload={**provider_event.payload, **trust_payload},
+                    )
                 event_timestamp = self._append_event(
                     call_id,
                     provider_event.type,
                     "provider",
-                    self._event_payload(provider_event.type, provider_event.payload),
+                    event_payload,
                 )
-                if provider_event.type == "user_speech_started":
+                if handler_event.type == "user_speech_started":
                     await self._handle_user_speech_started(call_id, provider, event_timestamp)
-                elif provider_event.type == "user_speech_stopped":
+                elif handler_event.type == "user_speech_stopped":
                     await self._handle_user_speech_stopped(call_id, provider, event_timestamp)
-                elif provider_event.type in {"user_transcript_delta", "user_transcript_done"}:
+                elif handler_event.type in {"user_transcript_delta", "user_transcript_done"}:
                     await self._handle_user_transcript(
                         call_id,
                         provider,
-                        provider_event,
+                        handler_event,
                         event_timestamp,
                     )
-                elif provider_event.type == "tool_call_done":
-                    await self._handle_tool_call_done(call_id, provider, provider_event)
+                elif handler_event.type == "tool_call_done":
+                    await self._handle_tool_call_done(call_id, provider, handler_event)
                 else:
                     await self._apply_provider_event(
                         call_id,
                         provider,
-                        provider_event.type,
+                        handler_event.type,
                         event_timestamp,
-                        provider_event.payload,
+                        handler_event.payload,
                     )
-                if provider_event.type == "model_audio_delta":
+                if handler_event.type == "model_audio_delta":
                     await self._publish_model_audio_delta(call_id, provider_event)
         except asyncio.CancelledError:
             raise
@@ -549,18 +759,13 @@ class RealtimeCallAgentRunner:
         }:
             return False
 
-        decision = self._interrupt_policy.decide_browser_speech_segment(
-            InterruptDecisionContext(
-                source="browser",
-                session_status=session.status,
-                has_recent_ai_audio=self._has_recent_ai_audio(call_id, trigger_timestamp),
-                has_active_model_response=self._has_active_model_response(call_id),
-                browser_segment_phase=self._payload_str(payload, "phase"),
-                browser_segment_duration_ms=self._payload_int(payload, "durationMs"),
-                browser_segment_snr_db=self._payload_float(payload, "snrDb"),
-                browser_segment_hot_frame_count=self._payload_int(payload, "hotFrameCount"),
-            )
+        context = self._browser_segment_decision_context(
+            call_id=call_id,
+            session=session,
+            trigger_timestamp=trigger_timestamp,
+            payload=payload,
         )
+        decision = self._interrupt_policy.decide_browser_speech_segment(context)
         if decision.action != "candidate":
             return False
         if session.status in {
@@ -575,6 +780,7 @@ class RealtimeCallAgentRunner:
         turn = self._pending_turn(call_id, reset_if_finished=True)
         if turn.started_at is None:
             turn.started_at = trigger_timestamp
+        self._record_browser_segment_evidence(turn, payload)
         candidate_created = self._mark_interrupt_candidate(
             call_id=call_id,
             turn=turn,
@@ -604,6 +810,13 @@ class RealtimeCallAgentRunner:
             self._extend_browser_pre_stop(call_id, turn, trigger_timestamp)
         elif decision.reason == "browser_speech_segment_strong_during_ai_audio":
             await self._maybe_pre_stop_browser_candidate(
+                call_id=call_id,
+                turn=turn,
+                trigger_timestamp=trigger_timestamp,
+                payload=payload,
+            )
+        if not turn.browser_pre_stop_requested and not turn.browser_pre_stop_confirmed:
+            await self._maybe_audio_hold_browser_candidate(
                 call_id=call_id,
                 turn=turn,
                 trigger_timestamp=trigger_timestamp,
@@ -728,6 +941,12 @@ class RealtimeCallAgentRunner:
             source="provider",
             reason=decision.reason,
         )
+        self._confirm_browser_audio_hold(
+            call_id,
+            turn,
+            confirmed_by="provider_speech_started",
+            reason=decision.reason,
+        )
         self._confirm_browser_pre_stop(
             call_id,
             turn,
@@ -768,7 +987,31 @@ class RealtimeCallAgentRunner:
         text = self._transcript_text(provider_event)
         if not text:
             return
-        self._interrupt_pending_call_end(call_id, "user_transcript_after_call_end_tool")
+        if is_realtime_transcript_semantically_rejected(provider_event.payload):
+            self._append_event(
+                call_id,
+                "user_transcript_semantic_rejected",
+                "agent",
+                {
+                    "reason": str(
+                        provider_event.payload.get("semanticRejectReason")
+                        or "low_confidence_transcript"
+                    ),
+                    "transcriptPreview": self._text_preview(text),
+                    "transcriptTrust": provider_event.payload.get("transcriptTrust"),
+                    "semanticAction": provider_event.payload.get("semanticAction"),
+                    "commitDecision": provider_event.payload.get("commitDecision"),
+                },
+            )
+            return
+        call_end_decision: CallEndDecision | None = None
+        if provider_event.type == "user_transcript_done":
+            call_end_decision = self.call_end_decision_service.decide(text)
+        if call_end_decision is not None and call_end_decision.action == "explicit_end":
+            self._record_call_end_intent(call_id, text, call_end_decision)
+        else:
+            self._pending_call_end_intents.pop(call_id, None)
+            self._interrupt_pending_call_end(call_id, "user_transcript_after_call_end_tool")
         turn = self._pending_turn(call_id)
         if provider_event.type == "user_transcript_done" or (
             provider_event.type == "user_transcript_delta"
@@ -779,6 +1022,32 @@ class RealtimeCallAgentRunner:
             turn.transcript_parts.append(text)
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
         await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
+
+    def _record_call_end_intent(
+        self,
+        call_id: str,
+        transcript: str,
+        decision: CallEndDecision,
+    ) -> None:
+        self._pending_call_end_intents[call_id] = PendingCallEndIntent(
+            transcript=transcript,
+            reason=decision.reason,
+            summary=decision.summary,
+            source=decision.source,
+            confidence=decision.confidence,
+        )
+        self._append_event(
+            call_id,
+            "call_end_intent_detected",
+            "agent",
+            {
+                "reason": decision.reason,
+                "summary": decision.summary,
+                "confidence": decision.confidence,
+                "classifierSource": decision.source,
+                "transcriptPreview": self._text_preview(transcript),
+            },
+        )
 
     async def _handle_tool_call_done(
         self,
@@ -812,6 +1081,7 @@ class RealtimeCallAgentRunner:
             )
             return
 
+        self._pending_call_end_intents.pop(call_id, None)
         final_audio_already_spoken = self._has_current_response_audio(call_id)
         if call_id not in self._pending_call_ends:
             self._pending_call_ends[call_id] = PendingCallEnd(
@@ -1024,6 +1294,54 @@ class RealtimeCallAgentRunner:
                 result[key] = payload[key]
         return result
 
+    def _record_browser_segment_evidence(
+        self,
+        turn: PendingUserTurn,
+        payload: dict[str, Any],
+    ) -> None:
+        duration_ms = self._payload_int(payload, "durationMs")
+        current_duration_ms = turn.browser_segment_duration_ms or -1
+        if duration_ms is not None and duration_ms < current_duration_ms:
+            return
+        turn.browser_segment_phase = self._payload_str(payload, "phase")
+        turn.browser_segment_duration_ms = duration_ms
+        turn.browser_segment_snr_db = self._payload_float(payload, "snrDb")
+        turn.browser_segment_hot_frame_count = self._payload_int(payload, "hotFrameCount")
+        turn.browser_segment_rms_dbfs = self._payload_float(payload, "rmsDbfs")
+        turn.browser_segment_remote_audio_active = self._payload_bool(
+            payload,
+            "remoteAudioActive",
+        )
+        turn.browser_segment_remote_audio_rms_dbfs = self._payload_float(
+            payload,
+            "remoteAudioRmsDbfs",
+        )
+
+    def _browser_segment_decision_context(
+        self,
+        *,
+        call_id: str,
+        session: CallSession,
+        trigger_timestamp: datetime,
+        payload: dict[str, Any],
+    ) -> InterruptDecisionContext:
+        return InterruptDecisionContext(
+            source="browser",
+            session_status=session.status,
+            has_recent_ai_audio=self._has_recent_ai_audio(call_id, trigger_timestamp),
+            has_active_model_response=self._has_active_model_response(call_id),
+            browser_segment_phase=self._payload_str(payload, "phase"),
+            browser_segment_duration_ms=self._payload_int(payload, "durationMs"),
+            browser_segment_snr_db=self._payload_float(payload, "snrDb"),
+            browser_segment_hot_frame_count=self._payload_int(payload, "hotFrameCount"),
+            browser_segment_rms_dbfs=self._payload_float(payload, "rmsDbfs"),
+            browser_segment_remote_audio_active=self._payload_bool(payload, "remoteAudioActive"),
+            browser_segment_remote_audio_rms_dbfs=self._payload_float(
+                payload,
+                "remoteAudioRmsDbfs",
+            ),
+        )
+
     async def _maybe_pre_stop_browser_candidate(
         self,
         *,
@@ -1034,31 +1352,41 @@ class RealtimeCallAgentRunner:
     ) -> None:
         if turn.browser_pre_stop_requested or turn.browser_pre_stop_confirmed:
             return
-        if not self._is_browser_pre_stop_eligible(payload):
-            return
-        rejection_reason = self._browser_pre_stop_rejection_reason(payload)
-        if rejection_reason is not None:
+        decision = self._interrupt_policy.decide_browser_pre_stop(
+            self._browser_segment_decision_context(
+                call_id=call_id,
+                session=self.registry.get(call_id),
+                trigger_timestamp=trigger_timestamp,
+                payload=payload,
+            )
+        )
+        if decision.action != "pre_stop":
+            if decision.reason == "remote_audio_dominates":
+                self._append_event(
+                    call_id,
+                    "browser_pre_stop_rejected_echo",
+                    "agent",
+                    {
+                        **self._browser_segment_event_payload(
+                            "browser_pre_stop_rejected_echo",
+                            payload,
+                        ),
+                        "rejectionReason": decision.reason,
+                    },
+                )
+                return
             self._append_event(
                 call_id,
-                "browser_pre_stop_rejected_echo",
+                "browser_pre_stop_skipped",
                 "agent",
-                {
-                    **self._browser_segment_event_payload(
-                        "browser_pre_stop_rejected_echo",
-                        payload,
-                    ),
-                    "rejectionReason": rejection_reason,
-                },
+                self._browser_pre_stop_skip_payload(payload, skip_reason=decision.reason),
             )
             return
 
         turn.browser_pre_stop_requested = True
         self._extend_browser_pre_stop(call_id, turn, trigger_timestamp)
         guard = self._playback_guard(call_id)
-        event_payload = self._browser_segment_event_payload(
-            "browser_pre_stop_strong_speech_segment",
-            payload,
-        )
+        event_payload = self._browser_segment_event_payload(decision.reason, payload)
         event_payload.update({
             "responseId": guard.current_response_id,
             "timeoutSeconds": self.browser_pre_stop_timeout_seconds,
@@ -1086,6 +1414,112 @@ class RealtimeCallAgentRunner:
         for cleanup_error in cleanup_errors:
             self._append_event(call_id, "interrupt_cleanup_failed", "agent", cleanup_error)
 
+    async def _maybe_audio_hold_browser_candidate(
+        self,
+        *,
+        call_id: str,
+        turn: PendingUserTurn,
+        trigger_timestamp: datetime,
+        payload: dict[str, Any],
+    ) -> None:
+        if turn.browser_audio_hold_requested or turn.browser_audio_hold_confirmed:
+            return
+        decision = self._interrupt_policy.decide_browser_audio_hold(
+            self._browser_segment_decision_context(
+                call_id=call_id,
+                session=self.registry.get(call_id),
+                trigger_timestamp=trigger_timestamp,
+                payload=payload,
+            )
+        )
+        if decision.action != "hold_audio":
+            if decision.reason == "remote_audio_dominates":
+                self._append_event(
+                    call_id,
+                    "browser_audio_hold_rejected_echo",
+                    "agent",
+                    {
+                        **self._browser_segment_event_payload(
+                            "browser_audio_hold_rejected_echo",
+                            payload,
+                        ),
+                        "rejectionReason": decision.reason,
+                    },
+                )
+            return
+
+        turn.browser_audio_hold_requested = True
+        self._extend_browser_audio_hold(call_id, turn, trigger_timestamp)
+        guard = self._playback_guard(call_id)
+        event_payload = self._browser_segment_event_payload(decision.reason, payload)
+        event_payload.update({
+            "responseId": guard.current_response_id,
+            "timeoutSeconds": self.browser_audio_hold_timeout_seconds,
+        })
+        self._append_event(call_id, "browser_audio_hold_requested", "agent", event_payload)
+
+        await self._cancel_playout_task(call_id)
+        stop_audio_succeeded = self.audio_publisher is None
+        cleanup_errors: list[dict[str, str]] = []
+        if self.audio_publisher is not None:
+            try:
+                await self.audio_publisher.stop_audio(call_id)
+                stop_audio_succeeded = True
+                guard.audio_stop_requested = True
+            except Exception as exc:
+                cleanup_errors.append({
+                    "step": "stop_audio",
+                    "errorType": type(exc).__name__,
+                    "message": str(exc),
+                })
+
+        completed_payload = dict(event_payload)
+        completed_payload["stopAudioSucceeded"] = stop_audio_succeeded
+        self._append_event(call_id, "browser_audio_hold_completed", "agent", completed_payload)
+        for cleanup_error in cleanup_errors:
+            self._append_event(call_id, "interrupt_cleanup_failed", "agent", cleanup_error)
+
+    def _extend_browser_audio_hold(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        trigger_timestamp: datetime,
+    ) -> None:
+        timeout = self.browser_audio_hold_timeout_seconds
+        turn.browser_audio_hold_expires_at = trigger_timestamp + timedelta(seconds=timeout)
+        guard = self._playback_guard(call_id)
+        suppress_until = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        if guard.suppress_audio_until is None or suppress_until > guard.suppress_audio_until:
+            guard.suppress_audio_until = suppress_until
+        self._schedule_browser_audio_hold_expiry(call_id, turn)
+
+    def _confirm_browser_audio_hold(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        *,
+        confirmed_by: str,
+        reason: str,
+    ) -> None:
+        if not turn.browser_audio_hold_requested or turn.browser_audio_hold_confirmed:
+            return
+        turn.browser_audio_hold_confirmed = True
+        self._cancel_browser_audio_hold_task_nowait(call_id)
+        self._append_event(
+            call_id,
+            "browser_audio_hold_confirmed",
+            "agent",
+            {
+                "confirmedBy": confirmed_by,
+                "reason": reason,
+                "expiresAt": (
+                    turn.browser_audio_hold_expires_at.isoformat()
+                    if turn.browser_audio_hold_expires_at is not None
+                    else None
+                ),
+            },
+        )
+
     def _extend_browser_pre_stop(
         self,
         call_id: str,
@@ -1100,31 +1534,44 @@ class RealtimeCallAgentRunner:
             guard.suppress_audio_until = suppress_until
         self._schedule_browser_pre_stop_expiry(call_id, turn)
 
-    def _is_browser_pre_stop_eligible(self, payload: dict[str, Any]) -> bool:
+    def _browser_pre_stop_skip_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        skip_reason: str | None = None,
+    ) -> dict[str, Any]:
+        event_payload = self._browser_segment_event_payload(
+            "browser_pre_stop_not_eligible",
+            payload,
+        )
+        event_payload.update({
+            "skipReason": skip_reason or self._browser_pre_stop_skip_reason(payload),
+            "minDurationMs": BROWSER_PRE_STOP_MIN_DURATION_MS,
+            "minSnrDb": BROWSER_PRE_STOP_MIN_SNR_DB,
+            "minHotFrameCount": BROWSER_PRE_STOP_MIN_HOT_FRAMES,
+            "minRmsDbfs": BROWSER_PRE_STOP_MIN_RMS_DBFS,
+        })
+        return event_payload
+
+    def _browser_pre_stop_skip_reason(self, payload: dict[str, Any]) -> str:
         phase = self._payload_str(payload, "phase")
         duration_ms = self._payload_int(payload, "durationMs") or 0
         snr_db = self._payload_float(payload, "snrDb") or 0.0
         hot_frames = self._payload_int(payload, "hotFrameCount") or 0
         rms_dbfs = self._payload_float(payload, "rmsDbfs")
-        return (
-            phase in {"updated", "ended"}
-            and duration_ms >= BROWSER_PRE_STOP_MIN_DURATION_MS
-            and snr_db >= BROWSER_PRE_STOP_MIN_SNR_DB
-            and hot_frames >= BROWSER_PRE_STOP_MIN_HOT_FRAMES
-            and rms_dbfs is not None
-            and rms_dbfs >= BROWSER_PRE_STOP_MIN_RMS_DBFS
-        )
-
-    def _browser_pre_stop_rejection_reason(self, payload: dict[str, Any]) -> str | None:
-        if self._payload_bool(payload, "remoteAudioActive") is not True:
-            return None
-        local_rms = self._payload_float(payload, "rmsDbfs")
-        remote_rms = self._payload_float(payload, "remoteAudioRmsDbfs")
-        if local_rms is None or remote_rms is None:
-            return None
-        if local_rms + BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB < remote_rms:
-            return "remote_audio_dominates"
-        return None
+        if phase not in {"updated", "ended"}:
+            return "phase_not_final_enough"
+        if duration_ms < BROWSER_PRE_STOP_MIN_DURATION_MS:
+            return "below_min_duration"
+        if snr_db < BROWSER_PRE_STOP_MIN_SNR_DB:
+            return "below_min_snr"
+        if hot_frames < BROWSER_PRE_STOP_MIN_HOT_FRAMES:
+            return "below_min_hot_frames"
+        if rms_dbfs is None:
+            return "missing_rms"
+        if rms_dbfs < BROWSER_PRE_STOP_MIN_RMS_DBFS:
+            return "below_min_rms"
+        return "not_eligible"
 
     def _confirm_browser_pre_stop(
         self,
@@ -1167,6 +1614,75 @@ class RealtimeCallAgentRunner:
             name=f"ai-call-browser-pre-stop-expiry-{call_id}",
         )
 
+    def _schedule_browser_audio_hold_expiry(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+    ) -> None:
+        expires_at = turn.browser_audio_hold_expires_at
+        if expires_at is None:
+            return
+        self._cancel_browser_audio_hold_task_nowait(call_id)
+        self._browser_audio_hold_tasks[call_id] = asyncio.create_task(
+            self._expire_browser_audio_hold_at(call_id, turn, expires_at),
+            name=f"ai-call-browser-audio-hold-expiry-{call_id}",
+        )
+
+    async def _expire_browser_audio_hold_at(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        expires_at: datetime,
+    ) -> None:
+        try:
+            delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._pending_user_turns.get(call_id) is not turn:
+                return
+            if (
+                not turn.browser_audio_hold_requested
+                or turn.browser_audio_hold_confirmed
+                or turn.browser_pre_stop_requested
+                or turn.interrupt_confirmed
+                or turn.browser_audio_hold_expires_at != expires_at
+            ):
+                return
+            self._append_event(
+                call_id,
+                "browser_audio_hold_expired",
+                "agent",
+                {
+                    "reason": "browser_audio_hold_expired",
+                    "expiresAt": expires_at.isoformat(),
+                },
+            )
+            turn.browser_audio_hold_requested = False
+            guard = self._playback_guard(call_id)
+            if guard.suppress_audio_until is not None and datetime.now(timezone.utc) >= (
+                guard.suppress_audio_until
+            ):
+                guard.suppress_audio_until = None
+            guard.audio_stop_requested = False
+            self._ignore_empty_turn(call_id, turn, "browser_audio_hold_expired")
+            self._restore_after_expired_browser_audio_hold(call_id)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._browser_audio_hold_tasks.get(call_id) is asyncio.current_task():
+                self._browser_audio_hold_tasks.pop(call_id, None)
+
+    def _restore_after_expired_browser_audio_hold(self, call_id: str) -> None:
+        if self._has_active_model_response(call_id):
+            return
+        session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.AI_SPEAKING:
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        elif session.status == CallSessionStatus.INTERRUPTED:
+            self.registry.transition(call_id, CallSessionStatus.WAITING)
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        self._schedule_pending_call_end_nowait(call_id)
+
     async def _expire_browser_pre_stop_at(
         self,
         call_id: str,
@@ -1208,6 +1724,21 @@ class RealtimeCallAgentRunner:
         finally:
             if self._browser_pre_stop_tasks.get(call_id) is asyncio.current_task():
                 self._browser_pre_stop_tasks.pop(call_id, None)
+
+    def _cancel_browser_audio_hold_task_nowait(self, call_id: str) -> None:
+        task = self._browser_audio_hold_tasks.pop(call_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_browser_audio_hold_task(self, call_id: str) -> None:
+        task = self._browser_audio_hold_tasks.pop(call_id, None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def _cancel_browser_pre_stop_task_nowait(self, call_id: str) -> None:
         task = self._browser_pre_stop_tasks.pop(call_id, None)
@@ -1377,6 +1908,12 @@ class RealtimeCallAgentRunner:
             return
         if turn.interrupt_confirmed or decision.action != "confirm":
             return
+        self._confirm_browser_audio_hold(
+            call_id,
+            turn,
+            confirmed_by="transcript",
+            reason=decision.reason,
+        )
         self._confirm_browser_pre_stop(
             call_id,
             turn,
@@ -1737,6 +2274,60 @@ class RealtimeCallAgentRunner:
             self._playback_guard(call_id).current_response_audio_published
         )
 
+    def _decide_realtime_transcript_trust(
+        self,
+        call_id: str,
+        provider_event: ProviderEvent,
+    ):
+        now = datetime.now(timezone.utc)
+        session = self.registry.get(call_id)
+        turn = self._pending_turn(call_id)
+        during_ai_audio = (
+            session.status == CallSessionStatus.AI_SPEAKING
+            or self._has_recent_ai_audio(call_id, now)
+            or self._has_active_model_response(call_id)
+        )
+        return decide_realtime_transcript_trust(
+            self._transcript_text(provider_event),
+            during_ai_audio=during_ai_audio,
+            has_interrupt_candidate=turn.interrupt_candidate,
+            has_reliable_user_audio=self._has_reliable_short_transcript_audio_evidence(turn),
+            payload=provider_event.payload,
+        )
+
+    @staticmethod
+    def _has_reliable_short_transcript_audio_evidence(turn: PendingUserTurn) -> bool:
+        if turn.browser_audio_hold_confirmed or turn.browser_pre_stop_confirmed:
+            return True
+        if turn.browser_segment_phase not in {"updated", "ended"}:
+            return False
+        duration_ms = turn.browser_segment_duration_ms or 0
+        snr_db = turn.browser_segment_snr_db or 0.0
+        hot_frames = turn.browser_segment_hot_frame_count or 0
+        rms_dbfs = turn.browser_segment_rms_dbfs
+        if rms_dbfs is None:
+            return False
+        if (
+            turn.browser_segment_remote_audio_active is True
+            and turn.browser_segment_remote_audio_rms_dbfs is not None
+            and rms_dbfs + BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB
+            < turn.browser_segment_remote_audio_rms_dbfs
+        ):
+            return False
+        audio_hold_reliable = (
+            duration_ms >= BROWSER_AUDIO_HOLD_MIN_DURATION_MS
+            and snr_db >= BROWSER_AUDIO_HOLD_MIN_SNR_DB
+            and hot_frames >= BROWSER_AUDIO_HOLD_MIN_HOT_FRAMES
+            and rms_dbfs >= BROWSER_AUDIO_HOLD_MIN_RMS_DBFS
+        )
+        strong_short_segment_reliable = (
+            duration_ms >= BROWSER_SPEECH_SEGMENT_SHORT_STOP_DURATION_MS
+            and snr_db >= BROWSER_SPEECH_SEGMENT_SHORT_STOP_SNR_DB
+            and hot_frames >= BROWSER_SPEECH_SEGMENT_SHORT_STOP_HOT_FRAMES
+            and rms_dbfs >= BROWSER_AUDIO_HOLD_MIN_RMS_DBFS
+        )
+        return audio_hold_reliable or strong_short_segment_reliable
+
     @staticmethod
     def _transcript_text(provider_event: ProviderEvent) -> str:
         payload = provider_event.payload
@@ -1900,6 +2491,7 @@ class RealtimeCallAgentRunner:
         lifecycle.cancel_pending = False
         self._playback_guard(call_id).cancel_requested = False
         if not lifecycle.pending_create:
+            self._promote_missing_call_end_tool(call_id)
             self._schedule_pending_call_end_nowait(call_id)
             return
         if self.registry.get(call_id).status in {
@@ -1913,6 +2505,36 @@ class RealtimeCallAgentRunner:
         lifecycle.pending_create = False
         lifecycle.pending_input_text = None
         await self._request_response(call_id, provider, input_text=input_text)
+
+    def _promote_missing_call_end_tool(self, call_id: str) -> None:
+        if call_id in self._pending_call_ends:
+            return
+        intent = self._pending_call_end_intents.pop(call_id, None)
+        if intent is None:
+            return
+
+        tool_call_id = f"local_call_end_intent:{intent.reason}"
+        self._pending_call_ends[call_id] = PendingCallEnd(
+            tool_call_id=tool_call_id,
+            tool_reason="customer_end",
+            end_reason="customer_end",
+            final_response_started=True,
+        )
+        self._append_event(
+            call_id,
+            "call_end_tool_missing",
+            "agent",
+            {
+                "toolCallId": tool_call_id,
+                "toolReason": "customer_end",
+                "endReason": "customer_end",
+                "intentReason": intent.reason,
+                "intentSummary": intent.summary,
+                "classifierSource": intent.source,
+                "confidence": intent.confidence,
+                "transcriptPreview": self._text_preview(intent.transcript),
+            },
+        )
 
     def _schedule_pending_call_end_nowait(self, call_id: str) -> None:
         pending_call_end = self._pending_call_ends.get(call_id)
@@ -1996,6 +2618,11 @@ class RealtimeCallAgentRunner:
                 "agent",
                 {"message": f"调度异常结束通话失败: {exc}", "endReason": end_reason},
             )
+
+    @staticmethod
+    def _text_preview(text: str, limit: int = 120) -> str:
+        stripped = " ".join(text.split())
+        return stripped if len(stripped) <= limit else f"{stripped[:limit]}..."
 
     def _response_lifecycle(self, call_id: str) -> ResponseLifecycle:
         lifecycle = self._response_lifecycles.get(call_id)

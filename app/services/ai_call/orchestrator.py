@@ -343,7 +343,12 @@ class AiCallOrchestrator:
             await self.agent_runner.start(session)
         except Exception as exc:
             await self._handle_agent_start_failed(call_id, room_name, exc)
-        self._append_event(call_id, "agent_started", "agent")
+        self._append_event(
+            call_id,
+            "agent_started",
+            "agent",
+            self._agent_runner_runtime_diagnostics(),
+        )
 
         self.registry.transition(call_id, CallSessionStatus.READY)
         self._append_event(call_id, "session_ready", "orchestrator")
@@ -685,6 +690,8 @@ class AiCallOrchestrator:
                 should_start_opening = bool(
                     str(self._config_value(session.effective_config, "opening_message", "")).strip()
                 )
+        elif event_type == "browser_audio_input_diagnostics":
+            pass
         elif event_type == "browser_user_speech_started":
             should_record_browser_speech_candidate = True
         elif event_type == "browser_user_speech_segment":
@@ -753,6 +760,20 @@ class AiCallOrchestrator:
         session = self.registry.get(call_id)
         session.last_event_at = event.timestamp
         return event.timestamp
+
+    def _agent_runner_runtime_diagnostics(self) -> dict[str, Any]:
+        diagnostics = getattr(self.agent_runner, "runtime_diagnostics", None)
+        if not callable(diagnostics):
+            return {}
+        try:
+            payload = diagnostics()
+        except Exception as exc:
+            return {
+                "diagnosticsVersion": "runtime-diagnostics-error",
+                "diagnosticsErrorType": type(exc).__name__,
+                "diagnosticsErrorMessage": str(exc),
+            }
+        return payload if isinstance(payload, dict) else {}
 
     def _append_failed_terminal_event(
         self,

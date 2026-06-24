@@ -31,6 +31,26 @@ class CreateWebSessionRequest(AiCallBaseSchema):
 class BrowserEventReportRequest(AiCallBaseSchema):
     type: str = Field(description="浏览器事件类型")
     timestamp: datetime | None = Field(default=None, description="浏览器侧事件时间")
+    diagnostics_version: str | None = Field(default=None, description="浏览器诊断版本")
+    source: str | None = Field(default=None, description="浏览器诊断来源")
+    track_label: str | None = Field(default=None, description="麦克风轨道标签")
+    track_state: dict[str, Any] | None = Field(default=None, description="麦克风轨道状态")
+    requested_constraints: dict[str, Any] | None = Field(
+        default=None,
+        description="页面请求的音频约束",
+    )
+    track_constraints: dict[str, Any] | None = Field(
+        default=None,
+        description="浏览器返回的音频轨道约束",
+    )
+    track_settings: dict[str, Any] | None = Field(
+        default=None,
+        description="浏览器实际生效的音频轨道设置",
+    )
+    audio_context: dict[str, Any] | None = Field(
+        default=None,
+        description="本地音频分析上下文诊断",
+    )
     segment_id: str | None = Field(default=None, description="浏览器语音段 ID")
     phase: Literal["started", "updated", "ended"] | None = Field(
         default=None,

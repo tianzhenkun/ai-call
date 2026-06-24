@@ -45,6 +45,8 @@ CALL_END_TOOL_INSTRUCTIONS = """通话结束工具约束：
 
 可结束的依据包括：用户明确不愿继续、表示无其他需求、主动收束对话，或当前业务目标已完成。不得仅因短暂停顿、简单否定、要求稍等、没听清，或拒绝某个具体选项就结束通话。
 
+当用户明确要求挂断、结束通话、不再继续沟通时，必须调用 schedule_call_end，不能只回复“好的、再见”而不调用工具。
+
 调用 schedule_call_end 后，用一句简短礼貌的话结束通话，不再提出新问题。若不确定是否应结束，继续澄清或自然推进对话。"""
 
 SENSITIVE_BUSINESS_PARAM_KEYS = ("token", "apikey", "api_key", "password", "secret")

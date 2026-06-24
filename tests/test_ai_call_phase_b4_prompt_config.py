@@ -196,6 +196,7 @@ async def test_prompt_components_include_runtime_common_constraints(b4_service) 
     assert "Asia/Shanghai" in components["rows"][0]["content"]
     assert "schedule_call_end" in components["rows"][2]["content"]
     assert "仅当上下文明确表明通话已适合结束" in components["rows"][2]["content"]
+    assert "必须调用 schedule_call_end" in components["rows"][2]["content"]
 
 
 @pytest.mark.anyio

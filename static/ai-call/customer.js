@@ -12,6 +12,7 @@ const state = {
   pendingBrowserFirstAudioTurnId: null,
   reportedBrowserFirstAudioTurnId: null,
   reportedBrowserReadyFor: null,
+  reportedAudioInputDiagnosticsFor: null,
   remoteAudioContext: null,
   remoteAudioMonitorTimer: null,
   remoteAudioAnalyser: null,
@@ -395,6 +396,7 @@ const EVENT_TYPE_LABELS = {
   session_completed: "会话已完成",
   browser_first_audio: "浏览器收到首包音频",
   browser_disconnect: "浏览器断开",
+  browser_audio_input_diagnostics: "浏览器音频输入诊断",
   browser_user_speech_segment: "浏览器检测到用户语音段",
   browser_user_speech_started: "浏览器检测到用户说话",
   user_speech_started: "用户开始说话",
@@ -429,7 +431,7 @@ const EVENT_TYPE_LABELS = {
   handoff_unavailable_prompt_started: "无坐席提示开始",
   handoff_unavailable_prompt_done: "无坐席提示完成",
   handoff_unavailable_prompt_failed: "无坐席提示失败",
-  handoff_auto_ended: "转人工失败后自动结束",
+  handoff_auto_ended: "转人工自动结束通话",
   agent_suspended_for_handoff: "AI 已暂停等待人工",
 };
 
@@ -736,11 +738,7 @@ function renderDialogue(rows) {
     .sort(compareDialogueSegments)
     .map((segment) => {
       const side = segment.speakerType === "customer" ? "is-customer" : "is-agent";
-      const speakerName = {
-        customer: "用户",
-        ai: "AI",
-        human_agent: "人工",
-      }[segment.speakerType] || segment.speakerType;
+      const speakerName = dialogueSpeakerName(segment);
       return `
         <div class="dialogue-row ${side}">
           <div class="dialogue-bubble">
@@ -753,6 +751,18 @@ function renderDialogue(rows) {
       `;
     })
     .join("");
+}
+
+function dialogueSpeakerName(segment) {
+  const speakerName = {
+    customer: "用户",
+    ai: "AI",
+    human_agent: "人工",
+  }[segment.speakerType] || segment.speakerType;
+  if (segment.speakerType === "ai" && segment.segmentStatus === "interrupted") {
+    return "AI（已打断）";
+  }
+  return speakerName;
 }
 
 function compareDialogueSegments(left, right) {
@@ -840,6 +850,7 @@ function resetClientRuntime() {
   state.handoff = null;
   state.handoffRequesting = false;
   state.reportedBrowserReadyFor = null;
+  state.reportedAudioInputDiagnosticsFor = null;
   state.disconnectReportedFor = null;
   el.sessionStatus.textContent = "未创建";
   el.micState.textContent = "未连接";
@@ -973,6 +984,7 @@ async function connectRoom() {
     state.localTrack = audioTrack;
     state.localMuted = false;
     startLocalSpeechMonitor(audioTrack);
+    await reportBrowserAudioInputDiagnostics(audioTrack);
     try {
       await reportBrowserReady();
     } catch (error) {
@@ -1052,25 +1064,17 @@ function checkLocalSpeechLevel() {
   }
   const rms = Math.sqrt(sumSquares / state.localAudioSamples.length);
 
-  if (!state.remoteAudioActive) {
-    if (state.localSpeechSegmentId) {
-      reportBrowserSpeechSegment("ended", rms).catch((error) => log(error.message));
-      clearLocalSpeechSegment();
-    }
-    state.localSpeechBaselineRms =
-      state.localSpeechBaselineRms * (1 - LOCAL_SPEECH_BASELINE_ALPHA) +
-      rms * LOCAL_SPEECH_BASELINE_ALPHA;
-    state.localSpeechHotTicks = 0;
-    state.localSpeechQuietTicks = 0;
-    return;
-  }
-
   const threshold = Math.max(
     LOCAL_SPEECH_MIN_RMS,
     state.localSpeechBaselineRms * LOCAL_SPEECH_BASELINE_MULTIPLIER +
       LOCAL_SPEECH_DELTA_RMS,
   );
   if (rms < threshold) {
+    if (!state.remoteAudioActive && !state.localSpeechSegmentId) {
+      state.localSpeechBaselineRms =
+        state.localSpeechBaselineRms * (1 - LOCAL_SPEECH_BASELINE_ALPHA) +
+        rms * LOCAL_SPEECH_BASELINE_ALPHA;
+    }
     state.localSpeechHotTicks = 0;
     if (state.localSpeechSegmentId) {
       state.localSpeechQuietTicks += 1;
@@ -1191,6 +1195,63 @@ async function reportBrowserReady() {
   state.reportedBrowserReadyFor = state.session.callId;
   log("已上报 browser_ready");
   await refreshAll();
+}
+
+function compactDiagnosticsObject(value) {
+  if (!value || typeof value !== "object") return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([_key, item]) => item !== undefined && item !== null),
+  );
+}
+
+function buildAudioInputDiagnostics(track) {
+  const mediaStreamTrack = track?.mediaStreamTrack || null;
+  const trackSettings =
+    mediaStreamTrack && typeof mediaStreamTrack.getSettings === "function"
+      ? compactDiagnosticsObject(track.mediaStreamTrack.getSettings())
+      : {};
+  const trackConstraints =
+    mediaStreamTrack && typeof mediaStreamTrack.getConstraints === "function"
+      ? compactDiagnosticsObject(track.mediaStreamTrack.getConstraints())
+      : {};
+  const requestedConstraints = compactDiagnosticsObject(state.session?.webAudioConstraints || {});
+  return {
+    diagnosticsVersion: "browser-audio-input-v1",
+    source: "livekit_local_audio_track",
+    trackLabel: mediaStreamTrack?.label || "",
+    trackState: compactDiagnosticsObject({
+      enabled: mediaStreamTrack?.enabled,
+      muted: mediaStreamTrack?.muted,
+      readyState: mediaStreamTrack?.readyState,
+    }),
+    requestedConstraints,
+    trackConstraints,
+    trackSettings,
+    audioContext: compactDiagnosticsObject({
+      sampleRate: state.localAudioContext?.sampleRate,
+      baseLatency: state.localAudioContext?.baseLatency,
+      outputLatency: state.localAudioContext?.outputLatency,
+    }),
+  };
+}
+
+async function reportBrowserAudioInputDiagnostics(track) {
+  if (!state.session) return;
+  if (state.reportedAudioInputDiagnosticsFor === state.session.callId) return;
+  try {
+    await api(`/ai-call/sessions/${state.session.callId}/browser-events`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: "browser_audio_input_diagnostics",
+        timestamp: new Date().toISOString(),
+        ...buildAudioInputDiagnostics(track),
+      }),
+    });
+    state.reportedAudioInputDiagnosticsFor = state.session.callId;
+    log("已上报 browser_audio_input_diagnostics");
+  } catch (error) {
+    log(`上报 browser_audio_input_diagnostics 失败：${error.message}`);
+  }
 }
 
 async function reportBrowserFirstAudio() {
