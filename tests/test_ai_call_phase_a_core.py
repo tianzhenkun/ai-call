@@ -117,6 +117,18 @@ class FailingAgentRunner(FakeAgentRunner):
         raise RuntimeError("agent boom")
 
 
+class BlockingStopAgentRunner(FakeAgentRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_started = asyncio.Event()
+        self.release_stop = asyncio.Event()
+
+    async def stop(self, call_id: str) -> None:
+        self.stopped_call_ids.append(call_id)
+        self.stop_started.set()
+        await self.release_stop.wait()
+
+
 class FakeRealtimeProvider:
     def __init__(self, events: list[ProviderEvent]) -> None:
         self.events = events
@@ -415,9 +427,11 @@ class FakeRemoteAudioTrack:
     audio_events: list[FakeRtcAudioFrameEvent]
 
 
-def build_orchestrator() -> tuple[AiCallOrchestrator, FakeLiveKitRoomManager, FakeAgentRunner]:
+def build_orchestrator(
+    agent_runner: FakeAgentRunner | None = None,
+) -> tuple[AiCallOrchestrator, FakeLiveKitRoomManager, FakeAgentRunner]:
     livekit = FakeLiveKitRoomManager()
-    agent = FakeAgentRunner()
+    agent = agent_runner or FakeAgentRunner()
     orchestrator = AiCallOrchestrator(
         config=AiCallRuntimeConfig(
             livekit_url="wss://livekit.test",
@@ -643,6 +657,35 @@ async def test_orchestrator_auto_end_session_completes_with_model_reason() -> No
     assert livekit.deleted_rooms == [created.room_name]
     assert events.rows[-1].type == "session_completed"
     assert events.rows[-1].payload == {"endReason": "customer_end"}
+
+
+@pytest.mark.anyio
+async def test_end_session_is_idempotent_while_session_is_ending() -> None:
+    agent = BlockingStopAgentRunner()
+    orchestrator, livekit, _agent = build_orchestrator(agent_runner=agent)
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    first_end = asyncio.create_task(
+        orchestrator.end_session(created.call_id, end_reason="customer_end")
+    )
+    await asyncio.wait_for(agent.stop_started.wait(), timeout=1)
+
+    second_end = await orchestrator.end_session(created.call_id, end_reason="web_user_end")
+
+    assert second_end.status == CallSessionStatus.ENDING
+    assert orchestrator.registry.get(created.call_id).status == CallSessionStatus.ENDING
+
+    agent.release_stop.set()
+    first_result = await asyncio.wait_for(first_end, timeout=1)
+
+    events = await orchestrator.list_events(created.call_id)
+    event_types = [event.type for event in events.rows]
+    assert first_result.status == CallSessionStatus.COMPLETED
+    assert orchestrator.registry.get(created.call_id).status == CallSessionStatus.COMPLETED
+    assert event_types.count("session_ending") == 1
+    assert event_types.count("session_completed") == 1
+    assert events.rows[-1].payload == {"endReason": "customer_end"}
+    assert livekit.deleted_rooms == [created.room_name]
 
 
 @pytest.mark.anyio

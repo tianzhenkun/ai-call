@@ -787,6 +787,43 @@ async def test_create_web_session_persists_record_and_key_events(b1_service) -> 
 
 
 @pytest.mark.anyio
+async def test_call_end_interrupted_runtime_event_is_persisted(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+
+    service.orchestrator.event_store.append(
+        call_id=result.call_id,
+        type="call_end_interrupted",
+        source="agent",
+        payload={
+            "reason": "user_transcript_after_call_end_tool",
+            "toolCallId": "tool_pending_end",
+            "toolReason": "customer_end",
+            "endReason": "customer_end",
+        },
+    )
+
+    await b1_service.flush_events()
+
+    events = await record_service.list_events(
+        result.call_id,
+        event_type="call_end_interrupted",
+    )
+    assert len(events) == 1
+    assert events[0].source == "agent"
+    assert events[0].payload == {
+        "endReason": "customer_end",
+        "reason": "user_transcript_after_call_end_tool",
+        "toolCallId": "tool_pending_end",
+        "toolReason": "customer_end",
+    }
+
+
+@pytest.mark.anyio
 async def test_end_session_updates_record_terminal_state_and_reason(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
@@ -2186,6 +2223,136 @@ async def test_handoff_timeout_plays_unavailable_prompt_before_auto_end(
             "handoff_auto_ended"
         )
         assert "handoff_auto_ended" in event_types
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_handoff_timeout_closes_room_by_name_when_runtime_session_is_missing(
+    b1_service,
+    tmp_path,
+) -> None:
+    service, record_service = b1_service
+    prompt_player = FakeSystemPromptPlayer()
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        recording_service_factory=lambda _repository: None,
+        system_prompt_player=prompt_player,
+        timeout_seconds=1,
+        unavailable_prompt_audio_path=tmp_path / "handoff-unavailable.wav",
+    )
+    service.handoff_exception_manager = manager
+    service.handoff_service.request_timeout_seconds = 1
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await service.create_handoff(
+            call_id=result.call_id,
+            source="operator",
+            reason="customer_request",
+            request_message=None,
+        )
+        service.orchestrator.registry._sessions.pop(result.call_id)
+
+        await wait_until(
+            lambda: b1_service.room_manager.deleted_rooms == [result.room_name],
+            attempts=50,
+            delay_seconds=0.05,
+        )
+        await wait_until(
+            lambda: "handoff_auto_ended"
+            in [
+                event.type
+                for event in service.orchestrator.event_store.list_all(result.call_id)
+            ],
+            attempts=50,
+            delay_seconds=0.05,
+        )
+        await manager.shutdown()
+        await b1_service.flush_events()
+
+        record_service.repository.db.expire_all()
+        record = await record_service.get_record(result.call_id)
+
+        assert record is not None
+        assert record.status == "completed"
+        assert record.end_reason == "handoff_timeout"
+        assert prompt_player.played == [
+            (result.call_id, result.room_name, str(tmp_path / "handoff-unavailable.wav"))
+        ]
+
+        event_types = [
+            event.type for event in service.orchestrator.event_store.list_all(result.call_id)
+        ]
+        assert "handoff_runtime_close_fallback" in event_types
+        assert "handoff_auto_ended" in event_types
+        assert event_types.index("handoff_runtime_close_fallback") < event_types.index(
+            "handoff_auto_ended"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_handoff_timeout_does_not_mark_auto_ended_when_room_fallback_fails(
+    b1_service,
+    monkeypatch,
+) -> None:
+    service, record_service = b1_service
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        recording_service_factory=lambda _repository: None,
+        timeout_seconds=1,
+    )
+    service.handoff_exception_manager = manager
+    service.handoff_service.request_timeout_seconds = 1
+
+    async def fail_delete_room(_room_name: str) -> None:
+        raise AiCallError(
+            error_id="room_delete_failed",
+            msg="LiveKit Room 删除失败",
+        )
+
+    monkeypatch.setattr(b1_service.room_manager, "delete_room", fail_delete_room)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await service.create_handoff(
+            call_id=result.call_id,
+            source="operator",
+            reason="customer_request",
+            request_message=None,
+        )
+        service.orchestrator.registry._sessions.pop(result.call_id)
+
+        await wait_until(
+            lambda: "handoff_auto_end_runtime_failed"
+            in [
+                event.type
+                for event in service.orchestrator.event_store.list_all(result.call_id)
+            ],
+            attempts=50,
+            delay_seconds=0.05,
+        )
+        record_service.repository.db.expire_all()
+        record = await record_service.get_record(result.call_id)
+
+        assert record is not None
+        assert record.status != "completed"
+
+        event_types = [
+            event.type for event in service.orchestrator.event_store.list_all(result.call_id)
+        ]
+        assert "handoff_auto_ended" not in event_types
+        await b1_service.flush_events()
     finally:
         await manager.shutdown()
 

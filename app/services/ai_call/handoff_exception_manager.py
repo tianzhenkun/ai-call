@@ -392,27 +392,152 @@ class AiCallHandoffExceptionManager:
                 )
                 if recording_service is not None:
                     await recording_service.stop_for_session(call_id)
-                try:
-                    await self.orchestrator.end_session(
-                        call_id,
-                        end_reason=call_end_reason,
-                    )
-                except AiCallError as exc:
-                    log.warning(
-                        "转人工异常自动结束运行态会话失败: callId={}, errorId={}, message={}",
-                        call_id,
-                        exc.error_id,
-                        exc.msg,
-                    )
+                runtime_close_mode = await self._close_runtime_after_exception(
+                    call_id=call_id,
+                    room_name=room_name,
+                    handoff_id=handoff_id,
+                    handoff_status=handoff_status,
+                    call_end_reason=call_end_reason,
+                )
+                if runtime_close_mode is None:
+                    return
                 record_service = AiCallRecordService(repository)
                 await record_service.complete_session(call_id, end_reason=call_end_reason)
 
+        payload = {"reason": call_end_reason}
+        if runtime_close_mode != "orchestrator":
+            payload["runtimeCloseMode"] = runtime_close_mode
         self._record_handoff_event(
             call_id=call_id,
             event_type="handoff_auto_ended",
             handoff_id=handoff_id,
             handoff_status=handoff_status,
-            payload={"reason": call_end_reason},
+            payload=payload,
+        )
+
+    async def _close_runtime_after_exception(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        handoff_id: str,
+        handoff_status: str,
+        call_end_reason: str,
+    ) -> str | None:
+        try:
+            await self.orchestrator.end_session(
+                call_id,
+                end_reason=call_end_reason,
+            )
+            return "orchestrator"
+        except AiCallError as exc:
+            log.warning(
+                "转人工异常自动结束运行态会话失败: callId={}, errorId={}, message={}",
+                call_id,
+                exc.error_id,
+                exc.msg,
+            )
+            if exc.error_id != "session_not_found":
+                self._record_runtime_close_failed(
+                    call_id=call_id,
+                    handoff_id=handoff_id,
+                    handoff_status=handoff_status,
+                    call_end_reason=call_end_reason,
+                    stage="orchestrator_end",
+                    error=exc,
+                )
+                return None
+            if await self._close_runtime_by_room_name(
+                call_id=call_id,
+                room_name=room_name,
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                call_end_reason=call_end_reason,
+                original_error=exc,
+            ):
+                return "room_name_fallback"
+            return None
+
+    async def _close_runtime_by_room_name(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        handoff_id: str,
+        handoff_status: str,
+        call_end_reason: str,
+        original_error: AiCallError,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "reason": call_end_reason,
+            "fallback": "room_name",
+            "roomName": room_name,
+            "runtimeErrorId": original_error.error_id,
+            "runtimeErrorMessage": original_error.msg,
+        }
+        try:
+            await self.orchestrator.agent_runner.stop(call_id)
+        except Exception as exc:
+            payload["agentStopErrorType"] = type(exc).__name__
+            payload["agentStopErrorMessage"] = str(exc)
+        try:
+            await self.orchestrator.livekit_room_manager.delete_room(room_name)
+        except Exception as exc:
+            log.warning(
+                "转人工异常按房间名关闭运行态失败: callId={}, roomName={}, errorType={}, message={}",
+                call_id,
+                room_name,
+                type(exc).__name__,
+                str(exc),
+            )
+            self._record_runtime_close_failed(
+                call_id=call_id,
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                call_end_reason=call_end_reason,
+                stage="room_name_fallback",
+                error=exc,
+                original_error=original_error,
+            )
+            return False
+        self._record_handoff_event(
+            call_id=call_id,
+            event_type="handoff_runtime_close_fallback",
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            payload=payload,
+        )
+        return True
+
+    def _record_runtime_close_failed(
+        self,
+        *,
+        call_id: str,
+        handoff_id: str,
+        handoff_status: str,
+        call_end_reason: str,
+        stage: str,
+        error: Exception,
+        original_error: AiCallError | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "reason": call_end_reason,
+            "stage": stage,
+            "errorType": type(error).__name__,
+            "message": str(error),
+        }
+        if isinstance(error, AiCallError):
+            payload["errorId"] = error.error_id
+            payload["message"] = error.msg
+        if original_error is not None:
+            payload["originalErrorId"] = original_error.error_id
+            payload["originalMessage"] = original_error.msg
+        self._record_handoff_event(
+            call_id=call_id,
+            event_type="handoff_auto_end_runtime_failed",
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            payload=payload,
         )
 
     async def _play_unavailable_prompt(

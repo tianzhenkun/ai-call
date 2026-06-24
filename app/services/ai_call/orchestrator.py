@@ -570,6 +570,8 @@ class AiCallOrchestrator:
         session = self.registry.get(call_id)
         if session.status == CallSessionStatus.COMPLETED:
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
+        if session.status == CallSessionStatus.ENDING:
+            return EndSessionResult(call_id=call_id, status=CallSessionStatus.ENDING)
         if session.status == CallSessionStatus.FAILED:
             await self.agent_runner.stop(call_id)
             await self.livekit_room_manager.delete_room(session.room_name)
