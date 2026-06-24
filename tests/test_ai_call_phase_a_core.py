@@ -6421,6 +6421,210 @@ console.log(JSON.stringify(reported));
     assert events[0]["remoteAudioActive"] is False
 
 
+def test_agent_join_failure_clears_local_room_state_and_refreshes_lists() -> None:
+    if not shutil.which("node"):
+        pytest.skip("node is required to execute the agent page behavior test")
+
+    script = read_ai_call_web_asset("agent.js")
+    harness = f"""
+const apiCalls = [];
+let disconnected = 0;
+let trackStopped = 0;
+
+function elementStub() {{
+  return {{
+    textContent: "",
+    innerHTML: "",
+    disabled: false,
+    dataset: {{}},
+    className: "",
+    classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+    setAttribute() {{}},
+    addEventListener() {{}},
+    appendChild() {{}},
+    remove() {{}},
+    pause() {{}},
+    value: "online",
+  }};
+}}
+
+globalThis.window = {{
+  isSecureContext: true,
+  location: {{ pathname: "/static/ai-call/agent.html" }},
+  setTimeout: () => 0,
+  setInterval: () => 0,
+  clearInterval() {{}},
+  addEventListener() {{}},
+  LivekitClient: {{
+    RoomEvent: {{
+      TrackSubscribed: "TrackSubscribed",
+      Disconnected: "Disconnected",
+    }},
+    Room: class {{
+      constructor() {{
+        this.localParticipant = {{
+          publishTrack: async () => {{
+            state.selectedHandoff = null;
+          }},
+        }};
+      }}
+      on() {{}}
+      async connect() {{}}
+      disconnect() {{
+        disconnected += 1;
+      }}
+    }},
+    createLocalAudioTrack: async () => ({{
+      stop() {{
+        trackStopped += 1;
+      }},
+      mediaStreamTrack: {{ enabled: true }},
+    }}),
+  }},
+}};
+globalThis.setTimeout = window.setTimeout;
+globalThis.setInterval = window.setInterval;
+globalThis.clearInterval = window.clearInterval;
+Object.defineProperty(globalThis, "navigator", {{
+  value: {{ mediaDevices: {{ getUserMedia() {{}} }} }},
+  configurable: true,
+}});
+globalThis.document = {{
+  querySelector() {{ return elementStub(); }},
+  createElement() {{ return elementStub(); }},
+  body: {{ appendChild() {{}}, classList: {{ toggle() {{}} }} }},
+  documentElement: {{ dataset: {{}} }},
+}};
+globalThis.fetch = async (url, options = {{}}) => {{
+  apiCalls.push({{ url, method: options.method || "GET" }});
+  if (String(url).includes("/handoff-agents/")) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        code: 200,
+        data: {{
+          humanAgentIdentity: "agent-debug-001",
+          status: "online",
+          activeHandoffId: null,
+        }},
+      }}),
+    }};
+  }}
+  if (String(url).includes("/handoffs/joinable")) {{
+    return {{
+      ok: true,
+      json: async () => ({{ code: 200, data: {{ rows: [], total: 0 }} }}),
+    }};
+  }}
+  if (String(url).endsWith("/accept")) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        code: 200,
+        data: {{
+          handoff: {{
+            handoffId: "handoff_failed_connect",
+            callId: "call_failed_connect",
+            roomName: "ai-call-call_failed_connect",
+            status: "accepted",
+            humanAgentIdentity: "agent-debug-001",
+            expiresAt: new Date(Date.now() + 30000).toISOString(),
+          }},
+          seatToken: {{
+            livekitUrl: "wss://livekit.test",
+            participantToken: "seat-token",
+          }},
+        }},
+      }}),
+    }};
+  }}
+  if (String(url).endsWith("/connected")) {{
+    return {{
+      ok: false,
+      json: async () => ({{ code: 500, msg: "connected failed" }}),
+    }};
+  }}
+  if (String(url).endsWith("/fail")) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        code: 200,
+        data: {{
+          handoffId: "handoff_failed_connect",
+          callId: "call_failed_connect",
+          roomName: "ai-call-call_failed_connect",
+          status: "failed",
+          failureStage: "agent_connect",
+          failureMessage: "connected failed",
+          expiresAt: new Date(Date.now() + 30000).toISOString(),
+        }},
+      }}),
+    }};
+  }}
+  throw new Error(`unexpected api call: ${{url}}`);
+}};
+
+{script}
+
+state.selectedHandoff = {{
+  handoffId: "handoff_failed_connect",
+  callId: "call_failed_connect",
+  roomName: "ai-call-call_failed_connect",
+  status: "requested",
+  expiresAt: new Date(Date.now() + 30000).toISOString(),
+}};
+state.agentStatus = {{ status: "online", activeHandoffId: null }};
+apiCalls.length = 0;
+
+let errorMessage = "";
+try {{
+  await joinSelectedHandoff();
+}} catch (error) {{
+  errorMessage = error.message;
+}}
+
+console.log(JSON.stringify({{
+  errorMessage,
+  roomCleared: state.room === null,
+  localTrackCleared: state.localTrack === null,
+  tokenCleared: state.seatToken === null,
+  disconnected,
+  trackStopped,
+  connectedCalls: apiCalls.filter((call) =>
+    String(call.url).includes("/connected")
+  ).length,
+  failCalls: apiCalls.filter((call) =>
+    String(call.url).includes("/fail")
+  ).length,
+  agentStatusRefreshes: apiCalls.filter((call) =>
+    String(call.url).includes("/handoff-agents/")
+  ).length,
+  joinableRefreshes: apiCalls.filter((call) =>
+    String(call.url).includes("/handoffs/joinable")
+  ).length,
+}}));
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    outcome = json.loads(result.stdout)
+
+    assert outcome["errorMessage"] == "connected failed"
+    assert outcome["roomCleared"] is True
+    assert outcome["localTrackCleared"] is True
+    assert outcome["tokenCleared"] is True
+    assert outcome["disconnected"] >= 1
+    assert outcome["trackStopped"] >= 1
+    assert outcome["connectedCalls"] == 1
+    assert outcome["failCalls"] == 1
+    assert outcome["agentStatusRefreshes"] >= 2
+    assert outcome["joinableRefreshes"] >= 1
+
+
 def test_customer_web_probe_normalizes_audio_connect_errors() -> None:
     script = read_ai_call_web_asset("customer.js")
 

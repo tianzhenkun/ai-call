@@ -286,6 +286,11 @@ async function refreshJoinableHandoffs() {
   renderActiveHandoff();
 }
 
+async function refreshAgentAndJoinableHandoffs() {
+  await fetchAgentStatus();
+  await refreshJoinableHandoffs();
+}
+
 async function acceptHandoff(handoff) {
   const humanAgentIdentity = currentAgentIdentity();
   const result = await api(`/ai-call/handoffs/${handoff.handoffId}/accept`, {
@@ -297,6 +302,7 @@ async function acceptHandoff(handoff) {
   await fetchAgentStatus();
   renderActiveHandoff();
   log("坐席令牌已签发");
+  return result.handoff;
 }
 
 async function joinSelectedHandoff() {
@@ -312,21 +318,30 @@ async function joinSelectedHandoff() {
     throw new Error("转人工请求即将超时，请刷新后重新发起");
   }
   await ensureAgentMediaPreflight();
+  const requestedHandoff = state.selectedHandoff;
+  let acceptedHandoff = null;
   try {
-    await acceptHandoff(state.selectedHandoff);
-    await connectRoom();
-    await markConnected();
+    acceptedHandoff = await acceptHandoff(requestedHandoff);
+    const seatToken = state.seatToken;
+    await connectRoom(seatToken);
+    acceptedHandoff = await markConnected(acceptedHandoff);
     setStatus("通话中", "is-ready");
     log("坐席已接入房间，可开始通话");
-    await refreshJoinableHandoffs();
+    await refreshJoinableHandoffs().catch((refreshError) => {
+      log(`刷新可接入列表失败：${refreshError.message}`);
+    });
   } catch (error) {
-    await failAcceptedHandoff("agent_connect", error.message);
+    await failAcceptedHandoff(acceptedHandoff, "agent_connect", error.message);
+    cleanupLocalRoomState();
+    await refreshAgentAndJoinableHandoffs().catch((refreshError) => {
+      log(`刷新坐席状态失败：${refreshError.message}`);
+    });
     throw error;
   }
 }
 
-async function connectRoom() {
-  if (!state.seatToken) {
+async function connectRoom(seatToken = state.seatToken) {
+  if (!seatToken) {
     throw new Error("缺少坐席 Token");
   }
   const { Room, RoomEvent, createLocalAudioTrack } = window.LivekitClient;
@@ -353,7 +368,7 @@ async function connectRoom() {
       noiseSuppression: true,
       autoGainControl: true,
     });
-    await room.connect(state.seatToken.livekitUrl, state.seatToken.participantToken);
+    await room.connect(seatToken.livekitUrl, seatToken.participantToken);
     await room.localParticipant.publishTrack(audioTrack);
     state.room = room;
     state.localTrack = audioTrack;
@@ -368,13 +383,18 @@ async function connectRoom() {
   }
 }
 
-async function markConnected() {
-  const handoff = await api(`/ai-call/handoffs/${state.selectedHandoff.handoffId}/connected`, {
+async function markConnected(handoff = state.selectedHandoff) {
+  const handoffId = handoff?.handoffId || state.selectedHandoff?.handoffId;
+  if (!handoffId) {
+    throw new Error("缺少转人工 ID，无法标记已接入");
+  }
+  const connectedHandoff = await api(`/ai-call/handoffs/${handoffId}/connected`, {
     method: "POST",
   });
-  state.selectedHandoff = handoff;
+  state.selectedHandoff = connectedHandoff;
   await fetchAgentStatus();
   renderActiveHandoff();
+  return connectedHandoff;
 }
 
 async function completeHandoff() {
@@ -387,11 +407,15 @@ async function completeHandoff() {
   renderActiveHandoff();
 }
 
-async function failAcceptedHandoff(failureStage, failureMessage) {
-  const handoff = state.selectedHandoff;
-  if (!handoff || !["accepted", "connected"].includes(handoff.status)) return;
+async function failAcceptedHandoff(handoff, failureStage, failureMessage) {
+  const targetHandoff = handoff || state.selectedHandoff;
+  const handoffId = targetHandoff?.handoffId;
+  if (!handoffId) return;
+  const handoffStatus = targetHandoff?.status || state.selectedHandoff?.status;
+  const reportableStatuses = ["accepted", "connected"];
+  if (!reportableStatuses.includes(handoffStatus)) return;
   try {
-    state.selectedHandoff = await api(`/ai-call/handoffs/${handoff.handoffId}/fail`, {
+    state.selectedHandoff = await api(`/ai-call/handoffs/${handoffId}/fail`, {
       method: "POST",
       body: JSON.stringify({ failureStage, failureMessage }),
     });
@@ -399,6 +423,26 @@ async function failAcceptedHandoff(failureStage, failureMessage) {
   } catch (error) {
     log(`标记转人工失败失败：${error.message}`);
   }
+}
+
+function cleanupLocalRoomState() {
+  if (state.localTrack) {
+    state.localTrack.stop();
+  }
+  if (state.room) {
+    state.room.disconnect();
+  }
+  for (const media of state.remoteAudioElements) {
+    media.pause();
+    media.srcObject = null;
+    media.remove();
+  }
+  state.localTrack = null;
+  state.localMuted = false;
+  state.room = null;
+  state.seatToken = null;
+  state.remoteAudioElements = [];
+  updateMicButton();
 }
 
 function updateMicButton() {
@@ -431,22 +475,7 @@ async function completeConnectedHandoff() {
 }
 
 async function disconnectAgent({ complete = false } = {}) {
-  if (state.localTrack) {
-    state.localTrack.stop();
-  }
-  if (state.room) {
-    state.room.disconnect();
-  }
-  for (const media of state.remoteAudioElements) {
-    media.pause();
-    media.srcObject = null;
-    media.remove();
-  }
-  state.localTrack = null;
-  state.localMuted = false;
-  state.room = null;
-  state.seatToken = null;
-  state.remoteAudioElements = [];
+  cleanupLocalRoomState();
   if (complete) {
     await completeConnectedHandoff();
   }
@@ -467,7 +496,7 @@ function bindActions() {
       });
   });
   el.refreshList.addEventListener("click", () => {
-    refreshJoinableHandoffs()
+    refreshAgentAndJoinableHandoffs()
       .then(() => notify("可接入列表已刷新"))
       .catch((error) => {
         log(error.message);
@@ -503,7 +532,7 @@ function bindActions() {
 
 function startPolling() {
   state.pollTimer = window.setInterval(() => {
-    refreshJoinableHandoffs().catch((error) => log(error.message));
+    refreshAgentAndJoinableHandoffs().catch((error) => log(error.message));
   }, 2000);
 }
 
@@ -513,7 +542,6 @@ window.addEventListener("pagehide", () => {
 
 document.documentElement.dataset.livekitReady = String(Boolean(window.LivekitClient));
 bindActions();
-fetchAgentStatus()
-  .then(() => refreshJoinableHandoffs())
+refreshAgentAndJoinableHandoffs()
   .catch((error) => log(error.message));
 startPolling();

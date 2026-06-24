@@ -603,7 +603,7 @@ def test_prompt_config_page_and_customer_page_use_business_fields() -> None:
     assert "会话工单" not in agent_html
     assert ".agent-status-card" in agent_css
     assert ".agent-pending-list" not in agent_css
-    assert "agent-handoff-p0-agent-preflight-20260623" in agent_html
+    assert "agent-handoff-connect-state-pin-20260624" in agent_html
     assert "/ai-call/handoff-agents/" in agent_js
     assert "setAgentPresence(\"online\")" not in agent_js
     assert "fetchAgentStatus()" in agent_js
