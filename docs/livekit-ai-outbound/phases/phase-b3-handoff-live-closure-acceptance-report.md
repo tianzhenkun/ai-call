@@ -219,7 +219,7 @@ docs 尾随空白检查: 通过
 下一阶段不建议继续围绕“接入按钮”和单条状态做小补丁。更高价值的后续方向是：
 
 1. AI 角色边界与上下文治理。
-2. 业务语义和 ASR 准确率。
+2. 业务语义和 ASR 准确率，后续问题记录见 [phase-b-business-semantics-asr-followup.md](phase-b-business-semantics-asr-followup.md)。
 3. SIP 真实线路转人工样本。
 4. 商用压测、弱网和多通连续样本统计。
 

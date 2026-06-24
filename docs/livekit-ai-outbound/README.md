@@ -28,11 +28,12 @@
 12. [phases/phase-b3-1-acceptance-report.md](phases/phase-b3-1-acceptance-report.md)：Phase B3.1 验收报告。
 13. [phases/phase-b3-2-auto-handoff-trigger-design.md](phases/phase-b3-2-auto-handoff-trigger-design.md)：Phase B3.2 转人工自动触发技术设计。
 14. [phases/phase-b3-handoff-live-closure-acceptance-report.md](phases/phase-b3-handoff-live-closure-acceptance-report.md)：Phase B3/B3.1/B3.2 Web/LAN 转人工真实通话闭环验收记录。
-15. [phases/phase-b4-prompt-config-design.md](phases/phase-b4-prompt-config-design.md)：Phase B4 业务提示词配置与组装设计。
-16. [sql/phase-b2-b25-postgres.sql](sql/phase-b2-b25-postgres.sql)：Phase B2/B2.5 PostgreSQL 建表脚本。
-17. [sql/phase-b3-handoff-postgres.sql](sql/phase-b3-handoff-postgres.sql)：Phase B3 PostgreSQL 建表脚本。
-18. [sql/phase-b4-voice-profile-postgres.sql](sql/phase-b4-voice-profile-postgres.sql)：端到端音色配置表和 Qwen Omni Realtime 内置音色种子数据。
-19. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
+15. [phases/phase-b-business-semantics-asr-followup.md](phases/phase-b-business-semantics-asr-followup.md)：Phase B 后续业务语义与 ASR 识别准确率问题记录。
+16. [phases/phase-b4-prompt-config-design.md](phases/phase-b4-prompt-config-design.md)：Phase B4 业务提示词配置与组装设计。
+17. [sql/phase-b2-b25-postgres.sql](sql/phase-b2-b25-postgres.sql)：Phase B2/B2.5 PostgreSQL 建表脚本。
+18. [sql/phase-b3-handoff-postgres.sql](sql/phase-b3-handoff-postgres.sql)：Phase B3 PostgreSQL 建表脚本。
+19. [sql/phase-b4-voice-profile-postgres.sql](sql/phase-b4-voice-profile-postgres.sql)：端到端音色配置表和 Qwen Omni Realtime 内置音色种子数据。
+20. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
 
 Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它已作为 Phase B1/B2/B2.5/B3 正式设计的输入，后续实现以对应阶段正式设计文档为准。
 
