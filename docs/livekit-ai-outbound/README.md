@@ -10,7 +10,7 @@
 
 当前模型固定为阿里百炼 `qwen3.5-omni-plus-realtime`。音色由 Phase A 前端下拉选择阿里官方 `voice` 参数，后端透传给模型，不建设模型切换、模型路由或音色管理能力。
 
-当前 Phase A 实现已收尾，Phase A 打断稳定化已通过当前 Web 链路真实通话样本验收；2026-06-24 的打断与通话文本展示收口记录已确认 `AI（已打断）` 展示、被打断 AI 段保留、迟到事件补标和重复文本治理可作为当前开发基线。Phase B1 记录与查询已形成当前实现基线；事件明细采用进程内后台队列异步持久化，实时会话事件查询与历史记录事件查询分离。Phase B2 录音闭环和 Phase B2.5 对话文本闭环已完成设计、接口、数据表、Phase A 验证页入口和本地闭环验收；录音状态、`ossId`、`playUrl`、对象访问、Range 支持此前已按 MP4 主混音验证，当前配置为主混音 MP3、分参与方录音 OGG，避免 LiveKit Participant Egress MP3 编码兼容问题；对话文本预览和通话后查询已完成。Phase B3 最小转人工、Phase B3.1 异常闭环和 Phase B3.2 自动触发已完成 Web/LAN 真实通话验收，覆盖无人接听超时、坐席接入、客户主动挂断和坐席主动断开；Phase B4 业务提示词配置与组装设计已生成，待实现。Phase A/B Web 链路剩余生产补证项以验收报告为准，SIP、弱网、商用并发和业务语义仍需单独关闭。
+当前 Phase A 实现已收尾，Phase A 打断稳定化已通过当前 Web 链路真实通话样本验收；2026-06-24 的打断与通话文本展示收口记录已确认 `AI（已打断）` 展示、被打断 AI 段保留、迟到事件补标和重复文本治理可作为当前开发基线。Phase B1 记录与查询已形成当前实现基线；事件明细采用进程内后台队列异步持久化，实时会话事件查询与历史记录事件查询分离。Phase B2 录音闭环和 Phase B2.5 对话文本闭环已完成设计、接口、数据表、Phase A 验证页入口和本地闭环验收；录音状态、`ossId`、`playUrl`、对象访问、Range 支持此前已按 MP4 主混音验证，当前配置为主混音 MP3、分参与方录音 OGG，避免 LiveKit Participant Egress MP3 编码兼容问题；对话文本预览和通话后查询已完成。Phase B3 最小转人工、Phase B3.1 异常闭环和 Phase B3.2 自动触发已完成 Web/LAN 真实通话验收，覆盖无人接听超时、坐席接入、客户主动挂断和坐席主动断开；Phase B4 业务提示词配置与组装设计已生成，待实现。Phase E SIP 真实线路最小接入设计已生成，明确只新增电话入口并复用现有 Room、Agent、录音、文本和转人工状态机；当前仍未接入 LiveKit SIP service，也未完成真实手机验收。Phase A/B Web 链路剩余生产补证项以验收报告为准，SIP、弱网、商用并发和业务语义仍需单独关闭。
 
 ## 阅读顺序
 
@@ -30,10 +30,11 @@
 14. [phases/phase-b3-handoff-live-closure-acceptance-report.md](phases/phase-b3-handoff-live-closure-acceptance-report.md)：Phase B3/B3.1/B3.2 Web/LAN 转人工真实通话闭环验收记录。
 15. [phases/phase-b-business-semantics-asr-followup.md](phases/phase-b-business-semantics-asr-followup.md)：Phase B 后续业务语义与 ASR 识别准确率问题记录。
 16. [phases/phase-b4-prompt-config-design.md](phases/phase-b4-prompt-config-design.md)：Phase B4 业务提示词配置与组装设计。
-17. [sql/phase-b2-b25-postgres.sql](sql/phase-b2-b25-postgres.sql)：Phase B2/B2.5 PostgreSQL 建表脚本。
-18. [sql/phase-b3-handoff-postgres.sql](sql/phase-b3-handoff-postgres.sql)：Phase B3 PostgreSQL 建表脚本。
-19. [sql/phase-b4-voice-profile-postgres.sql](sql/phase-b4-voice-profile-postgres.sql)：端到端音色配置表和 Qwen Omni Realtime 内置音色种子数据。
-20. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
+17. [phases/phase-e-sip-minimal-entry-design.md](phases/phase-e-sip-minimal-entry-design.md)：Phase E SIP 真实线路最小接入设计。
+18. [sql/phase-b2-b25-postgres.sql](sql/phase-b2-b25-postgres.sql)：Phase B2/B2.5 PostgreSQL 建表脚本。
+19. [sql/phase-b3-handoff-postgres.sql](sql/phase-b3-handoff-postgres.sql)：Phase B3 PostgreSQL 建表脚本。
+20. [sql/phase-b4-voice-profile-postgres.sql](sql/phase-b4-voice-profile-postgres.sql)：端到端音色配置表和 Qwen Omni Realtime 内置音色种子数据。
+21. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
 
 Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它已作为 Phase B1/B2/B2.5/B3 正式设计的输入，后续实现以对应阶段正式设计文档为准。
 

@@ -1,6 +1,6 @@
 # 端到端 AI 外呼引擎总纲
 
-最后更新：2026-06-17
+最后更新：2026-06-24
 
 ## 1. 文档定位
 
@@ -24,16 +24,17 @@ AI 实现前必须按顺序执行：
 
 | 项 | 当前值 |
 |---|---|
-| 当前阶段 | Phase B4：业务提示词配置与组装设计已生成，待实现 |
+| 当前阶段 | Phase E：SIP 真实线路最小接入设计已生成，待实现 |
 | 最近收尾阶段 | Phase B3/B3.1/B3.2：转人工 Web/LAN 真实通话闭环已验收 |
 | Phase A 状态 | Web 端到端核心引擎实现已收尾，补证项见验收报告 |
 | Phase A 设计文档 | [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md) |
 | Phase A 验收报告 | [phases/phase-a-acceptance-report.md](phases/phase-a-acceptance-report.md) |
 | Phase B 当前文档 | B4 见 [phases/phase-b4-prompt-config-design.md](phases/phase-b4-prompt-config-design.md)；B3.2 见 [phases/phase-b3-2-auto-handoff-trigger-design.md](phases/phase-b3-2-auto-handoff-trigger-design.md)；B3/B3.1/B3.2 真实通话验收见 [phases/phase-b3-handoff-live-closure-acceptance-report.md](phases/phase-b3-handoff-live-closure-acceptance-report.md)；B3.1 见 [phases/phase-b3-1-handoff-exception-closure-design.md](phases/phase-b3-1-handoff-exception-closure-design.md)、[phases/phase-b3-1-acceptance-report.md](phases/phase-b3-1-acceptance-report.md)；B3 见 [phases/phase-b3-minimal-handoff-design.md](phases/phase-b3-minimal-handoff-design.md)、[phases/phase-b3-acceptance-report.md](phases/phase-b3-acceptance-report.md)、[sql/phase-b3-handoff-postgres.sql](sql/phase-b3-handoff-postgres.sql)；B2/B2.5 见 [phases/phase-b2-recording-closure-design.md](phases/phase-b2-recording-closure-design.md)、[phases/phase-b2-5-dialogue-text-closure-design.md](phases/phase-b2-5-dialogue-text-closure-design.md)、[sql/phase-b2-b25-postgres.sql](sql/phase-b2-b25-postgres.sql)；B1 见 [phases/phase-b1-record-query-design.md](phases/phase-b1-record-query-design.md)，预设计见 [phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md) |
+| Phase E 当前文档 | [phases/phase-e-sip-minimal-entry-design.md](phases/phase-e-sip-minimal-entry-design.md) |
 | 当前入口 | 浏览器入口优先 |
 | 当前模型 | 固定使用阿里百炼 `qwen3.5-omni-plus-realtime` |
 | 当前音色策略 | 前端下拉选择阿里官方 `voice` 参数，默认 `Tina` |
-| 真实 SIP | Phase E 最后接入 |
+| 真实 SIP | Phase E 设计已生成，尚未实现或真实手机验收 |
 | 业务系统接入 | Phase B/C 逐步接入 |
 
 阶段完成后必须更新本节。不能只更新阶段文档，不更新总纲当前状态。
@@ -185,7 +186,7 @@ flowchart TB
 | Phase B4：业务提示词配置与组装 | 设计已生成，待实现 | 支持业务提示词 profile、业务 Provider、公共提示词组件和最终 instructions 预览 | 创建通话时可按业务场景解析提示词和开场白，公共安全规则与转人工能力规则由平台统一组装 |
 | Phase C：Web 并发压测与容量验证 | 未开始 | 在不接真实 SIP 的情况下验证模型、Agent、LiveKit、事件、录音和成本的容量边界 | 形成容量报告：在指定配置和场景下可支持的并发会话数、新建速率、首个瓶颈、扩容方式和超限策略 |
 | Phase D：生产加固与运维兜底 | 未开始 | 监控、告警、回滚、限流、排障和故障兜底 | 有 SLO、告警、排障、压测复现和故障兜底 |
-| Phase E：真实 SIP 入口 | 未开始 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
+| Phase E：真实 SIP 入口 | 设计已生成，待实现 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
 
 ## 9. Phase A 实施边界
 
@@ -201,7 +202,7 @@ Phase A 只建立 Web 入口下的端到端核心通话链路，实施时按以�
 
 ## 10. 阶段推进规则
 
-1. 当前 Phase B4 业务提示词配置与组装设计已生成，下一步按设计实现；Phase B3/B3.1/B3.2 Web/LAN 转人工真实通话验收已记录，SIP 和商用补证仍需后续独立关闭。
+1. 当前 Phase E SIP 真实线路最小接入设计已生成，下一步如进入实现，必须保持现有 Web 主链路不动，只新增电话入口；Phase B4 业务提示词配置与组装仍只是设计已生成，未实现。
 2. 任何阶段完成后，必须同步更新本文档的“当前状态”和“阶段路线”。
 3. 进入新阶段前，必须先生成或更新该阶段技术设计文档。
 4. Phase A 验收报告中的补证项由独立验收流程关闭；它不阻塞 B3 最小转人工技术设计，但不能在生产验收中被遗漏。
