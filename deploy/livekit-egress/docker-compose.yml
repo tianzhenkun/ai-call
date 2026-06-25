@@ -35,5 +35,18 @@ services:
     volumes:
       - ./egress.yaml:/etc/egress.yaml:ro
 
+  livekit-sip:
+    image: livekit/sip:latest
+    container_name: ai-call-livekit-sip
+    depends_on:
+      - livekit
+      - redis
+    command: ["--config", "/etc/sip.yaml"]
+    ports:
+      - "${SIP_SIGNALING_PORT:-5060}:${SIP_SIGNALING_PORT:-5060}/udp"
+      - "${SIP_RTP_RANGE:-10000-20000}:${SIP_RTP_RANGE:-10000-20000}/udp"
+    volumes:
+      - ./sip.yaml:/etc/sip.yaml:ro
+
 volumes:
   redis-data:

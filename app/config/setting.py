@@ -116,10 +116,22 @@ class Settings(BaseSettings):
     # ================================================= #
     # ******************** SIP配置 ********************* #
     # ================================================= #
+    AI_CALL_SIP_OUTBOUND_ENABLED: bool = False
+    AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES: str = ""
+    AI_CALL_SIP_DEFAULT_RINGING_TIMEOUT_SECONDS: int = 45
+    AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS: int = 120
+    AI_CALL_SIP_MAX_CALL_DURATION_SECONDS: int = 600
+    LIVEKIT_SIP_OUTBOUND_TRUNK_ID: str = ""
+    LIVEKIT_SIP_OUTBOUND_TRUNK_HOSTNAME: str = ""
+    LIVEKIT_SIP_OUTBOUND_DESTINATION_COUNTRY: str = "CN"
+    LIVEKIT_SIP_AUTH_USERNAME: str = ""
+    LIVEKIT_SIP_AUTH_PASSWORD: str = ""
     SIP_PROXY: str = ""
     SIP_CALLER_NUMBER: str = ""
     SIP_SIGNALING_PORT: int = 5080
     SIP_RTP_RANGE: str = "16384-16484"
+    SIP_PUBLIC_IP: str = ""
+    SIP_USE_EXTERNAL_IP: bool = True
 
     # ================================================= #
     # ***************** AI Provider配置 **************** #

@@ -85,6 +85,7 @@ env/.env.prod
 devops/nginx/ssl
 deploy/livekit-egress/livekit.yaml
 deploy/livekit-egress/egress.yaml
+deploy/livekit-egress/sip.yaml
 
 # Local planning and temporary test files
 /agent.md
