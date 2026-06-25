@@ -93,6 +93,16 @@ class BusinessPromptProvider(Protocol):
     ) -> BusinessPromptResult: ...
 
 
+class RecovCollectionPromptStore(Protocol):
+    async def resolve_collection_prompt(
+        self,
+        *,
+        debt_id: str,
+        identity_name: str,
+        context: PromptResolveContext,
+    ) -> BusinessPromptResult | None: ...
+
+
 class DefaultPromptProvider:
     def __init__(
         self,
@@ -155,7 +165,10 @@ class StaticProfilePromptProvider:
         )
 
 
-class CollectionProductIntroPromptProvider:
+class RecovCollectionPromptProvider:
+    def __init__(self, *, prompt_store: RecovCollectionPromptStore | None) -> None:
+        self.prompt_store = prompt_store
+
     async def resolve(
         self,
         context: PromptResolveContext,
@@ -164,51 +177,27 @@ class CollectionProductIntroPromptProvider:
         if profile is None:
             raise _prompt_error("prompt_profile_missing", "业务提示词配置不存在", 404)
 
-        product_name = _business_param_text(
-            context.business_params,
-            "productName",
-            default="灵宸智能催收系统",
-        )
-        target_customer = _business_param_text(
-            context.business_params,
-            "targetCustomer",
-            default="需要确认待归还款项安排的用户",
-        )
-        core_value = _business_param_text(
-            context.business_params,
-            "coreValue",
-            default="在合规边界内提醒用户确认预计归还时间，并保持沟通过程克制、清晰、可留痕。",
-        )
-        call_goal = _business_param_text(
-            context.business_params,
-            "callGoal",
-            default="礼貌询问并记录用户预计什么时候归还；如果用户暂时无法确定，只确认一个大致时间范围。",
-        )
-        opening_message = _business_param_text(
-            context.business_params,
-            "openingMessage",
-            default="您好，我是灵宸智能助手，想和您确认一下当前款项的归还安排，请问您现在方便简单沟通一下吗？",
-        )
+        if self.prompt_store is None:
+            raise _prompt_error(
+                "collection_prompt_store_disabled",
+                "催收业务提示词查询服务未配置",
+                503,
+            )
 
-        prompt = (
-            f"你是{product_name}的电话沟通专员，正在进行一次主动外呼。"
-            f"当前沟通对象主要是{target_customer}。\n"
-            f"本次外呼目标：{call_goal}\n"
-            f"沟通核心要求：{core_value}\n"
-            "沟通要求：\n"
-            "1. 先确认对方是否方便沟通，不要向无关人员透露敏感信息。\n"
-            "2. 本次通话主要确认用户预计什么时候归还；如果用户愿意说明，记录其表达的还款时间或大致时间范围。\n"
-            "3. 还款时间不是强制信息；用户拒绝或不方便回答时，不要施压，也不要反复追问。\n"
-            "4. 若用户给出的时间比较模糊，只追问一次大致时间范围；仍无法确认时，记录为待确认。\n"
-            "5. 如果用户询问金额、案件、减免、展期或其他当前信息无法确认的问题，不要编造，说明需要人工进一步确认。\n"
-            "6. 不承诺减免、展期、销账或具体结果，不诱导违规施压，不讨论无关个人隐私。\n"
-            "7. 如果用户明确表示不方便或拒绝继续，礼貌收束；需要人工处理时按转人工约束执行。"
+        debt_id = _required_collection_debt_id(context)
+        identity_name = _business_param_required_text(
+            context.business_params,
+            "identityName",
+            message="businessParams.identityName 不能为空",
         )
-        return BusinessPromptResult(
-            prompt=prompt,
-            opening_message=opening_message,
-            source_key=normalize_scene_code(profile.scene_code) or profile.scene_code,
+        result = await self.prompt_store.resolve_collection_prompt(
+            debt_id=debt_id,
+            identity_name=identity_name,
+            context=context,
         )
+        if result is None:
+            raise _prompt_error("collection_prompt_not_found", "催收业务提示词不存在", 404)
+        return result
 
 
 class BusinessPromptResolver:
@@ -219,6 +208,7 @@ class BusinessPromptResolver:
         default_provider: BusinessPromptProvider,
         debug_provider: BusinessPromptProvider,
         providers: dict[str, BusinessPromptProvider] | None = None,
+        collection_prompt_store: RecovCollectionPromptStore | None = None,
         timeout_seconds: float = 2.0,
         debug_override_enabled: bool = False,
     ) -> None:
@@ -230,7 +220,9 @@ class BusinessPromptResolver:
             **(providers or {}),
         }
         self.scene_providers = {
-            PROMPT_SCENE_COLLECTION_PRODUCT_INTRO: CollectionProductIntroPromptProvider(),
+            PROMPT_SCENE_COLLECTION_PRODUCT_INTRO: RecovCollectionPromptProvider(
+                prompt_store=collection_prompt_store,
+            ),
         }
         self.timeout_seconds = max(0.1, timeout_seconds)
         self.debug_override_enabled = debug_override_enabled
@@ -472,6 +464,35 @@ def _business_param_text(params: dict[str, Any], key: str, *, default: str) -> s
         return default
     text = str(value).strip()
     return text or default
+
+
+def _business_param_required_text(
+    params: dict[str, Any],
+    key: str,
+    *,
+    message: str,
+) -> str:
+    value = params.get(key)
+    if value is None or isinstance(value, (dict, list)):
+        raise _prompt_error("business_param_required", message, 400)
+    text = str(value).strip()
+    if not text:
+        raise _prompt_error("business_param_required", message, 400)
+    return text
+
+
+def _required_collection_debt_id(context: PromptResolveContext) -> str:
+    business_id = _blank_to_none(context.business_id)
+    param_debt_id = _blank_to_none(str(context.business_params.get("debtId") or ""))
+    if not business_id:
+        raise _prompt_error("business_id_required", "businessId 不能为空", 400)
+    if param_debt_id and param_debt_id != business_id:
+        raise _prompt_error(
+            "business_id_debt_id_mismatch",
+            "businessId 与 businessParams.debtId 不一致",
+            400,
+        )
+    return business_id
 
 
 def _find_sensitive_key(value: Any) -> str | None:

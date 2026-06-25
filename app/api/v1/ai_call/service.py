@@ -51,6 +51,7 @@ from app.services.ai_call.prompt_config import (
 )
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
+from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
 from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
 from app.services.ai_call.system_prompt_player import LiveKitSystemPromptPlayer
 from app.services.ai_call.voice_profile import (
@@ -1484,8 +1485,19 @@ def _build_prompt_resolver(
         debug_provider=DebugPromptProvider(
             opening_message=orchestrator.config.opening_message,
         ),
+        collection_prompt_store=_build_collection_prompt_store(),
         timeout_seconds=settings.AI_CALL_PROMPT_RESOLVE_TIMEOUT_SECONDS,
         debug_override_enabled=settings.AI_CALL_DEBUG_PROMPT_OVERRIDE_ENABLED,
+    )
+
+
+def _build_collection_prompt_store() -> RecovCollectionPostgresPromptStore | None:
+    dsn = (settings.AI_CALL_COLLECTION_POSTGRES_DSN or "").strip()
+    if not dsn:
+        return None
+    return RecovCollectionPostgresPromptStore(
+        dsn=dsn,
+        timeout_seconds=settings.AI_CALL_COLLECTION_POSTGRES_TIMEOUT_SECONDS,
     )
 
 

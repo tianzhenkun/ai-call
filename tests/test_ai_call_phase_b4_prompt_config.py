@@ -32,6 +32,7 @@ from app.services.ai_call.prompt_config import (
     PromptComposer,
 )
 from app.services.ai_call.record_service import AiCallRecordService
+from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
 from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
@@ -78,6 +79,67 @@ class CapturingAgentRunner:
 
     async def stop(self, call_id: str) -> None:
         _ = call_id
+
+
+class FakeRecovCollectionPromptStore:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def resolve_collection_prompt(
+        self,
+        *,
+        debt_id: str,
+        identity_name: str,
+        context,
+    ) -> BusinessPromptResult:
+        self.calls.append({
+            "debt_id": debt_id,
+            "identity_name": identity_name,
+            "business_id": context.business_id,
+            "business_params": context.business_params,
+        })
+        return BusinessPromptResult(
+            prompt=(
+                "# 角色\n"
+                f"你是{identity_name}，负责通过电话进行合规的逾期费用提醒。\n"
+                "# 本轮可核实业务信息\n"
+                f"债务记录：{debt_id}"
+            ),
+            opening_message=f"您好，这边是{identity_name}，有一项费用事项需要和您本人核实。",
+            source_key="intro_collection",
+        )
+
+
+class FakeRecovPostgresConnection:
+    def __init__(self) -> None:
+        self.queries: list[tuple[str, tuple]] = []
+        self.closed = False
+
+    async def fetchrow(self, query: str, *args):
+        self.queries.append((query, args))
+        if "from debt_record" in query:
+            return {
+                "debtor_name": "张三",
+                "address": "一期 3 栋 1201",
+                "debt_amount": "1280.50",
+                "deadline_time": "2026-06-30",
+                "overdue_amount": "12.30",
+                "debtor_gender": "男",
+                "debtor_age": "36",
+                "tenant_id": "tenant_001",
+                "persona_id": 7,
+                "organization": "星河花园",
+            }
+        if "from persona_call_strategy" in query:
+            return {
+                "strategy_core": "先核实身份，再说明物业费事项，禁止施压。",
+                "speaking_style": "语速放慢，语气克制。",
+                "opening_template": "您好，请问是{{name}}吗？我是{{organization}}的{{identityName}}。",
+            }
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def build_runtime_config() -> AiCallRuntimeConfig:
@@ -129,6 +191,42 @@ def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None
     assert b4_config.prompt == composed_prompt.instructions
 
 
+@pytest.mark.anyio
+async def test_recov_collection_postgres_store_renders_prompt_and_opening() -> None:
+    connection = FakeRecovPostgresConnection()
+
+    async def connect(dsn: str, *, timeout: float):
+        assert dsn == "postgresql://recov.test/db"
+        assert timeout == 1.5
+        return connection
+
+    store = RecovCollectionPostgresPromptStore(
+        dsn="postgresql://recov.test/db",
+        timeout_seconds=1.5,
+        connect=connect,
+    )
+
+    result = await store.resolve_collection_prompt(
+        debt_id="2064663837392551940",
+        identity_name="项目员工",
+        context=None,
+    )
+
+    assert result is not None
+    assert result.source_key == "intro_collection"
+    assert "# 角色" in result.prompt
+    assert "你是项目员工" in result.prompt
+    assert "先核实身份，再说明物业费事项，禁止施压。" in result.prompt
+    assert "语速放慢，语气克制。" in result.prompt
+    assert "所属项目：星河花园" in result.prompt
+    assert "地址：一期 3 栋 1201" in result.prompt
+    assert "逾期金额：1280.50元" in result.prompt
+    assert result.opening_message == "您好，请问是张先生吗？我是星河花园的项目员工。"
+    assert connection.queries[0][1] == (2064663837392551940,)
+    assert connection.queries[1][1] == ("项目员工", 7)
+    assert connection.closed is True
+
+
 @pytest.fixture
 async def b4_service():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -148,6 +246,7 @@ async def b4_service():
             registry=InMemorySessionRegistry(),
             event_store=InMemoryEventStore(),
         )
+        collection_prompt_store = FakeRecovCollectionPromptStore()
         service = AiCallService(
             orchestrator,
             AiCallRecordService(repository),
@@ -161,10 +260,12 @@ async def b4_service():
                 debug_provider=DebugPromptProvider(
                     opening_message=runtime_config.opening_message,
                 ),
+                collection_prompt_store=collection_prompt_store,
                 timeout_seconds=2.0,
             ),
             prompt_composer=PromptComposer(handoff_component_enabled=True),
         )
+        service.collection_prompt_store_for_test = collection_prompt_store
         yield service, repository, room_manager, agent_runner
 
     await engine.dispose()
@@ -447,7 +548,7 @@ async def test_empty_opening_fails_before_livekit_room_created(b4_service) -> No
 
 
 @pytest.mark.anyio
-async def test_business_query_scene_builds_prompt_from_business_params(
+async def test_business_query_scene_uses_recov_collection_store(
     b4_service,
 ) -> None:
     service, _repository, _room_manager, _agent_runner = b4_service
@@ -460,22 +561,68 @@ async def test_business_query_scene_builds_prompt_from_business_params(
     })
 
     preview = await service.preview_prompt_profile(
-        business_id="collection_product",
+        business_id="2064663837392551940",
         scene_code="intro_collection",
-        business_params={
-            "productName": "灵宸智能催收中台",
-            "targetCustomer": "有批量应收账款管理需求的企业",
-            "openingMessage": "您好，我是灵宸智能助手，想向您介绍一下智能催收中台。",
-        },
+        business_params={"identityName": "项目员工"},
         prompt=None,
     )
 
     assert preview["promptSourceKey"] == "intro_collection"
-    assert "灵宸智能催收中台" in preview["instructions"]
-    assert "有批量应收账款管理需求的企业" in preview["instructions"]
-    assert "预计什么时候归还" in preview["instructions"]
-    assert "只追问一次大致时间范围" in preview["instructions"]
-    assert preview["openingMessage"] == "您好，我是灵宸智能助手，想向您介绍一下智能催收中台。"
+    assert "你是项目员工" in preview["instructions"]
+    assert "债务记录：2064663837392551940" in preview["instructions"]
+    assert "灵宸智能催收系统" not in preview["instructions"]
+    assert preview["openingMessage"] == "您好，这边是项目员工，有一项费用事项需要和您本人核实。"
+    assert service.collection_prompt_store_for_test.calls == [
+        {
+            "debt_id": "2064663837392551940",
+            "identity_name": "项目员工",
+            "business_id": "2064663837392551940",
+            "business_params": {"identityName": "项目员工"},
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_business_query_scene_requires_business_id_and_identity_name(
+    b4_service,
+) -> None:
+    service, _repository, _room_manager, _agent_runner = b4_service
+    await service.create_prompt_profile({
+        "scene_code": "intro_collection",
+        "name": "催收还款时间确认",
+        "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
+        "prompt_text": None,
+        "opening_message": None,
+    })
+
+    with pytest.raises(CustomException) as missing_business_id:
+        await service.preview_prompt_profile(
+            business_id=None,
+            scene_code="intro_collection",
+            business_params={"identityName": "项目员工"},
+            prompt=None,
+        )
+    with pytest.raises(CustomException) as missing_identity_name:
+        await service.preview_prompt_profile(
+            business_id="2064663837392551940",
+            scene_code="intro_collection",
+            business_params={},
+            prompt=None,
+        )
+    with pytest.raises(CustomException) as mismatched_debt_id:
+        await service.preview_prompt_profile(
+            business_id="2064663837392551940",
+            scene_code="intro_collection",
+            business_params={
+                "identityName": "项目员工",
+                "debtId": "2064663837392551999",
+            },
+            prompt=None,
+        )
+
+    assert missing_business_id.value.msg == "businessId 不能为空"
+    assert missing_identity_name.value.msg == "businessParams.identityName 不能为空"
+    assert mismatched_debt_id.value.msg == "businessId 与 businessParams.debtId 不一致"
 
 
 @pytest.mark.anyio
