@@ -203,7 +203,12 @@ class AiCallService:
             room_name=room_name,
             participant_identity=participant_identity,
         )
+        sip_invite_sent = False
         try:
+            self._record_sip_preflight(
+                call_id=call_id,
+                callee_phone_number=callee_phone_number,
+            )
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=call_id,
                 business_id=business_id,
@@ -227,6 +232,7 @@ class AiCallService:
                     "ringingTimeoutSeconds": ringing_timeout_seconds,
                 },
             )
+            sip_invite_sent = True
             sip_participant = await self.sip_client.create_participant(
                 room_name=room_name,
                 participant_identity=participant_identity,
@@ -235,15 +241,16 @@ class AiCallService:
                 wait_until_answered=True,
             )
         except AiCallError as exc:
-            self._record_sip_event(
-                call_id=call_id,
-                event_type="sip_failed",
-                payload={
-                    "errorId": exc.error_id,
-                    "message": exc.msg,
-                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
-                },
-            )
+            if sip_invite_sent:
+                self._record_sip_event(
+                    call_id=call_id,
+                    event_type="sip_failed",
+                    payload={
+                        "errorId": exc.error_id,
+                        "message": exc.msg,
+                        "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                    },
+                )
             await self.record_service.fail_session(
                 call_id,
                 end_reason=exc.error_id,
@@ -914,6 +921,8 @@ class AiCallService:
             "provider_connect_failed": "provider_connect",
             "sip_caller_number_missing": "sip_trunk",
             "sip_create_participant_failed": "sip",
+            "invalid_callee_number": "callee_number",
+            "callee_prefix_not_allowed": "callee_number",
             "sip_outbound_disabled": "sip_config",
             "sip_preflight_failed": "sip_config",
             "sip_public_ip_missing": "sip_network",
@@ -941,6 +950,39 @@ class AiCallService:
             )
         except Exception:
             return
+
+    def _record_sip_preflight(
+        self,
+        *,
+        call_id: str,
+        callee_phone_number: str,
+    ) -> None:
+        if self.sip_client is None:
+            return
+        preflight = self.sip_client.preflight(callee_phone_number=callee_phone_number)
+        if preflight.ok:
+            self._record_sip_event(
+                call_id=call_id,
+                event_type="sip_preflight_passed",
+                payload={
+                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                },
+            )
+            return
+        self._record_sip_event(
+            call_id=call_id,
+            event_type="sip_preflight_failed",
+            payload={
+                "errorId": preflight.failure_reason or "sip_preflight_failed",
+                "message": preflight.message or "SIP 外呼预检失败",
+                "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+            },
+        )
+        raise AiCallError(
+            error_id=preflight.failure_reason or "sip_preflight_failed",
+            msg=preflight.message or "SIP 外呼预检失败",
+            status_code=400,
+        )
 
     def _record_successful_sip_participant(
         self,

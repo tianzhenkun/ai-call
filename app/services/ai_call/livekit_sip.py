@@ -105,6 +105,12 @@ class LiveKitSipClient:
         self.timeout_seconds = max(1.0, timeout_seconds)
         self._create_participant = create_participant
 
+    def preflight(self, *, callee_phone_number: str) -> SipOutboundPreflightResult:
+        return validate_sip_outbound_preflight(
+            self.config,
+            callee_phone_number=callee_phone_number,
+        )
+
     async def create_participant(
         self,
         *,
@@ -114,10 +120,7 @@ class LiveKitSipClient:
         ringing_timeout_seconds: int | None = None,
         wait_until_answered: bool = True,
     ) -> CreateSipParticipantResult:
-        preflight = validate_sip_outbound_preflight(
-            self.config,
-            callee_phone_number=callee_phone_number,
-        )
+        preflight = self.preflight(callee_phone_number=callee_phone_number)
         if not preflight.ok:
             raise AiCallError(
                 error_id=preflight.failure_reason or "sip_preflight_failed",

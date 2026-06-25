@@ -118,6 +118,8 @@ PERSISTED_EVENT_TYPES = frozenset({
     "sip_failed",
     "sip_hangup",
     "sip_invite_sent",
+    "sip_preflight_failed",
+    "sip_preflight_passed",
     "sip_ringing",
     "user_speech_started",
     "user_speech_stopped",

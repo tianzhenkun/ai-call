@@ -18,6 +18,7 @@ from app.services.ai_call.livekit_sip import (
     CreateSipParticipantResult,
     LiveKitSipClient,
     SipOutboundConfig,
+    SipOutboundPreflightResult,
     validate_sip_outbound_preflight,
 )
 from app.services.ai_call.orchestrator import AiCallOrchestrator, AiCallRuntimeConfig
@@ -72,9 +73,21 @@ class CapturingAgentRunner:
 
 
 class FakeSipClient:
-    def __init__(self, error: AiCallError | None = None) -> None:
+    def __init__(
+        self,
+        error: AiCallError | None = None,
+        preflight_result: SipOutboundPreflightResult | None = None,
+    ) -> None:
         self.created: list[dict[str, object]] = []
         self.error = error
+        self.preflight_result = preflight_result
+        self.preflighted_callees: list[str] = []
+
+    def preflight(self, *, callee_phone_number: str) -> SipOutboundPreflightResult:
+        self.preflighted_callees.append(callee_phone_number)
+        if self.preflight_result is not None:
+            return self.preflight_result
+        return SipOutboundPreflightResult(ok=True)
 
     async def create_participant(
         self,
@@ -242,6 +255,41 @@ def build_service_with_failing_sip_client() -> tuple[
         prompt_composer=PromptComposer(handoff_component_enabled=True),
     )
     return service, sip_client, record_service
+
+
+def build_service_with_failing_sip_preflight() -> tuple[
+    AiCallService,
+    FakeLiveKitRoomManager,
+    CapturingAgentRunner,
+    FakeSipClient,
+    FakeRecordService,
+]:
+    room_manager = FakeLiveKitRoomManager()
+    agent_runner = CapturingAgentRunner()
+    orchestrator = AiCallOrchestrator(
+        config=build_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=agent_runner,
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    record_service = FakeRecordService()
+    sip_client = FakeSipClient(
+        preflight_result=SipOutboundPreflightResult(
+            ok=False,
+            failure_reason="sip_outbound_disabled",
+            stage="sip_config",
+            message="SIP 真实外呼未启用",
+        )
+    )
+    service = AiCallService(
+        orchestrator,
+        record_service=record_service,
+        sip_client=sip_client,
+        prompt_resolver=FakePromptResolver(),
+        prompt_composer=PromptComposer(handoff_component_enabled=True),
+    )
+    return service, room_manager, agent_runner, sip_client, record_service
 
 
 def test_livekit_api_dependency_is_declared() -> None:
@@ -518,6 +566,7 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
     call_id = str(failed["call_id"])
     events = service.orchestrator.event_store.list_all(call_id)
     assert [event.type for event in events if event.type.startswith("sip_")] == [
+        "sip_preflight_passed",
         "sip_invite_sent",
         "sip_failed",
     ]
@@ -525,6 +574,44 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
     assert sip_failed.payload == {
         "errorId": "sip_create_participant_failed",
         "message": "LiveKit SIP Participant 创建失败",
+        "calleePhoneNumberMasked": "138****0000",
+    }
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_stops_before_room_when_sip_preflight_fails() -> None:
+    service, room_manager, agent_runner, sip_client, record_service = (
+        build_service_with_failing_sip_preflight()
+    )
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.create_sip_session(
+            callee_phone_number="13800000000",
+            voice=None,
+            business_id="geo_task_001",
+            scene_code="intro_geo",
+            business_params={},
+            ringing_timeout_seconds=30,
+        )
+
+    assert exc_info.value.msg == "SIP 真实外呼未启用"
+    assert sip_client.preflighted_callees == ["13800000000"]
+    assert sip_client.created == []
+    assert room_manager.created_rooms == []
+    assert agent_runner.started_sessions == []
+    assert len(record_service.failed_sessions) == 1
+    failed = record_service.failed_sessions[0]
+    assert failed["end_reason"] == "sip_outbound_disabled"
+    assert failed["failure_stage"] == "sip_config"
+
+    call_id = str(failed["call_id"])
+    events = service.orchestrator.event_store.list_all(call_id)
+    assert [event.type for event in events if event.type.startswith("sip_")] == [
+        "sip_preflight_failed",
+    ]
+    assert events[0].payload == {
+        "errorId": "sip_outbound_disabled",
+        "message": "SIP 真实外呼未启用",
         "calleePhoneNumberMasked": "138****0000",
     }
 
