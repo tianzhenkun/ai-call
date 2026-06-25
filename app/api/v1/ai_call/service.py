@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,11 @@ from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptio
 from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.interrupt_summary import build_interrupt_summary
 from app.services.ai_call.livekit_egress import LiveKitEgressManager
+from app.services.ai_call.livekit_sip import (
+    CreateSipParticipantResult,
+    LiveKitSipClient,
+    SipOutboundConfig,
+)
 from app.services.ai_call.orchestrator import (
     AiCallOrchestrator,
     BrowserEventReportResult,
@@ -62,6 +68,19 @@ if TYPE_CHECKING:
     from app.services.ai_call.offline_asr_service import AiCallOfflineAsrWorker
 
 
+@dataclass(frozen=True, slots=True)
+class CreateSipSessionResult:
+    call_id: str
+    room_name: str
+    participant_identity: str
+    status: CallSessionStatus
+    effective_config: Any
+    sip_call_id: str | None
+    sip_call_id_full: str | None
+    sip_trunk_id: str | None
+    sip_call_status: str | None
+
+
 class AiCallService:
     def __init__(
         self,
@@ -74,6 +93,7 @@ class AiCallService:
         prompt_repository: AiCallRecordRepository | None = None,
         prompt_resolver: BusinessPromptResolver | None = None,
         prompt_composer: PromptComposer | None = None,
+        sip_client: LiveKitSipClient | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.record_service = record_service
@@ -86,6 +106,7 @@ class AiCallService:
         )
         self.prompt_resolver = prompt_resolver
         self.prompt_composer = prompt_composer
+        self.sip_client = sip_client
 
     async def create_web_session(
         self,
@@ -151,6 +172,108 @@ class AiCallService:
                 ai_participant_identity=f"agent-{result.call_id}",
             )
         return result
+
+    async def create_sip_session(
+        self,
+        *,
+        callee_phone_number: str,
+        voice: str | None,
+        business_id: str | None = None,
+        scene_code: str | None = None,
+        business_params: dict | None = None,
+        ringing_timeout_seconds: int | None = None,
+    ) -> CreateSipSessionResult:
+        self._ensure_record_service()
+        if self.sip_client is None:
+            raise CustomException(
+                msg="SIP 外呼服务未启用",
+                code=RET.ERROR.code,
+                status_code=500,
+            )
+        if self.prompt_resolver is not None or self.prompt_composer is not None:
+            scene_code = self._require_scene_code(scene_code)
+
+        resolved_voice = await self._resolve_voice(voice)
+        call_id = f"call_{generate_snowflake_id()}"
+        room_name = f"ai-call-{call_id}"
+        participant_identity = f"sip-{call_id}"
+        await self.record_service.create_sip_record(
+            call_id=call_id,
+            business_id=business_id,
+            room_name=room_name,
+            participant_identity=participant_identity,
+        )
+        try:
+            prompt_effective_config = await self._resolve_prompt_effective_config(
+                call_id=call_id,
+                business_id=business_id,
+                scene_code=scene_code,
+                business_params=business_params or {},
+                debug_prompt=None,
+            )
+            room_session = await self.orchestrator.create_sip_session(
+                voice=resolved_voice,
+                prompt=None,
+                call_id=call_id,
+                prompt_effective_config=prompt_effective_config,
+            )
+            await self.record_service.mark_status(call_id, room_session.status)
+            self._record_sip_event(
+                call_id=call_id,
+                event_type="sip_invite_sent",
+                payload={
+                    "participantIdentity": participant_identity,
+                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                    "ringingTimeoutSeconds": ringing_timeout_seconds,
+                },
+            )
+            sip_participant = await self.sip_client.create_participant(
+                room_name=room_name,
+                participant_identity=participant_identity,
+                callee_phone_number=callee_phone_number,
+                ringing_timeout_seconds=ringing_timeout_seconds,
+                wait_until_answered=True,
+            )
+        except AiCallError as exc:
+            self._record_sip_event(
+                call_id=call_id,
+                event_type="sip_failed",
+                payload={
+                    "errorId": exc.error_id,
+                    "message": exc.msg,
+                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                },
+            )
+            await self.record_service.fail_session(
+                call_id,
+                end_reason=exc.error_id,
+                failure_stage=self._failure_stage_for_end_reason(exc.error_id),
+                failure_message=exc.msg,
+            )
+            raise self._to_custom_exception(exc) from exc
+
+        self._record_successful_sip_participant(
+            call_id=call_id,
+            sip_participant=sip_participant,
+        )
+        if self.recording_service is not None:
+            await self.recording_service.start_for_session(
+                call_id=room_session.call_id,
+                room_name=room_session.room_name,
+                customer_participant_identity=room_session.participant_identity,
+                ai_participant_identity=f"agent-{room_session.call_id}",
+            )
+        return CreateSipSessionResult(
+            call_id=room_session.call_id,
+            room_name=room_session.room_name,
+            participant_identity=room_session.participant_identity,
+            status=room_session.status,
+            effective_config=room_session.effective_config,
+            sip_call_id=sip_participant.sip_call_id,
+            sip_call_id_full=sip_participant.sip_call_id_full,
+            sip_trunk_id=sip_participant.sip_trunk_id,
+            sip_call_status=sip_participant.sip_call_status,
+        )
 
     async def list_voice_profiles(
         self,
@@ -789,7 +912,68 @@ class AiCallService:
             "agent_start_failed": "agent_start",
             "room_create_failed": "room_create",
             "provider_connect_failed": "provider_connect",
+            "sip_caller_number_missing": "sip_trunk",
+            "sip_create_participant_failed": "sip",
+            "sip_outbound_disabled": "sip_config",
+            "sip_preflight_failed": "sip_config",
+            "sip_public_ip_missing": "sip_network",
+            "sip_rtp_range_invalid": "sip_network",
+            "sip_sdk_config_missing": "sip_sdk",
+            "sip_sdk_unavailable": "sip_sdk",
+            "sip_signaling_port_invalid": "sip_network",
+            "sip_trunk_missing": "sip_trunk",
         }.get(end_reason, end_reason)
+
+    def _record_sip_event(
+        self,
+        *,
+        call_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        source: str = "sip",
+    ) -> None:
+        try:
+            self.orchestrator.record_sip_event(
+                call_id=call_id,
+                event_type=event_type,
+                payload=payload,
+                source=source,
+            )
+        except Exception:
+            return
+
+    def _record_successful_sip_participant(
+        self,
+        *,
+        call_id: str,
+        sip_participant: CreateSipParticipantResult,
+    ) -> None:
+        payload = {
+            "participantIdentity": sip_participant.participant_identity,
+            "sipCallId": sip_participant.sip_call_id,
+            "sipCallIdFull": sip_participant.sip_call_id_full,
+            "sipTrunkId": sip_participant.sip_trunk_id,
+            "sipCallStatus": sip_participant.sip_call_status,
+        }
+        self._record_sip_event(
+            call_id=call_id,
+            event_type="sip_answered",
+            payload=payload,
+        )
+        if sip_participant.sip_call_status:
+            self._record_sip_event(
+                call_id=call_id,
+                event_type="media_connected",
+                payload=payload,
+                source="livekit",
+            )
+
+    @staticmethod
+    def _mask_phone_number(phone_number: str) -> str:
+        normalized = "".join(ch for ch in str(phone_number or "") if ch.isdigit())
+        if len(normalized) <= 7:
+            return "***"
+        return f"{normalized[:3]}****{normalized[-4:]}"
 
     def _ensure_record_service(self) -> None:
         if self.record_service is None:
@@ -1199,6 +1383,7 @@ def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService
         prompt_repository=repository,
         prompt_resolver=_build_prompt_resolver(repository, _default_orchestrator),
         prompt_composer=_build_prompt_composer(_default_orchestrator),
+        sip_client=_build_sip_client(),
     )
 
 
@@ -1232,6 +1417,15 @@ def _build_recording_service(repository: AiCallRecordRepository) -> AiCallRecord
         egress_manager=manager,
         participant_recording_enabled=settings.AI_CALL_PARTICIPANT_RECORDING_ENABLED,
         verify_deadline_seconds=settings.AI_CALL_RECORDING_VERIFY_DEADLINE_SECONDS,
+    )
+
+
+def _build_sip_client() -> LiveKitSipClient:
+    return LiveKitSipClient(
+        config=SipOutboundConfig.from_settings(settings),
+        livekit_url=settings.LIVEKIT_URL,
+        api_key=settings.LIVEKIT_API_KEY,
+        api_secret=settings.LIVEKIT_API_SECRET,
     )
 
 

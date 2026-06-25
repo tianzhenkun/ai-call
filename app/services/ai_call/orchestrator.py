@@ -164,6 +164,15 @@ class CreateSessionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CreateSipRoomSessionResult:
+    call_id: str
+    room_name: str
+    participant_identity: str
+    status: CallSessionStatus
+    effective_config: EffectiveConfig
+
+
+@dataclass(frozen=True, slots=True)
 class ReissueTokenResult:
     call_id: str
     room_name: str
@@ -364,6 +373,92 @@ class AiCallOrchestrator:
             web_audio_constraints=self._web_audio_constraints(),
         )
 
+    async def create_sip_session(
+        self,
+        voice: str | None,
+        prompt: str | None,
+        call_id: str | None = None,
+        prompt_effective_config: PromptEffectiveConfig | None = None,
+    ) -> CreateSipRoomSessionResult:
+        self.config.ensure_ready()
+        call_id = call_id or self._new_call_id()
+        room_name = f"ai-call-{call_id}"
+        participant_identity = f"sip-{call_id}"
+        effective_config = self._build_effective_config(
+            voice=voice,
+            prompt=prompt,
+            prompt_effective_config=prompt_effective_config,
+        )
+        session = CallSession(
+            call_id=call_id,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            status=CallSessionStatus.CREATED,
+            effective_config=effective_config,
+        )
+        self.registry.add(session)
+        self.metrics_by_call_id[call_id] = CallMetrics()
+        self._append_event(
+            call_id,
+            "session_created",
+            "orchestrator",
+            {
+                "entryType": "sip_outbound",
+                "promptHash": effective_config.prompt_hash,
+                "openingMessageHash": effective_config.opening_message_hash,
+                "promptSourceKey": effective_config.prompt_source_key,
+            },
+        )
+
+        self.registry.transition(call_id, CallSessionStatus.PREPARING)
+        self._append_event(call_id, "session_preparing", "orchestrator")
+
+        try:
+            await self.livekit_room_manager.create_room(room_name)
+        except AiCallError as exc:
+            self._append_failed_terminal_event(
+                call_id,
+                end_reason=exc.error_id,
+                failure_stage=self._failure_stage_for_end_reason(exc.error_id),
+                failure_message=exc.msg,
+            )
+            raise
+        except Exception as exc:
+            self._append_failed_terminal_event(
+                call_id,
+                end_reason="room_create_failed",
+                failure_stage="room_create",
+                failure_message="LiveKit Room 创建失败",
+            )
+            raise AiCallError(
+                error_id="room_create_failed",
+                msg="LiveKit Room 创建失败",
+                status_code=status.HTTP_502_BAD_GATEWAY,
+            ) from exc
+        self._append_event(call_id, "room_created", "livekit", {"roomName": room_name})
+
+        try:
+            await self.agent_runner.start(session)
+        except Exception as exc:
+            await self._handle_agent_start_failed(call_id, room_name, exc)
+        self._append_event(
+            call_id,
+            "agent_started",
+            "agent",
+            self._agent_runner_runtime_diagnostics(),
+        )
+
+        self.registry.transition(call_id, CallSessionStatus.READY)
+        self._append_event(call_id, "session_ready", "orchestrator")
+
+        return CreateSipRoomSessionResult(
+            call_id=call_id,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            status=CallSessionStatus.READY,
+            effective_config=effective_config,
+        )
+
     async def _handle_agent_start_failed(
         self,
         call_id: str,
@@ -534,6 +629,16 @@ class AiCallOrchestrator:
         if payload:
             event_payload.update(payload)
         self._append_event(call_id, event_type, source, event_payload)
+
+    def record_sip_event(
+        self,
+        *,
+        call_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        source: str = "sip",
+    ) -> None:
+        self._append_event(call_id, event_type, source, payload)
 
     async def get_session(self, call_id: str) -> SessionStatusResult:
         session = self.registry.get(call_id)
