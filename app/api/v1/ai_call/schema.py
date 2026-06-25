@@ -28,6 +28,29 @@ class CreateWebSessionRequest(AiCallBaseSchema):
     )
 
 
+class CreateSipSessionRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    callee_phone_number: str = Field(
+        min_length=3,
+        max_length=32,
+        description="动态被叫号码，服务端线路配置负责主叫和 trunk 能力",
+    )
+    voice: str | None = Field(default=None, description="Qwen Realtime voice 参数")
+    business_id: str | None = Field(default=None, description="上游业务ID")
+    scene_code: str = Field(description="业务场景编码")
+    business_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="业务侧上下文参数",
+    )
+    ringing_timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=120,
+        description="SIP 振铃等待秒数",
+    )
+
+
 class BrowserEventReportRequest(AiCallBaseSchema):
     type: str = Field(description="浏览器事件类型")
     timestamp: datetime | None = Field(default=None, description="浏览器侧事件时间")
@@ -91,6 +114,17 @@ class CreateSessionOut(AiCallBaseSchema):
     status: CallSessionStatus
     effective_config: EffectiveConfigOut
     web_audio_constraints: WebAudioConstraintsOut
+
+
+class CreateSipSessionOut(AiCallBaseSchema):
+    call_id: str
+    room_name: str
+    participant_identity: str
+    status: CallSessionStatus
+    effective_config: EffectiveConfigOut
+    sip_call_id: str | None = None
+    sip_trunk_id: str | None = None
+    sip_call_status: str | None = None
 
 
 class TokenOut(AiCallBaseSchema):

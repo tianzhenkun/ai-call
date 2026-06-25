@@ -14,6 +14,8 @@ from .schema import (
     BrowserEventReportRequest,
     CreateHandoffRequest,
     CreateSessionOut,
+    CreateSipSessionOut,
+    CreateSipSessionRequest,
     CreateWebSessionRequest,
     DialogueSegmentListOut,
     EndSessionOut,
@@ -81,6 +83,29 @@ async def create_session_controller(
     )
     return SuccessResponse(
         data=CreateSessionOut.model_validate(result),
+        msg="创建成功",
+    )
+
+
+@AiCallRouter.post(
+    "/sip-sessions",
+    summary="创建 SIP 外呼会话",
+    response_model=ResponseSchema[CreateSipSessionOut],
+)
+async def create_sip_session_controller(
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    request: Annotated[CreateSipSessionRequest, Body()],
+) -> JSONResponse:
+    result = await service.create_sip_session(
+        callee_phone_number=request.callee_phone_number,
+        voice=request.voice,
+        business_id=request.business_id,
+        scene_code=request.scene_code,
+        business_params=request.business_params,
+        ringing_timeout_seconds=request.ringing_timeout_seconds,
+    )
+    return SuccessResponse(
+        data=CreateSipSessionOut.model_validate(result),
         msg="创建成功",
     )
 

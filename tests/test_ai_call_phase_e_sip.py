@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.service import AiCallService
 from app.config.setting import Settings
 from app.core.exceptions import CustomException
@@ -524,3 +527,43 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
         "message": "LiveKit SIP Participant 创建失败",
         "calleePhoneNumberMasked": "138****0000",
     }
+
+
+def test_create_sip_session_controller_accepts_dynamic_callee_without_browser_token() -> None:
+    service, _room_manager, _agent_runner, sip_client, _record_service, _prompt_resolver = (
+        build_service_with_sip_fakes()
+    )
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/ai-call/sip-sessions",
+            json={
+                "calleePhoneNumber": "13800000000",
+                "businessId": "geo_task_001",
+                "sceneCode": "intro_geo",
+                "businessParams": {"customerId": "customer_001"},
+                "ringingTimeoutSeconds": 30,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    assert body["msg"] == "创建成功"
+    data = body["data"]
+    assert data["callId"].startswith("call_")
+    assert data["roomName"] == f"ai-call-{data['callId']}"
+    assert data["participantIdentity"] == f"sip-{data['callId']}"
+    assert data["status"] == "ready"
+    assert data["effectiveConfig"]["voice"] == "Tina"
+    assert data["sipCallId"] == "short-call-id"
+    assert data["sipTrunkId"] == "trunk_123"
+    assert data["sipCallStatus"] == "active"
+    assert "participantToken" not in data
+    assert "livekitUrl" not in data
+    assert "sipCallIdFull" not in data
+    assert "calleePhoneNumber" not in data
+    assert sip_client.created[0]["callee_phone_number"] == "13800000000"
