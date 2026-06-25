@@ -1,6 +1,6 @@
 # Phase E：SIP 真实线路最小接入设计
 
-最后更新：2026-06-24
+最后更新：2026-06-25
 
 ## 1. 文档定位
 
@@ -22,7 +22,7 @@ Phase E 不是重新设计 AI Agent，不切换实时模型，不修改 `intro_g
 
 ## 2. 当前代码事实
 
-本节只记录当前 checkout 已核对事实，不能直接推断为 Phase E 已实现。
+本节只记录当前 checkout 已核对事实，不能直接推断为真实电话已验收。
 
 当前已具备：
 
@@ -30,27 +30,32 @@ Phase E 不是重新设计 AI Agent，不切换实时模型，不修改 `intro_g
 2. 会话服务：`AiCallService.create_web_session(...)`。
 3. Room 编排：`AiCallOrchestrator.create_web_session(...)`。
 4. Web 用户身份：`participant_identity = f"browser-{call_id}"`。
-5. LiveKit Room 封装：`LiveKitRoomManager` 只包含 `CreateRoom`、`DeleteRoom` 和浏览器/坐席 Token 签发。
-6. 录音闭环：`AiCallRecordingService` 以 `call_id`、`room_name`、用户 participant identity 和 `agent-{call_id}` 启动录音。
-7. 对话文本闭环：已有实时对话段和通话后查询能力。
-8. 转人工闭环：坐席以 `human-agent-{handoff_id}` 加入同一个 Room，AI 挂起，handoff 状态闭环已通过 Web/LAN 验收。
-9. 部署模板：`deploy/livekit-egress/docker-compose.yml` 当前只启动 `redis`、`livekit`、`egress`。
+5. SIP 会话入口：`POST /ai-call/sip-sessions`。
+6. SIP 会话服务：`AiCallService.create_sip_session(...)`。
+7. SIP Room 编排：`AiCallOrchestrator.create_sip_session(...)`。
+8. SIP 用户身份：`participant_identity = f"sip-{call_id}"`，不使用完整手机号。
+9. `LiveKitSipClient` 已封装外呼预检和 LiveKit `CreateSIPParticipant` 调用，优先使用官方 `livekit-api` / `livekit.protocol.sip`。
+10. SIP 外呼配置项已补齐真实外呼开关、号码前缀、trunk、认证、主叫显号、振铃超时、公网 IP/NAT 和 RTP 范围。
+11. `deploy/livekit-egress/docker-compose.yml` 已补 `livekit-sip` service，`sip.yaml.example` 已给出自托管模板。
+12. LiveKit Room 封装：`LiveKitRoomManager` 仍只包含 `CreateRoom`、`DeleteRoom` 和浏览器/坐席 Token 签发；SIP 调用由 `LiveKitSipClient` 单独承担。
+13. 录音闭环：`AiCallRecordingService` 以 `call_id`、`room_name`、用户 participant identity 和 `agent-{call_id}` 启动录音。
+14. 对话文本闭环：已有实时对话段和通话后查询能力。
+15. 转人工闭环：坐席以 `human-agent-{handoff_id}` 加入同一个 Room，AI 挂起，handoff 状态闭环已通过 Web/LAN 验收。
 
 当前缺口：
 
-1. 没有 `create_sip_session` 服务入口。
-2. 没有 `POST /ai-call/sip-sessions` 或等价 SIP 会话 API。
-3. 没有 `LiveKitSipClient`。
-4. 没有 LiveKit SIP `CreateSIPParticipant` 调用。
-5. 没有 LiveKit SIP service 自托管 compose 配置。
-6. `app/config/setting.py` 只有粗粒度 `SIP_PROXY`、`SIP_CALLER_NUMBER`、`SIP_SIGNALING_PORT`、`SIP_RTP_RANGE`，缺少 trunk、认证、拨号、真实外呼开关、超时和公网/NAT 配置。
-7. 当前依赖锁定为 `livekit==1.1.10`，本地核验未暴露 `livekit.api` 和 `livekit.protocol.sip` 模块；Phase E 实现不能直接假设当前 Python 包可调用官方 `SipService` SDK。
+1. 尚未启动并验证本地/自托管 LiveKit SIP service。
+2. 尚未执行真实手机 smoke，不能宣称真实电话已拨通。
+3. 尚未补 guarded smoke 脚本；真实拨号仍必须通过显式确认参数保护。
+4. 尚未覆盖无人接听、忙线、拒接、号码错误、trunk 鉴权失败、RTP/media 失败等真实失败样本。
+5. 尚未接入 SIP hangup/ringing/failed 等运行期回调或事件 reconciliation；当前只完成创建阶段事件和失败映射地基。
+6. 尚未把动态主叫显号按业务上下文解析；当前主叫显号仍来自服务端 SIP 配置。
 
 设计推论：
 
 1. Phase E 不能直接宣称“已具备真实 SIP 电话验收能力”。
-2. Phase E 的第一步应是新增入口和 SIP client，而不是改写 Web 主链路。
-3. Phase E P1-min 应优先新增 `livekit-api` 依赖，并只在 `LiveKitSipClient` 内部使用官方 `SipService`；如果 SDK 不可用或与当前自托管 LiveKit Server 不兼容，再降级到手写 Twirp。
+2. 当前已经完成“新增入口和 SIP client”的代码地基，Web 主链路保持不动。
+3. 当前实现已经新增 `livekit-api` 依赖，并只在 `LiveKitSipClient` 内部使用官方 `SipService`；如果 SDK 不可用或与当前自托管 LiveKit Server 不兼容，再降级到手写 Twirp，且不能静默降级。
 
 ## 3. LiveKit SIP 官方能力核对
 
@@ -174,15 +179,15 @@ flowchart TB
 
 Phase E 外呼创建建议采用以下顺序：
 
-1. 校验真实外呼开关、目标号码、trunk/caller 配置和 LiveKit/Qwen 配置。
-2. 生成 `call_id`、`room_name=ai-call-{call_id}`、`participant_identity=sip-{call_id}`。
-3. 创建 `ai_call_record`，`entry_type=sip_outbound`，`participant_identity=sip-{call_id}`。
+1. 生成 `call_id`、`room_name=ai-call-{call_id}`、`participant_identity=sip-{call_id}`。
+2. 创建 `ai_call_record`，`entry_type=sip_outbound`，`participant_identity=sip-{call_id}`。
+3. 前置 SIP preflight，校验真实外呼开关、目标号码、trunk/caller 配置、公网/NAT 和 RTP 范围；失败时写 `sip_preflight_failed`，不创建 Room，不启动 Agent，不调用 `CreateSIPParticipant`。
 4. 解析 `sceneCode/businessId/businessParams`，得到现有 `PromptEffectiveConfig`。
 5. 创建 LiveKit Room。
 6. 启动 Realtime Agent，让 Agent 先准备好订阅 Room。
-7. 调用 `LiveKitSipClient.create_participant(...)` 发起 `CreateSIPParticipant`。
-8. 写入 `sip_invite_sent`。
-9. 根据 LiveKit SIP 返回、participant attributes、webhook 或轮询事件写入 `sip_ringing`、`sip_answered`、`media_connected`、`sip_failed`、`sip_hangup`。
+7. 写入 `sip_invite_sent`。
+8. 调用 `LiveKitSipClient.create_participant(...)` 发起 `CreateSIPParticipant`。
+9. 根据 LiveKit SIP 返回、participant attributes、webhook 或轮询事件写入 `sip_answered`、`media_connected`、`sip_failed`；后续再补 `sip_ringing`、`sip_hangup` 的运行期事件来源。
 10. 启动录音，用户侧 participant identity 使用 `sip-{call_id}`。
 11. 通话结束时沿用现有 `end_session` 和记录终态逻辑。
 
@@ -230,8 +235,7 @@ POST /ai-call/sip-sessions
     "customerId": "customer_001",
     "taskId": "task_001"
   },
-  "ringingTimeoutSeconds": 45,
-  "maxCallDurationSeconds": 600
+  "ringingTimeoutSeconds": 45
 }
 ```
 
@@ -245,7 +249,6 @@ POST /ai-call/sip-sessions
 | `sceneCode` | 是 | 业务场景编码 |
 | `businessParams` | 否 | 业务上下文参数，只允许 JSON object |
 | `ringingTimeoutSeconds` | 否 | 被叫接听等待时间，不能超过 LiveKit 上限 |
-| `maxCallDurationSeconds` | 否 | 单通最长通话时长 |
 
 号码边界：
 
@@ -264,13 +267,19 @@ POST /ai-call/sip-sessions
     "callId": "call_328200000000000001",
     "roomName": "ai-call-call_328200000000000001",
     "participantIdentity": "sip-call_328200000000000001",
-    "entryType": "sip_outbound",
     "status": "ready",
-    "sipOutboundStatus": "sent",
+    "sipCallId": "short-call-id",
+    "sipTrunkId": "trunk_123",
+    "sipCallStatus": "active",
     "effectiveConfig": {
       "model": "qwen3.5-omni-plus-realtime",
       "voice": "Tina",
-      "promptHash": "..."
+      "promptHash": "...",
+      "openingMessageHash": "...",
+      "promptSourceKey": "intro_geo",
+      "vadType": "server_vad",
+      "vadThreshold": 0.5,
+      "vadSilenceDurationMs": 800
     }
   }
 }
@@ -279,8 +288,9 @@ POST /ai-call/sip-sessions
 说明：
 
 1. SIP 创建接口不返回浏览器 `participantToken`，因为真实手机不通过浏览器加入 Room。
-2. 调试页如需观察状态，继续用记录和事件查询接口。
-3. 坐席接管仍走现有 handoff API。
+2. SIP 创建接口不返回 `livekitUrl`、完整被叫号码、`sipCallIdFull`、trunk host、SIP 账号或密码。
+3. 调试页如需观察状态，继续用记录和事件查询接口。
+4. 坐席接管仍走现有 handoff API。
 
 ### 9.2 保留现有接口
 
@@ -306,10 +316,10 @@ app/services/ai_call/livekit_sip.py
 职责：
 
 1. 创建 `CreateSIPParticipant` 请求。
-2. 签发包含 SIP `call` grant 的服务端 token。
+2. 准备包含 SIP `call` 权限的服务端调用上下文。
 3. 调用 LiveKit SIPService。
 4. 把 LiveKit/SIP 异常归一为 `AiCallError`。
-5. 返回脱敏后的 `SIPParticipantInfo` 摘要。
+5. 返回 `sipCallId`、`sipTrunkId`、`sipCallStatus` 等最小诊断摘要；完整号码和密钥不得进入 API 响应。
 
 不负责：
 
@@ -320,18 +330,18 @@ app/services/ai_call/livekit_sip.py
 5. 不判断业务场景。
 6. 不处理转人工。
 
-第一版实现策略：
+第一版实现策略与当前状态：
 
-1. Phase E P1-min 优先引入官方 `livekit-api` 包，并只在 `LiveKitSipClient` 内部使用。
-2. `LiveKitSipClient` 优先通过官方 SDK 调用 `create_sip_participant`，请求类型来自 `livekit.protocol.sip`。
+1. 当前已引入官方 `livekit-api` 包，并只在 `LiveKitSipClient` 内部使用。
+2. 当前 `LiveKitSipClient` 优先通过官方 SDK 调用 `create_sip_participant`，请求类型来自 `livekit.protocol.sip`。
 3. 如果 SDK 模块不可用、版本不兼容或自托管 LiveKit Server 响应不匹配，再降级到手写 Twirp，调用 `/twirp/livekit.SIP/CreateSIPParticipant`。
 4. Twirp 兜底不能静默启用；实现阶段如果需要走手写 Twirp，必须先说明 SDK 不可用的证据、降级影响和验证方案。
 5. 不把 SDK/Twirp 细节泄露到 `AiCallService`，外层只依赖 `LiveKitSipClient.create_participant(...)`。
 
-依赖建议：
+依赖状态：
 
-1. 后续实现时在 `pyproject.toml` 新增 `livekit-api>=1.0,<2.0` 或与当前 `livekit`/LiveKit Server 版本兼容的官方版本。
-2. 具体版本以实现时的 `uv lock`、导入验证、单测和本地自托管 smoke 为准。
+1. 当前已在 `pyproject.toml` 新增 `livekit-api>=1.0,<2.0`。
+2. 具体解析版本以 `uv.lock` 为准；真实兼容性仍需通过本地自托管 SIP service 和真实手机 smoke 验证。
 3. 不为引入 `livekit-api` 同步迁移 `LiveKitRoomManager`、`LiveKitEgressManager`、Token 签发或 Web 会话主链路。
 
 ### 10.1 `livekit-api` 后续评估记录
@@ -618,16 +628,21 @@ Phase E P1-min 验收必须使用真实手机，不以 Web/LAN 结果替代。
 
 ## 16. 实施拆分建议
 
-Phase E 实现时建议拆成以下小步：
+Phase E 已完成的代码地基：
 
-1. 新增配置与 preflight，不拨真实电话。
-2. 新增 `LiveKitSipClient` 单测，使用 fake Twirp/SDK client。
-3. 新增 `create_sip_session` 服务层 happy path 单测，fake Room、Agent、SIP client、recording。
-4. 新增 API schema/controller 单测。
+1. 新增配置与前置 preflight，不拨真实电话。
+2. 新增 `LiveKitSipClient` 单测，使用 fake SDK client。
+3. 新增 `create_sip_session` 服务层 happy path 和失败路径单测，fake Room、Agent、SIP client、recording。
+4. 新增 `POST /ai-call/sip-sessions` API schema/controller 单测。
 5. 新增 deploy SIP service 模板，不写真实密钥。
-6. 新增 guarded smoke 脚本，必须显式传测试号码和确认参数。
-7. 做第一通真实手机 smoke。
-8. 补验收报告，记录 call_id、事件、失败样本和剩余风险。
+
+Phase E 下一步仍需完成：
+
+1. 新增 guarded smoke 脚本，必须显式传测试号码和确认参数。
+2. 启动并验证自托管 LiveKit SIP service。
+3. 做第一通真实手机 smoke。
+4. 补真实电话验收报告，记录 call_id、事件、失败样本和剩余风险。
+5. 根据真实事件来源补 `sip_ringing`、`sip_hangup` 和 provider 失败码映射。
 
 不得在第一步就把 SIP 接入 Web 页面主按钮，避免误拨真实电话。
 

@@ -1,6 +1,6 @@
 # 端到端 AI 外呼引擎总纲
 
-最后更新：2026-06-24
+最后更新：2026-06-25
 
 ## 1. 文档定位
 
@@ -24,7 +24,7 @@ AI 实现前必须按顺序执行：
 
 | 项 | 当前值 |
 |---|---|
-| 当前阶段 | Phase E：SIP 真实线路最小接入设计已生成，待实现 |
+| 当前阶段 | Phase E：SIP 真实线路最小接入代码地基已落地，待自托管 SIP service 和真实手机 smoke 验收 |
 | 最近收尾阶段 | Phase B3/B3.1/B3.2：转人工 Web/LAN 真实通话闭环已验收 |
 | Phase A 状态 | Web 端到端核心引擎实现已收尾，补证项见验收报告 |
 | Phase A 设计文档 | [phases/phase-a-e2e-core-engine.md](phases/phase-a-e2e-core-engine.md) |
@@ -34,7 +34,7 @@ AI 实现前必须按顺序执行：
 | 当前入口 | 浏览器入口优先 |
 | 当前模型 | 固定使用阿里百炼 `qwen3.5-omni-plus-realtime` |
 | 当前音色策略 | 前端下拉选择阿里官方 `voice` 参数，默认 `Tina` |
-| 真实 SIP | Phase E 设计已生成，尚未实现或真实手机验收 |
+| 真实 SIP | 已新增 `LiveKitSipClient`、`POST /ai-call/sip-sessions`、前置 preflight、SIP 事件/失败映射和自托管 SIP service 模板；尚未完成真实手机验收 |
 | 业务系统接入 | Phase B/C 逐步接入 |
 
 阶段完成后必须更新本节。不能只更新阶段文档，不更新总纲当前状态。
@@ -186,7 +186,7 @@ flowchart TB
 | Phase B4：业务提示词配置与组装 | 设计已生成，待实现 | 支持业务提示词 profile、业务 Provider、公共提示词组件和最终 instructions 预览 | 创建通话时可按业务场景解析提示词和开场白，公共安全规则与转人工能力规则由平台统一组装 |
 | Phase C：Web 并发压测与容量验证 | 未开始 | 在不接真实 SIP 的情况下验证模型、Agent、LiveKit、事件、录音和成本的容量边界 | 形成容量报告：在指定配置和场景下可支持的并发会话数、新建速率、首个瓶颈、扩容方式和超限策略 |
 | Phase D：生产加固与运维兜底 | 未开始 | 监控、告警、回滚、限流、排障和故障兜底 | 有 SLO、告警、排障、压测复现和故障兜底 |
-| Phase E：真实 SIP 入口 | 设计已生成，待实现 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
+| Phase E：真实 SIP 入口 | 代码地基已落地，待真实手机验收 | 真实电话用户通过 LiveKit SIP 接入 Phase A-D 已验证链路 | 真实手机接听后可与 S2S Agent 对话，SIP/RTP/codec/挂机等问题可记录和处理 |
 
 ## 9. Phase A 实施边界
 
