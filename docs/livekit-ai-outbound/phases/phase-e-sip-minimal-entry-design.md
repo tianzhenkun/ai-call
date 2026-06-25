@@ -635,16 +635,40 @@ Phase E 已完成的代码地基：
 3. 新增 `create_sip_session` 服务层 happy path 和失败路径单测，fake Room、Agent、SIP client、recording。
 4. 新增 `POST /ai-call/sip-sessions` API schema/controller 单测。
 5. 新增 deploy SIP service 模板，不写真实密钥。
+6. 新增 guarded smoke 脚本 `tools/ai_call_sip_smoke.py`，默认 dry-run 或缺少确认参数时不拨真实电话。
 
 Phase E 下一步仍需完成：
 
-1. 新增 guarded smoke 脚本，必须显式传测试号码和确认参数。
-2. 启动并验证自托管 LiveKit SIP service。
-3. 做第一通真实手机 smoke。
-4. 补真实电话验收报告，记录 call_id、事件、失败样本和剩余风险。
-5. 根据真实事件来源补 `sip_ringing`、`sip_hangup` 和 provider 失败码映射。
+1. 启动并验证自托管 LiveKit SIP service。
+2. 做第一通真实手机 smoke。
+3. 补真实电话验收报告，记录 call_id、事件、失败样本和剩余风险。
+4. 根据真实事件来源补 `sip_ringing`、`sip_hangup` 和 provider 失败码映射。
 
 不得在第一步就把 SIP 接入 Web 页面主按钮，避免误拨真实电话。
+
+guarded smoke 脚本用法：
+
+```bash
+uv run python tools/ai_call_sip_smoke.py \
+  --base-url http://127.0.0.1:19011 \
+  --callee-phone-number '<真实被叫号码>' \
+  --scene-code intro_geo \
+  --dry-run
+```
+
+真实拨号必须显式追加：
+
+```bash
+uv run python tools/ai_call_sip_smoke.py \
+  --base-url http://127.0.0.1:19011 \
+  --callee-phone-number '<真实被叫号码>' \
+  --scene-code intro_geo \
+  --business-id '<业务ID>' \
+  --ringing-timeout-seconds 30 \
+  --confirm-real-call
+```
+
+脚本只把被叫号码放进 HTTP 请求体，终端输出会脱敏；不要在命令行里传 SIP trunk host、SIP 账号、SIP 密码、LiveKit API Secret 或模型 API Key。
 
 ## 17. 商用前补证
 
