@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     SIP_RTP_RANGE: str = "16384-16484"
     SIP_PUBLIC_IP: str = ""
     SIP_USE_EXTERNAL_IP: bool = True
+    AI_CALL_SIP_BARGE_IN_ENABLED: bool = True
+    AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS: float = -35.0
+    AI_CALL_SIP_BARGE_IN_MIN_SPEECH_DURATION_MS: int = 220
+    AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS: float = 5.0
 
     # ================================================= #
     # ***************** AI Provider配置 **************** #

@@ -54,12 +54,13 @@ class FakeLiveKitRoomManager:
 class CapturingAgentRunner:
     def __init__(self) -> None:
         self.started_sessions: list[CallSession] = []
+        self.started_opening_call_ids: list[str] = []
 
     async def start(self, session: CallSession) -> None:
         self.started_sessions.append(session)
 
     async def start_opening(self, call_id: str) -> None:
-        _ = call_id
+        self.started_opening_call_ids.append(call_id)
 
     async def record_browser_speech_candidate(self, call_id: str, trigger_timestamp) -> bool:
         _ = call_id, trigger_timestamp
@@ -452,6 +453,28 @@ async def test_livekit_sip_client_builds_create_participant_payload_for_fake_sdk
     assert result.sip_call_status == "active"
 
 
+def test_livekit_sip_client_extends_sdk_timeout_when_waiting_until_answered() -> None:
+    client = LiveKitSipClient(
+        config=SipOutboundConfig(enabled=True),
+        timeout_seconds=10,
+    )
+    payload = CreateSipParticipantPayload(
+        room_name="ai-call-call_1",
+        participant_identity="sip-call_1",
+        sip_call_to="13800000000",
+        sip_number="037100000000",
+        sip_trunk_id="trunk_123",
+        trunk_hostname="",
+        auth_username="",
+        auth_password="",
+        destination_country="CN",
+        wait_until_answered=True,
+        ringing_timeout_seconds=30,
+    )
+
+    assert client._request_timeout_seconds(payload) == 35
+
+
 @pytest.mark.anyio
 async def test_livekit_sip_client_raises_aicall_error_when_preflight_fails() -> None:
     client = LiveKitSipClient(
@@ -509,6 +532,7 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     assert record_service.failed_sessions == []
     assert len(agent_runner.started_sessions) == 1
     assert agent_runner.started_sessions[0].participant_identity == result.participant_identity
+    assert agent_runner.started_opening_call_ids == [result.call_id]
     assert prompt_resolver.contexts[0].scene_code == "intro_geo"
     assert prompt_resolver.contexts[0].business_params == {"customerId": "customer_001"}
     assert sip_client.created == [
@@ -530,6 +554,7 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     assert "sip_invite_sent" in event_types
     assert "sip_answered" in event_types
     assert "media_connected" in event_types
+    assert "opening_started" in event_types
     sip_invite = next(event for event in events if event.type == "sip_invite_sent")
     sip_answered = next(event for event in events if event.type == "sip_answered")
     media_connected = next(event for event in events if event.type == "media_connected")

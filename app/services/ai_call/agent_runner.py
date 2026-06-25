@@ -32,6 +32,7 @@ from app.services.ai_call.session_registry import (
     CallSessionStatus,
     InMemorySessionRegistry,
 )
+from app.services.ai_call.sip_barge_in import SipBargeInDetector, SipBargeInObservation
 from app.services.ai_call.transcript_trust import (
     decide_realtime_transcript_trust,
     is_realtime_transcript_semantically_rejected,
@@ -125,6 +126,7 @@ BROWSER_PRE_STOP_MIN_SNR_DB = 24.0
 BROWSER_PRE_STOP_MIN_HOT_FRAMES = 10
 BROWSER_PRE_STOP_MIN_RMS_DBFS = -30.0
 BROWSER_PRE_STOP_ECHO_REJECT_MARGIN_DB = 6.0
+SIP_BARGE_IN_INTERRUPT_REASON = "sip_uplink_speech_during_ai_audio"
 AGENT_RUNNER_DIAGNOSTICS_VERSION = "interrupt-diagnostics-v1"
 InterruptSource = Literal["browser", "provider"]
 InterruptAction = Literal["ignore", "candidate", "hold_audio", "pre_stop", "stop_only", "confirm"]
@@ -392,6 +394,9 @@ class PendingUserTurn:
     browser_pre_stop_requested: bool = False
     browser_pre_stop_confirmed: bool = False
     browser_pre_stop_expires_at: datetime | None = None
+    sip_barge_in_requested: bool = False
+    sip_barge_in_confirmed: bool = False
+    sip_barge_in_expires_at: datetime | None = None
     browser_segment_phase: str | None = None
     browser_segment_duration_ms: int | None = None
     browser_segment_snr_db: float | None = None
@@ -461,6 +466,10 @@ class RealtimeCallAgentRunner:
         browser_interrupt_audio_suppress_seconds: float = 1.5,
         browser_audio_hold_timeout_seconds: float = BROWSER_AUDIO_HOLD_TIMEOUT_SECONDS,
         browser_pre_stop_timeout_seconds: float = BROWSER_INTERRUPT_PROVIDER_UPGRADE_GRACE_SECONDS,
+        sip_barge_in_enabled: bool = True,
+        sip_barge_in_min_rms_dbfs: float = -35.0,
+        sip_barge_in_min_speech_duration_ms: int = 220,
+        sip_barge_in_hold_timeout_seconds: float = 5.0,
         user_turn_stability_delay_seconds: float = 0.35,
         handoff_prompt_constraint_enabled: bool = False,
         call_end_decision_service: RuleBasedCallEndDecisionService | None = None,
@@ -481,6 +490,10 @@ class RealtimeCallAgentRunner:
         )
         self.browser_audio_hold_timeout_seconds = max(0.0, browser_audio_hold_timeout_seconds)
         self.browser_pre_stop_timeout_seconds = max(0.0, browser_pre_stop_timeout_seconds)
+        self.sip_barge_in_enabled = sip_barge_in_enabled
+        self.sip_barge_in_min_rms_dbfs = sip_barge_in_min_rms_dbfs
+        self.sip_barge_in_min_speech_duration_ms = max(20, sip_barge_in_min_speech_duration_ms)
+        self.sip_barge_in_hold_timeout_seconds = max(0.0, sip_barge_in_hold_timeout_seconds)
         self.user_turn_stability_delay_seconds = max(0.0, user_turn_stability_delay_seconds)
         self.handoff_prompt_constraint_enabled = handoff_prompt_constraint_enabled
         self.call_end_decision_service = (
@@ -488,6 +501,14 @@ class RealtimeCallAgentRunner:
         )
         self.call_end_scheduler = call_end_scheduler
         self._interrupt_policy = InterruptDecisionPolicy()
+        self._sip_barge_in_detector = (
+            SipBargeInDetector(
+                min_rms_dbfs=self.sip_barge_in_min_rms_dbfs,
+                min_speech_duration_ms=self.sip_barge_in_min_speech_duration_ms,
+            )
+            if self.sip_barge_in_enabled
+            else None
+        )
         self._providers: dict[str, RealtimeProviderProtocol] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._audio_tasks: dict[str, asyncio.Task[None]] = {}
@@ -501,6 +522,7 @@ class RealtimeCallAgentRunner:
         self._pending_call_end_intents: dict[str, PendingCallEndIntent] = {}
         self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
+        self._sip_barge_in_tasks: dict[str, asyncio.Task[None]] = {}
 
     def runtime_diagnostics(self) -> dict[str, object]:
         return dict(AGENT_RUNNER_RUNTIME_DIAGNOSTICS)
@@ -524,6 +546,7 @@ class RealtimeCallAgentRunner:
         await self._cancel_turn_response_task(call_id)
         await self._cancel_browser_audio_hold_task(call_id)
         await self._cancel_browser_pre_stop_task(call_id)
+        await self._cancel_sip_barge_in_task(call_id)
 
         audio_task = self._audio_tasks.pop(call_id, None)
         if audio_task is not None and not audio_task.done():
@@ -552,6 +575,8 @@ class RealtimeCallAgentRunner:
         self._playback_guards.pop(call_id, None)
         self._pending_call_ends.pop(call_id, None)
         self._pending_call_end_intents.pop(call_id, None)
+        if self._sip_barge_in_detector is not None:
+            self._sip_barge_in_detector.reset(call_id)
 
     async def suspend_for_handoff(self, call_id: str) -> None:
         await self._cancel_playout_task(call_id)
@@ -590,6 +615,7 @@ class RealtimeCallAgentRunner:
 
     async def send_audio_frame(self, call_id: str, frame: PcmAudioFrame) -> None:
         provider = self._providers[call_id]
+        await self._maybe_handle_sip_barge_in_audio(call_id, provider, frame)
         for chunk in self.audio_bridge.iter_qwen_input_chunks(frame):
             await provider.send_audio(chunk)
 
@@ -617,6 +643,120 @@ class RealtimeCallAgentRunner:
                 failure_stage="audio_transport",
                 failure_message=f"通话音频传输异常: {exc}",
             )
+
+    async def _maybe_handle_sip_barge_in_audio(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        frame: PcmAudioFrame,
+    ) -> None:
+        detector = self._sip_barge_in_detector
+        if detector is None:
+            return
+
+        session = self.registry.get(call_id)
+        if not self._is_sip_participant(session):
+            detector.reset(call_id)
+            return
+
+        now = datetime.now(timezone.utc)
+        interruptible = self._is_sip_barge_in_interruptible(call_id, session, now)
+        observation = detector.observe(
+            call_id,
+            frame,
+            now=now,
+            interruptible=interruptible,
+        )
+        if not observation.candidate:
+            return
+
+        await self._handle_sip_barge_in_candidate(
+            call_id=call_id,
+            provider=provider,
+            trigger_timestamp=now,
+            observation=observation,
+        )
+
+    async def _handle_sip_barge_in_candidate(
+        self,
+        *,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        trigger_timestamp: datetime,
+        observation: SipBargeInObservation,
+    ) -> None:
+        session = self.registry.get(call_id)
+        if session.status in {
+            CallSessionStatus.CONNECTED,
+            CallSessionStatus.AI_THINKING,
+        }:
+            self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+            session = self.registry.get(call_id)
+        if session.status != CallSessionStatus.AI_SPEAKING:
+            return
+
+        turn = self._pending_turn(call_id, reset_if_finished=True)
+        if turn.started_at is None:
+            turn.started_at = trigger_timestamp
+        candidate_created = self._mark_interrupt_candidate(
+            call_id=call_id,
+            turn=turn,
+            trigger_timestamp=trigger_timestamp,
+            source="sip",
+            reason=SIP_BARGE_IN_INTERRUPT_REASON,
+        )
+        if candidate_created and not turn.sip_barge_in_requested:
+            turn.sip_barge_in_requested = True
+            self._append_event(
+                call_id,
+                "sip_interrupt_candidate",
+                "agent",
+                self._sip_barge_in_event_payload(call_id, observation),
+            )
+
+        guard = self._playback_guard(call_id)
+        guard.user_speech_active = True
+        self._extend_sip_barge_in(call_id, turn, trigger_timestamp)
+
+    def _is_sip_barge_in_interruptible(
+        self,
+        call_id: str,
+        session: CallSession,
+        timestamp: datetime,
+    ) -> bool:
+        if session.status == CallSessionStatus.AI_SPEAKING:
+            return True
+        return session.status in {
+            CallSessionStatus.CONNECTED,
+            CallSessionStatus.AI_THINKING,
+        } and (
+            self._has_recent_ai_audio(call_id, timestamp)
+            or self._has_active_model_response(call_id)
+        )
+
+    @staticmethod
+    def _is_sip_participant(session: CallSession) -> bool:
+        return session.participant_identity.startswith("sip-")
+
+    def _sip_barge_in_event_payload(
+        self,
+        call_id: str,
+        observation: SipBargeInObservation,
+    ) -> dict[str, Any]:
+        guard = self._playback_guard(call_id)
+        payload: dict[str, Any] = {
+            "reason": SIP_BARGE_IN_INTERRUPT_REASON,
+            "speechDurationMs": observation.speech_duration_ms,
+            "frameDurationMs": observation.frame_duration_ms,
+            "minSpeechDurationMs": self.sip_barge_in_min_speech_duration_ms,
+            "minRmsDbfs": self.sip_barge_in_min_rms_dbfs,
+            "holdTimeoutSeconds": self.sip_barge_in_hold_timeout_seconds,
+        }
+        if observation.rms_dbfs is not None:
+            payload["rmsDbfs"] = round(observation.rms_dbfs, 2)
+        if guard.current_response_id:
+            payload["responseId"] = guard.current_response_id
+        return payload
 
     async def _consume_provider_events(
         self,
@@ -838,6 +978,8 @@ class RealtimeCallAgentRunner:
         if event_type == "model_session_started" and session.status == CallSessionStatus.READY:
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         elif event_type == "model_response_started":
+            if session.status == CallSessionStatus.READY:
+                session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
             self._mark_response_started(call_id, payload)
         elif event_type == "user_speech_started" and session.status == CallSessionStatus.CONNECTED:
             self.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
@@ -878,6 +1020,8 @@ class RealtimeCallAgentRunner:
         timestamp: datetime,
     ) -> None:
         session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.READY:
+            session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         self._playback_guard(call_id).user_speech_active = True
         turn = self._pending_turn(call_id, reset_if_finished=True)
         self._cancel_turn_response_task_nowait(call_id)
@@ -939,6 +1083,12 @@ class RealtimeCallAgentRunner:
             turn=turn,
             trigger_timestamp=timestamp,
             source="provider",
+            reason=decision.reason,
+        )
+        self._confirm_sip_barge_in(
+            call_id,
+            turn,
+            confirmed_by="provider_speech_started",
             reason=decision.reason,
         )
         self._confirm_browser_audio_hold(
@@ -1600,6 +1750,115 @@ class RealtimeCallAgentRunner:
             },
         )
 
+    def _extend_sip_barge_in(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        trigger_timestamp: datetime,
+    ) -> None:
+        timeout = self.sip_barge_in_hold_timeout_seconds
+        turn.sip_barge_in_expires_at = trigger_timestamp + timedelta(seconds=timeout)
+        guard = self._playback_guard(call_id)
+        suppress_until = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        if guard.suppress_audio_until is None or suppress_until > guard.suppress_audio_until:
+            guard.suppress_audio_until = suppress_until
+        self._schedule_sip_barge_in_expiry(call_id, turn)
+
+    def _confirm_sip_barge_in(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        *,
+        confirmed_by: str,
+        reason: str,
+    ) -> None:
+        if not turn.sip_barge_in_requested or turn.sip_barge_in_confirmed:
+            return
+        turn.sip_barge_in_confirmed = True
+        self._cancel_sip_barge_in_task_nowait(call_id)
+        self._append_event(
+            call_id,
+            "sip_interrupt_candidate_confirmed",
+            "agent",
+            {
+                "confirmedBy": confirmed_by,
+                "reason": reason,
+                "expiresAt": (
+                    turn.sip_barge_in_expires_at.isoformat()
+                    if turn.sip_barge_in_expires_at is not None
+                    else None
+                ),
+            },
+        )
+
+    def _schedule_sip_barge_in_expiry(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+    ) -> None:
+        expires_at = turn.sip_barge_in_expires_at
+        if expires_at is None:
+            return
+        self._cancel_sip_barge_in_task_nowait(call_id)
+        self._sip_barge_in_tasks[call_id] = asyncio.create_task(
+            self._expire_sip_barge_in_at(call_id, turn, expires_at),
+            name=f"ai-call-sip-barge-in-expiry-{call_id}",
+        )
+
+    async def _expire_sip_barge_in_at(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        expires_at: datetime,
+    ) -> None:
+        try:
+            delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._pending_user_turns.get(call_id) is not turn:
+                return
+            if (
+                not turn.sip_barge_in_requested
+                or turn.sip_barge_in_confirmed
+                or turn.interrupt_confirmed
+                or turn.sip_barge_in_expires_at != expires_at
+            ):
+                return
+            self._append_event(
+                call_id,
+                "sip_interrupt_candidate_expired",
+                "agent",
+                {
+                    "reason": "sip_barge_in_expired",
+                    "expiresAt": expires_at.isoformat(),
+                },
+            )
+            turn.sip_barge_in_requested = False
+            guard = self._playback_guard(call_id)
+            guard.user_speech_active = False
+            if guard.suppress_audio_until is not None and datetime.now(timezone.utc) >= (
+                guard.suppress_audio_until
+            ):
+                guard.suppress_audio_until = None
+            guard.audio_stop_requested = False
+            self._ignore_empty_turn(call_id, turn, "sip_barge_in_expired")
+            self._restore_after_expired_sip_barge_in(call_id)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._sip_barge_in_tasks.get(call_id) is asyncio.current_task():
+                self._sip_barge_in_tasks.pop(call_id, None)
+
+    def _restore_after_expired_sip_barge_in(self, call_id: str) -> None:
+        if self._has_active_model_response(call_id):
+            return
+        session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.AI_SPEAKING:
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        elif session.status == CallSessionStatus.INTERRUPTED:
+            self.registry.transition(call_id, CallSessionStatus.WAITING)
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+
     def _schedule_browser_pre_stop_expiry(
         self,
         call_id: str,
@@ -1747,6 +2006,21 @@ class RealtimeCallAgentRunner:
 
     async def _cancel_browser_pre_stop_task(self, call_id: str) -> None:
         task = self._browser_pre_stop_tasks.pop(call_id, None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _cancel_sip_barge_in_task_nowait(self, call_id: str) -> None:
+        task = self._sip_barge_in_tasks.pop(call_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_sip_barge_in_task(self, call_id: str) -> None:
+        task = self._sip_barge_in_tasks.pop(call_id, None)
         if task is None or task.done():
             return
         task.cancel()
@@ -1908,6 +2182,12 @@ class RealtimeCallAgentRunner:
             return
         if turn.interrupt_confirmed or decision.action != "confirm":
             return
+        self._confirm_sip_barge_in(
+            call_id,
+            turn,
+            confirmed_by="transcript",
+            reason=decision.reason,
+        )
         self._confirm_browser_audio_hold(
             call_id,
             turn,
@@ -2477,9 +2757,23 @@ class RealtimeCallAgentRunner:
             )
         else:
             guard.awaiting_response_start_after_interrupt = False
+            self._promote_stopped_turn_for_model_response(call_id)
         pending_call_end = self._pending_call_ends.get(call_id)
         if pending_call_end is not None:
             pending_call_end.final_response_started = True
+
+    def _promote_stopped_turn_for_model_response(self, call_id: str) -> None:
+        guard = self._playback_guard(call_id)
+        if guard.user_speech_active:
+            return
+        session = self.registry.get(call_id)
+        if session.status != CallSessionStatus.USER_SPEAKING:
+            return
+        self.registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        turn = self._pending_user_turns.get(call_id)
+        if turn is not None and turn.stopped_at is not None and not turn.response_requested:
+            turn.response_requested = True
+            self._cancel_turn_response_task_nowait(call_id)
 
     async def _complete_response_and_flush_pending(
         self,

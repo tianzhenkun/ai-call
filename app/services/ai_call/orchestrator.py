@@ -90,6 +90,10 @@ class AiCallRuntimeConfig:
     vad_silence_duration_ms: int
     user_turn_stability_delay_seconds: float = 0.35
     handoff_prompt_constraint_enabled: bool = True
+    sip_barge_in_enabled: bool = True
+    sip_barge_in_min_rms_dbfs: float = -35.0
+    sip_barge_in_min_speech_duration_ms: int = 220
+    sip_barge_in_hold_timeout_seconds: float = 5.0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -112,6 +116,14 @@ class AiCallRuntimeConfig:
             vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
             user_turn_stability_delay_seconds=(settings.AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS),
             handoff_prompt_constraint_enabled=(settings.AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED),
+            sip_barge_in_enabled=settings.AI_CALL_SIP_BARGE_IN_ENABLED,
+            sip_barge_in_min_rms_dbfs=settings.AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS,
+            sip_barge_in_min_speech_duration_ms=(
+                settings.AI_CALL_SIP_BARGE_IN_MIN_SPEECH_DURATION_MS
+            ),
+            sip_barge_in_hold_timeout_seconds=(
+                settings.AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS
+            ),
         )
 
     def ensure_ready(self) -> None:
@@ -271,6 +283,10 @@ class AiCallOrchestrator:
             audio_transport=audio_transport,
             user_turn_stability_delay_seconds=(self.config.user_turn_stability_delay_seconds),
             handoff_prompt_constraint_enabled=(self.config.handoff_prompt_constraint_enabled),
+            sip_barge_in_enabled=self.config.sip_barge_in_enabled,
+            sip_barge_in_min_rms_dbfs=self.config.sip_barge_in_min_rms_dbfs,
+            sip_barge_in_min_speech_duration_ms=self.config.sip_barge_in_min_speech_duration_ms,
+            sip_barge_in_hold_timeout_seconds=self.config.sip_barge_in_hold_timeout_seconds,
             call_end_scheduler=self._schedule_auto_end_session,
         )
 
@@ -826,22 +842,7 @@ class AiCallOrchestrator:
                 event.payload,
             )
         if should_start_opening:
-            opening_started_at = self._append_event(
-                call_id,
-                "opening_started",
-                "agent",
-                {
-                    "openingMessageHash": self._config_value(
-                        session.effective_config,
-                        "opening_message_hash",
-                        "",
-                    )
-                },
-            )
-            metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
-            metrics.mark_model_response_requested(opening_started_at)
-            session.metrics = metrics.snapshot()
-            await self.agent_runner.start_opening(call_id)
+            await self._start_opening_for_session(session)
         return BrowserEventReportResult(
             event_id=event.event_id,
             call_id=event.call_id,
@@ -850,6 +851,41 @@ class AiCallOrchestrator:
             source=event.source,
             payload=event.payload,
         )
+
+    async def start_opening(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if session.status not in RUNNING_STATUSES:
+            raise AiCallError(
+                error_id="invalid_session_state",
+                msg="当前会话状态不允许该操作",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        if session.status == CallSessionStatus.READY:
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        if not str(self._config_value(session.effective_config, "opening_message", "")).strip():
+            return
+        await self._start_opening_for_session(session)
+
+    async def _start_opening_for_session(self, session: CallSession) -> None:
+        call_id = session.call_id
+        if any(event.type == "opening_started" for event in self.event_store.list_all(call_id)):
+            return
+        opening_started_at = self._append_event(
+            call_id,
+            "opening_started",
+            "agent",
+            {
+                "openingMessageHash": self._config_value(
+                    session.effective_config,
+                    "opening_message_hash",
+                    "",
+                )
+            },
+        )
+        metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
+        metrics.mark_model_response_requested(opening_started_at)
+        session.metrics = metrics.snapshot()
+        await self.agent_runner.start_opening(call_id)
 
     def _append_event(
         self,

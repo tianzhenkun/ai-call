@@ -254,6 +254,73 @@ def test_interrupt_policy_matrix_upgrades_provider_after_browser_candidate() -> 
     assert transcript_decision.action == "confirm"
 
 
+def _pcm16_constant_frame(
+    *,
+    amplitude: int,
+    sample_rate_hz: int = 8000,
+    duration_ms: int = 20,
+) -> PcmAudioFrame:
+    sample_count = sample_rate_hz * duration_ms // 1000
+    pcm = struct.pack("<" + "h" * sample_count, *([amplitude] * sample_count))
+    return PcmAudioFrame(
+        data=pcm,
+        sample_rate_hz=sample_rate_hz,
+        channels=1,
+        sample_width_bytes=2,
+    )
+
+
+def test_sip_barge_in_detector_promotes_sustained_uplink_audio() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        min_rms_dbfs=-35.0,
+        min_speech_duration_ms=200,
+    )
+    started_at = datetime.now(timezone.utc)
+    loud_frame = _pcm16_constant_frame(amplitude=4000)
+
+    observations = [
+        detector.observe(
+            "call_sip_detector",
+            loud_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(10)
+    ]
+
+    assert observations[-1].active is True
+    assert observations[-1].candidate is True
+    assert observations[-1].speech_duration_ms >= 200
+    assert observations[-1].rms_dbfs >= -35.0
+
+
+def test_sip_barge_in_detector_ignores_silence_and_low_level_audio() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        min_rms_dbfs=-35.0,
+        min_speech_duration_ms=200,
+    )
+    started_at = datetime.now(timezone.utc)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    observations = [
+        detector.observe(
+            "call_sip_detector",
+            quiet_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(12)
+    ]
+
+    assert all(observation.candidate is False for observation in observations)
+    assert observations[-1].active is False
+    assert observations[-1].speech_duration_ms == 0
+
+
 class WaitingAudioPublisher(FakeAudioPublisher):
     def __init__(self) -> None:
         super().__init__()
@@ -465,6 +532,23 @@ def test_ai_call_runtime_config_defaults_to_server_vad(monkeypatch: pytest.Monke
     runtime_config = AiCallRuntimeConfig.from_settings(Settings(_env_file=None))
 
     assert runtime_config.vad_type == "server_vad"
+
+
+def test_ai_call_runtime_config_reads_sip_barge_in_settings() -> None:
+    runtime_config = AiCallRuntimeConfig.from_settings(
+        Settings(
+            _env_file=None,
+            AI_CALL_SIP_BARGE_IN_ENABLED=True,
+            AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS=-32.5,
+            AI_CALL_SIP_BARGE_IN_MIN_SPEECH_DURATION_MS=260,
+            AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS=4.5,
+        )
+    )
+
+    assert runtime_config.sip_barge_in_enabled is True
+    assert runtime_config.sip_barge_in_min_rms_dbfs == -32.5
+    assert runtime_config.sip_barge_in_min_speech_duration_ms == 260
+    assert runtime_config.sip_barge_in_hold_timeout_seconds == 4.5
 
 
 def test_orchestrator_default_agent_runner_uses_realtime_qwen_livekit_stack() -> None:
@@ -3020,6 +3104,125 @@ async def test_realtime_agent_runner_publishes_model_audio_delta_to_audio_sink()
     assert frame.channels == 1
     assert "ai_audio_published" in [event.type for event in store.list("call_publish")]
     assert registry.get("call_publish").metrics["lastPublishDelayMs"] is not None
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_publishes_model_audio_when_response_starts_after_stopped_turn() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    output_pcm = b"\x01\x02" * 240
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_response_started",
+            payload={"response": {"id": "resp_auto_after_stop"}},
+        ),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={
+                "response_id": "resp_auto_after_stop",
+                "delta": base64.b64encode(output_pcm).decode("ascii"),
+            },
+        ),
+        ProviderEvent(
+            type="model_response_done",
+            payload={"response": {"id": "resp_auto_after_stop", "status": "completed"}},
+        ),
+    ])
+    publisher = FakeAudioPublisher()
+    session = CallSession(
+        call_id="call_response_started_after_stop",
+        room_name="ai-call-call_response_started_after_stop",
+        participant_identity="browser-call_response_started_after_stop",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_response_started_after_stop")
+
+    assert len(publisher.published) == 1
+    assert provider.created_responses == []
+    event_types = [event.type for event in store.list("call_response_started_after_stop")]
+    assert "ai_audio_published" in event_types
+    assert "stale_audio_dropped" not in event_types
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_publishes_model_audio_when_user_turn_starts_from_ready() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    output_pcm = b"\x01\x02" * 240
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="user_speech_started", payload={}),
+        ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(
+            type="model_response_started",
+            payload={"response": {"id": "resp_ready_turn"}},
+        ),
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={
+                "response_id": "resp_ready_turn",
+                "delta": base64.b64encode(output_pcm).decode("ascii"),
+            },
+        ),
+        ProviderEvent(
+            type="model_response_done",
+            payload={"response": {"id": "resp_ready_turn", "status": "completed"}},
+        ),
+    ])
+    publisher = FakeAudioPublisher()
+    session = CallSession(
+        call_id="call_ready_turn",
+        room_name="ai-call-call_ready_turn",
+        participant_identity="browser-call_ready_turn",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0.05,
+    )
+
+    await runner.start(session)
+    await runner.wait("call_ready_turn")
+
+    assert len(publisher.published) == 1
+    assert provider.created_responses == []
+    event_types = [event.type for event in store.list("call_ready_turn")]
+    assert "ai_audio_published" in event_types
+    assert "stale_audio_dropped" not in event_types
 
 
 @pytest.mark.anyio
@@ -6113,6 +6316,208 @@ async def test_realtime_agent_runner_forwards_room_audio_frames_to_provider() ->
     assert transport.closed_call_ids == ["call_room_audio"]
     assert len(provider.sent_audio) == 1
     assert len(provider.sent_audio[0]) == 640
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_sip_candidate_before_provider_vad() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = FakeAudioPublisher()
+    call_id = "call_sip_barge_in"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        sip_barge_in_enabled=True,
+        sip_barge_in_min_rms_dbfs=-35.0,
+        sip_barge_in_min_speech_duration_ms=200,
+    )
+    loud_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_opening"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+        runner._last_ai_audio_published_at[call_id] = datetime.now(timezone.utc)
+
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, loud_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        sip_candidate = next(event for event in events if event.type == "sip_interrupt_candidate")
+
+        assert len(provider.sent_audio) == 10
+        assert provider.cancelled_response_count == 0
+        assert publisher.stopped_call_ids == []
+        assert sip_candidate.payload["reason"] == "sip_uplink_speech_during_ai_audio"
+        assert sip_candidate.payload["speechDurationMs"] >= 200
+        assert "interrupt_candidate" in event_types
+        assert "sip_interrupt_candidate" in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "interrupt_audio_stop_requested" not in event_types
+        assert "playout_queue_flushed" not in event_types
+        assert "interrupt_audio_stop_completed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        guard = runner._playback_guard(call_id)
+        assert guard.user_speech_active is True
+        assert guard.suppress_audio_until is not None
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_hard_stops_sip_candidate_after_provider_speech() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = FakeAudioPublisher()
+    call_id = "call_sip_barge_in_provider_confirmed"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        sip_barge_in_enabled=True,
+        sip_barge_in_min_rms_dbfs=-35.0,
+        sip_barge_in_min_speech_duration_ms=200,
+    )
+    loud_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_opening"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+        runner._last_ai_audio_published_at[call_id] = datetime.now(timezone.utc)
+
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, loud_frame)
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        confirmed = next(
+            event for event in events if event.type == "sip_interrupt_candidate_confirmed"
+        )
+
+        assert provider.cancelled_response_count == 1
+        assert publisher.stopped_call_ids == [call_id]
+        assert confirmed.payload["confirmedBy"] == "provider_speech_started"
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_interrupt_candidate_confirmed" in event_types
+        assert "response_generation_invalidated" in event_types
+        assert "interrupt_audio_stop_requested" in event_types
+        assert "playout_queue_flushed" in event_types
+        assert "interrupt_audio_stop_completed" in event_types
+        assert "interrupt_confirmed" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_expires_unconfirmed_sip_candidate() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = FakeAudioPublisher()
+    call_id = "call_sip_barge_in_expired"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        sip_barge_in_enabled=True,
+        sip_barge_in_min_rms_dbfs=-35.0,
+        sip_barge_in_min_speech_duration_ms=200,
+        sip_barge_in_hold_timeout_seconds=0.01,
+    )
+    loud_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_opening"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+        runner._last_ai_audio_published_at[call_id] = datetime.now(timezone.utc)
+
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, loud_frame)
+        for _ in range(10):
+            if any(event.type == "sip_interrupt_candidate_expired" for event in store.list(call_id)):
+                break
+            await asyncio.sleep(0.01)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        ignored = next(event for event in events if event.type == "interrupt_ignored")
+        guard = runner._playback_guard(call_id)
+
+        assert provider.cancelled_response_count == 0
+        assert publisher.stopped_call_ids == []
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_interrupt_candidate_expired" in event_types
+        assert "sip_interrupt_candidate_confirmed" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert ignored.payload["reason"] == "sip_barge_in_expired"
+        assert guard.user_speech_active is False
+        assert guard.suppress_audio_until is None
+    finally:
+        await runner.stop(call_id)
 
 
 @pytest.mark.anyio

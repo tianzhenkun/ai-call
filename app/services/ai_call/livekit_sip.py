@@ -196,7 +196,7 @@ class LiveKitSipClient:
         try:
             return await client.sip.create_sip_participant(
                 request,
-                timeout=self.timeout_seconds,
+                timeout=self._request_timeout_seconds(payload),
                 trunk_id=payload.sip_trunk_id or None,
                 outbound_trunk_config=outbound_trunk_config,
             )
@@ -214,6 +214,11 @@ class LiveKitSipClient:
     def _ringing_timeout_seconds(self, value: int | None) -> int:
         timeout = self.config.default_ringing_timeout_seconds if value is None else int(value)
         return min(max(1, timeout), self.config.max_ringing_timeout_seconds)
+
+    def _request_timeout_seconds(self, payload: CreateSipParticipantPayload) -> float:
+        if not payload.wait_until_answered:
+            return self.timeout_seconds
+        return max(self.timeout_seconds, float(payload.ringing_timeout_seconds + 5))
 
     @staticmethod
     def _coerce_result(

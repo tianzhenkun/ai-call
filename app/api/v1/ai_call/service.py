@@ -271,6 +271,7 @@ class AiCallService:
                 customer_participant_identity=room_session.participant_identity,
                 ai_participant_identity=f"agent-{room_session.call_id}",
             )
+        await self.orchestrator.start_opening(room_session.call_id)
         return CreateSipSessionResult(
             call_id=room_session.call_id,
             room_name=room_session.room_name,

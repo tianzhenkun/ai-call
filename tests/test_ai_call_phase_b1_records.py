@@ -2703,6 +2703,9 @@ def test_record_service_persists_promoted_browser_interrupt_candidate() -> None:
 @pytest.mark.parametrize(
     "event_type",
     [
+        "sip_interrupt_candidate",
+        "sip_interrupt_candidate_confirmed",
+        "sip_interrupt_candidate_expired",
         "browser_pre_stop_requested",
         "browser_pre_stop_completed",
         "browser_pre_stop_confirmed",
@@ -2716,7 +2719,7 @@ def test_record_service_persists_promoted_browser_interrupt_candidate() -> None:
         "browser_audio_hold_rejected_echo",
     ],
 )
-def test_record_service_persists_browser_pre_stop_diagnostics(event_type: str) -> None:
+def test_record_service_persists_interrupt_observation_diagnostics(event_type: str) -> None:
     event = InMemoryEventStore().append(
         call_id="call_browser_pre_stop_persist",
         type=event_type,
