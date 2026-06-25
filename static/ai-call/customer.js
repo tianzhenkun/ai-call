@@ -2,7 +2,6 @@ const state = {
   session: null,
   room: null,
   handoff: null,
-  handoffRequesting: false,
   localTrack: null,
   localMuted: false,
   pollTimer: null,
@@ -42,8 +41,14 @@ const state = {
   voiceProfiles: [],
   promptProfiles: [],
   asrActive: false,
+  sessionEntryMode: null,
 };
 
+const CALL_MODE_WEB = "web";
+const CALL_MODE_SIP = "sip";
+const SIP_TARGET_LINPHONE = "linphone";
+const SIP_TARGET_REAL_PHONE = "real_phone";
+const LINPHONE_DEFAULT_CALLEE_NUMBER = "19900001000";
 const EVENT_RENDER_LIMIT = 300;
 const REMOTE_AUDIO_POLL_MS = 40;
 const REMOTE_AUDIO_START_RMS = 0.015;
@@ -71,7 +76,11 @@ const el = {
   refreshRecording: document.querySelector("#refresh-recording"),
   refreshDialogue: document.querySelector("#refresh-dialogue"),
   refreshHandoff: document.querySelector("#refresh-handoff"),
-  requestHandoff: document.querySelector("#request-handoff"),
+  callModeSelect: document.querySelector("#call-mode-select"),
+  sipTargetSelect: document.querySelector("#sip-target-select"),
+  sipCallFields: document.querySelector("#sip-call-fields"),
+  calleePhoneInput: document.querySelector("#callee-phone-input"),
+  ringingTimeoutInput: document.querySelector("#ringing-timeout-input"),
   voiceSelect: document.querySelector("#voice-select"),
   sceneCodeInput: document.querySelector("#scene-code-input"),
   businessIdInput: document.querySelector("#business-id-input"),
@@ -204,11 +213,12 @@ function setButtonLoading(button, active, text) {
 function restoreLoadingButtonState(button) {
   if (button === el.createSession) {
     el.createSession.disabled = false;
+    updateCallModeControls();
     return;
   }
   if (button === el.connectRoom) {
     el.connectRoom.disabled =
-      !state.session || Boolean(state.localTrack) || Boolean(state.room);
+      isSipMode() || !state.session || Boolean(state.localTrack) || Boolean(state.room);
   }
 }
 
@@ -358,6 +368,7 @@ const SOURCE_LABELS = {
   agent: "AI 坐席",
   human_agent: "人工坐席",
   handoff: "转人工",
+  sip: "SIP",
   qwen_realtime: "实时文本",
   offline_asr: "离线ASR",
 };
@@ -399,6 +410,16 @@ const EVENT_TYPE_LABELS = {
   browser_audio_input_diagnostics: "浏览器音频输入诊断",
   browser_user_speech_segment: "浏览器检测到用户语音段",
   browser_user_speech_started: "浏览器检测到用户说话",
+  sip_preflight_passed: "SIP 外呼预检通过",
+  sip_preflight_failed: "SIP 外呼预检失败",
+  sip_invite_sent: "SIP 已发起呼叫",
+  sip_answered: "SIP 已接听",
+  media_connected: "电话媒体已接入",
+  sip_failed: "SIP 外呼失败",
+  sip_hangup: "SIP 已挂断",
+  sip_interrupt_candidate: "电话侧检测到插话候选",
+  sip_interrupt_candidate_confirmed: "电话侧插话候选已确认",
+  sip_interrupt_candidate_expired: "电话侧插话候选已过期",
   user_speech_started: "用户开始说话",
   user_speech_stopped: "用户停止说话",
   input_audio_committed: "用户音频已提交",
@@ -455,13 +476,42 @@ function isTerminalStatus(status) {
   return status === "completed" || status === "failed";
 }
 
+function isSipMode() {
+  return el.callModeSelect?.value === CALL_MODE_SIP;
+}
+
+function isRealPhoneTarget() {
+  return el.sipTargetSelect?.value === SIP_TARGET_REAL_PHONE;
+}
+
+function isLinphoneTarget() {
+  return el.sipTargetSelect?.value === SIP_TARGET_LINPHONE;
+}
+
+function isCurrentSessionSipMode() {
+  return (
+    state.sessionEntryMode === CALL_MODE_SIP ||
+    String(state.session?.participantIdentity || "").startsWith("sip-")
+  );
+}
+
+function maskPhoneNumber(phoneNumber) {
+  const digits = String(phoneNumber || "").replace(/\D/g, "");
+  if (digits.length <= 7) return "***";
+  return `${digits.slice(0, 3)}****${digits.slice(-4)}`;
+}
+
 function renderSession(session) {
   state.session = session;
   el.callId.textContent = session.callId;
   el.roomName.textContent = session.roomName;
   el.modelName.textContent = session.effectiveConfig.model;
   renderSessionStatus(session.status);
-  el.connectRoom.disabled = false;
+  const sipSession = isCurrentSessionSipMode();
+  el.connectRoom.disabled = sipSession;
+  if (sipSession) {
+    el.micState.textContent = "电话侧接入";
+  }
   updateLocalMuteButton();
   el.endSession.disabled = false;
   el.refreshStatus.disabled = false;
@@ -469,7 +519,7 @@ function renderSession(session) {
   el.refreshRecording.disabled = false;
   el.refreshDialogue.disabled = false;
   el.refreshHandoff.disabled = false;
-  updateHandoffControls();
+  updateCallModeControls();
   setStatus(session.status, "is-ready");
 }
 
@@ -648,7 +698,6 @@ function renderHandoff(handoff) {
         ? "暂无转人工记录"
         : "暂无转人工请求";
     el.handoffState.innerHTML = `<div class="subtle">${emptyText}</div>`;
-    updateHandoffControls();
     return;
   }
 
@@ -676,7 +725,6 @@ function renderHandoff(handoff) {
       `,
     )
     .join("");
-  updateHandoffControls();
 }
 
 function formatDateTime(value) {
@@ -695,36 +743,6 @@ function formatHandoffWaitState(handoff) {
   const remainingMs = new Date(handoff.expiresAt).getTime() - Date.now();
   const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
   return `等待人工接入，剩余 ${remainingSeconds}s`;
-}
-
-function isHandoffTerminal(status) {
-  return ["completed", "canceled", "failed", "expired"].includes(status);
-}
-
-function updateHandoffControls() {
-  const hasSession = Boolean(state.session) && !isTerminalStatus(state.session.status);
-  const handoff = state.handoff;
-  const handoffStatus = handoff?.status;
-  const active = handoff && !isHandoffTerminal(handoffStatus);
-  const requesting = Boolean(state.handoffRequesting);
-
-  el.requestHandoff.disabled = !hasSession || Boolean(active) || requesting;
-  if (!state.session) {
-    el.requestHandoff.textContent = "主动转人工";
-    el.requestHandoff.title = "请先创建会话";
-  } else if (isTerminalStatus(state.session.status)) {
-    el.requestHandoff.textContent = "会话已结束";
-    el.requestHandoff.title = "会话已结束，不能再发起转人工";
-  } else if (active) {
-    el.requestHandoff.textContent = "转人工处理中";
-    el.requestHandoff.title = "已有进行中的转人工请求，不能重复发起";
-  } else if (requesting) {
-    el.requestHandoff.textContent = "转人工发起中...";
-    el.requestHandoff.title = "正在发起转人工请求";
-  } else {
-    el.requestHandoff.textContent = "主动转人工";
-    el.requestHandoff.title = "发起人工接管请求";
-  }
 }
 
 function renderDialogue(rows) {
@@ -847,14 +865,15 @@ function resetClientRuntime() {
   stopClientAudioRuntime();
   resetEventState();
   state.session = null;
+  state.sessionEntryMode = null;
   state.handoff = null;
-  state.handoffRequesting = false;
   state.reportedBrowserReadyFor = null;
   state.reportedAudioInputDiagnosticsFor = null;
   state.disconnectReportedFor = null;
   el.sessionStatus.textContent = "未创建";
   el.micState.textContent = "未连接";
   disableSessionControls();
+  updateCallModeControls();
   state.suppressDisconnectReport = false;
 }
 
@@ -867,10 +886,62 @@ function disableSessionControls() {
   el.refreshRecording.disabled = true;
   el.refreshDialogue.disabled = true;
   el.refreshHandoff.disabled = true;
-  el.requestHandoff.disabled = true;
+}
+
+function updateCallModeControls() {
+  const sipMode = isSipMode();
+  const activeSession = Boolean(state.session) && !isTerminalStatus(state.session.status);
+  if (el.sipCallFields) {
+    el.sipCallFields.hidden = !sipMode;
+  }
+  if (el.connectRoom) {
+    el.connectRoom.hidden = sipMode;
+    el.connectRoom.disabled =
+      sipMode || !state.session || Boolean(state.localTrack) || Boolean(state.room);
+  }
+  if (el.muteRoom) {
+    el.muteRoom.hidden = sipMode;
+    if (sipMode) {
+      el.muteRoom.disabled = true;
+    }
+  }
+  if (el.callModeSelect) {
+    el.callModeSelect.disabled = activeSession;
+  }
+  if (el.sipTargetSelect) {
+    el.sipTargetSelect.disabled = activeSession || !sipMode;
+  }
+  if (el.calleePhoneInput) {
+    const linphoneTarget = sipMode && isLinphoneTarget();
+    if (linphoneTarget) {
+      el.calleePhoneInput.value = "";
+      el.calleePhoneInput.placeholder = "留空默认拨打本机 Linphone";
+    } else {
+      el.calleePhoneInput.placeholder = "请输入真实电话被叫号码";
+    }
+    el.calleePhoneInput.required = sipMode && isRealPhoneTarget();
+    el.calleePhoneInput.disabled = activeSession || !sipMode || linphoneTarget;
+  }
+  if (el.ringingTimeoutInput) {
+    el.ringingTimeoutInput.disabled = activeSession || !sipMode;
+  }
+  if (el.createSession) {
+    const text = sipMode ? "确认拨打" : "创建会话";
+    el.createSession.textContent = text;
+    el.createSession.dataset.defaultText = text;
+  }
+  if (!state.session) {
+    el.micState.textContent = sipMode ? "无需浏览器麦克风" : "未连接";
+  }
+  updateLocalMuteButton();
 }
 
 function updateLocalMuteButton() {
+  if (isSipMode() || isCurrentSessionSipMode()) {
+    el.muteRoom.disabled = true;
+    el.muteRoom.textContent = "麦克风：关";
+    return;
+  }
   el.muteRoom.disabled = !state.localTrack;
   el.muteRoom.textContent = state.localMuted ? "麦克风：开" : "麦克风：关";
 }
@@ -895,8 +966,7 @@ async function toggleLocalMute() {
   notify(state.localMuted ? "客户麦克风已关闭" : "客户麦克风已开启", "info");
 }
 
-async function createSession() {
-  resetClientRuntime();
+function buildBaseSessionPayload() {
   const payload = { voice: el.voiceSelect.value };
   const sceneCode = el.sceneCodeInput.value.trim();
   const businessId = el.businessIdInput.value.trim();
@@ -920,14 +990,82 @@ async function createSession() {
     }
     payload.businessParams = businessParams;
   }
+  return payload;
+}
+
+function resolveCalleePhoneNumber() {
+  if (isLinphoneTarget()) {
+    return LINPHONE_DEFAULT_CALLEE_NUMBER;
+  }
+  const calleePhoneNumber = el.calleePhoneInput.value.trim();
+  if (!calleePhoneNumber) {
+    throw new Error("请填写真实电话被叫号码");
+  }
+  return calleePhoneNumber;
+}
+
+function buildSipSessionPayload() {
+  const payload = buildBaseSessionPayload();
+  const calleePhoneNumber = resolveCalleePhoneNumber();
+  if (!/^\+?\d{5,20}$/.test(calleePhoneNumber)) {
+    throw new Error("被叫号码需为 5-20 位数字，可带 + 前缀");
+  }
+  payload.calleePhoneNumber = calleePhoneNumber;
+
+  const timeoutText = el.ringingTimeoutInput.value.trim();
+  if (timeoutText) {
+    const timeout = Number(timeoutText);
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120) {
+      throw new Error("振铃超时需为 1-120 秒");
+    }
+    payload.ringingTimeoutSeconds = timeout;
+  }
+  return payload;
+}
+
+function confirmRealPhoneCall(payload) {
+  if (!isRealPhoneTarget()) return true;
+  const maskedPhone = maskPhoneNumber(payload.calleePhoneNumber);
+  return window.confirm(`确认拨打真实电话 ${maskedPhone}？`);
+}
+
+async function createWebSession() {
+  const payload = buildBaseSessionPayload();
   const session = await api("/ai-call/sessions", {
     method: "POST",
     body: JSON.stringify(payload),
   });
+  state.sessionEntryMode = CALL_MODE_WEB;
   renderSession(session);
   await refreshAll();
   startPolling();
   log(`会话已创建：${session.callId}`);
+}
+
+async function createSipSession() {
+  const payload = buildSipSessionPayload();
+  if (!confirmRealPhoneCall(payload)) {
+    throw new Error("已取消真实电话拨打");
+  }
+  const session = await api("/ai-call/sip-sessions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.sessionEntryMode = CALL_MODE_SIP;
+  renderSession(session);
+  await refreshAll();
+  startPolling();
+  log(`电话外呼已发起：${session.callId} / ${maskPhoneNumber(payload.calleePhoneNumber)}`);
+}
+
+async function createSession() {
+  const sipMode = isSipMode();
+  resetClientRuntime();
+  if (sipMode) {
+    await createSipSession();
+    return;
+  }
+  await createWebSession();
 }
 
 async function connectRoom() {
@@ -1393,6 +1531,7 @@ async function refreshStatus() {
     el.refreshDialogue.disabled = false;
     el.refreshHandoff.disabled = false;
     el.micState.textContent = "已断开";
+    updateCallModeControls();
   }
 }
 
@@ -1495,6 +1634,7 @@ async function endSession() {
   renderSessionStatus("completed");
   setStatus("completed");
   disableSessionControls();
+  updateCallModeControls();
   el.refreshEvents.disabled = false;
   el.refreshRecording.disabled = false;
   el.refreshDialogue.disabled = false;
@@ -1512,49 +1652,30 @@ async function endSession() {
   log("会话已结束");
 }
 
-async function requestHandoff() {
-  if (!state.session || state.handoffRequesting) return null;
-  state.handoffRequesting = true;
-  updateHandoffControls();
-  try {
-    const handoff = await api(`/ai-call/sessions/${state.session.callId}/handoffs`, {
-      method: "POST",
-      body: JSON.stringify({
-        source: "operator",
-        reason: "customer_request",
-        requestMessage: "验证页手工发起转人工",
-      }),
-    });
-    renderHandoff(handoff);
-    await refreshStatus();
-    await refreshEvents();
-    log(`已发起转人工：${handoff.handoffId}`);
-    return handoff;
-  } finally {
-    state.handoffRequesting = false;
-    updateHandoffControls();
-  }
-}
-
 function bindActions() {
   el.createSession.addEventListener("click", () => {
+    const sipMode = isSipMode();
     runWithLoading(
       {
         button: el.createSession,
-        loadingText: "创建中...",
-        title: "正在创建会话",
-        desc: "正在请求服务端创建 LiveKit 验收会话",
+        loadingText: sipMode ? "拨打中..." : "创建中...",
+        title: sipMode ? "正在发起电话外呼" : "正在创建会话",
+        desc: sipMode
+          ? "正在请求服务端创建 SIP 外呼会话"
+          : "正在请求服务端创建 LiveKit 验收会话",
       },
       createSession,
     )
-      .then(() => notify("会话已创建"))
+      .then(() => notify(sipMode ? "电话外呼已发起" : "会话已创建"))
       .catch((error) => {
-        const message = actionErrorMessage(error, "创建会话失败");
+        const message = actionErrorMessage(error, sipMode ? "电话外呼失败" : "创建会话失败");
         setStatus("创建失败", "is-error");
         log(message);
         notify(message, "error");
       });
   });
+  el.callModeSelect.addEventListener("change", updateCallModeControls);
+  el.sipTargetSelect.addEventListener("change", updateCallModeControls);
   el.connectRoom.addEventListener("click", () => {
     runWithLoading(
       {
@@ -1628,17 +1749,6 @@ function bindActions() {
         notify(error.message || "刷新通话文本失败", "error");
       });
   });
-  el.requestHandoff.addEventListener("click", () => {
-    requestHandoff()
-      .then((handoff) => {
-        if (handoff) notify("转人工已发起");
-      })
-      .catch((error) => {
-        log(error.message);
-        notify(error.message || "发起转人工失败", "error");
-        refreshHandoff().catch(() => {});
-      });
-  });
 }
 
 window.addEventListener("pagehide", () => {
@@ -1647,5 +1757,6 @@ window.addEventListener("pagehide", () => {
 
 document.documentElement.dataset.livekitReady = String(Boolean(window.LivekitClient));
 bindActions();
+updateCallModeControls();
 loadVoiceProfiles().catch((error) => log(`音色列表加载失败：${error.message}`));
 loadPromptProfiles().catch((error) => log(`业务场景加载失败：${error.message}`));

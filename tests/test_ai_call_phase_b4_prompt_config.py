@@ -689,6 +689,8 @@ def test_prompt_config_page_and_customer_page_use_business_fields() -> None:
     assert 'id="connect-handoff"' not in customer_html
     assert 'id="cancel-handoff"' not in customer_html
     assert 'id="handoff-agent-identity"' not in customer_html
+    assert 'id="request-handoff"' not in customer_html
+    assert "主动转人工" not in customer_html
     assert "通话文本" in customer_html
     assert "payload.businessType" not in customer_js
     assert "payload.sceneCode" in customer_js
@@ -698,9 +700,17 @@ def test_prompt_config_page_and_customer_page_use_business_fields() -> None:
     assert "/ai-call/prompt-profiles" in customer_js
     assert "payload.prompt" not in customer_js
     assert "joinSeatAndCompleteHandoff" not in customer_js
+    assert "requestHandoff" not in customer_js
+    assert "验证页手工发起转人工" not in customer_js
     assert "/accept" not in customer_js
     assert "/connected" not in customer_js
     assert "/cancel" not in customer_js
+    end_session_body = customer_js[
+        customer_js.index("async function endSession()") : customer_js.index("function bindActions()")
+    ]
+    assert end_session_body.index("disableSessionControls();") < end_session_body.index(
+        "updateCallModeControls();"
+    )
     assert "/ai-call/voice-profiles" in customer_js
     assert "function apiPath" in customer_js
     assert "人工接管" in index_html

@@ -6656,15 +6656,15 @@ def test_phase_a_web_probe_page_wires_core_session_endpoints() -> None:
     assert 'id="metric-model-stats"' in html
     assert 'id="metric-browser-stats"' in html
     assert 'class="control-actions"' in html
-    assert html.count('id="request-handoff"') == 1
-    assert "主动转人工" in html
+    assert 'id="request-handoff"' not in html
+    assert "主动转人工" not in html
+    assert "requestHandoff" not in script
     assert "发起转人工" not in html
     assert "麦克风：关" in html
     create_index = html.index('id="create-session"')
-    request_handoff_index = html.index('id="request-handoff"')
     mute_index = html.index('id="mute-room"')
     handoff_state_index = html.index('id="handoff-state"')
-    assert create_index < request_handoff_index < mute_index < handoff_state_index
+    assert create_index < mute_index < handoff_state_index
     assert "转人工状态" in html
     assert "转人工闭环" not in html
     assert '<div id="recording-state" class="recording-box">' in html
@@ -6701,6 +6701,48 @@ def test_phase_a_web_probe_page_wires_core_session_endpoints() -> None:
     assert "暂无转人工记录" in script
     assert "暂无转人工请求" in script
     assert "LivekitClient" in script
+
+
+def test_customer_page_wires_sip_outbound_mode_without_replacing_web_mode() -> None:
+    html = read_ai_call_web_asset("customer.html")
+    script = read_ai_call_web_asset("customer.js")
+
+    assert 'id="call-mode-select"' in html
+    assert 'value="web"' in html
+    assert "浏览器通话" in html
+    assert 'value="sip"' in html
+    assert "电话外呼" in html
+    assert 'id="sip-target-select"' in html
+    assert 'value="linphone"' in html
+    assert "本机软电话 Linphone" in html
+    assert 'value="real_phone"' in html
+    assert "真实电话" in html
+    assert 'id="callee-phone-input"' in html
+    assert 'id="ringing-timeout-input"' in html
+    assert "/ai-call/sessions" in script
+    assert "/ai-call/sip-sessions" in script
+    assert "calleePhoneNumber" in script
+    assert "ringingTimeoutSeconds" in script
+    assert "createSipSession" in script
+    assert "confirmRealPhoneCall" in script
+    assert "sip_interrupt_candidate" in script
+    assert "电话侧检测到插话候选" in script
+    assert "sip_interrupt_candidate_confirmed" in script
+    assert "sip_interrupt_candidate_expired" in script
+
+
+def test_customer_page_defaults_linphone_callee_without_relaxing_real_phone_guard() -> None:
+    html = read_ai_call_web_asset("customer.html")
+    script = read_ai_call_web_asset("customer.js")
+
+    assert "留空默认拨打本机 Linphone" in html
+    assert "LINPHONE_DEFAULT_CALLEE_NUMBER" in script
+    assert 'LINPHONE_DEFAULT_CALLEE_NUMBER = "19900001000"' in script
+    assert "resolveCalleePhoneNumber" in script
+    assert "return LINPHONE_DEFAULT_CALLEE_NUMBER;" in script
+    assert "请填写真实电话被叫号码" in script
+    assert "isRealPhoneTarget()" in script
+    assert "confirmRealPhoneCall" in script
 
 
 def test_phase_a_web_probe_requests_microphone_before_joining_room() -> None:

@@ -28,6 +28,35 @@
             </div>
             <div class="panel-body form-grid">
               <label>
+                通话方式
+                <select id="call-mode-select">
+                  <option value="web">浏览器通话</option>
+                  <option value="sip">电话外呼</option>
+                </select>
+              </label>
+              <div id="sip-call-fields" class="sip-call-fields" hidden>
+                <label>
+                  拨号目标
+                  <select id="sip-target-select">
+                    <option value="linphone">本机软电话 Linphone</option>
+                    <option value="real_phone">真实电话</option>
+                  </select>
+                </label>
+                <label>
+                  被叫号码
+                  <input
+                    id="callee-phone-input"
+                    inputmode="tel"
+                    maxlength="32"
+                    placeholder="留空默认拨打本机 Linphone"
+                  />
+                </label>
+                <label>
+                  振铃超时
+                  <input id="ringing-timeout-input" type="number" min="1" max="120" value="45" />
+                </label>
+              </div>
+              <label>
                 音色
                 <select id="voice-select">
                   <option value="Tina">甜甜 Tina</option>
@@ -59,8 +88,7 @@
                   <button id="create-session" class="primary" type="button">创建会话</button>
                   <button id="connect-room" type="button" disabled>连接麦克风</button>
                 </div>
-                <div class="button-row">
-                  <button id="request-handoff" type="button" disabled>主动转人工</button>
+                <div class="button-row single">
                   <button id="mute-room" type="button" disabled>麦克风：关</button>
                 </div>
                 <div class="button-row single">
@@ -200,6 +228,6 @@
       </div>
     </div>
 
-    <script src="./customer.js?v=customer-handoff-click-20260618"></script>
+    <script src="./customer.js?v=customer-call-controls-20260625"></script>
   </body>
 </html>
