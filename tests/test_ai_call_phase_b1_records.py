@@ -2978,6 +2978,98 @@ async def test_interrupt_summary_flags_candidate_without_confirm(b1_service) -> 
 
 
 @pytest.mark.anyio
+async def test_interrupt_summary_counts_sip_candidate_confirmation(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 25, 11, 23, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base,
+        payload={"source": "sip", "reason": "sip_uplink_speech_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="sip_interrupt_candidate",
+        event_time=base + timedelta(milliseconds=1),
+        payload={"reason": "sip_uplink_speech_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="sip_interrupt_candidate_confirmed",
+        event_time=base + timedelta(milliseconds=300),
+        payload={"confirmedBy": "transcript", "reason": "sip_uplink_speech_during_ai_audio"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["interruptCandidateCount"] == 1
+    assert summary["interruptConfirmedCount"] == 1
+    assert summary["candidateNotConfirmedCount"] == 0
+    assert summary["verdict"] == "normal"
+    assert summary["issues"] == []
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_deduplicates_sip_and_generic_confirmation(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 25, 11, 51, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base,
+        payload={"source": "sip", "reason": "sip_uplink_speech_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="sip_interrupt_candidate",
+        event_time=base + timedelta(milliseconds=1),
+        payload={"reason": "sip_uplink_speech_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="user_speech_started",
+        event_time=base + timedelta(milliseconds=500),
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="sip_interrupt_candidate_confirmed",
+        event_time=base + timedelta(milliseconds=501),
+        payload={"confirmedBy": "provider_speech_started"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_confirmed",
+        event_time=base + timedelta(milliseconds=504),
+        payload={"reason": "user_speech_started_during_ai_audio"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["interruptCandidateCount"] == 1
+    assert summary["interruptConfirmedCount"] == 1
+    assert summary["candidateNotConfirmedCount"] == 0
+    assert summary["providerToConfirmedMs"] == 1
+    assert summary["verdict"] == "normal"
+    assert summary["issues"] == []
+
+
+@pytest.mark.anyio
 async def test_interrupt_summary_flags_slow_confirm(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(voice=None, prompt=None, business_id=None)

@@ -24,6 +24,7 @@ def build_interrupt_summary(call_id: str, events: list[dict[str, Any]]) -> dict[
     browser_to_provider_samples: list[int] = []
     provider_to_confirmed_samples: list[int] = []
     browser_to_confirmed_samples: list[int] = []
+    has_open_candidate = False
 
     for event in events:
         event_type = str(event.get("eventType") or event.get("type") or "")
@@ -39,20 +40,23 @@ def build_interrupt_summary(call_id: str, events: list[dict[str, Any]]) -> dict[
                 browser_to_provider_samples.append(
                     _milliseconds_between(current_browser_started_at, event_time)
                 )
-        elif event_type == "interrupt_confirmed":
-            confirmed_count += 1
-            if current_provider_started_at is not None:
-                provider_to_confirmed_samples.append(
-                    _milliseconds_between(current_provider_started_at, event_time)
-                )
-            if current_browser_started_at is not None:
-                browser_to_confirmed_samples.append(
-                    _milliseconds_between(current_browser_started_at, event_time)
-                )
-            current_browser_started_at = None
-            current_provider_started_at = None
+        elif event_type in {"interrupt_confirmed", "sip_interrupt_candidate_confirmed"}:
+            if has_open_candidate:
+                confirmed_count += 1
+                has_open_candidate = False
+                if current_provider_started_at is not None:
+                    provider_to_confirmed_samples.append(
+                        _milliseconds_between(current_provider_started_at, event_time)
+                    )
+                if current_browser_started_at is not None:
+                    browser_to_confirmed_samples.append(
+                        _milliseconds_between(current_browser_started_at, event_time)
+                    )
+                current_browser_started_at = None
+                current_provider_started_at = None
         elif event_type == "interrupt_candidate":
             candidate_count += 1
+            has_open_candidate = True
         elif event_type == "stale_audio_dropped":
             stale_audio_dropped_count += 1
             stale_audio_dropped_bytes += _payload_int(payload, "deltaBytes")

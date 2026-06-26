@@ -714,8 +714,6 @@ class RealtimeCallAgentRunner:
                 self._sip_barge_in_event_payload(call_id, observation),
             )
 
-        guard = self._playback_guard(call_id)
-        guard.user_speech_active = True
         self._extend_sip_barge_in(call_id, turn, trigger_timestamp)
 
     def _is_sip_barge_in_interruptible(
@@ -1758,10 +1756,6 @@ class RealtimeCallAgentRunner:
     ) -> None:
         timeout = self.sip_barge_in_hold_timeout_seconds
         turn.sip_barge_in_expires_at = trigger_timestamp + timedelta(seconds=timeout)
-        guard = self._playback_guard(call_id)
-        suppress_until = datetime.now(timezone.utc) + timedelta(seconds=timeout)
-        if guard.suppress_audio_until is None or suppress_until > guard.suppress_audio_until:
-            guard.suppress_audio_until = suppress_until
         self._schedule_sip_barge_in_expiry(call_id, turn)
 
     def _confirm_sip_barge_in(
@@ -2163,11 +2157,16 @@ class RealtimeCallAgentRunner:
         timestamp: datetime,
     ) -> None:
         turn = self._pending_turn(call_id)
+        session = self.registry.get(call_id)
+        has_active_model_response = self._has_active_model_response(call_id)
+        has_recent_ai_audio = self._has_recent_ai_audio(call_id, timestamp)
         # 只在已有有效文字时确认打断；短噪声、回声和无转写输入停留在候选阶段。
         decision = self._interrupt_policy.decide_transcript(
             InterruptDecisionContext(
                 source="provider",
-                session_status=self.registry.get(call_id).status,
+                session_status=session.status,
+                has_recent_ai_audio=has_recent_ai_audio,
+                has_active_model_response=has_active_model_response,
                 has_interrupt_candidate=turn.interrupt_candidate,
                 candidate_reason=turn.interrupt_reason if turn.interrupt_candidate else None,
                 candidate_stale=(
@@ -2179,6 +2178,18 @@ class RealtimeCallAgentRunner:
         )
         if decision.action == "ignore" and decision.reason == "browser_candidate_expired":
             self._ignore_empty_turn(call_id, turn, decision.reason)
+            return
+        if (
+            decision.action == "confirm"
+            and turn.sip_barge_in_requested
+            and turn.interrupt_reason == SIP_BARGE_IN_INTERRUPT_REASON
+            and session.status != CallSessionStatus.AI_SPEAKING
+            and not has_active_model_response
+        ):
+            self._cancel_sip_barge_in_task_nowait(call_id)
+            turn.sip_barge_in_requested = False
+            turn.sip_barge_in_expires_at = None
+            self._ignore_empty_turn(call_id, turn, "not_interrupt")
             return
         if turn.interrupt_confirmed or decision.action != "confirm":
             return
