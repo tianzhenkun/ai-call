@@ -17,5 +17,10 @@ keys:
 room:
   auto_create: true
 
+webhook:
+  api_key: CHANGE_ME_LIVEKIT_API_KEY
+  urls:
+    - http://host.docker.internal:19011/ai-call/livekit-webhook
+
 logging:
   level: info

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import status
@@ -12,6 +13,7 @@ from app.common.constant import RET
 from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.exceptions import CustomException
+from app.core.logger import log
 from app.services.ai_call.dialogue_service import (
     AiCallDialoguePersistenceWorker,
     AiCallDialogueRuntimeStore,
@@ -264,6 +266,10 @@ class AiCallService:
             call_id=call_id,
             sip_participant=sip_participant,
         )
+        await self.record_service.mark_answered(
+            room_session.call_id,
+            datetime.now(timezone.utc),
+        )
         if self.recording_service is not None:
             await self.recording_service.start_for_session(
                 call_id=room_session.call_id,
@@ -272,6 +278,13 @@ class AiCallService:
                 ai_participant_identity=f"agent-{room_session.call_id}",
             )
         await self.orchestrator.start_opening(room_session.call_id)
+        if self.recording_service is not None:
+            await self.recording_service.start_session_participant_recordings(
+                call_id=room_session.call_id,
+                room_name=room_session.room_name,
+                customer_participant_identity=room_session.participant_identity,
+                ai_participant_identity=f"agent-{room_session.call_id}",
+            )
         return CreateSipSessionResult(
             call_id=room_session.call_id,
             room_name=room_session.room_name,
@@ -496,6 +509,47 @@ class AiCallService:
                 )
                 await self._enqueue_offline_asr_if_recordings_closed(call_id)
         return result
+
+    async def handle_livekit_webhook_event(
+        self,
+        *,
+        event_type: str,
+        room_name: str | None,
+        participant_identity: str | None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict:
+        if event_type != "participant_left":
+            return {"handled": False, "reason": "unsupported_event"}
+        call_id = self._call_id_from_sip_participant(participant_identity)
+        if call_id is None:
+            return {"handled": False, "reason": "non_sip_participant"}
+        if room_name and room_name != f"ai-call-{call_id}":
+            return {"handled": False, "reason": "room_mismatch"}
+        try:
+            session = await self.orchestrator.get_session(call_id)
+        except AiCallError:
+            return {"handled": False, "reason": "session_not_found"}
+        if session.status not in RUNNING_STATUSES:
+            return {"handled": False, "reason": "session_not_running"}
+
+        self._record_sip_event(
+            call_id=call_id,
+            event_type="sip_hangup",
+            source="livekit",
+            payload=self._sip_hangup_payload(
+                room_name=room_name,
+                participant_identity=participant_identity,
+                event_type=event_type,
+                payload=payload,
+            ),
+        )
+        await self.end_session(call_id, end_reason="remote_hangup")
+        return {
+            "handled": True,
+            "action": "end_session",
+            "callId": call_id,
+            "endReason": "remote_hangup",
+        }
 
     async def end_session(
         self,
@@ -1013,6 +1067,39 @@ class AiCallService:
             )
 
     @staticmethod
+    def _call_id_from_sip_participant(participant_identity: str | None) -> str | None:
+        if not participant_identity or not participant_identity.startswith("sip-"):
+            return None
+        call_id = participant_identity.removeprefix("sip-")
+        return call_id or None
+
+    @staticmethod
+    def _sip_hangup_payload(
+        *,
+        room_name: str | None,
+        participant_identity: str,
+        event_type: str,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        source_payload = payload or {}
+        result: dict[str, Any] = {
+            "roomName": room_name,
+            "participantIdentity": participant_identity,
+            "livekitEventType": event_type,
+        }
+        for source_key, target_key in (
+            ("id", "livekitEventId"),
+            ("disconnectReason", "disconnectReason"),
+            ("disconnect_reason", "disconnectReason"),
+            ("createdAt", "createdAt"),
+            ("created_at", "createdAt"),
+        ):
+            value = source_payload.get(source_key)
+            if value not in (None, ""):
+                result[target_key] = value
+        return result
+
+    @staticmethod
     def _mask_phone_number(phone_number: str) -> str:
         normalized = "".join(ch for ch in str(phone_number or "") if ch.isdigit())
         if len(normalized) <= 7:
@@ -1429,6 +1516,58 @@ def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService
         prompt_composer=_build_prompt_composer(_default_orchestrator),
         sip_client=_build_sip_client(),
     )
+
+
+def schedule_livekit_webhook_event(
+    *,
+    event_type: str,
+    room_name: str | None,
+    participant_identity: str | None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    task = asyncio.create_task(
+        _handle_livekit_webhook_event_background(
+            event_type=event_type,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            payload=payload,
+        ),
+        name=f"ai-call-livekit-webhook-{event_type or 'event'}",
+    )
+    task.add_done_callback(_consume_livekit_webhook_task)
+    return {
+        "queued": True,
+        "eventType": event_type,
+        "roomName": room_name,
+        "participantIdentity": participant_identity,
+    }
+
+
+async def _handle_livekit_webhook_event_background(
+    *,
+    event_type: str,
+    room_name: str | None,
+    participant_identity: str | None,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    async with async_db_session() as db:
+        async with db.begin():
+            service = get_default_ai_call_service(db)
+            return await service.handle_livekit_webhook_event(
+                event_type=event_type,
+                room_name=room_name,
+                participant_identity=participant_identity,
+                payload=payload,
+            )
+
+
+def _consume_livekit_webhook_task(task: asyncio.Task[dict[str, Any]]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        log.exception(f"AI Call LiveKit webhook 后台处理失败: {exc!s}")
 
 
 def _ensure_default_dialogue_runtime_store() -> AiCallDialogueRuntimeStore:

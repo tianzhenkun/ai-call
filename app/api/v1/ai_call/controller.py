@@ -2,11 +2,13 @@ from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
+from google.protobuf.json_format import MessageToDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
+from app.config.setting import settings
 
 from .schema import (
     AcceptHandoffOut,
@@ -42,7 +44,11 @@ from .schema import (
     VoiceProfileCreateRequest,
     VoiceProfileOut,
 )
-from .service import AiCallService, get_default_ai_call_service
+from .service import (
+    AiCallService,
+    get_default_ai_call_service,
+    schedule_livekit_webhook_event,
+)
 
 AiCallRouter = APIRouter(prefix="/ai-call", tags=["智能外呼"])
 
@@ -63,6 +69,48 @@ def get_ai_call_service(
 @AiCallRouter.get("/health", summary="智能外呼模块健康检查")
 async def ai_call_health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@AiCallRouter.post("/livekit-webhook", summary="接收 LiveKit 房间事件")
+async def livekit_webhook_controller(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    body = (await request.body()).decode("utf-8")
+    auth_token = _livekit_webhook_token(authorization)
+    webhook_event = _receive_livekit_webhook(body, auth_token)
+    payload = MessageToDict(webhook_event, preserving_proto_field_name=False)
+    result = schedule_livekit_webhook_event(
+        event_type=webhook_event.event,
+        room_name=webhook_event.room.name or None,
+        participant_identity=webhook_event.participant.identity or None,
+        payload=payload,
+    )
+    return SuccessResponse(data=result, msg="接收成功")
+
+
+def _livekit_webhook_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="LiveKit webhook authorization missing")
+    value = authorization.strip()
+    prefix = "Bearer "
+    if value.lower().startswith(prefix.lower()):
+        value = value[len(prefix) :].strip()
+    if not value:
+        raise HTTPException(status_code=401, detail="LiveKit webhook authorization missing")
+    return value
+
+
+def _receive_livekit_webhook(body: str, auth_token: str):
+    try:
+        from livekit import api
+
+        receiver = api.WebhookReceiver(
+            api.TokenVerifier(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET)
+        )
+        return receiver.receive(body, auth_token)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="LiveKit webhook authorization invalid") from exc
 
 
 @AiCallRouter.post(

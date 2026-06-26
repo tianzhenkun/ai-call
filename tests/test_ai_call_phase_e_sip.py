@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from livekit import api
 
+from app.api.v1.ai_call import controller as ai_call_controller
 from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.service import AiCallService
-from app.config.setting import Settings
+from app.config.setting import Settings, settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
@@ -34,6 +39,7 @@ class FakeLiveKitRoomManager:
     def __init__(self) -> None:
         self.created_rooms: list[str] = []
         self.issued_browser_tokens: list[tuple[str, str]] = []
+        self.deleted_rooms: list[str] = []
 
     async def create_room(self, room_name: str) -> None:
         self.created_rooms.append(room_name)
@@ -48,13 +54,14 @@ class FakeLiveKitRoomManager:
         )
 
     async def delete_room(self, room_name: str) -> None:
-        _ = room_name
+        self.deleted_rooms.append(room_name)
 
 
 class CapturingAgentRunner:
     def __init__(self) -> None:
         self.started_sessions: list[CallSession] = []
         self.started_opening_call_ids: list[str] = []
+        self.stopped_call_ids: list[str] = []
 
     async def start(self, session: CallSession) -> None:
         self.started_sessions.append(session)
@@ -70,7 +77,7 @@ class CapturingAgentRunner:
         _ = call_id
 
     async def stop(self, call_id: str) -> None:
-        _ = call_id
+        self.stopped_call_ids.append(call_id)
 
 
 class FakeSipClient:
@@ -125,6 +132,8 @@ class FakeRecordService:
     def __init__(self) -> None:
         self.created_sip_records: list[dict[str, object]] = []
         self.status_updates: list[tuple[str, str]] = []
+        self.answered_updates: list[tuple[str, object]] = []
+        self.completed_sessions: list[dict[str, object]] = []
         self.failed_sessions: list[dict[str, object]] = []
 
     async def create_sip_record(
@@ -146,6 +155,22 @@ class FakeRecordService:
         status_value = status.value if isinstance(status, CallSessionStatus) else status
         self.status_updates.append((call_id, status_value))
 
+    async def mark_answered(self, call_id: str, answered_at) -> None:
+        self.answered_updates.append((call_id, answered_at))
+
+    async def complete_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+        ended_at=None,
+    ) -> None:
+        self.completed_sessions.append({
+            "call_id": call_id,
+            "end_reason": end_reason,
+            "ended_at": ended_at,
+        })
+
     async def fail_session(
         self,
         call_id: str,
@@ -160,6 +185,50 @@ class FakeRecordService:
             "failure_stage": failure_stage,
             "failure_message": failure_message,
         })
+
+
+class FakeRecordingService:
+    def __init__(self) -> None:
+        self.started_sessions: list[dict[str, object]] = []
+        self.started_participants: list[dict[str, object]] = []
+        self.stopped_call_ids: list[str] = []
+
+    async def start_for_session(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        customer_participant_identity: str | None = None,
+        ai_participant_identity: str | None = None,
+    ) -> None:
+        self.started_sessions.append({
+            "call_id": call_id,
+            "room_name": room_name,
+            "customer_participant_identity": customer_participant_identity,
+            "ai_participant_identity": ai_participant_identity,
+        })
+
+    async def start_session_participant_recordings(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        customer_participant_identity: str | None = None,
+        ai_participant_identity: str | None = None,
+    ) -> None:
+        self.started_participants.append({
+            "call_id": call_id,
+            "room_name": room_name,
+            "customer_participant_identity": customer_participant_identity,
+            "ai_participant_identity": ai_participant_identity,
+        })
+
+    async def stop_for_session(self, call_id: str) -> None:
+        self.stopped_call_ids.append(call_id)
+
+    async def is_ready_for_offline_asr(self, call_id: str) -> bool:
+        _ = call_id
+        return True
 
 
 class FakePromptResolver:
@@ -529,6 +598,8 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
         }
     ]
     assert record_service.status_updates == [(result.call_id, "ready")]
+    assert record_service.answered_updates
+    assert record_service.answered_updates[0][0] == result.call_id
     assert record_service.failed_sessions == []
     assert len(agent_runner.started_sessions) == 1
     assert agent_runner.started_sessions[0].participant_identity == result.participant_identity
@@ -565,6 +636,203 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     }
     assert sip_answered.source == "sip"
     assert media_connected.source == "livekit"
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_starts_customer_and_ai_participant_recordings() -> None:
+    (
+        service,
+        _room_manager,
+        _agent_runner,
+        _sip_client,
+        _record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    recording_service = FakeRecordingService()
+    service.recording_service = recording_service
+
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+
+    assert recording_service.started_sessions == [
+        {
+            "call_id": result.call_id,
+            "room_name": result.room_name,
+            "customer_participant_identity": result.participant_identity,
+            "ai_participant_identity": f"agent-{result.call_id}",
+        }
+    ]
+    assert recording_service.started_participants == [
+        {
+            "call_id": result.call_id,
+            "room_name": result.room_name,
+            "customer_participant_identity": result.participant_identity,
+            "ai_participant_identity": f"agent-{result.call_id}",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recording() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        _sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    recording_service = FakeRecordingService()
+    service.recording_service = recording_service
+
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+
+    handled = await service.handle_livekit_webhook_event(
+        event_type="participant_left",
+        room_name=result.room_name,
+        participant_identity=result.participant_identity,
+        payload={"disconnectReason": "CLIENT_INITIATED"},
+    )
+
+    assert handled == {
+        "handled": True,
+        "action": "end_session",
+        "callId": result.call_id,
+        "endReason": "remote_hangup",
+    }
+    status = await service.get_session(result.call_id)
+    assert status.status == CallSessionStatus.COMPLETED
+    assert room_manager.deleted_rooms == [result.room_name]
+    assert agent_runner.stopped_call_ids == [result.call_id]
+    assert recording_service.stopped_call_ids == [result.call_id]
+    assert record_service.completed_sessions == [
+        {
+            "call_id": result.call_id,
+            "end_reason": "remote_hangup",
+            "ended_at": None,
+        }
+    ]
+    event_types = [
+        event.type for event in service.orchestrator.event_store.list_all(result.call_id)
+    ]
+    assert "sip_hangup" in event_types
+    assert event_types.index("sip_hangup") < event_types.index("session_completed")
+
+
+@pytest.mark.anyio
+async def test_livekit_non_sip_participant_left_does_not_end_session() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        _sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+
+    handled = await service.handle_livekit_webhook_event(
+        event_type="participant_left",
+        room_name=result.room_name,
+        participant_identity=f"human-agent-handoff_{result.call_id}",
+        payload={},
+    )
+
+    assert handled == {
+        "handled": False,
+        "reason": "non_sip_participant",
+    }
+    status = await service.get_session(result.call_id)
+    assert status.status == CallSessionStatus.CONNECTED
+    assert room_manager.deleted_rooms == []
+    assert agent_runner.stopped_call_ids == []
+    assert record_service.completed_sessions == []
+    event_types = [
+        event.type for event in service.orchestrator.event_store.list_all(result.call_id)
+    ]
+    assert "sip_hangup" not in event_types
+    assert "session_completed" not in event_types
+
+
+def _livekit_webhook_auth(body: str) -> str:
+    body_hash = base64.b64encode(hashlib.sha256(body.encode()).digest()).decode()
+    return api.AccessToken("livekit-key", "livekit-secret").with_sha256(body_hash).to_jwt()
+
+
+def test_livekit_webhook_controller_queues_signed_event_without_waiting(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "livekit-key")
+    monkeypatch.setattr(settings, "LIVEKIT_API_SECRET", "livekit-secret")
+    scheduled: list[dict[str, object]] = []
+
+    class SlowWebhookService:
+        async def handle_livekit_webhook_event(self, **_kwargs):
+            raise AssertionError("webhook controller should queue instead of waiting")
+
+    def fake_schedule_livekit_webhook_event(**kwargs):
+        scheduled.append(kwargs)
+        return {
+            "queued": True,
+            "eventType": kwargs["event_type"],
+            "roomName": kwargs["room_name"],
+            "participantIdentity": kwargs["participant_identity"],
+        }
+
+    monkeypatch.setattr(
+        ai_call_controller,
+        "schedule_livekit_webhook_event",
+        fake_schedule_livekit_webhook_event,
+        raising=False,
+    )
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: SlowWebhookService()
+
+    with TestClient(app) as client:
+        body = json.dumps(
+            {
+                "event": "participant_left",
+                "room": {"name": "ai-call-call_queued"},
+                "participant": {"identity": "sip-call_queued"},
+                "id": "EV_test",
+                "createdAt": 1760000000,
+            },
+            separators=(",", ":"),
+        )
+        response = client.post(
+            "/ai-call/livekit-webhook",
+            content=body,
+            headers={"Authorization": f"Bearer {_livekit_webhook_auth(body)}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "queued": True,
+        "eventType": "participant_left",
+        "roomName": "ai-call-call_queued",
+        "participantIdentity": "sip-call_queued",
+    }
+    assert scheduled
+    assert scheduled[0]["event_type"] == "participant_left"
+    assert scheduled[0]["room_name"] == "ai-call-call_queued"
+    assert scheduled[0]["participant_identity"] == "sip-call_queued"
 
 
 @pytest.mark.anyio

@@ -7128,6 +7128,7 @@ def test_phase_a_web_probe_does_not_duck_remote_audio_for_local_speech() -> None
 async def test_standalone_lifespan_skips_system_service_startup(monkeypatch) -> None:
     app = FastAPI()
     monkeypatch.setattr(init_app.settings, "AI_CALL_STANDALONE_ENABLE", True, raising=False)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_RECORDING_ENABLED", False, raising=False)
 
     async def fail_import_modules_async(*args, **kwargs):
         raise AssertionError("standalone mode must not import system startup modules")
@@ -7136,6 +7137,43 @@ async def test_standalone_lifespan_skips_system_service_startup(monkeypatch) -> 
 
     async with init_app.lifespan(app):
         assert not hasattr(app.state, "redis")
+
+
+@pytest.mark.anyio
+async def test_standalone_lifespan_initializes_oss_when_recording_enabled(
+    monkeypatch,
+) -> None:
+    from app.api.v1.system.oss.service import OssService
+
+    app = FastAPI()
+    calls: list[str] = []
+
+    async def no_start_worker():
+        return None
+
+    async def no_stop_worker(worker) -> None:
+        return None
+
+    async def fake_init_active_config() -> None:
+        calls.append("init")
+
+    monkeypatch.setattr(init_app.settings, "AI_CALL_STANDALONE_ENABLE", True, raising=False)
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True, raising=False)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_RECORDING_ENABLED", True, raising=False)
+    monkeypatch.setattr(init_app, "_start_ai_call_event_worker", no_start_worker)
+    monkeypatch.setattr(init_app, "_start_ai_call_dialogue_worker", no_start_worker)
+    monkeypatch.setattr(init_app, "_start_ai_call_offline_asr_worker", no_start_worker)
+    monkeypatch.setattr(init_app, "_start_ai_call_recording_reconcile_worker", no_start_worker)
+    monkeypatch.setattr(init_app, "_start_ai_call_handoff_trigger_worker", no_start_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_event_worker", no_stop_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_dialogue_worker", no_stop_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_offline_asr_worker", no_stop_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_recording_reconcile_worker", no_stop_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_handoff_trigger_worker", no_stop_worker)
+    monkeypatch.setattr(OssService, "init_active_config", fake_init_active_config)
+
+    async with init_app.lifespan(app):
+        assert calls == ["init"]
 
 
 def test_standalone_router_registration_only_exposes_ai_call_routes(monkeypatch) -> None:

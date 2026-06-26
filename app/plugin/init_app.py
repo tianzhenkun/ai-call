@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
+            await _init_ai_call_standalone_oss_config()
             log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
             yield
             log.info("✅ AI Call standalone 模式关闭")
@@ -100,6 +101,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
 
     except Exception as e:
         log.error(f"❌ 应用关闭过程中发生错误: {e!s}")
+
+
+async def _init_ai_call_standalone_oss_config() -> None:
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_RECORDING_ENABLED:
+        return
+    from app.api.v1.system.oss.service import OssService
+
+    await OssService.init_active_config()
 
 
 async def _start_ai_call_event_worker():
