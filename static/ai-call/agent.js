@@ -173,6 +173,15 @@ async function setAgentPresence(status) {
   return state.agentStatus;
 }
 
+function saveSelectedAgentPresence() {
+  return setAgentPresence(el.agentPresence.value)
+    .then(() => notify("坐席状态已保存"))
+    .catch((error) => {
+      log(error.message);
+      notify(error.message || "保存失败", "error");
+    });
+}
+
 function renderList() {
   if (!state.handoffs.length) {
     el.handoffList.innerHTML = '<div class="subtle">暂无可接入请求</div>';
@@ -487,13 +496,11 @@ function bindActions() {
   el.agentIdentity.addEventListener("change", () => {
     fetchAgentStatus().catch((error) => log(error.message));
   });
+  el.agentPresence.addEventListener("change", () => {
+    saveSelectedAgentPresence();
+  });
   el.saveAgentStatus.addEventListener("click", () => {
-    setAgentPresence(el.agentPresence.value)
-      .then(() => notify("坐席状态已保存"))
-      .catch((error) => {
-        log(error.message);
-        notify(error.message || "保存失败", "error");
-      });
+    saveSelectedAgentPresence();
   });
   el.refreshList.addEventListener("click", () => {
     refreshAgentAndJoinableHandoffs()

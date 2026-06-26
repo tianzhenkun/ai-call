@@ -78,6 +78,12 @@ from app.services.ai_call.session_registry import (
 from app.utils.minio_util import MinioUtil
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class FakeLiveKitRoomManager:
     def __init__(self) -> None:
         self.created_rooms: list[str] = []
@@ -1986,6 +1992,91 @@ async def test_handoff_accept_requires_available_agent_and_marks_busy(b1_service
     busy = await service.get_handoff_agent_status("agent-debug-001")
     assert busy["status"] == "busy"
     assert busy["activeHandoffId"] == handoff["handoffId"]
+
+
+@pytest.mark.anyio
+async def test_handoff_agent_status_expires_stale_online_presence(b1_service) -> None:
+    service, _record_service = b1_service
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    stale_seen_at = datetime.now(timezone.utc) - timedelta(days=1)
+    await service.handoff_service.repository.upsert_handoff_agent(
+        agent_identity="agent-debug-001",
+        skill_group="default",
+        status="online",
+        active_handoff_id=None,
+        last_seen_at=stale_seen_at,
+        status_updated_at=stale_seen_at,
+    )
+
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+
+    assert agent["status"] == "offline"
+    assert agent["activeHandoffId"] is None
+    assert _as_utc(agent["lastSeenAt"]) == stale_seen_at
+
+
+@pytest.mark.anyio
+async def test_handoff_agent_status_refreshes_online_presence(b1_service) -> None:
+    service, _record_service = b1_service
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    previous_seen_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+    await service.handoff_service.repository.upsert_handoff_agent(
+        agent_identity="agent-debug-001",
+        skill_group="default",
+        status="online",
+        active_handoff_id=None,
+        last_seen_at=previous_seen_at,
+        status_updated_at=previous_seen_at,
+    )
+
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+
+    assert agent["status"] == "online"
+    assert _as_utc(agent["lastSeenAt"]) > previous_seen_at
+
+
+@pytest.mark.anyio
+async def test_handoff_accept_rejects_stale_online_agent(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    stale_seen_at = datetime.now(timezone.utc) - timedelta(days=1)
+    await service.handoff_service.repository.upsert_handoff_agent(
+        agent_identity="agent-debug-001",
+        skill_group="default",
+        status="online",
+        active_handoff_id=None,
+        last_seen_at=stale_seen_at,
+        status_updated_at=stale_seen_at,
+    )
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.accept_handoff(
+            handoff_id=handoff["handoffId"],
+            human_agent_identity="agent-debug-001",
+        )
+
+    assert exc_info.value.status_code == 409
+    history = await service.list_handoffs(result.call_id)
+    assert history["rows"][0]["status"] == "requested"
+    agent = await service.get_handoff_agent_status("agent-debug-001")
+    assert agent["status"] == "offline"
+    assert agent["activeHandoffId"] is None
 
 
 @pytest.mark.anyio

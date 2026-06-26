@@ -43,6 +43,7 @@ VALID_HANDOFF_SOURCES = {"operator", "system", "customer"}
 HANDOFF_AGENT_STATUS_ONLINE = "online"
 HANDOFF_AGENT_STATUS_BUSY = "busy"
 HANDOFF_AGENT_STATUS_OFFLINE = "offline"
+HANDOFF_AGENT_ONLINE_STALE_SECONDS = 15
 VALID_MANUAL_HANDOFF_AGENT_STATUSES = {
     HANDOFF_AGENT_STATUS_ONLINE,
     HANDOFF_AGENT_STATUS_OFFLINE,
@@ -148,7 +149,10 @@ class AiCallHandoffService:
 
     async def get_agent_status(self, human_agent_identity: str):
         identity = self._normalize_agent_identity(human_agent_identity)
-        return await self.repository.get_handoff_agent(identity)
+        agent = await self.repository.get_handoff_agent(identity)
+        if agent is None:
+            return None
+        return await self._refresh_agent_presence(agent)
 
     async def accept(
         self,
@@ -448,8 +452,49 @@ class AiCallHandoffService:
         agent = await self.repository.get_handoff_agent(human_agent_identity)
         if agent is None:
             self._raise_invalid_status("坐席未上线，不能接管转人工")
+        agent = await self._expire_stale_agent_if_needed(agent)
         if agent.status != HANDOFF_AGENT_STATUS_ONLINE or agent.active_handoff_id:
             self._raise_invalid_status("坐席当前不可接管转人工")
+
+    async def _refresh_agent_presence(self, agent):
+        agent = await self._expire_stale_agent_if_needed(agent)
+        if (
+            agent.status != HANDOFF_AGENT_STATUS_ONLINE
+            or agent.active_handoff_id
+        ):
+            return agent
+        now = utc_now()
+        return await self.repository.upsert_handoff_agent(
+            agent_identity=agent.agent_identity,
+            skill_group=agent.skill_group,
+            status=agent.status,
+            active_handoff_id=agent.active_handoff_id,
+            last_seen_at=now,
+            status_updated_at=agent.status_updated_at,
+        )
+
+    async def _expire_stale_agent_if_needed(self, agent):
+        if (
+            agent.status != HANDOFF_AGENT_STATUS_ONLINE
+            or agent.active_handoff_id
+            or not self._is_agent_presence_stale(agent)
+        ):
+            return agent
+        now = utc_now()
+        return await self.repository.upsert_handoff_agent(
+            agent_identity=agent.agent_identity,
+            skill_group=agent.skill_group,
+            status=HANDOFF_AGENT_STATUS_OFFLINE,
+            active_handoff_id=None,
+            last_seen_at=agent.last_seen_at,
+            status_updated_at=now,
+        )
+
+    def _is_agent_presence_stale(self, agent) -> bool:
+        if agent.last_seen_at is None:
+            return True
+        elapsed = utc_now() - self._ensure_utc(agent.last_seen_at)
+        return elapsed > timedelta(seconds=HANDOFF_AGENT_ONLINE_STALE_SECONDS)
 
     def _ensure_accept_window(self, handoff: AiCallHandoffModel) -> None:
         if handoff.expires_at is None:

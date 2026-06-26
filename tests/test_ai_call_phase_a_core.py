@@ -7072,6 +7072,148 @@ console.log(JSON.stringify({{
     assert outcome["joinableRefreshes"] >= 1
 
 
+def test_agent_presence_select_change_saves_status() -> None:
+    if not shutil.which("node"):
+        pytest.skip("node is required to execute the agent page behavior test")
+
+    script = read_ai_call_web_asset("agent.js")
+    harness = """
+const apiCalls = [];
+const elements = new Map();
+
+function elementStub(selector = "") {
+  return {
+    textContent: "",
+    innerHTML: "",
+    disabled: false,
+    dataset: {},
+    className: "",
+    classList: { toggle() {}, add() {}, remove() {} },
+    listeners: {},
+    value: selector === "#agent-identity" ? "agent-debug-001" : "offline",
+    setAttribute() {},
+    addEventListener(type, handler) {
+      this.listeners[type] = handler;
+    },
+    appendChild() {},
+    remove() {},
+    pause() {},
+  };
+}
+
+function elementFor(selector) {
+  if (!elements.has(selector)) {
+    elements.set(selector, elementStub(selector));
+  }
+  return elements.get(selector);
+}
+
+globalThis.window = {
+  isSecureContext: true,
+  location: { pathname: "/static/ai-call/agent.html" },
+  setTimeout: () => 0,
+  setInterval: () => 0,
+  clearInterval() {},
+  addEventListener() {},
+  LivekitClient: {
+    RoomEvent: {
+      TrackSubscribed: "TrackSubscribed",
+      Disconnected: "Disconnected",
+    },
+    Room: class {
+      constructor() {
+        this.localParticipant = { publishTrack: async () => {} };
+      }
+      on() {}
+      async connect() {}
+      disconnect() {}
+    },
+    createLocalAudioTrack: async () => ({
+      stop() {},
+      mediaStreamTrack: { enabled: true },
+    }),
+  },
+};
+globalThis.setTimeout = window.setTimeout;
+globalThis.setInterval = window.setInterval;
+globalThis.clearInterval = window.clearInterval;
+Object.defineProperty(globalThis, "navigator", {
+  value: { mediaDevices: { getUserMedia() {} } },
+  configurable: true,
+});
+globalThis.document = {
+  querySelector(selector) { return elementFor(selector); },
+  createElement() { return elementStub(); },
+  body: { appendChild() {}, classList: { toggle() {} } },
+  documentElement: { dataset: {} },
+};
+globalThis.fetch = async (url, options = {}) => {
+  apiCalls.push({
+    url: String(url),
+    method: options.method || "GET",
+    body: options.body || null,
+  });
+  if (String(url).includes("/handoff-agents/")) {
+    const requestBody = options.body ? JSON.parse(options.body) : {};
+    return {
+      ok: true,
+      json: async () => ({
+        code: 200,
+        data: {
+          humanAgentIdentity: "agent-debug-001",
+          status: requestBody.status || "offline",
+          activeHandoffId: null,
+        },
+      }),
+    };
+  }
+  if (String(url).includes("/handoffs/joinable")) {
+    return {
+      ok: true,
+      json: async () => ({ code: 200, data: { rows: [], total: 0 } }),
+    };
+  }
+  throw new Error(`unexpected api call: ${url}`);
+};
+
+""" + script + """
+
+await Promise.resolve();
+await Promise.resolve();
+apiCalls.length = 0;
+
+const presence = elements.get("#agent-presence");
+const changeHandler = presence.listeners.change;
+presence.value = "online";
+if (changeHandler) {
+  await changeHandler();
+  await Promise.resolve();
+}
+
+const statusCalls = apiCalls.filter((call) =>
+  call.method === "POST" && call.url.includes("/handoff-agents/agent-debug-001/status")
+);
+
+console.log(JSON.stringify({
+  hasChangeHandler: Boolean(changeHandler),
+  statusCallCount: statusCalls.length,
+  lastStatusBody: statusCalls.length ? JSON.parse(statusCalls.at(-1).body) : null,
+}));
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    outcome = json.loads(result.stdout)
+
+    assert outcome["hasChangeHandler"] is True
+    assert outcome["statusCallCount"] == 1
+    assert outcome["lastStatusBody"] == {"status": "online", "skillGroup": "default"}
+
+
 def test_customer_web_probe_normalizes_audio_connect_errors() -> None:
     script = read_ai_call_web_asset("customer.js")
 
