@@ -80,7 +80,7 @@ P1 不做以下内容：
 ```text
 SIP 上行音频
 -> 输入隔离，只处理 sip-{call_id} 客户轨
--> RMS/SNR + WebRTC VAD + 持续时间
+-> RMS/SNR + impulse noise guard + WebRTC VAD + 持续时间
 -> sip_interrupt_candidate
 -> sip_pre_stop，立即 stop_audio
 -> generation gate，阻止旧 AI 音频迟到播放
@@ -102,7 +102,7 @@ clean window 内仍有稳定人声
 rejected 分支：
 
 ```text
-clean window 内声音消失或 VAD 不再稳定
+clean window 内声音消失或 VAD 不再稳定，且不满足强短句保护
 -> sip_interrupt_rejected
 -> 不展示客户文本
 -> 不写上下文
@@ -131,9 +131,20 @@ P1 candidate 不再只看 RMS。
 AI 正在播放
 + RMS 达标
 + SNR 达标
++ 不像拍手/敲桌/碰麦这类冲击噪声
 + WebRTC VAD 连续命中
 + 候选持续时间达标
 ```
+
+pre-stop 前必须先做冲击噪声过滤。拍手、敲桌、碰麦通常表现为瞬时 peak 很高、持续很短、后续快速回到底噪、VAD 不连续。满足这类特征时，记录 `ignored_impulse_noise` 诊断，不触发 pre-stop。
+
+P1 需要保护“停”“别说了”“不用”等强短句。强短句可能在 clean window 内已经结束，不能仅因为 pre-stop 后很快安静就判定为回声或噪声。
+
+候选分类：
+
+1. `stable_speech_candidate`：稳定人声，进入 pre-stop + clean window。
+2. `strong_short_speech_candidate`：高置信短人声，进入 pre-stop，但 clean window 静音不直接 rejected。
+3. `impulse_noise`：冲击噪声，不 pre-stop。
 
 播放窗口边界：
 
@@ -149,6 +160,8 @@ AI 正在播放
 | `snr_threshold_db` | `10` | 高过底噪的信噪比 |
 | `vad_voiced_duration_ms` | `120` | WebRTC VAD 连续人声时长 |
 | `candidate_min_duration_ms` | `180` | 候选总持续时长 |
+| `short_speech_min_duration_ms` | `120` | 强短句最小保护时长 |
+| `impulse_noise_max_duration_ms` | `120` | 冲击噪声候选最大时长 |
 | `clean_window_ms` | `300` | pre-stop 后确认窗口 |
 | `max_hold_ms` | `500` | 确认窗口最大保护上限 |
 | `echo_tail_window_ms` | `500` | AI 刚播完后的尾音保护窗口 |
@@ -190,9 +203,10 @@ candidate 达标
 判断规则：
 
 1. clean window 内 VAD + SNR 仍稳定，判定 `confirmed`。
-2. clean window 内声音很快消失，判定 `rejected_echo_or_tail`。
-3. clean window 内只有短促声音，判定 `rejected_noise`。
-4. 超过 `max_hold_ms` 仍不确定时，有稳定 VAD 则 confirmed，无稳定 VAD 则 rejected。
+2. pre-stop 前已是 `strong_short_speech_candidate` 时，即使 clean window 内声音很快消失，也不直接 rejected；先进入 confirmed，并等待 Qwen final transcript 证明用户语义。
+3. clean window 内声音很快消失，且 pre-stop 前不是强短句，判定 `rejected_echo_or_tail`。
+4. clean window 内只有短促、不稳定、非连续 VAD 声音，判定 `rejected_noise`。
+5. 超过 `max_hold_ms` 仍不确定时，必须同时满足稳定 VAD、SNR 和累计人声时长达标才 confirmed；否则 rejected。
 
 P1 不展示 clean window 阶段识别文本。
 
@@ -257,6 +271,7 @@ P1 最小事件：
 
 | 事件 | 触发时机 |
 | --- | --- |
+| `sip_impulse_noise_ignored` | 高能量短促冲击声被 pre-stop 前过滤 |
 | `sip_interrupt_candidate` | 本地 RMS/SNR + WebRTC VAD 达标 |
 | `sip_pre_stop` | 已执行 stop_audio / generation gate |
 | `sip_interrupt_confirmed` | clean window 确认为真人插话 |
@@ -269,6 +284,7 @@ P1 最小事件：
 {
   "reason": "sip_uplink_speech_during_ai_audio",
   "decision": "confirmed",
+  "candidateClass": "stable_speech_candidate",
   "rmsDbfs": -32.5,
   "noiseFloorDbfs": -45.0,
   "snrDb": 12.5,
@@ -294,6 +310,8 @@ AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS
 AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB
 AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS
 AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS
+AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS
+AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS
 AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS
 AI_CALL_SIP_BARGE_IN_MAX_HOLD_MS
 AI_CALL_SIP_BARGE_IN_ECHO_TAIL_WINDOW_MS
@@ -346,10 +364,12 @@ Web 端先验证状态机，不证明真实 SIP 回声质量。
 
 1. RMS/SNR 不达标不产生 candidate。
 2. VAD 未连续命中不产生 candidate。
-3. candidate 达标后触发 pre-stop。
-4. clean window 持续人声进入 confirmed。
-5. clean window 声音消失进入 rejected。
-6. rejected 后同一轮最多恢复一次。
+3. 拍手/敲桌类冲击噪声不触发 pre-stop。
+4. candidate 达标后触发 pre-stop。
+5. clean window 持续人声进入 confirmed。
+6. 强短句 candidate 不因 clean window 静音直接 rejected。
+7. 非强短句的短促不稳定声音进入 rejected。
+8. rejected 后同一轮最多恢复一次。
 
 状态测试：
 
