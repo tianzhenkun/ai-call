@@ -13,7 +13,11 @@ WINDOW_MS = 100
 EVENT_ALIGNMENT_WINDOW_MS = 800
 
 CANDIDATE_EVENT_TYPES = {"interrupt_candidate", "sip_interrupt_candidate"}
-CONFIRMED_EVENT_TYPES = {"interrupt_confirmed", "sip_interrupt_candidate_confirmed"}
+CONFIRMED_EVENT_TYPES = {
+    "interrupt_confirmed",
+    "sip_interrupt_candidate_confirmed",
+    "sip_interrupt_confirmed",
+}
 PROVIDER_SPEECH_EVENT_TYPES = {"user_speech_started"}
 
 
@@ -340,13 +344,16 @@ def _event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     counts = {
         "interruptCandidateCount": 0,
         "interruptConfirmedCount": 0,
+        "sipPreStopDeferredCount": 0,
         "sipHangupCount": 0,
         "providerSpeechStartedCount": 0,
     }
     key_types = {
         "interrupt_candidate",
         "sip_interrupt_candidate",
+        "sip_pre_stop_deferred",
         "sip_interrupt_candidate_confirmed",
+        "sip_interrupt_confirmed",
         "interrupt_confirmed",
         "user_speech_started",
         "sip_hangup",
@@ -359,7 +366,9 @@ def _event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         event_type = str(event.get("eventType") or event.get("type") or "")
         if event_type in {"interrupt_candidate", "sip_interrupt_candidate"}:
             counts["interruptCandidateCount"] += 1
-        elif event_type in {"interrupt_confirmed", "sip_interrupt_candidate_confirmed"}:
+        elif event_type == "sip_pre_stop_deferred":
+            counts["sipPreStopDeferredCount"] += 1
+        elif event_type in CONFIRMED_EVENT_TYPES:
             counts["interruptConfirmedCount"] += 1
         elif event_type == "sip_hangup":
             counts["sipHangupCount"] += 1

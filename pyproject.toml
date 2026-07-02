@@ -37,6 +37,7 @@ dependencies = [
     "typer==0.19.0",
     "user-agents==2.2.0",
     "uvicorn==0.41.0",
+    "webrtcvad-wheels==2.0.14",
     "websockets>=14.0,<16.0",
 ]
 

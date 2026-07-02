@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -196,6 +197,13 @@ class AiCallService:
         if self.prompt_resolver is not None or self.prompt_composer is not None:
             scene_code = self._require_scene_code(scene_code)
 
+        callee_phone_number_masked = self._mask_phone_number(callee_phone_number)
+        callee_phone_number_hash = self._callee_phone_number_hash(callee_phone_number)
+        await self._ensure_no_active_sip_outbound_for_callee(
+            callee_phone_number_hash=callee_phone_number_hash,
+            callee_phone_number_masked=callee_phone_number_masked,
+        )
+
         resolved_voice = await self._resolve_voice(voice)
         call_id = f"call_{generate_snowflake_id()}"
         room_name = f"ai-call-{call_id}"
@@ -205,6 +213,8 @@ class AiCallService:
             business_id=business_id,
             room_name=room_name,
             participant_identity=participant_identity,
+            callee_phone_number_hash=callee_phone_number_hash,
+            callee_phone_number_masked=callee_phone_number_masked,
         )
         sip_invite_sent = False
         try:
@@ -231,7 +241,8 @@ class AiCallService:
                 event_type="sip_invite_sent",
                 payload={
                     "participantIdentity": participant_identity,
-                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                    "calleePhoneNumberMasked": callee_phone_number_masked,
+                    "calleePhoneNumberHash": callee_phone_number_hash,
                     "ringingTimeoutSeconds": ringing_timeout_seconds,
                 },
             )
@@ -245,14 +256,17 @@ class AiCallService:
             )
         except AiCallError as exc:
             if sip_invite_sent:
+                failure_payload = {
+                    "errorId": exc.error_id,
+                    "message": exc.msg,
+                    "calleePhoneNumberMasked": callee_phone_number_masked,
+                    "calleePhoneNumberHash": callee_phone_number_hash,
+                }
+                failure_payload.update(exc.details)
                 self._record_sip_event(
                     call_id=call_id,
                     event_type="sip_failed",
-                    payload={
-                        "errorId": exc.error_id,
-                        "message": exc.msg,
-                        "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
-                    },
+                    payload=failure_payload,
                 )
             await self.record_service.fail_session(
                 call_id,
@@ -434,6 +448,7 @@ class AiCallService:
             "promptHash": effective_config.prompt_hash,
             "openingMessageHash": effective_config.opening_message_hash,
             "promptSourceKey": effective_config.prompt_source_key,
+            "bargeInEnabled": effective_config.barge_in_enabled,
         }
 
     async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
@@ -977,6 +992,7 @@ class AiCallService:
             "provider_connect_failed": "provider_connect",
             "sip_caller_number_missing": "sip_trunk",
             "sip_create_participant_failed": "sip",
+            "sip_duplicate_active_callee": "sip_concurrency",
             "invalid_callee_number": "callee_number",
             "callee_prefix_not_allowed": "callee_number",
             "sip_outbound_disabled": "sip_config",
@@ -1015,13 +1031,16 @@ class AiCallService:
     ) -> None:
         if self.sip_client is None:
             return
+        callee_phone_number_masked = self._mask_phone_number(callee_phone_number)
+        callee_phone_number_hash = self._callee_phone_number_hash(callee_phone_number)
         preflight = self.sip_client.preflight(callee_phone_number=callee_phone_number)
         if preflight.ok:
             self._record_sip_event(
                 call_id=call_id,
                 event_type="sip_preflight_passed",
                 payload={
-                    "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                    "calleePhoneNumberMasked": callee_phone_number_masked,
+                    "calleePhoneNumberHash": callee_phone_number_hash,
                 },
             )
             return
@@ -1031,7 +1050,8 @@ class AiCallService:
             payload={
                 "errorId": preflight.failure_reason or "sip_preflight_failed",
                 "message": preflight.message or "SIP 外呼预检失败",
-                "calleePhoneNumberMasked": self._mask_phone_number(callee_phone_number),
+                "calleePhoneNumberMasked": callee_phone_number_masked,
+                "calleePhoneNumberHash": callee_phone_number_hash,
             },
         )
         raise AiCallError(
@@ -1105,6 +1125,38 @@ class AiCallService:
         if len(normalized) <= 7:
             return "***"
         return f"{normalized[:3]}****{normalized[-4:]}"
+
+    @staticmethod
+    def _callee_phone_number_hash(phone_number: str) -> str:
+        normalized = "".join(ch for ch in str(phone_number or "") if ch.isdigit())
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
+
+    async def _ensure_no_active_sip_outbound_for_callee(
+        self,
+        *,
+        callee_phone_number_hash: str,
+        callee_phone_number_masked: str,
+    ) -> None:
+        if self.record_service is None:
+            return
+        active_record = await self.record_service.get_active_sip_record_by_callee_hash(
+            callee_phone_number_hash,
+        )
+        if active_record is None:
+            return
+        active_status = getattr(active_record, "status", None)
+        active_call_id = getattr(active_record, "call_id", None)
+        raise CustomException(
+            msg="该号码已有进行中的电话外呼，请先结束当前通话后再重试",
+            code=RET.CONFLICT.code,
+            status_code=status.HTTP_409_CONFLICT,
+            data={
+                "activeCallId": active_call_id,
+                "activeStatus": active_status,
+                "calleePhoneNumberMasked": callee_phone_number_masked,
+            },
+        )
 
     def _ensure_record_service(self) -> None:
         if self.record_service is None:
@@ -1219,6 +1271,7 @@ class AiCallService:
             ).strip(),
             "prompt_text": _strip_or_none(values.get("prompt_text")),
             "opening_message": _strip_or_none(values.get("opening_message")),
+            "barge_in_enabled": _bool_or_false(values.get("barge_in_enabled")),
         }
         if not normalized["scene_code"]:
             raise CustomException(msg="sceneCode 不能为空", code=RET.ERROR.code, status_code=400)
@@ -1258,6 +1311,7 @@ class AiCallService:
             "providerKey": profile.provider_key,
             "promptText": profile.prompt_text,
             "openingMessage": profile.opening_message,
+            "bargeInEnabled": bool(getattr(profile, "barge_in_enabled", False)),
             "createdAt": profile.created_at,
             "updatedAt": profile.updated_at,
         }
@@ -1682,3 +1736,14 @@ def _strip_or_none(value) -> str | None:
         return None
     stripped = str(value).strip()
     return stripped or None
+
+
+def _bool_or_false(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    return normalized in {"1", "true", "yes", "y", "on"}

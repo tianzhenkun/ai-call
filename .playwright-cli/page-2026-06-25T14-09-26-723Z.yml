@@ -1,0 +1,40 @@
+- generic [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e5]:
+        - heading "人工接管" [level=1] [ref=e6]
+        - paragraph [ref=e7]: LiveKit 人工接管
+      - generic [ref=e8]: 未接入
+    - region "坐席在线状态" [ref=e9]:
+      - generic [ref=e10]:
+        - generic [ref=e11]: 坐席状态
+        - generic [ref=e12]: 在线
+      - generic [ref=e13]:
+        - combobox [ref=e14]:
+          - option "在线" [selected]
+          - option "离线"
+        - button "保存" [active] [ref=e15] [cursor=pointer]
+    - generic [ref=e16]:
+      - generic [ref=e17]:
+        - generic [ref=e18]:
+          - heading "可接入列表" [level=2] [ref=e19]
+          - button "刷新" [ref=e20] [cursor=pointer]
+        - generic [ref=e21]:
+          - generic [ref=e22]:
+            - generic [ref=e23]: 坐席标识
+            - textbox "坐席标识 用于记录哪位人工坐席接入，客户不可见；本地测试可保持默认。" [ref=e24]:
+              - /placeholder: agent-debug-001
+              - text: agent-debug-001
+            - generic [ref=e25]: 用于记录哪位人工坐席接入，客户不可见；本地测试可保持默认。
+          - generic [ref=e53]: 暂无可接入请求
+      - generic [ref=e28]:
+        - heading "接入状态" [level=2] [ref=e30]
+        - generic [ref=e31]:
+          - generic [ref=e55]: 暂无接入
+          - generic [ref=e34]:
+            - button "接入" [disabled] [ref=e35]
+            - button "麦克风关" [disabled] [ref=e36]
+          - button "断开坐席" [disabled] [ref=e38]
+      - heading "运行日志" [level=2] [ref=e41]
+  - generic:
+    - generic: 坐席状态已保存

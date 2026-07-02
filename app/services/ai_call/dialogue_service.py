@@ -452,7 +452,7 @@ class AiCallDialogueRuntimeStore:
     ) -> DialogueSegmentSnapshot | None:
         for candidate in reversed(rows[:current_index]):
             if candidate.speaker_type != "ai":
-                continue
+                break
             if not self._can_suppress_interrupted_ai_duplicate(candidate, snapshot):
                 break
             rows.remove(snapshot)

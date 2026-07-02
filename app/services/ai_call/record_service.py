@@ -118,11 +118,17 @@ PERSISTED_EVENT_TYPES = frozenset({
     "sip_failed",
     "sip_hangup",
     "sip_invite_sent",
+    "sip_impulse_noise_ignored",
     "sip_interrupt_candidate",
     "sip_interrupt_candidate_confirmed",
     "sip_interrupt_candidate_expired",
+    "sip_interrupt_confirmed",
+    "sip_interrupt_rejected",
     "sip_preflight_failed",
     "sip_preflight_passed",
+    "sip_pre_stop_deferred",
+    "sip_pre_stop",
+    "sip_recovery_started",
     "sip_ringing",
     "user_speech_started",
     "user_speech_stopped",
@@ -168,6 +174,8 @@ class AiCallRecordService:
         participant_identity: str,
         started_at: datetime | None = None,
         business_type: str | None = None,
+        callee_phone_number_hash: str | None = None,
+        callee_phone_number_masked: str | None = None,
     ) -> AiCallRecordModel:
         return await self.repository.create_record(
             call_id=call_id,
@@ -176,8 +184,31 @@ class AiCallRecordService:
             entry_type="sip_outbound",
             room_name=room_name,
             participant_identity=participant_identity,
+            callee_phone_number_hash=callee_phone_number_hash,
+            callee_phone_number_masked=callee_phone_number_masked,
             status=CallSessionStatus.CREATED.value,
             started_at=started_at or utc_now(),
+        )
+
+    async def get_active_sip_record_by_callee_hash(
+        self,
+        callee_phone_number_hash: str,
+    ) -> AiCallRecordModel | None:
+        active_statuses = {
+            CallSessionStatus.CREATED.value,
+            CallSessionStatus.PREPARING.value,
+            CallSessionStatus.READY.value,
+            CallSessionStatus.CONNECTED.value,
+            CallSessionStatus.USER_SPEAKING.value,
+            CallSessionStatus.AI_THINKING.value,
+            CallSessionStatus.AI_SPEAKING.value,
+            CallSessionStatus.INTERRUPTED.value,
+            CallSessionStatus.WAITING.value,
+            CallSessionStatus.ENDING.value,
+        }
+        return await self.repository.get_active_sip_record_by_callee_hash(
+            callee_phone_number_hash=callee_phone_number_hash,
+            active_statuses=active_statuses,
         )
 
     async def mark_status(

@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import status
 
 
@@ -9,8 +11,10 @@ class AiCallError(Exception):
         error_id: str,
         msg: str,
         status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(msg)
         self.error_id = error_id
         self.msg = msg
         self.status_code = status_code
+        self.details = details or {}

@@ -44,6 +44,7 @@ class LiveKitRoomAudioTransport:
         self._sources: dict[str, Any] = {}
         self._track_streams: dict[str, Any] = {}
         self._last_output_frames: dict[str, PcmAudioFrame] = {}
+        self._target_participant_identities: dict[str, str] = {}
 
     async def start(self, session: CallSession) -> None:
         room = self.room_factory()
@@ -55,6 +56,7 @@ class LiveKitRoomAudioTransport:
         track = self.rtc.LocalAudioTrack.create_audio_track("ai_audio", source)
         options = self.rtc.TrackPublishOptions(source=self.rtc.TrackSource.SOURCE_MICROPHONE)
         self._track_streams[session.call_id] = _StreamQueue()
+        self._target_participant_identities[session.call_id] = session.participant_identity
 
         room.on(
             "track_subscribed",
@@ -117,16 +119,21 @@ class LiveKitRoomAudioTransport:
             await self._maybe_await(room.disconnect())
         self._sources.pop(call_id, None)
         self._last_output_frames.pop(call_id, None)
+        self._target_participant_identities.pop(call_id, None)
 
     def _on_track_subscribed(
         self,
         call_id: str,
         track: Any,
         _publication: Any,
-        _participant: Any,
+        participant: Any,
     ) -> None:
         stream_queue = self._track_streams.get(call_id)
         if stream_queue is None:
+            return
+        target_identity = self._target_participant_identities.get(call_id)
+        participant_identity = getattr(participant, "identity", None)
+        if target_identity and participant_identity != target_identity:
             return
         stream_queue.put(
             self.rtc.AudioStream(

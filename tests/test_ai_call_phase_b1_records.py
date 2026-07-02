@@ -2795,8 +2795,14 @@ def test_record_service_persists_promoted_browser_interrupt_candidate() -> None:
     "event_type",
     [
         "sip_interrupt_candidate",
+        "sip_impulse_noise_ignored",
         "sip_interrupt_candidate_confirmed",
         "sip_interrupt_candidate_expired",
+        "sip_interrupt_confirmed",
+        "sip_interrupt_rejected",
+        "sip_pre_stop_deferred",
+        "sip_pre_stop",
+        "sip_recovery_started",
         "browser_pre_stop_requested",
         "browser_pre_stop_completed",
         "browser_pre_stop_confirmed",
@@ -3004,6 +3010,37 @@ async def test_interrupt_summary_counts_sip_candidate_confirmation(b1_service) -
         event_type="sip_interrupt_candidate_confirmed",
         event_time=base + timedelta(milliseconds=300),
         payload={"confirmedBy": "transcript", "reason": "sip_uplink_speech_during_ai_audio"},
+    )
+
+    summary = await service.get_record_interrupt_summary(result.call_id)
+
+    assert summary["interruptCandidateCount"] == 1
+    assert summary["interruptConfirmedCount"] == 1
+    assert summary["candidateNotConfirmedCount"] == 0
+    assert summary["verdict"] == "normal"
+    assert summary["issues"] == []
+
+
+@pytest.mark.anyio
+async def test_interrupt_summary_counts_sip_p1_confirmation(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(voice=None, prompt=None, business_id=None)
+    await b1_service.flush_events()
+    base = datetime(2026, 6, 30, 11, 23, tzinfo=timezone.utc)
+
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="interrupt_candidate",
+        event_time=base,
+        payload={"source": "sip", "reason": "sip_uplink_speech_during_ai_audio"},
+    )
+    await append_record_event(
+        record_service,
+        call_id=result.call_id,
+        event_type="sip_interrupt_confirmed",
+        event_time=base + timedelta(milliseconds=300),
+        payload={"decision": "confirmed", "reason": "sip_uplink_speech_during_ai_audio"},
     )
 
     summary = await service.get_record_interrupt_summary(result.call_id)
@@ -5654,6 +5691,57 @@ def test_dialogue_runtime_suppresses_interrupted_ai_done_duplicate() -> None:
     assert preview[0].segment_status == "interrupted"
     assert preview[0].text == "您好，我是灵宸智能助手。"
     assert len(persisted) == 1
+
+
+def test_dialogue_runtime_keeps_ai_done_duplicate_after_customer_turn() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    persisted: list[DialogueSegmentSnapshot] = []
+    runtime_store.add_persist_listener(persisted.append)
+    call_id = "call_ai_duplicate_after_customer_turn"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+    ai_text = "您看是约个时间给您做个简短演示更合适，还是我先安排同事跟您对接详细需求？"
+
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_delta",
+        source="provider",
+        payload={"item_id": "item_ai_interrupted", "delta": ai_text},
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="interrupt_confirmed",
+        source="agent",
+        payload={},
+        timestamp=started_at + timedelta(milliseconds=300),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="user_transcript_done",
+        source="provider",
+        payload={"item_id": "item_customer", "transcript": "行。"},
+        timestamp=started_at + timedelta(milliseconds=700),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="ai_transcript_done",
+        source="provider",
+        payload={"item_id": "item_ai_next", "transcript": ai_text},
+        timestamp=started_at + timedelta(milliseconds=900),
+    )
+
+    preview = runtime_store.list_preview(call_id)
+    assert [(row.speaker_type, row.source_segment_id) for row in preview] == [
+        ("ai", "item_ai_interrupted"),
+        ("customer", "item_customer"),
+        ("ai", "item_ai_next"),
+    ]
+    assert preview[0].segment_status == "interrupted"
+    assert preview[2].segment_status == "final"
+    assert preview[2].text == ai_text
+    assert len(persisted) == 3
 
 
 def test_dialogue_runtime_marks_late_ai_done_for_invalidated_response_interrupted() -> None:

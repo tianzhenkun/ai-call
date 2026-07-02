@@ -27,7 +27,11 @@ from app.services.ai_call.session_registry import (
     InMemorySessionRegistry,
     utc_now,
 )
+from app.services.ai_call.sip_barge_in import SipBargeInConfig
 from app.utils.id_util import generate_snowflake_id
+
+
+END_CLEANUP_TIMEOUT_SECONDS = 1.0
 
 
 class LiveKitRoomManagerProtocol(Protocol):
@@ -90,10 +94,15 @@ class AiCallRuntimeConfig:
     vad_silence_duration_ms: int
     user_turn_stability_delay_seconds: float = 0.35
     handoff_prompt_constraint_enabled: bool = True
+    barge_in_enabled: bool = True
     sip_barge_in_enabled: bool = True
     sip_barge_in_min_rms_dbfs: float = -35.0
     sip_barge_in_min_speech_duration_ms: int = 220
     sip_barge_in_hold_timeout_seconds: float = 5.0
+    sip_barge_in_fast_stop_enabled: bool = False
+    sip_barge_in_config: SipBargeInConfig = field(default_factory=SipBargeInConfig)
+    sip_barge_in_recovery_silence_ms: int = 600
+    sip_barge_in_recovery_max_per_turn: int = 1
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -116,6 +125,7 @@ class AiCallRuntimeConfig:
             vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
             user_turn_stability_delay_seconds=(settings.AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS),
             handoff_prompt_constraint_enabled=(settings.AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED),
+            barge_in_enabled=settings.AI_CALL_BARGE_IN_ENABLED,
             sip_barge_in_enabled=settings.AI_CALL_SIP_BARGE_IN_ENABLED,
             sip_barge_in_min_rms_dbfs=settings.AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS,
             sip_barge_in_min_speech_duration_ms=(
@@ -123,6 +133,33 @@ class AiCallRuntimeConfig:
             ),
             sip_barge_in_hold_timeout_seconds=(
                 settings.AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS
+            ),
+            sip_barge_in_fast_stop_enabled=settings.AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED,
+            sip_barge_in_config=SipBargeInConfig(
+                rms_threshold_dbfs=settings.AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS,
+                snr_threshold_db=settings.AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB,
+                vad_voiced_duration_ms=settings.AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS,
+                candidate_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS
+                ),
+                pre_stop_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_PRE_STOP_MIN_DURATION_MS
+                ),
+                short_speech_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS
+                ),
+                impulse_noise_max_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS
+                ),
+                clean_window_ms=settings.AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS,
+                max_hold_ms=settings.AI_CALL_SIP_BARGE_IN_MAX_HOLD_MS,
+                echo_tail_window_ms=settings.AI_CALL_SIP_BARGE_IN_ECHO_TAIL_WINDOW_MS,
+            ),
+            sip_barge_in_recovery_silence_ms=(
+                settings.AI_CALL_SIP_BARGE_IN_RECOVERY_SILENCE_MS
+            ),
+            sip_barge_in_recovery_max_per_turn=(
+                settings.AI_CALL_SIP_BARGE_IN_RECOVERY_MAX_PER_TURN
             ),
         )
 
@@ -153,6 +190,7 @@ class EffectiveConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    barge_in_enabled: bool = False
     instructions: str | None = field(default=None, repr=False)
 
 
@@ -247,11 +285,13 @@ class AiCallOrchestrator:
         registry: InMemorySessionRegistry | None = None,
         event_store: InMemoryEventStore | None = None,
         metrics_by_call_id: dict[str, CallMetrics] | None = None,
+        end_cleanup_timeout_seconds: float = END_CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.registry = registry or InMemorySessionRegistry()
         self.event_store = event_store or InMemoryEventStore()
         self.metrics_by_call_id = metrics_by_call_id if metrics_by_call_id is not None else {}
+        self.end_cleanup_timeout_seconds = max(0.001, end_cleanup_timeout_seconds)
         self.livekit_room_manager = livekit_room_manager or LiveKitRoomManager(
             livekit_url=config.livekit_url,
             api_key=config.livekit_api_key,
@@ -287,6 +327,10 @@ class AiCallOrchestrator:
             sip_barge_in_min_rms_dbfs=self.config.sip_barge_in_min_rms_dbfs,
             sip_barge_in_min_speech_duration_ms=self.config.sip_barge_in_min_speech_duration_ms,
             sip_barge_in_hold_timeout_seconds=self.config.sip_barge_in_hold_timeout_seconds,
+            sip_barge_in_fast_stop_enabled=self.config.sip_barge_in_fast_stop_enabled,
+            sip_barge_in_config=self.config.sip_barge_in_config,
+            sip_barge_in_recovery_silence_ms=self.config.sip_barge_in_recovery_silence_ms,
+            sip_barge_in_recovery_max_per_turn=self.config.sip_barge_in_recovery_max_per_turn,
             call_end_scheduler=self._schedule_auto_end_session,
         )
 
@@ -694,15 +738,31 @@ class AiCallOrchestrator:
         if session.status == CallSessionStatus.ENDING:
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.ENDING)
         if session.status == CallSessionStatus.FAILED:
-            await self.agent_runner.stop(call_id)
-            await self.livekit_room_manager.delete_room(session.room_name)
+            await self._run_end_cleanup_step(
+                call_id,
+                step="agent_stop",
+                awaitable=self.agent_runner.stop(call_id),
+            )
+            await self._run_end_cleanup_step(
+                call_id,
+                step="delete_room",
+                awaitable=self.livekit_room_manager.delete_room(session.room_name),
+            )
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.FAILED)
 
         self.registry.transition(call_id, CallSessionStatus.ENDING)
         self._append_event(call_id, "session_ending", "orchestrator")
 
-        await self.agent_runner.stop(call_id)
-        await self.livekit_room_manager.delete_room(session.room_name)
+        await self._run_end_cleanup_step(
+            call_id,
+            step="agent_stop",
+            awaitable=self.agent_runner.stop(call_id),
+        )
+        await self._run_end_cleanup_step(
+            call_id,
+            step="delete_room",
+            awaitable=self.livekit_room_manager.delete_room(session.room_name),
+        )
 
         self.registry.transition(call_id, CallSessionStatus.COMPLETED)
         self._append_event(
@@ -712,6 +772,26 @@ class AiCallOrchestrator:
             {"endReason": end_reason},
         )
         return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
+
+    async def _run_end_cleanup_step(
+        self,
+        call_id: str,
+        *,
+        step: str,
+        awaitable,
+    ) -> None:
+        try:
+            await asyncio.wait_for(awaitable, timeout=self.end_cleanup_timeout_seconds)
+        except TimeoutError:
+            self._append_event(
+                call_id,
+                "session_cleanup_timeout",
+                "orchestrator",
+                {
+                    "step": step,
+                    "timeoutSeconds": self.end_cleanup_timeout_seconds,
+                },
+            )
 
     def _schedule_auto_end_session(self, call_id: str, end_reason: str) -> None:
         task = asyncio.create_task(
@@ -978,6 +1058,9 @@ class AiCallOrchestrator:
                 vad_type=self.config.vad_type,
                 vad_threshold=self.config.vad_threshold,
                 vad_silence_duration_ms=self.config.vad_silence_duration_ms,
+                barge_in_enabled=(
+                    self.config.barge_in_enabled and prompt_effective_config.barge_in_enabled
+                ),
                 instructions=prompt_effective_config.instructions,
             )
 
@@ -1006,6 +1089,7 @@ class AiCallOrchestrator:
             vad_type=self.config.vad_type,
             vad_threshold=self.config.vad_threshold,
             vad_silence_duration_ms=self.config.vad_silence_duration_ms,
+            barge_in_enabled=False,
         )
 
     def _web_audio_constraints(self) -> WebAudioConstraints:

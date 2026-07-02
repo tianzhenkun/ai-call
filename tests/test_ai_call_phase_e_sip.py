@@ -4,16 +4,21 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from livekit import api
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import controller as ai_call_controller
 from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
+from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.schema import CreateSipSessionRequest
 from app.api.v1.ai_call.service import AiCallService
 from app.config.setting import Settings, settings
+from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
@@ -28,6 +33,7 @@ from app.services.ai_call.livekit_sip import (
 )
 from app.services.ai_call.orchestrator import AiCallOrchestrator, AiCallRuntimeConfig
 from app.services.ai_call.prompt_config import BusinessPromptResult, PromptComposer
+from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
@@ -135,6 +141,8 @@ class FakeRecordService:
         self.answered_updates: list[tuple[str, object]] = []
         self.completed_sessions: list[dict[str, object]] = []
         self.failed_sessions: list[dict[str, object]] = []
+        self.active_sip_records_by_callee_hash: dict[str, object] = {}
+        self.active_sip_record_lookups: list[str] = []
 
     async def create_sip_record(
         self,
@@ -143,12 +151,16 @@ class FakeRecordService:
         business_id: str | None,
         room_name: str,
         participant_identity: str,
+        callee_phone_number_hash: str | None = None,
+        callee_phone_number_masked: str | None = None,
     ) -> None:
         self.created_sip_records.append({
             "call_id": call_id,
             "business_id": business_id,
             "room_name": room_name,
             "participant_identity": participant_identity,
+            "callee_phone_number_hash": callee_phone_number_hash,
+            "callee_phone_number_masked": callee_phone_number_masked,
         })
 
     async def mark_status(self, call_id: str, status: str | CallSessionStatus) -> None:
@@ -185,6 +197,10 @@ class FakeRecordService:
             "failure_stage": failure_stage,
             "failure_message": failure_message,
         })
+
+    async def get_active_sip_record_by_callee_hash(self, callee_phone_number_hash: str):
+        self.active_sip_record_lookups.append(callee_phone_number_hash)
+        return self.active_sip_records_by_callee_hash.get(callee_phone_number_hash)
 
 
 class FakeRecordingService:
@@ -315,6 +331,10 @@ def build_service_with_failing_sip_client() -> tuple[
             error_id="sip_create_participant_failed",
             msg="LiveKit SIP Participant 创建失败",
             status_code=502,
+            details={
+                "rawErrorType": "TwirpError",
+                "rawErrorMessage": "callee already has an active SIP call",
+            },
         )
     )
     service = AiCallService(
@@ -368,6 +388,11 @@ def test_livekit_api_dependency_is_declared() -> None:
     assert '"livekit-api>=1.0,<2.0"' in pyproject
 
 
+def _callee_hash(phone_number: str) -> str:
+    normalized = "".join(ch for ch in str(phone_number or "") if ch.isdigit())
+    return f"sha256:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
+
+
 def test_self_hosted_livekit_sip_templates_are_declared() -> None:
     compose = Path("deploy/livekit-egress/docker-compose.yml").read_text(encoding="utf-8")
     sip_config = Path("deploy/livekit-egress/sip.yaml.example").read_text(encoding="utf-8")
@@ -398,6 +423,19 @@ def test_settings_expose_sip_outbound_defaults() -> None:
     assert settings.LIVEKIT_SIP_AUTH_PASSWORD == ""
     assert settings.SIP_PUBLIC_IP == ""
     assert settings.SIP_USE_EXTERNAL_IP is True
+    assert settings.AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED is False
+    assert settings.AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS == -36.0
+    assert settings.AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB == 10.0
+    assert settings.AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS == 120
+    assert settings.AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS == 180
+    assert settings.AI_CALL_SIP_BARGE_IN_PRE_STOP_MIN_DURATION_MS == 240
+    assert settings.AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS == 180
+    assert settings.AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS == 120
+    assert settings.AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS == 300
+    assert settings.AI_CALL_SIP_BARGE_IN_MAX_HOLD_MS == 500
+    assert settings.AI_CALL_SIP_BARGE_IN_ECHO_TAIL_WINDOW_MS == 500
+    assert settings.AI_CALL_SIP_BARGE_IN_RECOVERY_SILENCE_MS == 600
+    assert settings.AI_CALL_SIP_BARGE_IN_RECOVERY_MAX_PER_TURN == 1
 
 
 def test_sip_preflight_accepts_ip_allowlist_trunk_without_password() -> None:
@@ -595,6 +633,8 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
             "business_id": "geo_task_001",
             "room_name": result.room_name,
             "participant_identity": result.participant_identity,
+            "callee_phone_number_hash": _callee_hash("13800000000"),
+            "callee_phone_number_masked": "138****0000",
         }
     ]
     assert record_service.status_updates == [(result.call_id, "ready")]
@@ -632,10 +672,53 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     assert sip_invite.payload == {
         "participantIdentity": result.participant_identity,
         "calleePhoneNumberMasked": "138****0000",
+        "calleePhoneNumberHash": _callee_hash("13800000000"),
         "ringingTimeoutSeconds": 30,
     }
     assert sip_answered.source == "sip"
     assert media_connected.source == "livekit"
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_rejects_duplicate_active_callee_before_room_creation() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    callee_hash = _callee_hash("13800000000")
+    record_service.active_sip_records_by_callee_hash[callee_hash] = SimpleNamespace(
+        call_id="call_active",
+        status="connected",
+        room_name="ai-call-call_active",
+    )
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.create_sip_session(
+            callee_phone_number="13800000000",
+            voice=None,
+            business_id="geo_task_002",
+            scene_code="intro_geo",
+            business_params={},
+            ringing_timeout_seconds=30,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.code == 409
+    assert exc_info.value.msg == "该号码已有进行中的电话外呼，请先结束当前通话后再重试"
+    assert exc_info.value.data == {
+        "activeCallId": "call_active",
+        "activeStatus": "connected",
+        "calleePhoneNumberMasked": "138****0000",
+    }
+    assert record_service.active_sip_record_lookups == [callee_hash]
+    assert record_service.created_sip_records == []
+    assert room_manager.created_rooms == []
+    assert agent_runner.started_sessions == []
+    assert sip_client.created == []
 
 
 @pytest.mark.anyio
@@ -868,7 +951,71 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
         "errorId": "sip_create_participant_failed",
         "message": "LiveKit SIP Participant 创建失败",
         "calleePhoneNumberMasked": "138****0000",
+        "calleePhoneNumberHash": _callee_hash("13800000000"),
+        "rawErrorType": "TwirpError",
+        "rawErrorMessage": "callee already has an active SIP call",
     }
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_controller_commits_failed_record_before_error_response() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_maker() as db:
+            with pytest.raises(CustomException):
+                async with db.begin():
+                    room_manager = FakeLiveKitRoomManager()
+                    agent_runner = CapturingAgentRunner()
+                    orchestrator = AiCallOrchestrator(
+                        config=build_runtime_config(),
+                        livekit_room_manager=room_manager,
+                        agent_runner=agent_runner,
+                        registry=InMemorySessionRegistry(),
+                        event_store=InMemoryEventStore(),
+                    )
+                    record_service = AiCallRecordService(AiCallRecordRepository(db))
+                    service = AiCallService(
+                        orchestrator,
+                        record_service=record_service,
+                        sip_client=FakeSipClient(
+                            error=AiCallError(
+                                error_id="sip_create_participant_failed",
+                                msg="LiveKit SIP Participant 创建失败",
+                                status_code=502,
+                            )
+                        ),
+                        prompt_resolver=FakePromptResolver(),
+                        prompt_composer=PromptComposer(handoff_component_enabled=True),
+                    )
+                    await ai_call_controller.create_sip_session_controller(
+                        service=service,
+                        request=CreateSipSessionRequest(
+                            calleePhoneNumber="13800000000",
+                            sceneCode="intro_geo",
+                            ringingTimeoutSeconds=30,
+                        ),
+                    )
+
+        async with session_maker() as verify_db:
+            verify_service = AiCallRecordService(AiCallRecordRepository(verify_db))
+            rows, total = await verify_service.list_records(entry_type="sip_outbound")
+
+        assert total == 1
+        record = rows[0]
+        assert record.status == CallSessionStatus.FAILED.value
+        assert record.end_reason == "sip_create_participant_failed"
+        assert record.failure_stage == "sip"
+        assert record.failure_message == "LiveKit SIP Participant 创建失败"
+        assert record.callee_phone_number_hash == _callee_hash("13800000000")
+        assert record.callee_phone_number_masked == "138****0000"
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(MappedBase.metadata.drop_all)
+        await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -906,6 +1053,7 @@ async def test_create_sip_session_stops_before_room_when_sip_preflight_fails() -
         "errorId": "sip_outbound_disabled",
         "message": "SIP 真实外呼未启用",
         "calleePhoneNumberMasked": "138****0000",
+        "calleePhoneNumberHash": _callee_hash("13800000000"),
     }
 
 

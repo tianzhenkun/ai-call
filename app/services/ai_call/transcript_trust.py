@@ -17,23 +17,26 @@ COMMIT_TRANSCRIPT = "commit"
 CANDIDATE_TRANSCRIPT = "candidate"
 REJECT_TRANSCRIPT = "reject"
 
-VALID_SHORT_CUSTOMER_UTTERANCES = frozenset({
-    "嗯",
+TURN_TAKING_SHORT_UTTERANCES = frozenset({
     "好",
     "好的",
     "行",
     "可以",
-    "对",
-    "对的",
-    "对呀",
-    "是",
-    "不是",
-    "不",
     "不行",
     "不要",
     "不用",
     "喂",
     "你好",
+})
+
+NON_TURN_SHORT_UTTERANCES = frozenset({
+    "嗯",
+    "嗯嗯",
+    "唉",
+    "啊",
+    "哦",
+    "呃",
+    "唔",
 })
 
 
@@ -93,6 +96,21 @@ def decide_realtime_transcript_trust(
         during_ai_audio
         and has_interrupt_candidate
         and len(normalized) <= 2
+        and normalized in NON_TURN_SHORT_UTTERANCES
+    ):
+        return RealtimeTranscriptTrustDecision(
+            trust=LOW_CONFIDENCE_TRANSCRIPT,
+            semantic_action=SEMANTIC_REJECT,
+            commit_decision=CANDIDATE_TRANSCRIPT,
+            reason="non_turn_short_overlap_transcript",
+            confidence=0.3,
+        )
+
+    if (
+        during_ai_audio
+        and has_interrupt_candidate
+        and len(normalized) <= 2
+        and normalized not in TURN_TAKING_SHORT_UTTERANCES
         and not has_reliable_user_audio
     ):
         return RealtimeTranscriptTrustDecision(

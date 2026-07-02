@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
+from app.core.exceptions import CustomException
 
 from .schema import (
     AcceptHandoffOut,
@@ -144,18 +145,30 @@ async def create_sip_session_controller(
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     request: Annotated[CreateSipSessionRequest, Body()],
 ) -> JSONResponse:
-    result = await service.create_sip_session(
-        callee_phone_number=request.callee_phone_number,
-        voice=request.voice,
-        business_id=request.business_id,
-        scene_code=request.scene_code,
-        business_params=request.business_params,
-        ringing_timeout_seconds=request.ringing_timeout_seconds,
-    )
+    try:
+        result = await service.create_sip_session(
+            callee_phone_number=request.callee_phone_number,
+            voice=request.voice,
+            business_id=request.business_id,
+            scene_code=request.scene_code,
+            business_params=request.business_params,
+            ringing_timeout_seconds=request.ringing_timeout_seconds,
+        )
+    except CustomException:
+        await _commit_ai_call_record_audit(service)
+        raise
     return SuccessResponse(
         data=CreateSipSessionOut.model_validate(result),
         msg="创建成功",
     )
+
+
+async def _commit_ai_call_record_audit(service: AiCallService) -> None:
+    record_service = getattr(service, "record_service", None)
+    repository = getattr(record_service, "repository", None)
+    db = getattr(repository, "db", None)
+    if db is not None:
+        await db.commit()
 
 
 @AiCallRouter.get(

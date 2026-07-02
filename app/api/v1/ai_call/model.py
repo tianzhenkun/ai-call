@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -20,6 +20,13 @@ class AiCallRecordModel(MappedBase):
         Index("idx_ai_call_record_entry_started", "entry_type", "started_at"),
         Index("idx_ai_call_record_business", "business_type", "business_id"),
         Index("idx_ai_call_record_room_name", "room_name"),
+        Index(
+            "idx_ai_call_record_sip_callee_active",
+            "entry_type",
+            "callee_phone_number_hash",
+            "status",
+            "started_at",
+        ),
         {"comment": "AI Call 通话记录表"},
     )
     __permission_strategy__ = None
@@ -52,6 +59,16 @@ class AiCallRecordModel(MappedBase):
         String(128),
         nullable=False,
         comment="用户侧 Participant identity",
+    )
+    callee_phone_number_hash: Mapped[str | None] = mapped_column(
+        String(80),
+        nullable=True,
+        comment="SIP 被叫号码指纹",
+    )
+    callee_phone_number_masked: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="SIP 被叫号码脱敏展示",
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, comment="会话状态")
     end_reason: Mapped[str | None] = mapped_column(
@@ -666,6 +683,13 @@ class AiCallPromptProfileModel(MappedBase):
         String(1000),
         nullable=True,
         comment="固定开场白",
+    )
+    barge_in_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        comment="是否允许当前场景启用通话打断",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
