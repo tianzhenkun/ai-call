@@ -17,24 +17,29 @@ COMMIT_TRANSCRIPT = "commit"
 CANDIDATE_TRANSCRIPT = "candidate"
 REJECT_TRANSCRIPT = "reject"
 
-VALID_SHORT_CUSTOMER_UTTERANCES = frozenset({
-    "嗯",
+TURN_TAKING_SHORT_UTTERANCES = frozenset({
     "好",
     "好的",
     "行",
     "可以",
-    "对",
-    "对的",
-    "对呀",
-    "是",
-    "不是",
-    "不",
     "不行",
     "不要",
     "不用",
     "喂",
     "你好",
 })
+
+NON_TURN_SHORT_UTTERANCES = frozenset({
+    "嗯",
+    "嗯嗯",
+    "唉",
+    "啊",
+    "哦",
+    "呃",
+    "唔",
+})
+
+NUMBER_LIKE_CHARS = frozenset("0123456789零〇一二三四五六七八九十百千万亿两幺壹贰叁肆伍陆柒捌玖拾佰仟")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +97,36 @@ def decide_realtime_transcript_trust(
     if (
         during_ai_audio
         and has_interrupt_candidate
+        and is_number_like_transcript(normalized)
+        and not has_reliable_user_audio
+    ):
+        return RealtimeTranscriptTrustDecision(
+            trust=LOW_CONFIDENCE_TRANSCRIPT,
+            semantic_action=SEMANTIC_REJECT,
+            commit_decision=CANDIDATE_TRANSCRIPT,
+            reason="number_like_overlap_candidate_transcript",
+            confidence=0.35,
+        )
+
+    if (
+        during_ai_audio
+        and has_interrupt_candidate
         and len(normalized) <= 2
+        and normalized in NON_TURN_SHORT_UTTERANCES
+    ):
+        return RealtimeTranscriptTrustDecision(
+            trust=LOW_CONFIDENCE_TRANSCRIPT,
+            semantic_action=SEMANTIC_REJECT,
+            commit_decision=CANDIDATE_TRANSCRIPT,
+            reason="non_turn_short_overlap_transcript",
+            confidence=0.3,
+        )
+
+    if (
+        during_ai_audio
+        and has_interrupt_candidate
+        and len(normalized) <= 2
+        and normalized not in TURN_TAKING_SHORT_UTTERANCES
         and not has_reliable_user_audio
     ):
         return RealtimeTranscriptTrustDecision(
@@ -115,6 +149,11 @@ def decide_realtime_transcript_trust(
         reason=reason,
         confidence=0.9,
     )
+
+
+def is_number_like_transcript(transcript: str) -> bool:
+    normalized = normalize_dialogue_text(transcript)
+    return bool(normalized) and all(char in NUMBER_LIKE_CHARS for char in normalized)
 
 
 def is_realtime_transcript_semantically_rejected(payload: dict[str, Any]) -> bool:

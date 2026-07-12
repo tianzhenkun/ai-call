@@ -19,6 +19,7 @@ from app.services.ai_call.dialogue_merge import (
 )
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
 from app.services.ai_call.transcript_trust import (
+    is_number_like_transcript,
     is_realtime_transcript_semantically_rejected,
 )
 
@@ -450,27 +451,41 @@ class AiCallDialogueRuntimeStore:
         current_index: int,
         snapshot: DialogueSegmentSnapshot,
     ) -> DialogueSegmentSnapshot | None:
+        response_duplicate = self._suppress_interrupted_response_ai_duplicate(
+            rows=rows,
+            current_index=current_index,
+            snapshot=snapshot,
+        )
+        if response_duplicate is not None:
+            return response_duplicate
+        for candidate in reversed(rows[:current_index]):
+            if candidate.speaker_type != "ai":
+                break
+            if not self._can_suppress_interrupted_ai_duplicate(candidate, snapshot):
+                break
+            return self._suppress_ai_snapshot(rows, snapshot, candidate)
+        return None
+
+    def _suppress_interrupted_response_ai_duplicate(
+        self,
+        *,
+        rows: list[DialogueSegmentSnapshot],
+        current_index: int,
+        snapshot: DialogueSegmentSnapshot,
+    ) -> DialogueSegmentSnapshot | None:
+        if not self._interrupted_response_ids_for_ai_source(
+            snapshot.call_id,
+            snapshot.source_segment_id,
+        ):
+            return None
         for candidate in reversed(rows[:current_index]):
             if candidate.speaker_type != "ai":
                 continue
+            if not self._share_interrupted_ai_response(candidate, snapshot):
+                continue
             if not self._can_suppress_interrupted_ai_duplicate(candidate, snapshot):
-                break
-            rows.remove(snapshot)
-            current_key = (
-                snapshot.call_id,
-                snapshot.speaker_type,
-                snapshot.source_segment_id,
-            )
-            target_key = (
-                candidate.call_id,
-                candidate.speaker_type,
-                candidate.source_segment_id,
-            )
-            self._merged_key_targets[current_key] = target_key
-            pending = self._segments_by_source_key.get(current_key)
-            if pending is not None:
-                pending.suppress_persist = True
-            return candidate
+                continue
+            return self._suppress_ai_snapshot(rows, snapshot, candidate)
         return None
 
     def _can_merge_adjacent(
@@ -525,6 +540,61 @@ class AiCallDialogueRuntimeStore:
             return False
         gap_ms = self._duration_ms(previous_end, current_start)
         return gap_ms is not None and 0 <= gap_ms <= self.AI_INTERRUPTED_DUPLICATE_WINDOW_MS
+
+    def _share_interrupted_ai_response(
+        self,
+        previous: DialogueSegmentSnapshot,
+        current: DialogueSegmentSnapshot,
+    ) -> bool:
+        previous_response_ids = self._interrupted_response_ids_for_ai_source(
+            previous.call_id,
+            previous.source_segment_id,
+        )
+        if not previous_response_ids:
+            return False
+        current_response_ids = self._interrupted_response_ids_for_ai_source(
+            current.call_id,
+            current.source_segment_id,
+        )
+        return bool(previous_response_ids & current_response_ids)
+
+    def _interrupted_response_ids_for_ai_source(
+        self,
+        call_id: str,
+        source_segment_id: str,
+    ) -> set[str]:
+        interrupted_response_ids = self._interrupted_ai_response_ids_by_call.get(call_id, set())
+        if not interrupted_response_ids:
+            return set()
+        source_ids_by_response = self._ai_source_ids_by_response_id.get(call_id, {})
+        return {
+            response_id
+            for response_id in interrupted_response_ids
+            if source_segment_id in source_ids_by_response.get(response_id, set())
+        }
+
+    def _suppress_ai_snapshot(
+        self,
+        rows: list[DialogueSegmentSnapshot],
+        snapshot: DialogueSegmentSnapshot,
+        candidate: DialogueSegmentSnapshot,
+    ) -> DialogueSegmentSnapshot:
+        rows.remove(snapshot)
+        current_key = (
+            snapshot.call_id,
+            snapshot.speaker_type,
+            snapshot.source_segment_id,
+        )
+        target_key = (
+            candidate.call_id,
+            candidate.speaker_type,
+            candidate.source_segment_id,
+        )
+        self._merged_key_targets[current_key] = target_key
+        pending = self._segments_by_source_key.get(current_key)
+        if pending is not None:
+            pending.suppress_persist = True
+        return candidate
 
     def _merge_snapshots(
         self,
@@ -960,7 +1030,9 @@ class AiCallDialogueService:
         realtime_rows = [row for row in rows if row.source == QWEN_REALTIME_SOURCE]
         canonical: list[AiCallDialogueSegmentModel] = []
         for row in rows:
-            if AiCallDialogueService._is_obvious_short_realtime_asr_noise(
+            if AiCallDialogueService._is_unplayed_realtime_ai_segment(
+                row
+            ) or AiCallDialogueService._is_obvious_short_realtime_asr_noise(
                 row
             ) or AiCallDialogueService._is_double_talk_single_char_customer_asr(
                 row,
@@ -1009,7 +1081,9 @@ class AiCallDialogueService:
         realtime_rows = [row for row in rows if row.source == QWEN_REALTIME_SOURCE]
         canonical: list[DialogueSegmentSnapshot] = []
         for row in rows:
-            if AiCallDialogueService._is_obvious_short_realtime_asr_noise(
+            if AiCallDialogueService._is_unplayed_realtime_ai_segment(
+                row
+            ) or AiCallDialogueService._is_obvious_short_realtime_asr_noise(
                 row
             ) or AiCallDialogueService._is_double_talk_single_char_customer_asr(
                 row,
@@ -1052,25 +1126,43 @@ class AiCallDialogueService:
         return canonical
 
     @staticmethod
+    def _is_unplayed_realtime_ai_segment(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+    ) -> bool:
+        return (
+            row.source == QWEN_REALTIME_SOURCE
+            and row.speaker_type == "ai"
+            and row.segment_status == "interrupted"
+            and row.duration_ms is not None
+            and row.duration_ms <= 0
+        )
+
+    @staticmethod
     def _is_obvious_short_realtime_asr_noise(
         row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
     ) -> bool:
         if row.source != QWEN_REALTIME_SOURCE or row.speaker_type != "customer":
             return False
-        if row.audio_start_ms is not None and row.audio_end_ms is not None:
-            audio_span_ms = row.audio_end_ms - row.audio_start_ms
-            if audio_span_ms >= SHORT_ASR_REAL_AUDIO_MIN_SPAN_MS:
-                return False
         if row.duration_ms is None:
             return False
+        normalized_text = normalize_dialogue_text(AiCallDialogueService._dialogue_text(row))
+        if not normalized_text or normalized_text in VALID_SHORT_CUSTOMER_UTTERANCES:
+            return False
+        is_short_number_tail = (
+            is_number_like_transcript(normalized_text)
+            and row.duration_ms <= SHORT_ASR_NOISE_MAX_DURATION_MS
+        )
+        if row.audio_start_ms is not None and row.audio_end_ms is not None:
+            audio_span_ms = row.audio_end_ms - row.audio_start_ms
+            if audio_span_ms >= SHORT_ASR_REAL_AUDIO_MIN_SPAN_MS and not is_short_number_tail:
+                return False
         if (
             row.audio_end_ms is not None
             and row.duration_ms > SHORT_ASR_NOISE_MAX_DURATION_MS
         ):
             return False
-        normalized_text = normalize_dialogue_text(AiCallDialogueService._dialogue_text(row))
-        if not normalized_text or normalized_text in VALID_SHORT_CUSTOMER_UTTERANCES:
-            return False
+        if is_short_number_tail:
+            return True
         if len(normalized_text) > SHORT_ASR_NOISE_MAX_TEXT_LENGTH:
             return False
         return row.audio_end_ms is None or row.duration_ms <= SHORT_ASR_NOISE_MAX_DURATION_MS
