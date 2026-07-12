@@ -1,0 +1,446 @@
+{
+  "description": "Local labeled P1 VAD benchmark. Audio remains under /private/tmp and is not committed.",
+  "agreementToleranceMs": 200,
+  "benchmarkGates": {
+    "minSamples": 45,
+    "minSpeechSamples": 13,
+    "minNonSpeechSamples": 32,
+    "providers": {
+      "webrtc_main": {
+        "minDetected": 13,
+        "minWithinMaxLag": 12,
+        "maxDetectionLagP90Ms": 240,
+        "maxFalsePositiveWindows": 64
+      },
+      "fsmn_main": {
+        "minDetected": 13,
+        "minWithinMaxLag": 12,
+        "maxDetectionLagP90Ms": 240,
+        "maxFalsePositiveWindows": 60
+      },
+      "webrtc_fsmn_agreement": {
+        "minDetected": 13,
+        "minWithinMaxLag": 12,
+        "maxDetectionLagP90Ms": 240,
+        "maxFalsePositiveWindows": 50
+      }
+    }
+  },
+  "samples": [
+    {
+      "id": "single_short_noise",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333059784225075200_customer_11605_12505.wav",
+      "label": "non_speech",
+      "category": "single_short_noise"
+    },
+    {
+      "id": "opening_noise",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333167639641690112_customer_502_1402.wav",
+      "label": "non_speech",
+      "category": "opening_noise"
+    },
+    {
+      "id": "midcall_fan_noise",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333810711039770624_customer_37068_37968.wav",
+      "label": "non_speech",
+      "category": "midcall_fan_noise"
+    },
+    {
+      "id": "single_short_noise_second_burst",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/call_333059784225075200_customer_15405_16205.wav",
+      "label": "non_speech",
+      "category": "single_short_noise"
+    },
+    {
+      "id": "opening_noise_second_burst",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/call_333167639641690112_customer_2402_3302.wav",
+      "label": "non_speech",
+      "category": "opening_noise"
+    },
+    {
+      "id": "opening_fan_noise",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/call_333790178132156416_customer_2482_3582.wav",
+      "label": "non_speech",
+      "category": "opening_fan_noise"
+    },
+    {
+      "id": "synthetic_continuous_pink_noise",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/synthetic_continuous_pink_noise.wav",
+      "label": "non_speech",
+      "category": "continuous_noise",
+      "sourceType": "synthetic"
+    },
+    {
+      "id": "synthetic_impulse_noise",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/synthetic_impulse_noise.wav",
+      "label": "non_speech",
+      "category": "impulse_noise",
+      "sourceType": "synthetic"
+    },
+    {
+      "id": "synthetic_ai_echo",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/synthetic_ai_echo.wav",
+      "label": "non_speech",
+      "category": "ai_echo",
+      "sourceType": "synthetic"
+    },
+    {
+      "id": "synthetic_background_speech",
+      "wavPath": "/private/tmp/ai_call_p1_benchmark_negatives/synthetic_background_speech.wav",
+      "label": "non_speech",
+      "category": "background_speech",
+      "sourceType": "synthetic"
+    },
+    {
+      "id": "librispeech_dev_other_3660_172183_0012_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_3660_172183_0012_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_116_288048_0002_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_116_288048_0002_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_8288_274150_0006_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_8288_274150_0006_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_6455_67804_0018_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_6455_67804_0018_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_1686_142278_0090_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_1686_142278_0090_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_1651_136854_0008_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_1651_136854_0008_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_7601_101619_0003_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_7601_101619_0003_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_7641_96684_0009_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_7641_96684_0009_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_4831_25894_0033_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_4831_25894_0033_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "librispeech_dev_other_5849_50964_0005_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/librispeech_background_speech/librispeech_dev_other_5849_50964_0005_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "LibriSpeech dev-other",
+      "license": "CC BY 4.0"
+    },
+    {
+      "id": "thchs30_test_noise_car_D12_779_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_car_D12_779_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "car",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_car_D31_855_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_car_D31_855_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "car",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_car_D13_861_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_car_D13_861_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "car",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_car_D4_890_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_car_D4_890_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "car",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_cafe_D12_779_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_cafe_D12_779_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "cafe",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_cafe_D31_855_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_cafe_D31_855_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "cafe",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_cafe_D13_861_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_cafe_D13_861_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "cafe",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_cafe_D4_890_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_cafe_D4_890_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "cafe",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_white_D12_779_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_white_D12_779_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "white",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_white_D31_855_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_white_D31_855_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "white",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_white_D13_861_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_white_D13_861_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "white",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "thchs30_test_noise_white_D4_890_bg_speech",
+      "wavPath": "/private/tmp/ai_call_p1_public_corpus/thchs30_background_speech/thchs30_test_noise_white_D4_890_bg_speech.wav",
+      "label": "non_speech",
+      "category": "public_corpus_zh_noisy_background_speech",
+      "sourceType": "public_corpus",
+      "corpus": "THCHS-30 test-noise 0db",
+      "language": "zh",
+      "noiseType": "white",
+      "license": "Apache License v.2.0"
+    },
+    {
+      "id": "zenmezuo_stable_speech",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333167639641690112_customer_43000_45500.wav",
+      "label": "speech",
+      "category": "near_end_speech",
+      "speechStartMs": 780,
+      "speechEndMs": 2500,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "nihao_short_greeting",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333909921471635456_customer_8000_10500.wav",
+      "label": "speech",
+      "category": "near_end_speech",
+      "speechStartMs": 0,
+      "speechEndMs": 2500,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "xingxingxing_multi_segment",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333909921471635456_customer_74400_83300.wav",
+      "label": "speech",
+      "category": "midcall_near_end_speech",
+      "speechStartMs": 1120,
+      "speechEndMs": 8900,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "haole_ting_short_command",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333909921471635456_customer_104000_109300.wav",
+      "label": "speech",
+      "category": "short_command_candidate",
+      "speechStartMs": 980,
+      "speechEndMs": 5300,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "hao_gualeba_call_end",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_333909921471635456_customer_113800_116300.wav",
+      "label": "speech",
+      "category": "call_end",
+      "speechStartMs": 40,
+      "speechEndMs": 2500,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "short_command_stable_onset",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/call_334224153074712576_customer_22740_24380.wav",
+      "label": "speech",
+      "category": "short_command_candidate",
+      "speechStartMs": 580,
+      "speechEndMs": 1640,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "haode_keyi_aligned_track",
+      "wavPath": "/private/tmp/ai_call_p1_audio_fixtures/haode_keyi/call_333810711039770624_customer_84000_91000.wav",
+      "label": "speech",
+      "category": "short_ack_candidate",
+      "speechStartMs": 1100,
+      "speechEndMs": 7000,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333167_naxie_ai",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333167639641690112_customer_53140_60440.wav",
+      "label": "speech",
+      "category": "real_zh_near_end_speech",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "哪些AI啊",
+      "speechStartMs": 1360,
+      "speechEndMs": 7300,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333513_nihao_haode",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333513524133138432_customer_2820_12760.wav",
+      "label": "speech",
+      "category": "real_zh_near_end_speech",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "你好好的好的",
+      "speechStartMs": 1460,
+      "speechEndMs": 9940,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333513_bieshuole",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333513524133138432_customer_36480_44680.wav",
+      "label": "speech",
+      "category": "real_zh_short_stop_command",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "听一下，别说了",
+      "speechStartMs": 1540,
+      "speechEndMs": 7560,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333517_tingyixia",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333517350307270656_customer_49300_58420.wav",
+      "label": "speech",
+      "category": "real_zh_short_stop_command",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "停一下停一下",
+      "speechStartMs": 1500,
+      "speechEndMs": 9120,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333517_bieshuole_gualeba",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333517350307270656_customer_56460_68460.wav",
+      "label": "speech",
+      "category": "real_zh_call_end_stop_command",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "别说了别说了，挂了吧",
+      "speechStartMs": 1600,
+      "speechEndMs": 12000,
+      "maxDetectionLagMs": 600
+    },
+    {
+      "id": "real_zh_call_333551_repeated_bieshuole",
+      "wavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333551735128162304_customer_23300_35940.wav",
+      "label": "speech",
+      "category": "real_zh_repeated_stop_command",
+      "sourceType": "live_call_real_zh",
+      "transcriptHint": "等一下，别说了",
+      "speechStartMs": 1480,
+      "speechEndMs": 12640,
+      "maxDetectionLagMs": 600
+    }
+  ]
+}
