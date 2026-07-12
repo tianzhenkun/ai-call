@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -67,6 +67,7 @@ class BusinessPromptResult:
     prompt: str
     opening_message: str
     source_key: str
+    barge_in_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,7 @@ class PromptEffectiveConfig:
     opening_message: str
     opening_message_hash: str
     prompt_source_key: str
+    barge_in_enabled: bool = False
 
 
 class BusinessPromptProvider(Protocol):
@@ -162,6 +164,7 @@ class StaticProfilePromptProvider:
                 context.business_params,
             ).strip(),
             source_key=normalize_scene_code(profile.scene_code) or profile.scene_code,
+            barge_in_enabled=bool(getattr(profile, "barge_in_enabled", False)),
         )
 
 
@@ -197,7 +200,10 @@ class RecovCollectionPromptProvider:
         )
         if result is None:
             raise _prompt_error("collection_prompt_not_found", "催收业务提示词不存在", 404)
-        return result
+        return replace(
+            result,
+            barge_in_enabled=bool(getattr(profile, "barge_in_enabled", False)),
+        )
 
 
 class BusinessPromptResolver:
@@ -367,6 +373,7 @@ class PromptComposer:
             opening_message=opening_message,
             opening_message_hash=hash_text(opening_message),
             prompt_source_key=prompt_result.source_key,
+            barge_in_enabled=prompt_result.barge_in_enabled,
         )
 
 

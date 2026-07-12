@@ -27,7 +27,18 @@ from app.services.ai_call.session_registry import (
     InMemorySessionRegistry,
     utc_now,
 )
+from app.services.ai_call.sip_barge_in import SipBargeInConfig, WebRtcVadAdapter
+from app.services.ai_call.sip_vad_shadow import (
+    FsmnVadSidecarClient,
+    MultiSipVadShadowDetector,
+    QueuedSipVadShadowDetector,
+    SipFrameVadShadowDetector,
+    SipVadShadowDetectorProtocol,
+    UnavailableSipVadShadowDetector,
+)
 from app.utils.id_util import generate_snowflake_id
+
+END_CLEANUP_TIMEOUT_SECONDS = 1.0
 
 
 class LiveKitRoomManagerProtocol(Protocol):
@@ -90,10 +101,21 @@ class AiCallRuntimeConfig:
     vad_silence_duration_ms: int
     user_turn_stability_delay_seconds: float = 0.35
     handoff_prompt_constraint_enabled: bool = True
+    barge_in_enabled: bool = True
     sip_barge_in_enabled: bool = True
     sip_barge_in_min_rms_dbfs: float = -35.0
     sip_barge_in_min_speech_duration_ms: int = 220
     sip_barge_in_hold_timeout_seconds: float = 5.0
+    sip_barge_in_fast_stop_enabled: bool = False
+    sip_barge_in_config: SipBargeInConfig = field(default_factory=SipBargeInConfig)
+    sip_barge_in_recovery_silence_ms: int = 600
+    sip_barge_in_recovery_max_per_turn: int = 1
+    sip_vad_shadow_enabled: bool = False
+    sip_vad_shadow_detector: str = "webrtc"
+    sip_vad_shadow_fsmn_model: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+    sip_vad_shadow_fsmn_endpoint: str = ""
+    sip_vad_shadow_fsmn_timeout_seconds: float = 0.2
+    sip_vad_shadow_queue_size: int = 50
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -116,6 +138,7 @@ class AiCallRuntimeConfig:
             vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
             user_turn_stability_delay_seconds=(settings.AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS),
             handoff_prompt_constraint_enabled=(settings.AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED),
+            barge_in_enabled=settings.AI_CALL_BARGE_IN_ENABLED,
             sip_barge_in_enabled=settings.AI_CALL_SIP_BARGE_IN_ENABLED,
             sip_barge_in_min_rms_dbfs=settings.AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS,
             sip_barge_in_min_speech_duration_ms=(
@@ -124,6 +147,41 @@ class AiCallRuntimeConfig:
             sip_barge_in_hold_timeout_seconds=(
                 settings.AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS
             ),
+            sip_barge_in_fast_stop_enabled=settings.AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED,
+            sip_barge_in_config=SipBargeInConfig(
+                rms_threshold_dbfs=settings.AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS,
+                snr_threshold_db=settings.AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB,
+                vad_voiced_duration_ms=settings.AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS,
+                candidate_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS
+                ),
+                pre_stop_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_PRE_STOP_MIN_DURATION_MS
+                ),
+                short_speech_min_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS
+                ),
+                impulse_noise_max_duration_ms=(
+                    settings.AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS
+                ),
+                clean_window_ms=settings.AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS,
+                max_hold_ms=settings.AI_CALL_SIP_BARGE_IN_MAX_HOLD_MS,
+                echo_tail_window_ms=settings.AI_CALL_SIP_BARGE_IN_ECHO_TAIL_WINDOW_MS,
+            ),
+            sip_barge_in_recovery_silence_ms=(
+                settings.AI_CALL_SIP_BARGE_IN_RECOVERY_SILENCE_MS
+            ),
+            sip_barge_in_recovery_max_per_turn=(
+                settings.AI_CALL_SIP_BARGE_IN_RECOVERY_MAX_PER_TURN
+            ),
+            sip_vad_shadow_enabled=settings.AI_CALL_SIP_VAD_SHADOW_ENABLED,
+            sip_vad_shadow_detector=settings.AI_CALL_SIP_VAD_SHADOW_DETECTOR,
+            sip_vad_shadow_fsmn_model=settings.AI_CALL_SIP_VAD_SHADOW_FSMN_MODEL,
+            sip_vad_shadow_fsmn_endpoint=settings.AI_CALL_SIP_VAD_SHADOW_FSMN_ENDPOINT,
+            sip_vad_shadow_fsmn_timeout_seconds=(
+                settings.AI_CALL_SIP_VAD_SHADOW_FSMN_TIMEOUT_SECONDS
+            ),
+            sip_vad_shadow_queue_size=settings.AI_CALL_SIP_VAD_SHADOW_QUEUE_SIZE,
         )
 
     def ensure_ready(self) -> None:
@@ -153,6 +211,7 @@ class EffectiveConfig:
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
+    barge_in_enabled: bool = False
     instructions: str | None = field(default=None, repr=False)
 
 
@@ -247,11 +306,13 @@ class AiCallOrchestrator:
         registry: InMemorySessionRegistry | None = None,
         event_store: InMemoryEventStore | None = None,
         metrics_by_call_id: dict[str, CallMetrics] | None = None,
+        end_cleanup_timeout_seconds: float = END_CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.registry = registry or InMemorySessionRegistry()
         self.event_store = event_store or InMemoryEventStore()
         self.metrics_by_call_id = metrics_by_call_id if metrics_by_call_id is not None else {}
+        self.end_cleanup_timeout_seconds = max(0.001, end_cleanup_timeout_seconds)
         self.livekit_room_manager = livekit_room_manager or LiveKitRoomManager(
             livekit_url=config.livekit_url,
             api_key=config.livekit_api_key,
@@ -287,7 +348,57 @@ class AiCallOrchestrator:
             sip_barge_in_min_rms_dbfs=self.config.sip_barge_in_min_rms_dbfs,
             sip_barge_in_min_speech_duration_ms=self.config.sip_barge_in_min_speech_duration_ms,
             sip_barge_in_hold_timeout_seconds=self.config.sip_barge_in_hold_timeout_seconds,
+            sip_barge_in_fast_stop_enabled=self.config.sip_barge_in_fast_stop_enabled,
+            sip_barge_in_config=self.config.sip_barge_in_config,
+            sip_barge_in_recovery_silence_ms=self.config.sip_barge_in_recovery_silence_ms,
+            sip_barge_in_recovery_max_per_turn=self.config.sip_barge_in_recovery_max_per_turn,
+            sip_vad_shadow_enabled=self.config.sip_vad_shadow_enabled,
+            sip_vad_shadow_detector=self._build_sip_vad_shadow_detector(),
             call_end_scheduler=self._schedule_auto_end_session,
+        )
+
+    def _build_sip_vad_shadow_detector(self) -> SipVadShadowDetectorProtocol | None:
+        if not self.config.sip_vad_shadow_enabled:
+            return None
+        detector = self.config.sip_vad_shadow_detector.strip().lower()
+        if detector == "webrtc":
+            return SipFrameVadShadowDetector(
+                vad=WebRtcVadAdapter(),
+                detector_name="webrtc_shadow",
+            )
+        if detector == "fsmn":
+            return self._build_fsmn_sip_vad_shadow_detector()
+        if detector == "webrtc+fsmn":
+            return MultiSipVadShadowDetector([
+                SipFrameVadShadowDetector(
+                    vad=WebRtcVadAdapter(),
+                    detector_name="webrtc_shadow",
+                ),
+                self._build_fsmn_sip_vad_shadow_detector(),
+            ])
+        return UnavailableSipVadShadowDetector(
+            detector_name=f"{detector}_shadow",
+            reason=f"Unsupported SIP VAD shadow detector: {detector}",
+        )
+
+    def _build_fsmn_sip_vad_shadow_detector(self) -> SipVadShadowDetectorProtocol:
+        endpoint = self.config.sip_vad_shadow_fsmn_endpoint.strip()
+        if endpoint:
+            return QueuedSipVadShadowDetector(
+                client=FsmnVadSidecarClient(
+                    endpoint=endpoint,
+                    model=self.config.sip_vad_shadow_fsmn_model,
+                    timeout_seconds=self.config.sip_vad_shadow_fsmn_timeout_seconds,
+                ),
+                detector_name="fsmn_shadow",
+                max_queue_size=self.config.sip_vad_shadow_queue_size,
+            )
+        return UnavailableSipVadShadowDetector(
+            detector_name="fsmn_shadow",
+            reason=(
+                "FSMN realtime SIP VAD shadow detector is not wired yet; "
+                f"model={self.config.sip_vad_shadow_fsmn_model}"
+            ),
         )
 
     async def create_web_session(
@@ -694,15 +805,31 @@ class AiCallOrchestrator:
         if session.status == CallSessionStatus.ENDING:
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.ENDING)
         if session.status == CallSessionStatus.FAILED:
-            await self.agent_runner.stop(call_id)
-            await self.livekit_room_manager.delete_room(session.room_name)
+            await self._run_end_cleanup_step(
+                call_id,
+                step="agent_stop",
+                awaitable=self.agent_runner.stop(call_id),
+            )
+            await self._run_end_cleanup_step(
+                call_id,
+                step="delete_room",
+                awaitable=self.livekit_room_manager.delete_room(session.room_name),
+            )
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.FAILED)
 
         self.registry.transition(call_id, CallSessionStatus.ENDING)
         self._append_event(call_id, "session_ending", "orchestrator")
 
-        await self.agent_runner.stop(call_id)
-        await self.livekit_room_manager.delete_room(session.room_name)
+        await self._run_end_cleanup_step(
+            call_id,
+            step="agent_stop",
+            awaitable=self.agent_runner.stop(call_id),
+        )
+        await self._run_end_cleanup_step(
+            call_id,
+            step="delete_room",
+            awaitable=self.livekit_room_manager.delete_room(session.room_name),
+        )
 
         self.registry.transition(call_id, CallSessionStatus.COMPLETED)
         self._append_event(
@@ -712,6 +839,26 @@ class AiCallOrchestrator:
             {"endReason": end_reason},
         )
         return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
+
+    async def _run_end_cleanup_step(
+        self,
+        call_id: str,
+        *,
+        step: str,
+        awaitable,
+    ) -> None:
+        try:
+            await asyncio.wait_for(awaitable, timeout=self.end_cleanup_timeout_seconds)
+        except TimeoutError:
+            self._append_event(
+                call_id,
+                "session_cleanup_timeout",
+                "orchestrator",
+                {
+                    "step": step,
+                    "timeoutSeconds": self.end_cleanup_timeout_seconds,
+                },
+            )
 
     def _schedule_auto_end_session(self, call_id: str, end_reason: str) -> None:
         task = asyncio.create_task(
@@ -978,6 +1125,9 @@ class AiCallOrchestrator:
                 vad_type=self.config.vad_type,
                 vad_threshold=self.config.vad_threshold,
                 vad_silence_duration_ms=self.config.vad_silence_duration_ms,
+                barge_in_enabled=(
+                    self.config.barge_in_enabled and prompt_effective_config.barge_in_enabled
+                ),
                 instructions=prompt_effective_config.instructions,
             )
 
@@ -1006,6 +1156,7 @@ class AiCallOrchestrator:
             vad_type=self.config.vad_type,
             vad_threshold=self.config.vad_threshold,
             vad_silence_duration_ms=self.config.vad_silence_duration_ms,
+            barge_in_enabled=False,
         )
 
     def _web_audio_constraints(self) -> WebAudioConstraints:

@@ -177,6 +177,7 @@ def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None
             prompt="业务话术",
             opening_message="您好，这是开场白。",
             source_key="test.scene",
+            barge_in_enabled=True,
         )
     )
     b4_config = orchestrator._build_effective_config(
@@ -189,6 +190,31 @@ def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None
     assert legacy_config.prompt == "你是一个电话外呼助手，回答要简短自然。"
     assert b4_config.instructions == composed_prompt.instructions
     assert b4_config.prompt == composed_prompt.instructions
+    assert legacy_config.barge_in_enabled is False
+    assert b4_config.barge_in_enabled is True
+
+
+def test_prompt_profile_schema_defaults_barge_in_disabled() -> None:
+    request = PromptProfileCreateRequest.model_validate({
+        "sceneCode": "intro_geo",
+        "name": "GEO 产品介绍",
+        "providerKey": "static_profile",
+        "promptText": "介绍 GEO 产品。",
+        "openingMessage": "您好，请问现在方便吗？",
+    })
+
+    assert request.barge_in_enabled is False
+
+
+def test_prompt_profile_schema_accepts_barge_in_enabled() -> None:
+    request = PromptProfileCreateRequest.model_validate({
+        "sceneCode": "intro_collection",
+        "name": "物业催收",
+        "providerKey": "business_query",
+        "bargeInEnabled": True,
+    })
+
+    assert request.barge_in_enabled is True
 
 
 @pytest.mark.anyio
@@ -320,7 +346,9 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     )
 
     assert profile["sceneCode"] == "debt_promise_repay_reminder"
+    assert profile["bargeInEnabled"] is False
     assert preview["promptSourceKey"] == "debt_promise_repay_reminder"
+    assert preview["bargeInEnabled"] is False
     assert "平台关键约束" in preview["instructions"]
     assert "当前日期：" in preview["instructions"]
     assert "转人工能力约束" in preview["instructions"]
@@ -329,8 +357,10 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     assert "{{customerName}}" not in preview["instructions"]
     assert preview["openingMessage"] == "您好张总，我是灵宸智能助手，想和您确认一下还款安排。"
     assert result.effective_config.prompt_source_key == "debt_promise_repay_reminder"
+    assert result.effective_config.barge_in_enabled is False
     assert result.effective_config.prompt_hash == preview["promptHash"]
     assert agent_runner.started_sessions[0].effective_config.instructions == preview["instructions"]
+    assert agent_runner.started_sessions[0].effective_config.barge_in_enabled is False
     events = await service.orchestrator.list_events(result.call_id)
     assert events.rows[0].payload == {
         "promptHash": preview["promptHash"],
@@ -558,6 +588,7 @@ async def test_business_query_scene_uses_recov_collection_store(
         "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
         "prompt_text": None,
         "opening_message": None,
+        "barge_in_enabled": True,
     })
 
     preview = await service.preview_prompt_profile(
@@ -568,6 +599,7 @@ async def test_business_query_scene_uses_recov_collection_store(
     )
 
     assert preview["promptSourceKey"] == "intro_collection"
+    assert preview["bargeInEnabled"] is True
     assert "你是项目员工" in preview["instructions"]
     assert "债务记录：2064663837392551940" in preview["instructions"]
     assert "灵宸智能催收系统" not in preview["instructions"]
@@ -580,6 +612,15 @@ async def test_business_query_scene_uses_recov_collection_store(
             "business_params": {"identityName": "项目员工"},
         }
     ]
+
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id="2064663837392551940",
+        scene_code="intro_collection",
+        business_params={"identityName": "项目员工"},
+    )
+    assert result.effective_config.barge_in_enabled is True
 
 
 @pytest.mark.anyio

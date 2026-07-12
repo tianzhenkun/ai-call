@@ -5,6 +5,7 @@ insert into ai_call_prompt_profile (
     provider_key,
     prompt_text,
     opening_message,
+    barge_in_enabled,
     created_at,
     updated_at
 ) values
@@ -15,6 +16,7 @@ insert into ai_call_prompt_profile (
     'business_query',
     null,
     null,
+    true,
     now(),
     now()
 ),
@@ -41,6 +43,7 @@ insert into ai_call_prompt_profile (
 4. 用户无兴趣时礼貌结束；用户有兴趣时引导预约演示或转人工。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的合同审查产品，请问现在方便吗？',
+    false,
     now(),
     now()
 ),
@@ -67,6 +70,7 @@ insert into ai_call_prompt_profile (
 4. 用户无兴趣时礼貌结束；用户有兴趣时引导预约演示或转人工。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的单证审查产品，请问现在方便吗？',
+    false,
     now(),
     now()
 ),
@@ -93,6 +97,7 @@ insert into ai_call_prompt_profile (
 4. 用户无兴趣时礼貌结束；用户有兴趣时引导预约演示或转人工。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的出海获客产品，请问现在方便吗？',
+    false,
     now(),
     now()
 ),
@@ -120,6 +125,7 @@ insert into ai_call_prompt_profile (
 5. 用户无兴趣时礼貌结束；用户有兴趣时引导预约演示或转人工。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下 GEO 生成式引擎优化服务，请问现在方便吗？',
+    false,
     now(),
     now()
 )
@@ -128,4 +134,5 @@ on conflict (scene_code) do update set
     provider_key = excluded.provider_key,
     prompt_text = excluded.prompt_text,
     opening_message = excluded.opening_message,
+    barge_in_enabled = excluded.barge_in_enabled,
     updated_at = now();

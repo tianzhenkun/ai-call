@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -666,6 +666,13 @@ class AiCallPromptProfileModel(MappedBase):
         String(1000),
         nullable=True,
         comment="固定开场白",
+    )
+    barge_in_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        comment="是否允许当前场景启用通话打断",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
