@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -19,7 +20,7 @@ from app.api.v1.ai_call.service import AiCallService
 from app.config.setting import Settings
 from app.core.logger import sanitize_log_message
 from app.plugin import init_app
-from app.services.ai_call.agent_runner import RealtimeCallAgentRunner
+from app.services.ai_call.agent_runner import PendingUserTurn, RealtimeCallAgentRunner
 from app.services.ai_call.audio_bridge import AudioBridgeError, PcmAudioBridge, PcmAudioFrame
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
@@ -42,6 +43,14 @@ from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
     InMemorySessionRegistry,
+)
+from app.services.ai_call.sip_barge_in import SipBargeInObservation
+from app.services.ai_call.sip_vad_shadow import (
+    MultiSipVadShadowDetector,
+    QueuedSipVadShadowDetector,
+    SipFrameVadShadowDetector,
+    SipVadShadowObservation,
+    UnavailableSipVadShadowDetector,
 )
 
 
@@ -270,6 +279,127 @@ def _pcm16_constant_frame(
     )
 
 
+def _pcm16_constant_frames(amplitudes: list[int]) -> list[PcmAudioFrame]:
+    return [_pcm16_constant_frame(amplitude=amplitude) for amplitude in amplitudes]
+
+
+class FakeVad:
+    def __init__(self, decisions: list[bool]) -> None:
+        self.decisions = list(decisions)
+        self.calls = 0
+
+    def is_speech(self, frame: PcmAudioFrame) -> bool:
+        _ = frame
+        decision = self.decisions[min(self.calls, len(self.decisions) - 1)]
+        self.calls += 1
+        return decision
+
+
+class FakeSipVadShadowDetector:
+    def __init__(self, observations: list["SipVadShadowObservation"]) -> None:
+        self.observations = list(observations)
+        self.calls = 0
+        self.reset_call_ids: list[str] = []
+
+    def observe(
+        self,
+        call_id: str,
+        frame: PcmAudioFrame,
+        *,
+        now: datetime,
+        interruptible: bool,
+    ) -> "SipVadShadowObservation":
+        _ = call_id, frame, now, interruptible
+        observation = self.observations[min(self.calls, len(self.observations) - 1)]
+        self.calls += 1
+        return observation
+
+    def reset(self, call_id: str) -> None:
+        self.reset_call_ids.append(call_id)
+
+
+class FakeMultiSipVadShadowDetector:
+    def __init__(self, observations: list[SipVadShadowObservation]) -> None:
+        self.detector_name = "fake_multi_shadow"
+        self.observations = list(observations)
+        self.calls = 0
+
+    def observe(
+        self,
+        call_id: str,
+        frame: PcmAudioFrame,
+        *,
+        now: datetime,
+        interruptible: bool,
+    ) -> list[SipVadShadowObservation]:
+        _ = call_id, frame, now, interruptible
+        self.calls += 1
+        return list(self.observations)
+
+    def reset(self, call_id: str) -> None:
+        _ = call_id
+
+
+class FailingSipVadShadowDetector:
+    def __init__(self, message: str) -> None:
+        self.detector_name = "fake_failing_shadow"
+        self.message = message
+        self.calls = 0
+        self.reset_call_ids: list[str] = []
+
+    def observe(
+        self,
+        call_id: str,
+        frame: PcmAudioFrame,
+        *,
+        now: datetime,
+        interruptible: bool,
+    ) -> "SipVadShadowObservation":
+        _ = call_id, frame, now, interruptible
+        self.calls += 1
+        raise RuntimeError(self.message)
+
+    def reset(self, call_id: str) -> None:
+        self.reset_call_ids.append(call_id)
+
+
+def _pcm16_pulse_frame(
+    *,
+    amplitude: int,
+    sample_rate_hz: int = 8000,
+    duration_ms: int = 20,
+) -> PcmAudioFrame:
+    sample_count = sample_rate_hz * duration_ms // 1000
+    samples = [0] * sample_count
+    samples[0] = amplitude
+    pcm = struct.pack("<" + "h" * sample_count, *samples)
+    return PcmAudioFrame(
+        data=pcm,
+        sample_rate_hz=sample_rate_hz,
+        channels=1,
+        sample_width_bytes=2,
+    )
+
+
+def _pcm16_peak_with_body_frame(
+    *,
+    peak_amplitude: int,
+    body_amplitude: int,
+    sample_rate_hz: int = 8000,
+    duration_ms: int = 20,
+) -> PcmAudioFrame:
+    sample_count = sample_rate_hz * duration_ms // 1000
+    samples = [body_amplitude] * sample_count
+    samples[0] = peak_amplitude
+    pcm = struct.pack("<" + "h" * sample_count, *samples)
+    return PcmAudioFrame(
+        data=pcm,
+        sample_rate_hz=sample_rate_hz,
+        channels=1,
+        sample_width_bytes=2,
+    )
+
+
 def test_sip_barge_in_detector_promotes_sustained_uplink_audio() -> None:
     from app.services.ai_call.sip_barge_in import SipBargeInDetector
 
@@ -291,7 +421,7 @@ def test_sip_barge_in_detector_promotes_sustained_uplink_audio() -> None:
     ]
 
     assert observations[-1].active is True
-    assert observations[-1].candidate is True
+    assert any(observation.candidate for observation in observations)
     assert observations[-1].speech_duration_ms >= 200
     assert observations[-1].rms_dbfs >= -35.0
 
@@ -319,6 +449,885 @@ def test_sip_barge_in_detector_ignores_silence_and_low_level_audio() -> None:
     assert all(observation.candidate is False for observation in observations)
     assert observations[-1].active is False
     assert observations[-1].speech_duration_ms == 0
+
+
+def test_sip_barge_in_detector_does_not_label_low_level_sparse_frame_as_impulse() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-35.0,
+            snr_threshold_db=10.0,
+            impulse_noise_max_duration_ms=120,
+        ),
+        vad=FakeVad([True]),
+    )
+
+    observation = detector.observe(
+        "call_low_sparse_frame",
+        _pcm16_pulse_frame(amplitude=800),
+        now=datetime.now(timezone.utc),
+        interruptible=True,
+    )
+
+    assert observation.candidate is False
+    assert observation.candidate_class is None
+    assert observation.reason == "below_min_rms"
+    assert observation.rms_dbfs is not None
+    assert observation.rms_dbfs < -35.0
+
+
+def test_sip_barge_in_detector_requires_snr_and_vad() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=40.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frame = _pcm16_constant_frame(amplitude=4000)
+
+    observations = [
+        detector.observe(
+            "call_snr_detector",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(10)
+    ]
+
+    assert all(not observation.candidate for observation in observations)
+    assert observations[-1].reason == "below_min_snr"
+
+
+def test_sip_barge_in_detector_calibrates_floor_while_not_interruptible() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    class SwitchableVad:
+        voiced = False
+
+        def is_speech(self, frame: PcmAudioFrame) -> bool:
+            _ = frame
+            return self.voiced
+
+    vad = SwitchableVad()
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+        ),
+        vad=vad,
+    )
+    call_id = "call_high_floor_calibration"
+    started_at = datetime.now(timezone.utc)
+    high_floor_frame = _pcm16_constant_frame(amplitude=1200)
+
+    for index in range(30):
+        detector.observe(
+            call_id,
+            high_floor_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=False,
+        )
+
+    vad.voiced = True
+    observations = [
+        detector.observe(
+            call_id,
+            high_floor_frame,
+            now=started_at + timedelta(milliseconds=20 * (30 + index)),
+            interruptible=True,
+        )
+        for index in range(12)
+    ]
+    payload = detector.latest_observation_payload(call_id)
+
+    assert all(not observation.candidate for observation in observations)
+    assert observations[-1].reason == "below_min_snr"
+    assert payload["noiseFloorDbfs"] is not None
+    assert payload["noiseFloorDbfs"] > -36.0
+    assert payload["snrDb"] is not None
+    assert payload["snrDb"] < 10.0
+
+
+def test_sip_barge_in_detector_preserves_floor_after_impulse_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+        ),
+        vad=FakeVad([False] * 30 + [True] + [True] * 12),
+    )
+    call_id = "call_impulse_preserves_floor"
+    started_at = datetime.now(timezone.utc)
+    high_floor_frame = _pcm16_constant_frame(amplitude=1200)
+
+    for index in range(30):
+        detector.observe(
+            call_id,
+            high_floor_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=False,
+        )
+
+    impulse = detector.observe(
+        call_id,
+        _pcm16_pulse_frame(amplitude=30000),
+        now=started_at + timedelta(milliseconds=600),
+        interruptible=True,
+    )
+    observations = [
+        detector.observe(
+            call_id,
+            high_floor_frame,
+            now=started_at + timedelta(milliseconds=620 + 20 * index),
+            interruptible=True,
+        )
+        for index in range(12)
+    ]
+    payload = detector.latest_observation_payload(call_id)
+
+    assert impulse.candidate_class == "impulse_noise"
+    assert all(not observation.candidate for observation in observations)
+    assert observations[-1].reason == "below_min_snr"
+    assert payload["noiseFloorDbfs"] is not None
+    assert payload["noiseFloorDbfs"] > -36.0
+    assert payload["snrDb"] is not None
+    assert payload["snrDb"] < 10.0
+
+
+def test_sip_barge_in_detector_does_not_learn_floor_from_loud_non_voiced_tail() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    speech_frames = _pcm16_constant_frames([
+        1850,
+        2550,
+        3150,
+        3800,
+        4700,
+        5750,
+        5200,
+        5900,
+        5600,
+    ])
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+        vad=FakeVad([False] * 50 + [True] * len(speech_frames)),
+    )
+    call_id = "call_loud_tail_floor_guard"
+    started_at = datetime.now(timezone.utc)
+    loud_non_voiced_tail = _pcm16_constant_frame(amplitude=12000)
+
+    for index in range(50):
+        detector.observe(
+            call_id,
+            loud_non_voiced_tail,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+
+    tail_payload = detector.latest_observation_payload(call_id)
+    observations = [
+        detector.observe(
+            call_id,
+            frame,
+            now=started_at + timedelta(milliseconds=1000 + 20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(speech_frames)
+    ]
+
+    assert tail_payload["noiseFloorDbfs"] is not None
+    assert tail_payload["noiseFloorDbfs"] <= -45.0
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+
+
+def test_sip_barge_in_detector_ignores_impulse_noise_before_pre_stop() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-60.0,
+            snr_threshold_db=10.0,
+            impulse_noise_max_duration_ms=120,
+        ),
+        vad=FakeVad([True, False, False, False, False, False]),
+    )
+    started_at = datetime.now(timezone.utc)
+
+    observations = [
+        detector.observe(
+            "call_impulse_detector",
+            _pcm16_pulse_frame(amplitude=30000 if index == 0 else 80),
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(6)
+    ]
+
+    assert observations[0].candidate is False
+    assert observations[0].candidate_class == "impulse_noise"
+    assert observations[0].reason == "impulse_noise"
+    assert all(not observation.candidate for observation in observations)
+
+
+def test_sip_barge_in_detector_filters_clipped_short_burst_before_pre_stop() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 12),
+    )
+    started_at = datetime.now(timezone.utc)
+    clipped_burst_frame = _pcm16_constant_frame(amplitude=16000)
+
+    observations = [
+        detector.observe(
+            "call_clipped_burst_detector",
+            clipped_burst_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(6)
+    ]
+
+    assert observations[-1].candidate is False
+    assert observations[-1].candidate_class is None
+    assert observations[-1].reason == "speech_active_below_candidate_duration"
+
+
+def test_sip_barge_in_detector_suppresses_modulated_cough_like_short_burst() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 12),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([4000, 12000, 5000, 10000, 6000, 8500])
+
+    observations = [
+        detector.observe(
+            "call_modulated_cough_detector",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert all(not observation.candidate for observation in observations)
+    assert observations[-1].candidate_class is None
+    assert observations[-1].reason == "non_speech_energy_envelope"
+
+
+def test_sip_barge_in_detector_preserves_modulated_phone_speech_candidate() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([4700, 5500, 2300, 1600, 1300, 3300, 5250, 8350, 7150])
+
+    observations = [
+        detector.observe(
+            "call_modulated_phone_speech",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert observations[-1].reason == "speech_active_below_candidate_duration"
+
+
+def test_sip_barge_in_detector_releases_clipped_onset_after_stable_speech_recovers() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([4700, 5500, 2300, 1600, 1300, 3300, 5250])
+    frames.extend([
+        _pcm16_peak_with_body_frame(peak_amplitude=30000, body_amplitude=8350),
+        _pcm16_constant_frame(amplitude=7150),
+        _pcm16_constant_frame(amplitude=6000),
+        _pcm16_constant_frame(amplitude=5200),
+        _pcm16_constant_frame(amplitude=5000),
+    ])
+    frames.extend([_pcm16_constant_frame(amplitude=5000)] * 6)
+
+    observations = [
+        detector.observe(
+            "call_recovered_clipped_phone_speech",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert detector.has_pre_stop_local_speech("call_recovered_clipped_phone_speech") is True
+    assert detector.latest_observation_payload("call_recovered_clipped_phone_speech")[
+        "speechQualityRejection"
+    ] is None
+
+
+def test_sip_barge_in_detector_releases_short_hot_onset_after_modulated_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 30),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([
+        11500,
+        10000,
+        7600,
+        5200,
+        4300,
+        5600,
+        7200,
+        6100,
+        5200,
+        4800,
+        6200,
+        7600,
+        6800,
+        5900,
+        5200,
+        5000,
+        5400,
+        6000,
+    ])
+
+    observations = [
+        detector.observe(
+            "call_recovered_short_hot_phone_speech",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert detector.has_fast_pre_stop_local_speech("call_recovered_short_hot_phone_speech")
+    assert detector.has_pre_stop_local_speech("call_recovered_short_hot_phone_speech")
+    assert detector.latest_observation_payload("call_recovered_short_hot_phone_speech")[
+        "speechQualityRejection"
+    ] is None
+
+
+def test_sip_barge_in_detector_allows_human_phone_modulation_after_stable_turn_evidence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([
+        830,
+        3750,
+        3600,
+        1825,
+        1285,
+        880,
+        2950,
+        4520,
+        4200,
+        3600,
+        3350,
+        3100,
+        2950,
+        3300,
+        3650,
+        3900,
+        3700,
+        3500,
+    ])
+
+    observations = [
+        detector.observe(
+            "call_human_phone_modulation",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert detector.latest_observation_payload("call_human_phone_modulation")[
+        "speechQualityRejection"
+    ] is None
+    assert detector.has_fast_pre_stop_local_speech("call_human_phone_modulation") is True
+
+
+def test_sip_barge_in_detector_keeps_modulated_speech_when_envelope_changes_after_candidate() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+            noise_floor_initial_dbfs=-42.0,
+        ),
+        vad=FakeVad([True] * 30),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([
+        2197,
+        3248,
+        2356,
+        1762,
+        1819,
+        4215,
+        5869,
+        8072,
+        6440,
+        4791,
+        2210,
+        3374,
+        4725,
+        6572,
+        4725,
+        5043,
+        5492,
+        5824,
+        7314,
+        6417,
+        4841,
+        3029,
+    ])
+
+    observations = [
+        detector.observe(
+            "call_real_modulated_phone_speech",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].active is True
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert detector.has_fast_pre_stop_local_speech("call_real_modulated_phone_speech") is True
+    assert detector.latest_observation_payload("call_real_modulated_phone_speech")[
+        "speechQualityRejection"
+    ] is None
+
+
+def test_sip_barge_in_detector_withholds_pre_stop_for_low_confidence_flat_audio() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    flat_low_confidence_frame = _pcm16_constant_frame(amplitude=800)
+
+    observations = [
+        detector.observe(
+            "call_low_confidence_flat_audio",
+            flat_low_confidence_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(12)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert detector.has_pre_stop_local_speech("call_low_confidence_flat_audio") is False
+    assert detector.latest_observation_payload("call_low_confidence_flat_audio")[
+        "speechQualityRejection"
+    ] == "low_confidence_flat_audio"
+
+
+def test_sip_barge_in_detector_withholds_pre_stop_for_weak_flat_turn_evidence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    weak_flat_frame = _pcm16_constant_frame(amplitude=1050)
+
+    observations = [
+        detector.observe(
+            "call_weak_flat_turn_evidence",
+            weak_flat_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(12)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert detector.has_fast_pre_stop_local_speech("call_weak_flat_turn_evidence") is False
+    assert detector.has_pre_stop_local_speech("call_weak_flat_turn_evidence") is False
+    assert detector.latest_observation_payload("call_weak_flat_turn_evidence")[
+        "speechQualityRejection"
+    ] == "weak_flat_turn_evidence"
+
+
+def test_sip_barge_in_detector_withholds_pre_stop_for_breath_like_flat_turn_shape() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    breath_like_frames = _pcm16_constant_frames([1180] * 18)
+
+    observations = [
+        detector.observe(
+            "call_flat_breath_like_audio",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(breath_like_frames)
+    ]
+
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert detector.has_pre_stop_local_speech("call_flat_breath_like_audio") is False
+    assert detector.has_fast_pre_stop_local_speech("call_flat_breath_like_audio") is False
+    assert detector.has_confirmable_local_speech("call_flat_breath_like_audio") is False
+    assert detector.latest_observation_payload("call_flat_breath_like_audio")[
+        "speechQualityRejection"
+    ] == "insufficient_turn_taking_evidence"
+
+
+def test_sip_barge_in_detector_suppresses_rhythmic_clap_like_sequence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frames = _pcm16_constant_frames([900, 5000, 800, 4500, 900, 5200, 850, 4800, 900])
+
+    observations = [
+        detector.observe(
+            "call_clap_sequence_detector",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(frames)
+    ]
+
+    assert all(not observation.candidate for observation in observations)
+    assert observations[-1].candidate_class is None
+    assert observations[-1].reason == "non_speech_energy_envelope"
+
+
+def test_sip_barge_in_detector_preserves_moderate_strong_short_speech_candidate() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 12),
+    )
+    started_at = datetime.now(timezone.utc)
+    short_speech_frame = _pcm16_constant_frame(amplitude=7000)
+
+    observations = [
+        detector.observe(
+            "call_short_speech_detector",
+            short_speech_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(6)
+    ]
+
+    assert observations[-1].candidate is True
+    assert observations[-1].candidate_class == "strong_short_speech_candidate"
+
+
+def test_sip_barge_in_detector_promotes_hot_speech_after_stable_duration() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            short_speech_min_duration_ms=120,
+        ),
+        vad=FakeVad([True] * 10),
+    )
+    started_at = datetime.now(timezone.utc)
+    hot_speech_frame = _pcm16_constant_frame(amplitude=16000)
+
+    observations = [
+        detector.observe(
+            "call_hot_speech_detector",
+            hot_speech_frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(9)
+    ]
+
+    assert all(not observation.candidate for observation in observations[:8])
+    assert observations[-1].candidate is True
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+
+
+def test_sip_barge_in_detector_promotes_stable_speech_candidate() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+        ),
+        vad=FakeVad([True] * 20),
+    )
+    started_at = datetime.now(timezone.utc)
+    frame = _pcm16_constant_frame(amplitude=4000)
+
+    observations = [
+        detector.observe(
+            "call_stable_detector",
+            frame,
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+        for index in range(9)
+    ]
+
+    assert observations[-1].candidate is True
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+    assert observations[-1].vad_voiced_ms >= 120
+    assert observations[-1].candidate_duration_ms >= 180
+
+
+def test_sip_frame_vad_shadow_detector_emits_speech_boundaries() -> None:
+    detector = SipFrameVadShadowDetector(
+        vad=FakeVad([True, True, False]),
+        detector_name="fake_fsmn",
+    )
+    call_id = "call_shadow_boundaries"
+    frame = _pcm16_constant_frame(amplitude=4000)
+    now = datetime.now(timezone.utc)
+
+    first = detector.observe(call_id, frame, now=now, interruptible=True)
+    second = detector.observe(
+        call_id,
+        frame,
+        now=now + timedelta(milliseconds=20),
+        interruptible=True,
+    )
+    ended = detector.observe(
+        call_id,
+        frame,
+        now=now + timedelta(milliseconds=40),
+        interruptible=True,
+    )
+
+    assert first.started is True
+    assert first.ended is False
+    assert first.duration_ms == 20
+    assert first.detector == "fake_fsmn"
+    assert second.started is False
+    assert second.active is True
+    assert second.duration_ms == 40
+    assert ended.started is False
+    assert ended.ended is True
+    assert ended.active is False
+    assert ended.duration_ms == 40
+
+
+def _sip_session(call_id: str) -> CallSession:
+    return CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+
+
+async def _started_sip_runner(
+    *,
+    vad: FakeVad,
+    call_id: str = "call_sip_p1",
+    clean_window_ms: int = 60,
+    max_hold_ms: int = 100,
+    hold_timeout_seconds: float = 5.0,
+    short_speech_min_duration_ms: int = 180,
+    pre_stop_min_duration_ms: int = 240,
+    snr_threshold_db: float = 10.0,
+    recovery_silence_ms: int = 20,
+    recovery_max_per_turn: int = 1,
+    sip_vad_shadow_enabled: bool = False,
+    sip_vad_shadow_detector: Any | None = None,
+) -> tuple[
+    RealtimeCallAgentRunner,
+    InMemorySessionRegistry,
+    InMemoryEventStore,
+    FakeRealtimeProvider,
+    FakeAudioPublisher,
+    str,
+]:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = FakeAudioPublisher()
+    session = _sip_session(call_id)
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        sip_barge_in_enabled=True,
+        sip_barge_in_fast_stop_enabled=True,
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=snr_threshold_db,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=pre_stop_min_duration_ms,
+            short_speech_min_duration_ms=short_speech_min_duration_ms,
+            clean_window_ms=clean_window_ms,
+            max_hold_ms=max_hold_ms,
+        ),
+        sip_barge_in_vad=vad,
+        sip_barge_in_hold_timeout_seconds=hold_timeout_seconds,
+        sip_barge_in_recovery_silence_ms=recovery_silence_ms,
+        sip_barge_in_recovery_max_per_turn=recovery_max_per_turn,
+        sip_vad_shadow_enabled=sip_vad_shadow_enabled,
+        sip_vad_shadow_detector=sip_vad_shadow_detector,
+        user_turn_stability_delay_seconds=0,
+    )
+    await runner.start(session)
+    registry.transition(call_id, CallSessionStatus.CONNECTED)
+    registry.transition(call_id, CallSessionStatus.AI_THINKING)
+    registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+    runner._mark_response_started(call_id, {"response_id": "resp_sip_opening"})
+    runner._response_lifecycle(call_id).active = True
+    runner._playback_guard(call_id).current_response_audio_published = True
+    return runner, registry, store, provider, publisher, call_id
 
 
 class WaitingAudioPublisher(FakeAudioPublisher):
@@ -490,6 +1499,11 @@ class FakeLiveKitRoom:
 
 
 @dataclass(slots=True)
+class FakeLiveKitParticipant:
+    identity: str
+
+
+@dataclass(slots=True)
 class FakeRemoteAudioTrack:
     audio_events: list[FakeRtcAudioFrameEvent]
 
@@ -538,17 +1552,200 @@ def test_ai_call_runtime_config_reads_sip_barge_in_settings() -> None:
     runtime_config = AiCallRuntimeConfig.from_settings(
         Settings(
             _env_file=None,
+            AI_CALL_BARGE_IN_ENABLED=False,
             AI_CALL_SIP_BARGE_IN_ENABLED=True,
             AI_CALL_SIP_BARGE_IN_MIN_RMS_DBFS=-32.5,
             AI_CALL_SIP_BARGE_IN_MIN_SPEECH_DURATION_MS=260,
             AI_CALL_SIP_BARGE_IN_HOLD_TIMEOUT_SECONDS=4.5,
+            AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED=True,
+            AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS=-36.0,
+            AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB=11.0,
+            AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS=130,
+            AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS=190,
+            AI_CALL_SIP_BARGE_IN_PRE_STOP_MIN_DURATION_MS=250,
+            AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS=125,
+            AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS=115,
+            AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS=310,
+            AI_CALL_SIP_BARGE_IN_MAX_HOLD_MS=510,
+            AI_CALL_SIP_BARGE_IN_ECHO_TAIL_WINDOW_MS=520,
+            AI_CALL_SIP_BARGE_IN_RECOVERY_SILENCE_MS=650,
+            AI_CALL_SIP_BARGE_IN_RECOVERY_MAX_PER_TURN=2,
+            AI_CALL_SIP_VAD_SHADOW_ENABLED=True,
+            AI_CALL_SIP_VAD_SHADOW_DETECTOR="fsmn",
+            AI_CALL_SIP_VAD_SHADOW_FSMN_MODEL="custom/fsmn-vad",
+            AI_CALL_SIP_VAD_SHADOW_FSMN_ENDPOINT="http://127.0.0.1:19111/vad",
+            AI_CALL_SIP_VAD_SHADOW_FSMN_TIMEOUT_SECONDS=0.15,
+            AI_CALL_SIP_VAD_SHADOW_QUEUE_SIZE=8,
         )
     )
 
+    assert runtime_config.barge_in_enabled is False
     assert runtime_config.sip_barge_in_enabled is True
     assert runtime_config.sip_barge_in_min_rms_dbfs == -32.5
     assert runtime_config.sip_barge_in_min_speech_duration_ms == 260
     assert runtime_config.sip_barge_in_hold_timeout_seconds == 4.5
+    assert runtime_config.sip_barge_in_fast_stop_enabled is True
+    assert runtime_config.sip_barge_in_config.rms_threshold_dbfs == -36.0
+    assert runtime_config.sip_barge_in_config.snr_threshold_db == 11.0
+    assert runtime_config.sip_barge_in_config.vad_voiced_duration_ms == 130
+    assert runtime_config.sip_barge_in_config.candidate_min_duration_ms == 190
+    assert runtime_config.sip_barge_in_config.pre_stop_min_duration_ms == 250
+    assert runtime_config.sip_barge_in_config.short_speech_min_duration_ms == 125
+    assert runtime_config.sip_barge_in_config.impulse_noise_max_duration_ms == 115
+    assert runtime_config.sip_barge_in_config.clean_window_ms == 310
+    assert runtime_config.sip_barge_in_config.max_hold_ms == 510
+    assert runtime_config.sip_barge_in_config.echo_tail_window_ms == 520
+    assert runtime_config.sip_barge_in_recovery_silence_ms == 650
+    assert runtime_config.sip_barge_in_recovery_max_per_turn == 2
+    assert runtime_config.sip_vad_shadow_enabled is True
+    assert runtime_config.sip_vad_shadow_detector == "fsmn"
+    assert runtime_config.sip_vad_shadow_fsmn_model == "custom/fsmn-vad"
+    assert runtime_config.sip_vad_shadow_fsmn_endpoint == "http://127.0.0.1:19111/vad"
+    assert runtime_config.sip_vad_shadow_fsmn_timeout_seconds == 0.15
+    assert runtime_config.sip_vad_shadow_queue_size == 8
+
+
+def test_orchestrator_default_runner_enables_sip_vad_shadow_when_configured() -> None:
+    orchestrator = AiCallOrchestrator(
+        config=AiCallRuntimeConfig(
+            livekit_url="ws://livekit.test",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            browser_token_ttl_seconds=600,
+            dashscope_api_key="dashscope-key",
+            dashscope_realtime_url="wss://dashscope.test",
+            qwen_realtime_model="qwen-realtime",
+            qwen_realtime_voice="Tina",
+            default_prompt="简短回答",
+            opening_message="您好",
+            web_audio_echo_cancellation=True,
+            web_audio_noise_suppression=True,
+            web_audio_auto_gain_control=True,
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+            sip_vad_shadow_enabled=True,
+        ),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+
+    runner = orchestrator._build_default_agent_runner()
+
+    assert isinstance(runner, RealtimeCallAgentRunner)
+    assert runner.sip_vad_shadow_enabled is True
+    assert runner._sip_vad_shadow_detector is not None
+
+
+def test_orchestrator_default_runner_uses_configured_fsmn_shadow_fallback() -> None:
+    orchestrator = AiCallOrchestrator(
+        config=AiCallRuntimeConfig(
+            livekit_url="ws://livekit.test",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            browser_token_ttl_seconds=600,
+            dashscope_api_key="dashscope-key",
+            dashscope_realtime_url="wss://dashscope.test",
+            qwen_realtime_model="qwen-realtime",
+            qwen_realtime_voice="Tina",
+            default_prompt="简短回答",
+            opening_message="您好",
+            web_audio_echo_cancellation=True,
+            web_audio_noise_suppression=True,
+            web_audio_auto_gain_control=True,
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+            sip_vad_shadow_enabled=True,
+            sip_vad_shadow_detector="fsmn",
+            sip_vad_shadow_fsmn_model="custom/fsmn-vad",
+        ),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+
+    runner = orchestrator._build_default_agent_runner()
+
+    assert isinstance(runner, RealtimeCallAgentRunner)
+    assert runner.sip_vad_shadow_enabled is True
+    assert isinstance(runner._sip_vad_shadow_detector, UnavailableSipVadShadowDetector)
+
+
+def test_orchestrator_default_runner_uses_configured_fsmn_sidecar_shadow() -> None:
+    orchestrator = AiCallOrchestrator(
+        config=AiCallRuntimeConfig(
+            livekit_url="ws://livekit.test",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            browser_token_ttl_seconds=600,
+            dashscope_api_key="dashscope-key",
+            dashscope_realtime_url="wss://dashscope.test",
+            qwen_realtime_model="qwen-realtime",
+            qwen_realtime_voice="Tina",
+            default_prompt="简短回答",
+            opening_message="您好",
+            web_audio_echo_cancellation=True,
+            web_audio_noise_suppression=True,
+            web_audio_auto_gain_control=True,
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+            sip_vad_shadow_enabled=True,
+            sip_vad_shadow_detector="fsmn",
+            sip_vad_shadow_fsmn_model="custom/fsmn-vad",
+            sip_vad_shadow_fsmn_endpoint="http://127.0.0.1:19111/vad",
+            sip_vad_shadow_fsmn_timeout_seconds=0.15,
+            sip_vad_shadow_queue_size=8,
+        ),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+
+    runner = orchestrator._build_default_agent_runner()
+
+    assert isinstance(runner, RealtimeCallAgentRunner)
+    assert runner.sip_vad_shadow_enabled is True
+    assert isinstance(runner._sip_vad_shadow_detector, QueuedSipVadShadowDetector)
+    runner._sip_vad_shadow_detector.close()
+
+
+def test_orchestrator_default_runner_uses_configured_webrtc_and_fsmn_shadow() -> None:
+    orchestrator = AiCallOrchestrator(
+        config=AiCallRuntimeConfig(
+            livekit_url="ws://livekit.test",
+            livekit_api_key="key",
+            livekit_api_secret="secret",
+            browser_token_ttl_seconds=600,
+            dashscope_api_key="dashscope-key",
+            dashscope_realtime_url="wss://dashscope.test",
+            qwen_realtime_model="qwen-realtime",
+            qwen_realtime_voice="Tina",
+            default_prompt="简短回答",
+            opening_message="您好",
+            web_audio_echo_cancellation=True,
+            web_audio_noise_suppression=True,
+            web_audio_auto_gain_control=True,
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+            sip_vad_shadow_enabled=True,
+            sip_vad_shadow_detector="webrtc+fsmn",
+            sip_vad_shadow_fsmn_model="custom/fsmn-vad",
+            sip_vad_shadow_fsmn_endpoint="http://127.0.0.1:19111/vad",
+            sip_vad_shadow_fsmn_timeout_seconds=0.15,
+            sip_vad_shadow_queue_size=8,
+        ),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+
+    runner = orchestrator._build_default_agent_runner()
+
+    assert isinstance(runner, RealtimeCallAgentRunner)
+    assert runner.sip_vad_shadow_enabled is True
+    assert isinstance(runner._sip_vad_shadow_detector, MultiSipVadShadowDetector)
+    assert runner._sip_vad_shadow_detector.detector_names == ("webrtc_shadow", "fsmn_shadow")
+    runner._sip_vad_shadow_detector.close()
 
 
 def test_orchestrator_default_agent_runner_uses_realtime_qwen_livekit_stack() -> None:
@@ -770,6 +1967,52 @@ async def test_end_session_is_idempotent_while_session_is_ending() -> None:
     assert event_types.count("session_completed") == 1
     assert events.rows[-1].payload == {"endReason": "customer_end"}
     assert livekit.deleted_rooms == [created.room_name]
+
+
+@pytest.mark.anyio
+async def test_end_session_completes_even_when_agent_stop_blocks() -> None:
+    agent = BlockingStopAgentRunner()
+    livekit = FakeLiveKitRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=AiCallRuntimeConfig(
+            livekit_url="wss://livekit.test",
+            livekit_api_key="livekit-key",
+            livekit_api_secret="livekit-secret",
+            browser_token_ttl_seconds=600,
+            dashscope_api_key="dashscope-secret",
+            dashscope_realtime_url="wss://dashscope.test/api-ws/v1/realtime",
+            qwen_realtime_model="qwen3.5-omni-plus-realtime",
+            qwen_realtime_voice="Tina",
+            default_prompt="你是一个电话外呼助手，回答要简短自然。",
+            opening_message="您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？",
+            web_audio_echo_cancellation=True,
+            web_audio_noise_suppression=True,
+            web_audio_auto_gain_control=True,
+            vad_type="server_vad",
+            vad_threshold=0.5,
+            vad_silence_duration_ms=800,
+        ),
+        livekit_room_manager=livekit,
+        agent_runner=agent,
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        end_cleanup_timeout_seconds=0.01,
+    )
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    ended = await asyncio.wait_for(
+        orchestrator.end_session(created.call_id, end_reason="web_user_end"),
+        timeout=0.2,
+    )
+
+    events = await orchestrator.list_events(created.call_id)
+    event_types = [event.type for event in events.rows]
+    assert ended.status == CallSessionStatus.COMPLETED
+    assert orchestrator.registry.get(created.call_id).status == CallSessionStatus.COMPLETED
+    assert agent.stopped_call_ids == [created.call_id]
+    assert livekit.deleted_rooms == [created.room_name]
+    assert "session_cleanup_timeout" in event_types
+    assert event_types.index("session_cleanup_timeout") < event_types.index("session_completed")
 
 
 @pytest.mark.anyio
@@ -1132,6 +2375,50 @@ async def test_livekit_room_audio_transport_connects_publishes_and_receives_pcm_
 
     await transport.close("call_transport")
     assert room.disconnected is True
+
+
+@pytest.mark.anyio
+async def test_livekit_room_audio_transport_filters_to_session_participant_identity() -> None:
+    room = FakeLiveKitRoom()
+    transport = LiveKitRoomAudioTransport(
+        livekit_url="wss://livekit.test",
+        api_key="livekit-key",
+        api_secret="livekit-secret",
+        rtc_module=FakeRtcModule,
+        room_factory=lambda: room,
+    )
+    session = CallSession(
+        call_id="call_sip_filter",
+        room_name="ai-call-call_sip_filter",
+        participant_identity="sip-call_sip_filter",
+        status=CallSessionStatus.READY,
+        effective_config={},
+    )
+
+    await transport.start(session)
+    agent_track = FakeRemoteAudioTrack([
+        FakeRtcAudioFrameEvent(FakeRtcAudioFrame(b"\x02\x00" * 160, 8000, 1, 160))
+    ])
+    sip_track = FakeRemoteAudioTrack([
+        FakeRtcAudioFrameEvent(FakeRtcAudioFrame(b"\x01\x00" * 160, 8000, 1, 160))
+    ])
+
+    room.callbacks["track_subscribed"](
+        agent_track,
+        object(),
+        FakeLiveKitParticipant(identity="agent-call_sip_filter"),
+    )
+    room.callbacks["track_subscribed"](
+        sip_track,
+        object(),
+        FakeLiveKitParticipant(identity="sip-call_sip_filter"),
+    )
+    receiver = transport.receive_audio_frames("call_sip_filter")
+    received = await anext(receiver)
+
+    assert received.data == b"\x01\x00" * 160
+    assert received.sample_rate_hz == 8000
+    assert received.channels == 1
 
 
 @pytest.mark.anyio
@@ -1634,6 +2921,52 @@ async def test_realtime_agent_runner_schedules_end_on_model_error() -> None:
     }
 
     await runner.stop("call_model_error")
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_ignores_none_active_response_after_cancel_race() -> None:
+    runner, registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True]),
+        call_id="call_model_cancel_race",
+        clean_window_ms=40,
+        max_hold_ms=100,
+    )
+
+    try:
+        await runner._confirm_interrupt(
+            call_id,
+            provider,
+            datetime.now(timezone.utc),
+            reason="user_speech_started_during_ai_audio",
+        )
+        assert provider.cancelled_response_count == 1
+
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_done",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_opening", "status": "completed"}},
+        )
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_error",
+            datetime.now(timezone.utc),
+            {
+                "error": {
+                    "message": "Conversation has none active response",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert registry.get(call_id).status != CallSessionStatus.FAILED
+        assert "model_cancel_race_ignored" in event_types
+        assert "session_failed" not in event_types
+    finally:
+        await runner.stop(call_id)
 
 
 @pytest.mark.anyio
@@ -2206,6 +3539,62 @@ async def test_realtime_agent_runner_cancels_pending_call_end_when_user_speaks_a
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_schedules_explicit_customer_end_without_extra_response() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    call_id = "call_end_explicit_without_extra_response"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"browser-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        user_turn_stability_delay_seconds=0,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    try:
+        await runner.start(session)
+        await provider.emit(
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+        )
+        await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+        await provider.emit(
+            ProviderEvent(
+                type="user_transcript_done",
+                payload={"transcript": "好，挂了吧。"},
+            )
+        )
+        await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+        await asyncio.sleep(0)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert scheduler_calls == [(call_id, "customer_end")]
+        assert provider.created_responses == []
+        assert "call_end_intent_detected" in event_types
+        assert "call_end_tool_missing" in event_types
+        assert "call_end_scheduled" in event_types
+        assert "model_response_started" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("transcript", "call_id"),
     [
@@ -2389,6 +3778,8 @@ async def test_realtime_agent_runner_does_not_schedule_call_end_for_non_end_cont
         "对。",
         "最后。",
         "法人。",
+        "五七一八五。",
+        "15000。",
     ],
 )
 async def test_realtime_agent_runner_rejects_low_trust_short_overlap_transcript(
@@ -5341,6 +6732,110 @@ async def test_realtime_agent_runner_defers_browser_interrupt_while_ai_speaking(
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_skips_browser_interrupt_when_barge_in_disabled() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider([])
+    session = CallSession(
+        call_id="call_browser_barge_disabled",
+        room_name="ai-call-call_browser_barge_disabled",
+        participant_identity="browser-call_browser_barge_disabled",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+            "barge_in_enabled": False,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+
+    await runner.start(session)
+    registry.transition("call_browser_barge_disabled", CallSessionStatus.CONNECTED)
+    registry.transition("call_browser_barge_disabled", CallSessionStatus.AI_SPEAKING)
+    accepted = await runner.record_browser_speech_candidate(
+        "call_browser_barge_disabled",
+        datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc),
+    )
+
+    event_types = [event.type for event in store.list("call_browser_barge_disabled")]
+    assert accepted is False
+    assert "interrupt_candidate" not in event_types
+    assert "browser_interrupt_candidate_deferred" not in event_types
+    await runner.stop("call_browser_barge_disabled")
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_skips_provider_interrupt_when_barge_in_disabled() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
+    output_pcm = b"\x01\x02" * 240
+    session = CallSession(
+        call_id="call_provider_barge_disabled",
+        room_name="ai-call-call_provider_barge_disabled",
+        participant_identity="sip-call_provider_barge_disabled",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+            "barge_in_enabled": False,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="model_response_started",
+            payload={"response": {"id": "resp_no_barge"}},
+        )
+    )
+    await provider.emit(
+        ProviderEvent(
+            type="model_audio_delta",
+            payload={
+                "response_id": "resp_no_barge",
+                "delta": base64.b64encode(output_pcm).decode("ascii"),
+            },
+        )
+    )
+    await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.close_events()
+    await runner.wait("call_provider_barge_disabled")
+
+    event_types = [event.type for event in store.list("call_provider_barge_disabled")]
+    assert "user_speech_started" in event_types
+    assert "interrupt_candidate" not in event_types
+    assert "response_generation_invalidated" not in event_types
+    assert "interrupt_confirmed" not in event_types
+    assert provider.cancelled_response_count == 0
+    assert publisher.stopped_call_ids == []
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_defers_browser_interrupt_before_first_audio() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
@@ -5948,6 +7443,115 @@ async def test_realtime_agent_runner_blocks_unidentified_audio_until_new_respons
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_keeps_new_response_generation_after_duplicate_speech_start() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider([])
+    publisher = FakeAudioPublisher()
+    output_pcm = b"\x01\x02" * 240
+    call_id = "call_duplicate_speech_start_generation"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0,
+    )
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        runner._mark_response_started(call_id, {"response": {"id": "resp_old"}})
+        runner._response_lifecycle(call_id).active = True
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_old",
+                    "delta": base64.b64encode(output_pcm).decode("ascii"),
+                },
+            ),
+        )
+
+        first_speech_at = datetime.now(timezone.utc)
+        await runner._handle_user_speech_started(call_id, provider, first_speech_at)
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(type="user_transcript_done", payload={"transcript": "是的。"}),
+            first_speech_at + timedelta(milliseconds=200),
+        )
+        await runner._handle_user_speech_stopped(
+            call_id,
+            provider,
+            first_speech_at + timedelta(milliseconds=260),
+        )
+        await runner._complete_response_and_flush_pending(call_id, provider)
+        assert provider.created_responses == [None]
+
+        await runner._handle_user_speech_started(
+            call_id,
+            provider,
+            first_speech_at + timedelta(milliseconds=650),
+        )
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_started",
+            first_speech_at + timedelta(milliseconds=700),
+            {"response": {"id": "resp_new"}},
+        )
+        audio_event = ProviderEvent(
+            type="model_audio_delta",
+            payload={
+                "response_id": "resp_new",
+                "delta": base64.b64encode(output_pcm).decode("ascii"),
+            },
+        )
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_audio_delta",
+            first_speech_at + timedelta(milliseconds=720),
+            audio_event.payload,
+        )
+        await runner._publish_model_audio_delta(
+            call_id,
+            audio_event,
+        )
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert len(publisher.published) == 2
+        assert "sip_provider_speech_started_ignored" in event_types
+        assert not any(
+            event.type == "response_generation_invalidated"
+            and event.payload.get("reason") == "stale_response_started"
+            and event.payload.get("responseId") == "resp_new"
+            for event in events
+        )
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_queues_response_until_cancelled_response_done() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
@@ -6319,7 +7923,9 @@ async def test_realtime_agent_runner_forwards_room_audio_frames_to_provider() ->
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_holds_sip_candidate_before_provider_vad() -> None:
+async def test_realtime_agent_runner_pre_stops_sip_candidate_before_provider_vad() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
     registry = InMemorySessionRegistry()
     provider = FakeRealtimeProvider([])
     store = InMemoryEventStore()
@@ -6345,10 +7951,33 @@ async def test_realtime_agent_runner_holds_sip_candidate_before_provider_vad() -
         event_store=store,
         audio_publisher=publisher,
         sip_barge_in_enabled=True,
-        sip_barge_in_min_rms_dbfs=-35.0,
-        sip_barge_in_min_speech_duration_ms=200,
+        sip_barge_in_fast_stop_enabled=True,
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+        ),
+        sip_barge_in_vad=FakeVad([True] * 20),
     )
-    loud_frame = _pcm16_constant_frame(amplitude=4000)
+    deferred_frame = _pcm16_constant_frame(amplitude=4000)
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        5200,
+        3900,
+        6100,
+        4400,
+        5700,
+        4700,
+        6200,
+        4100,
+        5900,
+        4800,
+        6100,
+        5200,
+        5700,
+        5000,
+    ])
     output_pcm = b"\x01\x02" * 240
 
     try:
@@ -6360,28 +7989,50 @@ async def test_realtime_agent_runner_holds_sip_candidate_before_provider_vad() -
         runner._response_lifecycle(call_id).active = True
         runner._playback_guard(call_id).current_response_audio_published = True
 
-        for _ in range(10):
-            await runner.send_audio_frame(call_id, loud_frame)
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, deferred_frame)
 
         events = store.list(call_id)
         event_types = [event.type for event in events]
         sip_candidate = next(event for event in events if event.type == "sip_interrupt_candidate")
 
-        assert len(provider.sent_audio) == 10
+        assert len(provider.sent_audio) == 9
         assert provider.cancelled_response_count == 0
         assert publisher.stopped_call_ids == []
         assert sip_candidate.payload["reason"] == "sip_uplink_speech_during_ai_audio"
-        assert sip_candidate.payload["speechDurationMs"] >= 200
+        assert sip_candidate.payload["candidateClass"] == "stable_speech_candidate"
+        assert sip_candidate.payload["vadVoicedMs"] >= 120
+        assert sip_candidate.payload["candidateDurationMs"] >= 180
         assert "interrupt_candidate" in event_types
         assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
         assert "response_generation_invalidated" not in event_types
         assert "interrupt_audio_stop_requested" not in event_types
         assert "playout_queue_flushed" not in event_types
         assert "interrupt_audio_stop_completed" not in event_types
         assert "interrupt_confirmed" not in event_types
+
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert len(provider.sent_audio) == 24
+        assert publisher.stopped_call_ids == [call_id]
+        assert pre_stop.payload["candidateClass"] == "stable_speech_candidate"
+        assert pre_stop.payload["candidateDurationMs"] >= 360
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == "stable_local_speech"
+        assert "sip_pre_stop" in event_types
+        assert "response_generation_invalidated" in event_types
+        assert "interrupt_audio_stop_requested" in event_types
+        assert "playout_queue_flushed" in event_types
+        assert "interrupt_audio_stop_completed" in event_types
+        assert "interrupt_confirmed" not in event_types
         guard = runner._playback_guard(call_id)
         assert guard.user_speech_active is False
-        assert guard.suppress_audio_until is None
+        assert guard.suppress_audio_until is not None
 
         await runner._publish_model_audio_delta(
             call_id,
@@ -6395,8 +8046,5646 @@ async def test_realtime_agent_runner_holds_sip_candidate_before_provider_vad() -
         )
 
         events = store.list(call_id)
+        assert publisher.published == []
+        assert "stale_audio_dropped" in [event.type for event in events]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_sip_pre_stop_for_recent_ai_playback_echo_like_audio() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 30),
+        call_id="call_sip_ai_playback_echo",
+        clean_window_ms=40,
+        max_hold_ms=80,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=3200, sample_rate_hz=24000, duration_ms=40)
+    echo_like_uplink_frame = _pcm16_constant_frame(amplitude=3000)
+
+    try:
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for _ in range(18):
+            await runner.send_audio_frame(call_id, echo_like_uplink_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        echo_deferred = next(
+            event for event in events if event.type == "sip_ai_playback_echo_deferred"
+        )
+
+        assert len(provider.sent_audio) == 18
         assert len(publisher.published) == 1
-        assert "stale_audio_dropped" not in [event.type for event in events]
+        assert publisher.stopped_call_ids == []
+        assert echo_deferred.payload["reason"] == "awaiting_ai_playback_echo_guard"
+        assert echo_deferred.payload["candidateClass"] == "stable_speech_candidate"
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "interrupt_audio_stop_requested" not in event_types
+        assert "playout_queue_flushed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_clear_short_sip_speech_under_recent_ai_playback() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 20),
+        call_id="call_sip_clear_weak_short_speech_echo_guard",
+        clean_window_ms=40,
+        max_hold_ms=80,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=1000, sample_rate_hz=24000, duration_ms=40)
+    speech_frames = _pcm16_constant_frames([
+        900,
+        1500,
+        2300,
+        1650,
+        2600,
+        1800,
+        2450,
+        1700,
+        2250,
+    ])
+
+    try:
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_ai_playback_echo_deferred" not in event_types
+        assert deferred.payload["candidateClass"] == "stable_speech_candidate"
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["rmsDbfs"] < -20.0
+        assert deferred.payload["rmsRangeDb"] >= 6.0
+        assert deferred.payload["rmsDirectionChanges"] >= 1
+        assert deferred.payload["speechQualityRejection"] is None
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_echo_like_sip_audio_with_local_turn_evidence() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 30),
+        call_id="call_sip_echo_like_local_turn_evidence",
+        clean_window_ms=40,
+        max_hold_ms=80,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=6000, sample_rate_hz=24000, duration_ms=40)
+    speech_frames = _pcm16_constant_frames([
+        1500,
+        2200,
+        2700,
+        2300,
+        1600,
+        2400,
+        2800,
+        2300,
+        2600,
+        2300,
+        2100,
+        1900,
+        2300,
+        2700,
+        2400,
+        2900,
+        2500,
+        2800,
+        2400,
+        2600,
+        2300,
+        2700,
+        2500,
+        2800,
+    ])
+
+    try:
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_ai_playback_echo_deferred" in event_types
+        assert pre_stop.payload["candidateClass"] == "stable_speech_candidate"
+        assert pre_stop.payload["candidateDurationMs"] >= 360
+        assert pre_stop.payload["speechQualityRejection"] is None
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_sip_when_uplink_exceeds_recent_ai_playback() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 30),
+        call_id="call_sip_user_over_ai_playback",
+        clean_window_ms=40,
+        max_hold_ms=80,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=1200, sample_rate_hz=24000, duration_ms=40)
+    user_uplink_frames = _pcm16_constant_frames([
+        5000,
+        7200,
+        5600,
+        7600,
+        6100,
+        7900,
+        6400,
+        8100,
+        5900,
+        7500,
+        6200,
+        7800,
+        6600,
+        8000,
+        6300,
+        7700,
+        6000,
+        7400,
+        6500,
+        7900,
+        6300,
+        7600,
+        6100,
+        7300,
+    ])
+
+    try:
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for frame in user_uplink_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+
+        assert len(provider.sent_audio) == 24
+        assert len(publisher.published) == 1
+        assert publisher.stopped_call_ids == [call_id]
+        assert pre_stop.payload["candidateClass"] == "stable_speech_candidate"
+        assert "sip_ai_playback_echo_deferred" not in event_types
+        assert "response_generation_invalidated" in event_types
+        assert "interrupt_audio_stop_requested" in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_clears_sip_provisional_state_when_turn_is_ignored() -> None:
+    runner, _registry, _store, _provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 20),
+        call_id="call_sip_clear_provisional_on_ignore",
+    )
+
+    try:
+        turn = runner._pending_turn(call_id)
+        turn.interrupt_candidate = True
+        turn.sip_barge_in_requested = True
+        turn.sip_barge_in_confirmed = True
+        turn.sip_barge_in_confirmed_by = "provider_speech_started"
+        turn.sip_barge_in_expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+        turn.sip_pre_stop_requested = True
+        turn.sip_pre_stop_deferred = True
+        turn.sip_ai_playback_echo_deferred = True
+        turn.sip_candidate_class = "stable_speech_candidate"
+        turn.sip_candidate_response_id = "resp_sip_opening"
+        turn.sip_candidate_generation = 1
+        turn.sip_provider_speech_confirmable = True
+        turn.sip_interrupt_rejected = True
+
+        runner._ignore_empty_turn(call_id, turn, "no_valid_transcript")
+
+        assert turn.sip_barge_in_requested is False
+        assert turn.sip_barge_in_confirmed is False
+        assert turn.sip_barge_in_confirmed_by is None
+        assert turn.sip_barge_in_expires_at is None
+        assert turn.sip_pre_stop_requested is False
+        assert turn.sip_pre_stop_deferred is False
+        assert turn.sip_ai_playback_echo_deferred is False
+        assert turn.sip_candidate_class is None
+        assert turn.sip_candidate_response_id is None
+        assert turn.sip_candidate_generation is None
+        assert turn.sip_provider_speech_confirmable is False
+        assert turn.sip_interrupt_rejected is False
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_skips_sip_barge_in_when_scene_barge_in_disabled() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 20),
+        call_id="call_sip_barge_disabled",
+    )
+    session = runner.registry.get(call_id)
+    session.effective_config["barge_in_enabled"] = False
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert len(provider.sent_audio) == 18
+        assert publisher.stopped_call_ids == []
+        assert "interrupt_candidate" not in event_types
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "interrupt_confirmed" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_emits_sip_vad_shadow_without_pre_stop_side_effects() -> None:
+    shadow = FakeSipVadShadowDetector([
+        SipVadShadowObservation(
+            active=True,
+            started=True,
+            ended=False,
+            duration_ms=20,
+            frame_duration_ms=20,
+            confidence=0.91,
+            detector="fake_fsmn",
+            analyzed=True,
+            buffer_duration_ms=1200,
+            window_start_ms=820,
+            window_end_ms=1100,
+            detection_lag_ms=380,
+            speech_end_lag_ms=100,
+        ),
+        SipVadShadowObservation(
+            active=True,
+            started=False,
+            ended=False,
+            duration_ms=40,
+            frame_duration_ms=20,
+            confidence=0.93,
+            detector="fake_fsmn",
+        ),
+    ])
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 10),
+        call_id="call_sip_vad_shadow_only",
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        for _ in range(2):
+            await runner.send_audio_frame(call_id, speech_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        shadow_started = next(event for event in events if event.type == "sip_vad_shadow_started")
+        assert shadow_started.payload["detector"] == "fake_fsmn"
+        assert shadow_started.payload["confidence"] == 0.91
+        assert shadow_started.payload["durationMs"] == 20
+        assert shadow_started.payload["analyzed"] is True
+        assert shadow_started.payload["bufferDurationMs"] == 1200
+        assert shadow_started.payload["windowStartMs"] == 820
+        assert shadow_started.payload["windowEndMs"] == 1100
+        assert shadow_started.payload["detectionLagMs"] == 380
+        assert shadow_started.payload["speechEndLagMs"] == 100
+        assert shadow_started.payload["interruptible"] is True
+        assert shadow_started.payload["responseId"] == "resp_sip_opening"
+        assert len(provider.sent_audio) == 2
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_emits_multiple_sip_vad_shadow_observations() -> None:
+    shadow = FakeMultiSipVadShadowDetector([
+        SipVadShadowObservation(
+            active=True,
+            started=True,
+            ended=False,
+            duration_ms=20,
+            frame_duration_ms=20,
+            detector="webrtc_shadow",
+        ),
+        SipVadShadowObservation(
+            active=True,
+            started=True,
+            ended=False,
+            duration_ms=20,
+            frame_duration_ms=20,
+            confidence=0.92,
+            detector="fsmn_shadow",
+        ),
+    ])
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 10),
+        call_id="call_sip_multi_vad_shadow",
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        await runner.send_audio_frame(call_id, speech_frame)
+
+        shadow_started = [
+            event for event in store.list(call_id) if event.type == "sip_vad_shadow_started"
+        ]
+        assert [event.payload["detector"] for event in shadow_started] == [
+            "webrtc_shadow",
+            "fsmn_shadow",
+        ]
+        assert shadow_started[1].payload["confidence"] == 0.92
+        assert len(provider.sent_audio) == 1
+        assert publisher.stopped_call_ids == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_disables_sip_vad_shadow_after_error_without_side_effects() -> None:
+    shadow = FailingSipVadShadowDetector("FSMN shadow unavailable")
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 10),
+        call_id="call_sip_vad_shadow_error",
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=4000)
+
+    try:
+        for _ in range(2):
+            await runner.send_audio_frame(call_id, speech_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        shadow_errors = [event for event in events if event.type == "sip_vad_shadow_error"]
+        assert len(shadow_errors) == 1
+        assert shadow_errors[0].payload["detector"] == "fake_failing_shadow"
+        assert shadow_errors[0].payload["errorType"] == "RuntimeError"
+        assert shadow_errors[0].payload["message"] == "FSMN shadow unavailable"
+        assert shadow.calls == 1
+        assert len(provider.sent_audio) == 2
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_skips_sip_vad_shadow_when_scene_barge_in_disabled() -> None:
+    shadow = FakeSipVadShadowDetector([
+        SipVadShadowObservation(
+            active=True,
+            started=True,
+            ended=False,
+            duration_ms=20,
+            frame_duration_ms=20,
+            confidence=0.91,
+            detector="fake_fsmn",
+        )
+    ])
+    runner, registry, store, _provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 10),
+        call_id="call_sip_vad_shadow_scene_disabled",
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    session = registry.get(call_id)
+    session.effective_config["barge_in_enabled"] = False
+
+    try:
+        await runner.send_audio_frame(call_id, _pcm16_constant_frame(amplitude=4000))
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_vad_shadow_started" not in event_types
+        assert "sip_vad_shadow_ended" not in event_types
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert shadow.reset_call_ids == [call_id]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_ignores_sip_impulse_noise_before_pre_stop() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    store = InMemoryEventStore()
+    publisher = FakeAudioPublisher()
+    call_id = "call_sip_impulse"
+    session = _sip_session(call_id)
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        sip_barge_in_enabled=True,
+        sip_barge_in_fast_stop_enabled=True,
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-60.0,
+            snr_threshold_db=10.0,
+            impulse_noise_max_duration_ms=120,
+        ),
+        sip_barge_in_vad=FakeVad([True, False, False]),
+    )
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        registry.transition(call_id, CallSessionStatus.AI_THINKING)
+        registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_opening"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+
+        await runner.send_audio_frame(call_id, _pcm16_pulse_frame(amplitude=30000))
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        ignored = next(event for event in events if event.type == "sip_impulse_noise_ignored")
+        assert ignored.payload["candidateClass"] == "impulse_noise"
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_ignores_clipped_sip_burst_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 10),
+        call_id="call_sip_clipped_burst",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        short_speech_min_duration_ms=120,
+    )
+    clipped_burst_frame = _pcm16_constant_frame(amplitude=16000)
+
+    try:
+        for _ in range(6):
+            await runner.send_audio_frame(call_id, clipped_burst_frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_impulse_noise_ignored" not in event_types
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_ignores_rhythmic_clap_sequence_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 20),
+        call_id="call_sip_rhythmic_clap",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        short_speech_min_duration_ms=120,
+    )
+    frames = _pcm16_constant_frames([900, 5000, 800, 4500, 900, 5200, 850, 4800, 900])
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_confirms_sip_clean_window_with_stable_voice() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_clean_confirm",
+        clean_window_ms=60,
+        max_hold_ms=100,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.14)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_pre_stop" in event_types
+        assert "sip_interrupt_confirmed" in event_types
+        assert "interrupt_confirmed" in event_types
+        assert provider.cancelled_response_count == 1
+        assert publisher.stopped_call_ids == [call_id]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_recovers_local_sip_confirm_without_transcript() -> None:
+    runner, registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_confirm_without_transcript",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.14)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_confirmed" in event_types
+        assert "interrupt_confirmed" in event_types
+        assert provider.cancelled_response_count == 1
+        assert provider.created_responses == []
+
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_done",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_opening", "status": "cancelled"}},
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_recovery_started" in event_types
+        assert provider.created_responses
+        recovery_input = provider.created_responses[0]
+        assert recovery_input is not None
+        assert "一句简短自然" in recovery_input
+        assert "不要重复整段内容" in recovery_input
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_unmodulated_sip_noise_without_context() -> None:
+    runner, registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18 + [False] * 20),
+        call_id="call_sip_clean_reject",
+        clean_window_ms=60,
+        max_hold_ms=100,
+    )
+    noise_frame = _pcm16_constant_frame(amplitude=4000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(18):
+            await runner.send_audio_frame(call_id, noise_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.14)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_pre_stop_unmodulated_sip_candidate() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18 + [False] * 20),
+        call_id="call_sip_unmodulated_candidate_no_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    flat_frame = _pcm16_constant_frame(amplitude=4000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(18):
+            await runner.send_audio_frame(call_id, flat_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "interrupt_audio_stop_requested" not in event_types
+        assert "playout_queue_flushed" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+        assert provider.created_responses == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_strong_short_sip_noise_before_pre_stop() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 6 + [False] * 20),
+        call_id="call_sip_strong_short_noise",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        short_speech_min_duration_ms=120,
+        recovery_silence_ms=20,
+    )
+    strong_frame = _pcm16_constant_frame(amplitude=8000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(6):
+            await runner.send_audio_frame(call_id, strong_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert deferred.payload["candidateClass"] == "strong_short_speech_candidate"
+        assert deferred.payload["requiredPreStopDurationMs"] == 240
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_pre_stop_then_reject_short_noise() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 5 + [False] * 8),
+        call_id="call_sip_no_pre_stop_then_reject_short_noise",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    noise_frames = _pcm16_constant_frames([800, 4200, 900, 3800, 750] + [40] * 8)
+
+    try:
+        for frame in noise_frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.08)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_ambiguous_short_sip_burst_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 6 + [False] * 20),
+        call_id="call_sip_ambiguous_short_burst",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    burst_frame = _pcm16_constant_frame(amplitude=6000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(6):
+            await runner.send_audio_frame(call_id, burst_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_low_confidence_flat_sip_audio_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12 + [False] * 20),
+        call_id="call_sip_low_confidence_flat_audio",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    flat_low_confidence_frame = _pcm16_constant_frame(amplitude=800)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, flat_low_confidence_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_weak_flat_sip_audio_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12 + [False] * 20),
+        call_id="call_sip_weak_flat_turn_evidence",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    weak_flat_frame = _pcm16_constant_frame(amplitude=1050)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, weak_flat_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert deferred.payload["speechQualityRejection"] == "weak_flat_turn_evidence"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_breath_like_sip_candidate_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12 + [False] * 20),
+        call_id="call_sip_breath_like_candidate",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    breath_like_frames = _pcm16_constant_frames([760] * 9 + [1120] * 3)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in breath_like_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateClass"] == "stable_speech_candidate"
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_single_short_sip_speech_without_turn_authority() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_single_short_speech_micro_confirm",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    short_speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+    ])
+
+    try:
+        for frame in short_speech_frames[:9]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["snrDb"] >= 16
+        assert deferred.payload["rmsRangeDb"] >= 4
+        assert deferred.payload["rmsDirectionChanges"] >= 1
+        assert deferred.payload["speechQualityRejection"] is None
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+
+        for frame in short_speech_frames[9:]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_upgrades_deferred_sip_pre_stop_with_realtime_fsmn_shadow() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="fsmn_shadow",
+                )
+                for _ in range(9)
+            ],
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=20,
+                frame_duration_ms=20,
+                detector="fsmn_shadow",
+                analyzed=True,
+                buffer_duration_ms=1200,
+                window_start_ms=640,
+                window_end_ms=1180,
+                detection_lag_ms=560,
+                speech_end_lag_ms=20,
+            ),
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 10),
+        call_id="call_sip_deferred_shadow_upgrade",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        2500,
+        2700,
+        2900,
+        3100,
+        3300,
+        3500,
+        3700,
+        3900,
+        4100,
+        3000,
+        3200,
+        3400,
+    ])
+
+    try:
+        for frame in speech_frames[:9]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+
+        await runner.send_audio_frame(call_id, speech_frames[9])
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_vad_shadow_started" in event_types
+        assert "sip_pre_stop" not in event_types
+
+        for frame in speech_frames[10:]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert pre_stop.payload["candidateDurationMs"] >= 240
+        assert pre_stop.payload["sipVadShadowEvidence"] == "realtime_fsmn_shadow"
+        assert pre_stop.payload["sipVadShadowWindowMs"] == 540
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_upgrades_soft_sip_speech_with_realtime_fsmn_shadow() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="fsmn_shadow",
+                )
+                for _ in range(9)
+            ],
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=20,
+                frame_duration_ms=20,
+                detector="fsmn_shadow",
+                analyzed=True,
+                buffer_duration_ms=1200,
+                window_start_ms=630,
+                window_end_ms=1180,
+                detection_lag_ms=570,
+                speech_end_lag_ms=20,
+            ),
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_soft_speech_shadow_upgrade",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+        2300,
+        2850,
+        2450,
+    ])
+
+    try:
+        for frame in speech_frames[:9]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["rmsDbfs"] < -20.0
+        assert deferred.payload["speechQualityRejection"] is None
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+
+        await runner.send_audio_frame(call_id, speech_frames[9])
+
+        events = store.list(call_id)
+        assert "sip_pre_stop" not in [event.type for event in events]
+
+        for frame in speech_frames[10:]:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert pre_stop.payload["candidateDurationMs"] >= 240
+        assert pre_stop.payload["rmsDbfs"] < -20.0
+        assert pre_stop.payload["speechQualityRejection"] is None
+        assert pre_stop.payload["sipVadShadowEvidence"] == "realtime_fsmn_shadow"
+        assert pre_stop.payload["sipVadShadowWindowMs"] == 550
+        assert "sipShortSpeechEvidence" not in pre_stop.payload
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_creates_shadow_assisted_sip_candidate_before_main_candidate() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="fsmn_shadow",
+                )
+                for _ in range(5)
+            ],
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=20,
+                frame_duration_ms=20,
+                detector="fsmn_shadow",
+                analyzed=True,
+                buffer_duration_ms=1200,
+                window_start_ms=640,
+                window_end_ms=1180,
+                detection_lag_ms=560,
+                speech_end_lag_ms=20,
+            ),
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 6),
+        call_id="call_sip_shadow_assisted_candidate",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        candidate = next(event for event in events if event.type == "sip_interrupt_candidate")
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_vad_shadow_started" in event_types
+        assert candidate.payload["candidateDurationMs"] == 120
+        assert candidate.payload["sipVadShadowCandidateEvidence"] == "realtime_fsmn_shadow"
+        assert candidate.payload["sipVadShadowLocalEvidence"] == "local_modulated_candidate"
+        assert deferred.payload["reason"] == "awaiting_pre_stop_authority"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_180ms_webrtc_shadow_without_stable_window() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(9)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9),
+        call_id="call_sip_webrtc_shadow_180ms_deferred",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["requiredPreStopDurationMs"] > 180
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_uses_continuous_webrtc_shadow_context_for_clear_local_modulation() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=False,
+                ended=False,
+                duration_ms=2200 + index * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(9)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9),
+        call_id="call_sip_continuous_shadow_clear_local_modulation",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1600,
+        2200,
+        3000,
+        2600,
+        3400,
+        2800,
+        3200,
+        2600,
+        3000,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert pre_stop.payload["candidateDurationMs"] == 180
+        assert pre_stop.payload["sipPreStopAuthority"] == "local_speech"
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == (
+            "continuous_webrtc_shadow_local_modulation"
+        )
+        assert pre_stop.payload["sipVadShadowEvidence"] == (
+            "realtime_webrtc_shadow_continuous_context"
+        )
+        assert pre_stop.payload["sipVadShadowDetector"] == "webrtc_shadow"
+        assert pre_stop.payload["sipVadShadowLocalEvidence"] == "local_modulated_candidate"
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_sip_pre_stop_without_playback_target() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(18)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_no_playback_target_shadow_deferred",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    guard = runner._playback_guard(call_id)
+    guard.current_response_id = None
+    guard.current_response_audio_published = False
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+        2500,
+        3300,
+        2700,
+        3500,
+        2850,
+        3650,
+        3000,
+        3800,
+        3150,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred_events = [event for event in events if event.type == "sip_pre_stop_deferred"]
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred_events[-1].payload["reason"] == "awaiting_ai_playback_target"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_recent_stable_webrtc_shadow_until_local_candidate_reaches_pre_stop_duration() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=True,
+                    started=index == 0,
+                    ended=False,
+                    duration_ms=(index + 1) * 20,
+                    frame_duration_ms=20,
+                    detector="webrtc_shadow",
+                )
+                for index in range(18)
+            ],
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="webrtc_shadow",
+                )
+                for _ in range(9)
+            ],
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 18 + [True] * 9),
+        call_id="call_sip_recent_stable_webrtc_shadow_authority",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+    ])
+
+    try:
+        for _ in range(18):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_vad_shadow_started" in event_types
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["reason"] == "awaiting_pre_stop_authority"
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_uses_continuous_webrtc_shadow_authority_to_pre_stop() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(18)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_webrtc_shadow_upgrade",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        pre_stop_min_duration_ms=360,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+        2500,
+        3300,
+        2700,
+        3500,
+        2850,
+        3650,
+        3000,
+        3800,
+        3150,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert pre_stop.payload["candidateDurationMs"] == 360
+        assert pre_stop.payload["sipPreStopAuthority"] == "local_speech"
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == (
+            "realtime_webrtc_shadow_local_modulation"
+        )
+        assert pre_stop.payload["sipVadShadowEvidence"] == "realtime_webrtc_shadow"
+        assert pre_stop.payload["sipVadShadowDetector"] == "webrtc_shadow"
+        assert pre_stop.payload["sipVadShadowWindowMs"] == 360
+        assert pre_stop.payload["sipVadShadowLocalEvidence"] == "local_modulated_candidate"
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_shadow_authority_pre_stops_sustained_modulated_speech() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(18)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_shadow_authority_echo_guard",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        pre_stop_min_duration_ms=360,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=6000, sample_rate_hz=24000, duration_ms=40)
+    speech_frames = _pcm16_constant_frames([
+        1050,
+        1700,
+        2450,
+        1900,
+        2750,
+        2150,
+        3000,
+        2350,
+        3100,
+        2500,
+        3300,
+        2700,
+        3500,
+        2850,
+        3650,
+        3000,
+        3800,
+        3150,
+    ])
+
+    try:
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_ai_playback_echo_deferred" not in event_types
+        assert pre_stop.payload["sipPreStopAuthority"] == "local_speech"
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == (
+            "realtime_webrtc_shadow_local_modulation"
+        )
+        assert pre_stop.payload["candidateDurationMs"] == 360
+        assert pre_stop.payload["sipVadShadowWindowMs"] == 360
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_shadow_authority_rejects_flat_breath_like_audio() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(18)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_shadow_authority_flat_audio",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    flat_frames = _pcm16_constant_frames([1180] * 18)
+
+    try:
+        for frame in flat_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_rejects_continuous_webrtc_shadow_without_local_modulation() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            SipVadShadowObservation(
+                active=True,
+                started=index == 0,
+                ended=False,
+                duration_ms=(index + 1) * 20,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            )
+            for index in range(18)
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_webrtc_shadow_flat_rejected",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    flat_frames = _pcm16_constant_frames([1180] * 18)
+
+    try:
+        for frame in flat_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_sip_response_until_local_speech_clean() -> None:
+    active_shadow = SipVadShadowObservation(
+        active=True,
+        started=True,
+        ended=False,
+        duration_ms=20,
+        frame_duration_ms=20,
+        detector="fsmn_shadow",
+        analyzed=True,
+        buffer_duration_ms=1200,
+        window_start_ms=640,
+        window_end_ms=1180,
+        detection_lag_ms=560,
+        speech_end_lag_ms=20,
+    )
+    ended_shadow = SipVadShadowObservation(
+        active=False,
+        started=False,
+        ended=True,
+        duration_ms=1200,
+        frame_duration_ms=20,
+        detector="fsmn_shadow",
+        analyzed=True,
+        buffer_duration_ms=1200,
+        window_start_ms=0,
+        window_end_ms=1180,
+    )
+    inactive_shadow = SipVadShadowObservation(
+        active=False,
+        started=False,
+        ended=False,
+        duration_ms=0,
+        frame_duration_ms=20,
+        detector="fsmn_shadow",
+    )
+    shadow = FakeSipVadShadowDetector(
+        [active_shadow] * 12 + [ended_shadow] + [inactive_shadow] * 12
+    )
+    runner, registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12 + [False] * 12),
+        call_id="call_sip_release_waits_for_local_clean_window",
+        clean_window_ms=80,
+        max_hold_ms=200,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=4500)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, speech_frame)
+
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(type="user_transcript_done", payload={"transcript": "你先别说。"}),
+            datetime.now(timezone.utc),
+        )
+        await runner._handle_user_speech_stopped(call_id, provider, datetime.now(timezone.utc))
+
+        assert provider.created_responses == []
+        assert runner._response_lifecycle(call_id).pending_create is True
+
+        await runner._complete_response_and_flush_pending(call_id, provider)
+
+        assert provider.created_responses == []
+        assert "sip_response_release_deferred" in [
+            event.type for event in store.list(call_id)
+        ]
+
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.1)
+        assert provider.created_responses == [None]
+        assert registry.get(call_id).status == CallSessionStatus.AI_THINKING
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_uses_shadow_turn_evidence_for_decaying_sip_speech() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="fsmn_shadow",
+                )
+                for _ in range(8)
+            ],
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=20,
+                frame_duration_ms=20,
+                detector="fsmn_shadow",
+                analyzed=True,
+                buffer_duration_ms=1200,
+                window_start_ms=620,
+                window_end_ms=1180,
+                detection_lag_ms=560,
+                speech_end_lag_ms=20,
+            ),
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_decaying_shadow_turn_evidence",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    speech_frames = _pcm16_constant_frames([
+        4000,
+        3600,
+        3100,
+        2600,
+        2100,
+        1700,
+        1300,
+        1050,
+        720,
+        700,
+        680,
+        660,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert pre_stop.payload["candidateDurationMs"] >= 240
+        assert pre_stop.payload["snrDb"] < 17.5
+        assert pre_stop.payload["sipVadShadowEvidence"] == "realtime_fsmn_shadow"
+        assert pre_stop.payload["sipVadShadowLocalEvidence"] == "shadow_turn_cluster"
+        assert pre_stop.payload["sipTurnClusterBurstCount"] >= 2
+        assert pre_stop.payload["sipTurnClusterMaxSnrDb"] >= 20
+        assert pre_stop.payload["sipTurnClusterRmsRangeDb"] >= 3.0
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_rejects_shadow_turn_without_local_modulation() -> None:
+    shadow = FakeSipVadShadowDetector(
+        [
+            *[
+                SipVadShadowObservation(
+                    active=False,
+                    started=False,
+                    ended=False,
+                    duration_ms=0,
+                    frame_duration_ms=20,
+                    detector="fsmn_shadow",
+                )
+                for _ in range(8)
+            ],
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=20,
+                frame_duration_ms=20,
+                detector="fsmn_shadow",
+                analyzed=True,
+                buffer_duration_ms=1200,
+                window_start_ms=620,
+                window_end_ms=1180,
+                detection_lag_ms=560,
+                speech_end_lag_ms=20,
+            ),
+        ]
+    )
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_flat_shadow_turn_rejected",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        sip_vad_shadow_enabled=True,
+        sip_vad_shadow_detector=shadow,
+    )
+    flat_frames = _pcm16_constant_frames([900] * 9)
+
+    try:
+        for frame in flat_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_clear_modulated_180ms_sip_speech_without_continuation() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 20),
+        call_id="call_sip_clear_modulated_180ms_speech_without_continuation",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["rmsRangeDb"] >= 4
+        assert deferred.payload["rmsDirectionChanges"] >= 1
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+def _mark_sip_authority_playback_target(
+    runner: RealtimeCallAgentRunner,
+    call_id: str,
+    *,
+    response_id: str = "resp_sip_authority",
+) -> None:
+    guard = runner._playback_guard(call_id)
+    guard.current_response_id = response_id
+    guard.current_response_audio_published = True
+
+
+class _StaticSipAuthorityDetector:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        single_short: bool = False,
+        fast_local: bool = False,
+        pre_stop_local: bool = False,
+    ) -> None:
+        self.payload = payload
+        self.single_short = single_short
+        self.fast_local = fast_local
+        self.pre_stop_local = pre_stop_local
+
+    def has_single_short_pre_stop_local_speech(self, *_args, **_kwargs) -> bool:
+        return self.single_short
+
+    def has_fast_pre_stop_local_speech(self, _call_id: str) -> bool:
+        return self.fast_local
+
+    def has_pre_stop_local_speech(self, _call_id: str) -> bool:
+        return self.pre_stop_local
+
+    def latest_observation_payload(self, _call_id: str) -> dict[str, object]:
+        return self.payload
+
+
+def test_realtime_agent_runner_defers_single_short_local_only_micro_confirm() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_single_short_local_only_micro_confirm"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-18.8,
+        noise_floor_dbfs=-44.0,
+        snr_db=25.2,
+        peak_dbfs=-12.4,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 5.0,
+            "rmsDirectionChanges": 0,
+            "largeRmsJumpCount": 0,
+            "speechQualityRejection": None,
+        },
+        single_short=True,
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "single_high_confidence_burst"
+
+
+def test_realtime_agent_runner_pre_stops_fast_strong_short_local_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+            short_speech_min_duration_ms=180,
+        ),
+    )
+    call_id = "call_sip_fast_strong_short_local_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.0,
+        noise_floor_dbfs=-50.0,
+        snr_db=31.0,
+        peak_dbfs=-13.0,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="strong_short_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 8.0,
+            "rmsDirectionChanges": 1,
+            "largeRmsJumpCount": 1,
+            "speechQualityRejection": None,
+        },
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "strong_short_local_speech"
+    assert decision.required_duration_ms == 180
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "strong_short_local_speech"
+
+
+def test_realtime_agent_runner_defers_sub_480ms_local_only_fast_speech() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_sub_480ms_local_only_fast_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-18.5,
+        noise_floor_dbfs=-44.0,
+        snr_db=30.0,
+        peak_dbfs=-10.1,
+        vad_voiced_ms=460,
+        candidate_duration_ms=460,
+        speech_duration_ms=460,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 8.0,
+            "rmsDirectionChanges": 1,
+            "largeRmsJumpCount": 0,
+            "speechQualityRejection": None,
+        },
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+
+
+def test_realtime_agent_runner_defers_noise_shaped_local_only_turn_cluster() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_noise_shaped_turn_cluster"
+    response_id = "resp_noise_cluster"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id=response_id,
+    )
+    turn = PendingUserTurn(
+        sip_turn_cluster_response_id=response_id,
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=259),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=2,
+        sip_turn_cluster_voiced_ms=360,
+        sip_turn_cluster_max_snr_db=25.96,
+        sip_turn_cluster_max_rms_range_db=11.26,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-26.74,
+        noise_floor_dbfs=-39.4,
+        snr_db=12.66,
+        peak_dbfs=-19.01,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 8.46,
+        "rmsDirectionChanges": 5,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_contaminated_long_webrtc_shadow_authority() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_contaminated_long_shadow"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.24,
+        noise_floor_dbfs=-39.4,
+        snr_db=20.16,
+        peak_dbfs=-13.14,
+        vad_voiced_ms=200,
+        candidate_duration_ms=200,
+        speech_duration_ms=200,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 7.2,
+        "rmsDirectionChanges": 5,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+        shadow_observations=[
+            SipVadShadowObservation(
+                active=True,
+                started=False,
+                ended=False,
+                duration_ms=6340,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            ),
+        ],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert "sipVadShadowEvidence" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_short_continuous_shadow_context() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_short_continuous_shadow_context"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn(
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=458),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=2,
+        sip_turn_cluster_voiced_ms=360,
+        sip_turn_cluster_max_snr_db=31.37,
+        sip_turn_cluster_max_rms_range_db=17.9,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-29.65,
+        noise_floor_dbfs=-49.0,
+        snr_db=19.35,
+        peak_dbfs=-23.27,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 14.29,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+        shadow_observations=[
+            SipVadShadowObservation(
+                active=True,
+                started=False,
+                ended=False,
+                duration_ms=3820,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            ),
+        ],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert decision.extra_payload["sipVadShadowEvidence"] == (
+        "realtime_webrtc_shadow_continuous_context"
+    )
+
+
+def test_realtime_agent_runner_defers_unstable_shadow_local_modulation() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_unstable_shadow_local_modulation"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.16,
+        noise_floor_dbfs=-48.0,
+        snr_db=28.84,
+        peak_dbfs=-12.56,
+        vad_voiced_ms=360,
+        candidate_duration_ms=360,
+        speech_duration_ms=360,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 18.16,
+        "rmsDirectionChanges": 6,
+        "largeRmsJumpCount": 5,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+        shadow_observations=[
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=360,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            ),
+        ],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_speech_like_continuity"
+    assert decision.extra_payload["speechQualityRejection"] == "unstable_local_envelope"
+
+
+def test_realtime_agent_runner_defers_short_shadow_turn_cluster_until_duration_gate() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_short_shadow_turn_cluster_duration_gate"
+    response_id = "resp_shadow_turn_cluster"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id, response_id=response_id)
+    turn = PendingUserTurn(
+        sip_turn_cluster_response_id=response_id,
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=260),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=2,
+        sip_turn_cluster_voiced_ms=360,
+        sip_turn_cluster_shadow_burst_count=1,
+        sip_turn_cluster_shadow_voiced_ms=360,
+        sip_turn_cluster_shadow_detector="webrtc_shadow",
+        sip_turn_cluster_shadow_window_ms=720,
+        sip_turn_cluster_max_snr_db=21.0,
+        sip_turn_cluster_max_rms_range_db=7.5,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.0,
+        noise_floor_dbfs=-39.0,
+        snr_db=20.0,
+        peak_dbfs=-12.0,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 7.5,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+        shadow_observations=[
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=720,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            ),
+        ],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_compact_two_burst_deferred_turn_at_live_snr() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_compact_two_burst_live_snr"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 7.2,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    observations = [
+        (
+            now - timedelta(milliseconds=2258),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-22.13,
+                noise_floor_dbfs=-38.55,
+                snr_db=16.42,
+                peak_dbfs=-14.86,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-22.84,
+                noise_floor_dbfs=-38.55,
+                snr_db=15.71,
+                peak_dbfs=-15.57,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+    ]
+    for timestamp, observation in observations:
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == "compact_two_burst_turn"
+    assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 2
+    assert decision.extra_payload["sipDeferredEpisodeVoicedMs"] == 360
+    assert decision.extra_payload["sipDeferredEpisodeMaxGapMs"] >= 2200
+
+
+def test_realtime_agent_runner_ignores_deferred_episode_seed_without_playback_target() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_deferred_episode_seed_without_playback_target"
+    response_id = "resp_compact_false_seed"
+    now = datetime.now(timezone.utc)
+    guard = runner._playback_guard(call_id)
+    guard.current_response_id = response_id
+    guard.current_response_audio_published = False
+    turn = PendingUserTurn()
+    detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 22.74,
+        "rmsRangeDb": 12.62,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 2,
+        "speechQualityRejection": None,
+    })
+    runner._sip_barge_in_detector = detector
+
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-27.89,
+        noise_floor_dbfs=-40.14,
+        snr_db=12.24,
+        peak_dbfs=-21.5,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now - timedelta(milliseconds=2179),
+        observation=first_observation,
+    )
+
+    guard.current_response_audio_published = True
+    detector.payload = {
+        "maxSnrDb": 18.38,
+        "rmsRangeDb": 7.55,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    }
+    second_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-21.76,
+        noise_floor_dbfs=-40.14,
+        snr_db=18.38,
+        peak_dbfs=-15.03,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now,
+        observation=second_observation,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=second_observation,
+    )
+
+    assert decision.action == "defer"
+    assert "sipDeferredEpisodeEvidence" not in decision.extra_payload
+    assert turn.sip_deferred_episode_burst_count == 1
+
+
+def test_realtime_agent_runner_defers_opening_local_only_stable_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_opening_local_only_stable_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id, response_id="resp_opening")
+    runner._response_lifecycle(call_id).current_response_is_opening = True
+    runner._last_ai_audio_rms_dbfs[call_id] = -23.0
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=80)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-16.7,
+        noise_floor_dbfs=-37.24,
+        snr_db=20.54,
+        peak_dbfs=-11.84,
+        vad_voiced_ms=860,
+        candidate_duration_ms=860,
+        speech_duration_ms=860,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 11.63,
+            "rmsDirectionChanges": 19,
+            "largeRmsJumpCount": 10,
+            "speechQualityRejection": None,
+        },
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_opening_local_only_turn_cluster() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_opening_local_only_turn_cluster"
+    response_id = "resp_opening_cluster"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id=response_id,
+    )
+    runner._response_lifecycle(call_id).current_response_is_opening = True
+    turn = PendingUserTurn(
+        sip_turn_cluster_response_id=response_id,
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=60),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=4,
+        sip_turn_cluster_voiced_ms=840,
+        sip_turn_cluster_max_snr_db=32.6,
+        sip_turn_cluster_max_rms_range_db=6.5,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-23.05,
+        noise_floor_dbfs=-50.0,
+        snr_db=26.95,
+        peak_dbfs=-15.54,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 6.5,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+    assert decision.extra_payload["sipOpeningGuardedEvidence"] == "turn_cluster"
+
+
+def test_realtime_agent_runner_defers_opening_strong_stable_local_speech() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_opening_strong_stable_local"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id="resp_opening_stable",
+    )
+    runner._response_lifecycle(call_id).current_response_is_opening = True
+    turn = PendingUserTurn(
+        sip_deferred_episode_max_rms_dbfs=-17.96,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-24.24,
+        noise_floor_dbfs=-50.0,
+        snr_db=25.76,
+        peak_dbfs=-18.98,
+        vad_voiced_ms=440,
+        candidate_duration_ms=440,
+        speech_duration_ms=440,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 8.46,
+            "rmsDirectionChanges": 9,
+            "largeRmsJumpCount": 4,
+            "speechQualityRejection": None,
+        },
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+    assert decision.extra_payload["sipOpeningGuardedEvidence"] == "stable_local_speech"
+
+
+def test_realtime_agent_runner_defers_opening_local_only_when_lifecycle_flag_is_stale() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    store = InMemoryEventStore()
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=store,
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_opening_local_only_stale_lifecycle"
+    now = datetime.now(timezone.utc)
+    store.append(
+        call_id,
+        "opening_started",
+        "agent",
+        {"openingMessageHash": "sha256:test"},
+        timestamp=now - timedelta(seconds=5),
+    )
+    _mark_sip_authority_playback_target(runner, call_id, response_id="resp_opening")
+    runner._response_lifecycle(call_id).current_response_is_opening = False
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-16.7,
+        noise_floor_dbfs=-37.24,
+        snr_db=20.54,
+        peak_dbfs=-11.84,
+        vad_voiced_ms=860,
+        candidate_duration_ms=860,
+        speech_duration_ms=860,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 11.63,
+            "rmsDirectionChanges": 19,
+            "largeRmsJumpCount": 10,
+            "speechQualityRejection": None,
+        },
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_echo_guarded_compact_two_burst_deferred_turn() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_echo_guard_compact_two_burst_deferred"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = -20.0
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=30)
+    turn = PendingUserTurn()
+    detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 17.96,
+        "rmsRangeDb": 7.43,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    runner._sip_barge_in_detector = detector
+    observations = [
+        (
+            now - timedelta(milliseconds=2559),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-18.16,
+                noise_floor_dbfs=-36.12,
+                snr_db=17.96,
+                peak_dbfs=-9.94,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-16.8,
+                noise_floor_dbfs=-36.12,
+                snr_db=19.32,
+                peak_dbfs=-7.94,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+    ]
+    for index, (timestamp, observation) in enumerate(observations):
+        if index == 1:
+            detector.payload = {
+                "maxSnrDb": 19.32,
+                "rmsRangeDb": 5.98,
+                "rmsDirectionChanges": 1,
+                "largeRmsJumpCount": 1,
+                "speechQualityRejection": None,
+            }
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == "compact_two_burst_turn"
+    assert decision.extra_payload["sipAiPlaybackEchoGuardEscapedBy"] == "compact_two_burst_turn"
+
+
+def test_realtime_agent_runner_defers_elevated_noise_compact_two_burst_episode_without_cross_evidence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_elevated_noise_compact_two_burst_deferred"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 14.37,
+        "rmsRangeDb": 6.38,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    runner._sip_barge_in_detector = detector
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-23.51,
+        noise_floor_dbfs=-37.88,
+        snr_db=14.37,
+        peak_dbfs=-16.43,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now - timedelta(milliseconds=1200),
+        observation=first_observation,
+    )
+
+    detector.payload = {
+        "maxSnrDb": 20.75,
+        "rmsRangeDb": 8.1,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    }
+    current_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-17.13,
+        noise_floor_dbfs=-37.88,
+        snr_db=20.75,
+        peak_dbfs=-8.65,
+        vad_voiced_ms=300,
+        candidate_duration_ms=300,
+        speech_duration_ms=300,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now,
+        observation=current_observation,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=current_observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == (
+        "elevated_noise_compact_two_burst_turn"
+    )
+    assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 2
+
+
+def test_realtime_agent_runner_promotes_sparse_deferred_sip_turn_evidence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_sparse_deferred_turn"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 8.4,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    observations = [
+        (
+            now - timedelta(milliseconds=17900),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-19.65,
+                noise_floor_dbfs=-39.4,
+                snr_db=13.97,
+                peak_dbfs=-12.4,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now - timedelta(milliseconds=9540),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-23.36,
+                noise_floor_dbfs=-39.4,
+                snr_db=10.26,
+                peak_dbfs=-16.2,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-22.61,
+                noise_floor_dbfs=-39.4,
+                snr_db=11.01,
+                peak_dbfs=-15.8,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+    ]
+    for timestamp, observation in observations:
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "deferred_multi_candidate_turn"
+    assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 3
+    assert decision.extra_payload["sipDeferredEpisodeVoicedMs"] == 540
+    assert decision.extra_payload["sipDeferredEpisodeMaxGapMs"] >= 9000
+
+
+def test_realtime_agent_runner_defers_sparse_deferred_turn_under_elevated_noise_floor() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_sparse_deferred_turn_high_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 8.4,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    observations = [
+        (
+            now - timedelta(milliseconds=17900),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-19.65,
+                noise_floor_dbfs=-33.2,
+                snr_db=13.97,
+                peak_dbfs=-12.4,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now - timedelta(milliseconds=9540),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-23.36,
+                noise_floor_dbfs=-33.2,
+                snr_db=10.26,
+                peak_dbfs=-16.2,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-22.61,
+                noise_floor_dbfs=-33.2,
+                snr_db=11.01,
+                peak_dbfs=-15.8,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+    ]
+    for timestamp, observation in observations:
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_high_noise_sparse_deferred_turn_with_marginal_current_snr() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_high_noise_sparse_deferred_turn_marginal_snr"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 10.3,
+        "rmsDirectionChanges": 9,
+        "largeRmsJumpCount": 5,
+        "speechQualityRejection": None,
+    })
+    observations = [
+        (
+            now - timedelta(milliseconds=4560),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-16.56,
+                noise_floor_dbfs=-34.81,
+                snr_db=18.25,
+                peak_dbfs=-12.05,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now - timedelta(milliseconds=1642),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-15.37,
+                noise_floor_dbfs=-34.81,
+                snr_db=19.44,
+                peak_dbfs=-10.3,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-23.37,
+                noise_floor_dbfs=-34.81,
+                snr_db=11.45,
+                peak_dbfs=-15.96,
+                vad_voiced_ms=360,
+                candidate_duration_ms=360,
+                speech_duration_ms=360,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+        ),
+    ]
+    for timestamp, observation in observations:
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_speech_quality"
+
+
+def test_realtime_agent_runner_promotes_elevated_noise_sparse_turn_with_strong_anchor() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=12.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_elevated_noise_sparse_turn_strong_anchor"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 23.15,
+        "rmsRangeDb": 5.02,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+    runner._sip_barge_in_detector = detector
+    observations = [
+        (
+            now - timedelta(milliseconds=6404),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-12.87,
+                noise_floor_dbfs=-36.01,
+                snr_db=23.15,
+                peak_dbfs=-4.94,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+            {
+                "maxSnrDb": 23.15,
+                "rmsRangeDb": 5.02,
+                "rmsDirectionChanges": 2,
+                "largeRmsJumpCount": 0,
+                "speechQualityRejection": None,
+            },
+        ),
+        (
+            now - timedelta(milliseconds=2663),
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-21.49,
+                noise_floor_dbfs=-36.01,
+                snr_db=14.53,
+                peak_dbfs=-15.23,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+            {
+                "maxSnrDb": 14.53,
+                "rmsRangeDb": 6.58,
+                "rmsDirectionChanges": 1,
+                "largeRmsJumpCount": 1,
+                "speechQualityRejection": None,
+            },
+        ),
+        (
+            now,
+            SipBargeInObservation(
+                active=True,
+                candidate=True,
+                rms_dbfs=-19.7,
+                noise_floor_dbfs=-36.01,
+                snr_db=16.32,
+                peak_dbfs=-12.97,
+                vad_voiced_ms=180,
+                candidate_duration_ms=180,
+                speech_duration_ms=180,
+                frame_duration_ms=20,
+                candidate_class="stable_speech_candidate",
+                reason="sip_uplink_speech_during_ai_audio",
+            ),
+            {
+                "maxSnrDb": 16.32,
+                "rmsRangeDb": 7.09,
+                "rmsDirectionChanges": 2,
+                "largeRmsJumpCount": 1,
+                "speechQualityRejection": None,
+            },
+        ),
+    ]
+    for timestamp, observation, diagnostics in observations:
+        detector.payload = diagnostics
+        runner._record_sip_deferred_episode_observation(
+            call_id=call_id,
+            turn=turn,
+            timestamp=timestamp,
+            observation=observation,
+        )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observations[-1][1],
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "deferred_multi_candidate_turn"
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == "sparse_multi_candidate_turn"
+    assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 3
+    assert decision.extra_payload["sipDeferredEpisodeMaxGapMs"] >= 3700
+    assert decision.extra_payload["sipElevatedNoiseSparseTurnEvidence"] == (
+        "strong_anchor_current_modulation"
+    )
+
+
+def test_realtime_agent_runner_defers_echo_like_shadow_candidate_without_local_authority() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_echo_like_shadow_candidate"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = -23.25
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=32)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-20.47,
+        noise_floor_dbfs=-39.4,
+        snr_db=18.93,
+        peak_dbfs=-12.44,
+        vad_voiced_ms=300,
+        candidate_duration_ms=300,
+        speech_duration_ms=300,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 14.6,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 3,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+        shadow_observations=[
+            SipVadShadowObservation(
+                active=True,
+                started=True,
+                ended=False,
+                duration_ms=720,
+                frame_duration_ms=20,
+                detector="webrtc_shadow",
+            ),
+        ],
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+
+
+def test_realtime_agent_runner_defers_compact_modulated_echo_guarded_local_only_sip_turn() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_compact_modulated_echo_guard"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = -24.74
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=2)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=False,
+        rms_dbfs=-20.44,
+        noise_floor_dbfs=-39.85,
+        snr_db=19.41,
+        peak_dbfs=-12.12,
+        vad_voiced_ms=260,
+        candidate_duration_ms=260,
+        speech_duration_ms=260,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="speech_active_below_candidate_duration",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 19.41,
+        "rmsRangeDb": 10.69,
+        "rmsDirectionChanges": 5,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "compact_modulated_micro_confirmed"
+    )
+    assert decision.extra_payload["sipEchoGuardedTurnVoicedMs"] == 260
+    assert decision.extra_payload["sipEchoGuardedTurnRmsRangeDb"] == 10.69
+    assert decision.extra_payload["sipEchoGuardedTurnMaxSnrDb"] == 19.41
+
+
+def test_realtime_agent_runner_defers_marginal_high_noise_echo_guarded_turn() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_marginal_high_noise_echo_guarded_turn"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    guard = runner._playback_guard(call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = -17.29
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=30)
+    turn = PendingUserTurn(
+        sip_echo_guarded_turn_response_id=guard.current_response_id,
+        sip_echo_guarded_turn_generation=guard.generation,
+        sip_echo_guarded_turn_first_at=now - timedelta(milliseconds=882),
+        sip_echo_guarded_turn_last_at=now,
+        sip_echo_guarded_turn_burst_count=2,
+        sip_echo_guarded_turn_voiced_ms=480,
+        sip_echo_guarded_turn_min_rms_dbfs=-28.95,
+        sip_echo_guarded_turn_max_rms_dbfs=-21.95,
+        sip_echo_guarded_turn_max_snr_db=17.04,
+        sip_echo_guarded_turn_max_rms_range_db=7.0,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-21.95,
+        noise_floor_dbfs=-34.81,
+        snr_db=12.87,
+        peak_dbfs=-14.33,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 17.04,
+        "rmsRangeDb": 7.0,
+        "rmsDirectionChanges": 6,
+        "largeRmsJumpCount": 3,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_opening_echo_guarded_compact_local_micro_confirm() -> None:
+    registry = InMemorySessionRegistry()
+    provider = FakeRealtimeProvider([])
+    call_id = "call_sip_opening_echo_guarded_compact"
+    session = _sip_session(call_id)
+    session.effective_config["opening_message"] = "您好张总，请问现在方便吗？"
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=InMemoryEventStore(),
+    )
+    now = datetime.now(timezone.utc)
+
+    await runner.start(session)
+    await runner.start_opening(call_id)
+    runner._mark_response_started(call_id, {"response_id": "resp_opening"})
+    guard = runner._playback_guard(call_id)
+    guard.current_response_audio_published = True
+    runner._last_ai_audio_rms_dbfs[call_id] = -23.99
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=2)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=False,
+        rms_dbfs=-28.85,
+        noise_floor_dbfs=-48.0,
+        snr_db=19.15,
+        peak_dbfs=-20.81,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="speech_active_below_candidate_duration",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 21.86,
+        "rmsRangeDb": 7.65,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "compact_modulated_micro_confirmed"
+    )
+
+
+def test_realtime_agent_runner_defers_high_noise_echo_guarded_single_short_local_only_micro_confirm() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_high_noise_echo_guard_single_short"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = -19.86
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=29)
+    turn = PendingUserTurn(sip_single_short_pre_stop_evidence=True)
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=False,
+        rms_dbfs=-21.11,
+        noise_floor_dbfs=-36.63,
+        snr_db=15.52,
+        peak_dbfs=-11.31,
+        vad_voiced_ms=280,
+        candidate_duration_ms=280,
+        speech_duration_ms=280,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="speech_active_below_candidate_duration",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 21.22,
+        "rmsRangeDb": 6.69,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "single_short_micro_confirmed"
+    )
+    assert decision.extra_payload["sipEchoGuardedTurnVoicedMs"] == 280
+    assert decision.extra_payload["sipEchoGuardedTurnMaxSnrDb"] == 21.22
+
+
+def _decide_low_snr_echo_guarded_deferred_episode(
+    *,
+    current_noise_floor_dbfs: float | None = -35.63,
+    ai_rms_dbfs: float = -26.02,
+) -> Any:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_low_snr_echo_guard_deferred_episode"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._last_ai_audio_rms_dbfs[call_id] = ai_rms_dbfs
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=30)
+    turn = PendingUserTurn()
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.47,
+        noise_floor_dbfs=current_noise_floor_dbfs,
+        snr_db=16.16,
+        peak_dbfs=-12.5,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    current_observation = SipBargeInObservation(
+        active=True,
+        candidate=False,
+        rms_dbfs=-20.08,
+        noise_floor_dbfs=current_noise_floor_dbfs,
+        snr_db=15.55,
+        peak_dbfs=-10.92,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="speech_active_below_candidate_duration",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 16.16,
+        "rmsRangeDb": 7.67,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now - timedelta(milliseconds=1499),
+        observation=first_observation,
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=now,
+        observation=current_observation,
+    )
+
+    return runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=current_observation,
+    )
+
+
+def test_realtime_agent_runner_promotes_low_snr_echo_guarded_deferred_episode() -> None:
+    decision = _decide_low_snr_echo_guarded_deferred_episode()
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "echo_guarded_local_speech"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "deferred_episode_micro_confirmed"
+    )
+    assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 2
+    assert decision.extra_payload["sipDeferredEpisodeVoicedMs"] == 420
+    assert decision.extra_payload["sipDeferredEpisodeMaxSnrDb"] == 16.16
+
+
+def test_realtime_agent_runner_defers_echo_guarded_deferred_episode_without_noise_floor() -> None:
+    decision = _decide_low_snr_echo_guarded_deferred_episode(
+        current_noise_floor_dbfs=None,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "deferred_episode_micro_confirmed"
+    )
+    assert "sipAiPlaybackEchoGuardEscapedBy" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_echo_guarded_deferred_episode_when_uplink_near_ai() -> None:
+    decision = _decide_low_snr_echo_guarded_deferred_episode(ai_rms_dbfs=-22.0)
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipEchoGuardedLocalEvidence"] == (
+        "deferred_episode_micro_confirmed"
+    )
+    assert decision.extra_payload["sipUplinkAboveAiPlaybackDb"] < 3.0
+    assert "sipAiPlaybackEchoGuardEscapedBy" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_sparse_local_only_turn_cluster() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_sparse_local_only_turn_cluster"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id="resp_sparse_cluster",
+    )
+    turn = PendingUserTurn(
+        sip_turn_cluster_response_id="resp_sparse_cluster",
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=680),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=2,
+        sip_turn_cluster_voiced_ms=360,
+        sip_turn_cluster_max_snr_db=20.7,
+        sip_turn_cluster_max_rms_range_db=10.21,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-15.39,
+        noise_floor_dbfs=-36.09,
+        snr_db=20.7,
+        peak_dbfs=-9.84,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+
+
+def test_realtime_agent_runner_defers_continuous_non_speech_cluster_without_speech_like_quality() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_continuous_non_speech_cluster"
+    response_id = "resp_non_speech_cluster"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id, response_id=response_id)
+    turn = PendingUserTurn(
+        sip_turn_cluster_response_id=response_id,
+        sip_turn_cluster_first_at=now - timedelta(milliseconds=260),
+        sip_turn_cluster_last_at=now,
+        sip_turn_cluster_burst_count=2,
+        sip_turn_cluster_voiced_ms=360,
+        sip_turn_cluster_max_snr_db=26.0,
+        sip_turn_cluster_max_rms_range_db=12.0,
+    )
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-18.0,
+        noise_floor_dbfs=-39.0,
+        snr_db=21.0,
+        peak_dbfs=-8.0,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 12.0,
+        "rmsDirectionChanges": 6,
+        "largeRmsJumpCount": 4,
+        "speechQualityRejection": "non_speech_energy_envelope",
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_speech_like_continuity"
+    assert decision.extra_payload["speechQualityRejection"] == "non_speech_energy_envelope"
+
+
+def test_realtime_agent_runner_defers_mid_duration_local_only_speech_without_authority() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_mid_duration_local_only"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-15.17,
+        noise_floor_dbfs=-36.09,
+        snr_db=20.91,
+        peak_dbfs=-7.19,
+        vad_voiced_ms=440,
+        candidate_duration_ms=440,
+        speech_duration_ms=440,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+
+    class LocalOnlyDetector:
+        def has_single_short_pre_stop_local_speech(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def has_fast_pre_stop_local_speech(self, _call_id: str) -> bool:
+            return True
+
+        def has_pre_stop_local_speech(self, _call_id: str) -> bool:
+            return True
+
+        def latest_observation_payload(self, _call_id: str) -> dict[str, object]:
+            return {
+                "rmsRangeDb": 10.89,
+                "rmsDirectionChanges": 9,
+                "largeRmsJumpCount": 3,
+                "speechQualityRejection": None,
+            }
+
+    runner._sip_barge_in_detector = LocalOnlyDetector()
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+
+
+def test_realtime_agent_runner_defers_flat_elevated_noise_local_only_fast_speech_without_cross_evidence() -> None:
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    call_id = "call_sip_elevated_noise_local_only_fast_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-16.4,
+        noise_floor_dbfs=-35.2,
+        snr_db=18.8,
+        peak_dbfs=-8.5,
+        vad_voiced_ms=480,
+        candidate_duration_ms=480,
+        speech_duration_ms=480,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector(
+        {
+            "rmsRangeDb": 1.2,
+            "rmsDirectionChanges": 0,
+            "largeRmsJumpCount": 1,
+            "speechQualityRejection": None,
+        },
+        fast_local=True,
+        pre_stop_local=True,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_single_short_sip_burst_on_high_noise_floor() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 20 + [True] * 9 + [False] * 20),
+        call_id="call_sip_high_noise_floor_single_short_burst",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    fan_noise_frame = _pcm16_constant_frame(amplitude=490)
+    burst_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(20):
+            await runner.send_audio_frame(call_id, fan_noise_frame)
+        for frame in burst_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["noiseFloorDbfs"] > -38.0
+        assert deferred.payload["reason"] == "awaiting_pre_stop_authority"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_confirm_breath_like_sip_audio_from_provider_speech() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_breath_like_provider_speech_not_confirmed",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    breath_like_frames = _pcm16_constant_frames([1180] * 18)
+
+    try:
+        for frame in breath_like_frames:
+            await runner.send_audio_frame(call_id, frame)
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+        provider_event = ProviderEvent(type="user_transcript_done", payload={"transcript": "唉。"})
+        trust_decision = runner._decide_realtime_transcript_trust(call_id, provider_event)
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(
+                type=provider_event.type,
+                payload={**provider_event.payload, **trust_decision.as_payload()},
+            ),
+            datetime.now(timezone.utc),
+        )
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_candidate_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "user_transcript_semantic_rejected" in event_types
+        assert provider.cancelled_response_count == 0
+        assert provider.created_responses == []
+        assert publisher.stopped_call_ids == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_syllabic_sip_speech_across_short_gap() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 10 + [True] * 12),
+        call_id="call_sip_syllabic_short_gap_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    first_syllable_frame = _pcm16_constant_frame(amplitude=1200)
+    second_syllable_frames = _pcm16_constant_frames([
+        1700,
+        2200,
+        1900,
+        2600,
+        2100,
+        2800,
+        2300,
+        2500,
+        2000,
+        2400,
+        2100,
+        2300,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, first_syllable_frame)
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+        for frame in second_syllable_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert event_types.count("sip_interrupt_candidate") == 1
+        assert "sip_interrupt_candidate_expired" not in event_types
+        assert pre_stop.payload["sipTurnClusterBurstCount"] == 2
+        assert pre_stop.payload["sipTurnClusterVoicedMs"] >= 360
+        assert pre_stop.payload["sipTurnClusterRmsRangeDb"] >= 3.0
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_recovered_hot_onset_syllabic_sip_speech() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 10 + [True] * 12),
+        call_id="call_sip_recovered_hot_onset_syllabic_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    first_syllable_frames = _pcm16_constant_frames([11500] + [5850] * 8)
+    second_syllable_frames = _pcm16_constant_frames([
+        1800,
+        2500,
+        2100,
+        2900,
+        2300,
+        3100,
+        2400,
+        2800,
+        2200,
+        2600,
+        2300,
+        2500,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in first_syllable_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+        for frame in second_syllable_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        first_deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert first_deferred.payload["speechQualityRejection"] == "short_hot_onset_drop"
+        assert "sip_interrupt_candidate_expired" not in event_types
+        assert pre_stop.payload["speechQualityRejection"] is None
+        assert pre_stop.payload["candidateDurationMs"] >= 240
+        assert pre_stop.payload["sipTurnClusterBurstCount"] == 2
+        assert pre_stop.payload["sipTurnClusterVoicedMs"] >= 360
+        assert pre_stop.payload["sipTurnClusterRmsRangeDb"] >= 3.0
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_repeated_flat_breath_like_sip_bursts() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 10 + [True] * 9),
+        call_id="call_sip_repeated_flat_breath_like_bursts",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    breath_like_frame = _pcm16_constant_frame(amplitude=1180)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, breath_like_frame)
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(1.05)
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, breath_like_frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert event_types.count("sip_interrupt_candidate") == 2
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_180ms_sip_burst_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 20),
+        call_id="call_sip_180ms_burst",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    burst_frame = _pcm16_constant_frame(amplitude=6000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, burst_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["candidateClass"] == "stable_speech_candidate"
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["requiredPreStopDurationMs"] > 180
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_moderate_sip_speech_after_sustained_stable_turn_evidence() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 24),
+        call_id="call_sip_moderate_speech_stable_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1180,
+        1500,
+        1350,
+        1800,
+        1600,
+        2100,
+        1750,
+        2400,
+        2000,
+        2600,
+        2200,
+        2500,
+        2100,
+        2300,
+        1900,
+        2200,
+        2000,
+        2100,
+        2300,
+        2100,
+        2400,
+        2200,
+        2500,
+        2300,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert pre_stop.payload["candidateDurationMs"] >= 480
+        assert pre_stop.payload["vadVoicedMs"] >= 240
+        assert "wallClockSpeechMs" in pre_stop.payload
+        assert "maxVoicedFrameGapMs" in pre_stop.payload
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_clear_modulated_sip_short_turn_without_turn_authority() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 14 + [False] * 10),
+        call_id="call_sip_clear_modulated_short_turn",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    speech_frames = _pcm16_constant_frames([
+        1850,
+        2550,
+        3150,
+        3800,
+        4700,
+        5750,
+        5200,
+        5900,
+        5600,
+        6000,
+        5100,
+        4100,
+        3200,
+        2400,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.16)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_clear_louder_phone_speech_after_stable_turn_evidence() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18),
+        call_id="call_sip_clear_louder_phone_speech_stable_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3600,
+        5100,
+        4200,
+        5700,
+        4600,
+        6200,
+        5000,
+        5900,
+        4400,
+        5600,
+        4700,
+        6100,
+        5200,
+        5800,
+        4500,
+        5500,
+        4900,
+        6000,
+    ])
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert pre_stop.payload["candidateDurationMs"] >= 220
+        assert pre_stop.payload["speechQualityRejection"] is None
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_sip_tail_after_recent_provider_speech() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_post_speech_tail_guard",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    tail_frames = _pcm16_constant_frames([2330] * 9 + [1720] * 3)
+
+    try:
+        await runner._handle_user_speech_stopped(call_id, provider, datetime.now(timezone.utc))
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_after_user"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+
+        for frame in tail_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["reason"] == "awaiting_post_speech_tail_guard"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_expires_deferred_sip_candidate_before_next_response() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_deferred_candidate_next_response",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    tail_frames = [_pcm16_constant_frame(amplitude=3600) for _ in range(9)]
+
+    try:
+        runner._last_sip_provider_speech_stopped_at[call_id] = datetime.now(timezone.utc)
+        lifecycle = runner._response_lifecycle(call_id)
+        guard = runner._playback_guard(call_id)
+        lifecycle.active = False
+        guard.current_response_id = None
+        guard.current_response_audio_published = False
+
+        for frame in tail_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        runner._mark_response_started(call_id, {"response_id": "resp_sip_next"})
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = True
+        runner._last_sip_provider_speech_stopped_at[call_id] = (
+            datetime.now(timezone.utc) - timedelta(seconds=2)
+        )
+
+        for frame in tail_frames * 2:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        expired = next(event for event in events if event.type == "sip_interrupt_candidate_expired")
+        assert "sip_interrupt_candidate" in event_types
+        assert expired.payload["reason"] == "candidate_response_mismatch"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_hot_cough_like_sip_burst_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12 + [False] * 20),
+        call_id="call_sip_hot_cough_like_burst",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    frames = _pcm16_constant_frames([11500] * 9 + [5850] * 3 + [50] * 4)
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_short_loud_non_turn_tail_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 11 + [False] * 20),
+        call_id="call_sip_short_loud_non_turn_tail",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+    )
+    frames = _pcm16_constant_frames([7300] * 9 + [5200] * 2 + [50] * 4)
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.12)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_short_hot_onset_tail_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 14),
+        call_id="call_sip_short_hot_onset_tail",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    frames = _pcm16_constant_frames([11500] + [5850] * 12)
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["speechQualityRejection"] == "short_hot_onset_drop"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_clipped_hot_sip_burst_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 13),
+        call_id="call_sip_clipped_hot_burst",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    clipped_frame = _pcm16_constant_frame(amplitude=30000)
+
+    try:
+        for _ in range(13):
+            await runner.send_audio_frame(call_id, clipped_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["speechQualityRejection"] == "clipped_hot_onset"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_allows_continued_hot_onset_sip_speech() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 24),
+        call_id="call_sip_continued_hot_onset_speech",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    frames = _pcm16_constant_frames([
+        11500,
+        8200,
+        6200,
+        7000,
+        5600,
+        7600,
+        6100,
+        7200,
+        5800,
+        6900,
+        5400,
+        7300,
+        5900,
+        7100,
+        5600,
+        6800,
+        6200,
+        7000,
+    ])
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_pre_stop" in event_types
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_stale_deferred_sip_candidate_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_stale_deferred_candidate",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    burst_frame = _pcm16_constant_frame(amplitude=6000)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, burst_frame)
+
+        await asyncio.sleep(1.15)
+
+        for _ in range(3):
+            await runner.send_audio_frame(call_id, burst_frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert "sip_interrupt_candidate" in event_types
+        assert deferred.payload["reason"] == "awaiting_pre_stop_authority"
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_modulated_two_burst_deferred_sip_episode() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 10 + [True] * 9),
+        call_id="call_sip_modulated_two_burst_deferred_episode",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    first_burst = _pcm16_constant_frames([
+        900,
+        1100,
+        1300,
+        1550,
+        1800,
+        2100,
+        2350,
+        2600,
+        2900,
+    ])
+    second_burst = _pcm16_constant_frames([
+        1900,
+        2300,
+        2700,
+        3200,
+        3700,
+        4200,
+        4700,
+        5200,
+        5700,
+    ])
+
+    try:
+        for frame in first_burst:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(10):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(1.05)
+        for frame in second_burst:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert event_types.count("sip_interrupt_candidate") == 2
+        assert event_types.count("sip_interrupt_candidate_expired") == 1
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == "deferred_speech_episode"
+        assert pre_stop.payload["sipDeferredEpisodeBurstCount"] == 2
+        assert pre_stop.payload["sipDeferredEpisodeVoicedMs"] >= 360
+        assert pre_stop.payload["sipDeferredEpisodeRmsRangeDb"] >= 4.0
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_repeated_deferred_sip_speech_episode() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 4 + [True] * 9 + [False] * 4 + [True] * 9),
+        call_id="call_sip_repeated_deferred_speech_episode",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    speech_bursts = [
+        _pcm16_constant_frames([1280, 1480, 1360, 1720, 1510, 1880, 1660, 2050, 1820]),
+        _pcm16_constant_frames([2240, 2840, 2510, 3180, 2690, 3420, 2950, 3660, 3130]),
+        _pcm16_constant_frames([2460, 3320, 2810, 3920, 3190, 4300, 3560, 4660, 3810]),
+    ]
+
+    try:
+        for index, burst in enumerate(speech_bursts):
+            for frame in burst:
+                await runner.send_audio_frame(call_id, frame)
+            if index < len(speech_bursts) - 1:
+                for _ in range(4):
+                    await runner.send_audio_frame(call_id, quiet_frame)
+                await asyncio.sleep(1.08)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert event_types.count("sip_interrupt_candidate") == 3
+        assert event_types.count("sip_interrupt_candidate_expired") == 2
+        assert event_types.count("sip_pre_stop_deferred") >= 2
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == "deferred_speech_episode"
+        assert pre_stop.payload["sipDeferredEpisodeBurstCount"] >= 3
+        assert pre_stop.payload["sipDeferredEpisodeVoicedMs"] >= 540
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_repeated_episode_under_recent_ai_audio() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 4 + [True] * 9 + [False] * 4 + [True] * 9),
+        call_id="call_sip_repeated_deferred_episode_recent_ai_audio",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=4800, sample_rate_hz=24000, duration_ms=40)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    speech_bursts = [
+        _pcm16_constant_frames([1280, 1480, 1360, 1720, 1510, 1880, 1660, 2050, 1820]),
+        _pcm16_constant_frames([2240, 2840, 2510, 3180, 2690, 3420, 2950, 3660, 3130]),
+        _pcm16_constant_frames([2460, 3320, 2810, 3920, 3190, 4300, 3560, 4660, 3810]),
+    ]
+
+    try:
+        for index, burst in enumerate(speech_bursts):
+            await runner._publish_model_audio_delta(
+                call_id,
+                ProviderEvent(
+                    type="model_audio_delta",
+                    payload={
+                        "response_id": "resp_sip_opening",
+                        "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                    },
+                ),
+            )
+            for frame in burst:
+                await runner.send_audio_frame(call_id, frame)
+            if index < len(speech_bursts) - 1:
+                for _ in range(4):
+                    await runner.send_audio_frame(call_id, quiet_frame)
+                await asyncio.sleep(1.08)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert event_types.count("sip_interrupt_candidate") == 3
+        assert "sip_ai_playback_echo_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "response_generation_invalidated" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_pre_stops_sparse_deferred_turn_across_echo_guard() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 9 + [False] * 4 + [True] * 9 + [False] * 4 + [True] * 9),
+        call_id="call_sip_sparse_deferred_turn_echo_guard_pre_stop",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=4800, sample_rate_hz=24000, duration_ms=40)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    speech_bursts = [
+        _pcm16_constant_frames([2240, 2840, 2510, 3180, 2690, 3420, 2950, 3660, 3130]),
+        _pcm16_constant_frames([2460, 3320, 2810, 3920, 3190, 4300, 3560, 4660, 3810]),
+        _pcm16_constant_frames([2460, 3320, 2810, 3920, 3190, 4300, 3560, 4660, 3810]),
+    ]
+
+    try:
+        for index, burst in enumerate(speech_bursts):
+            await runner._publish_model_audio_delta(
+                call_id,
+                ProviderEvent(
+                    type="model_audio_delta",
+                    payload={
+                        "response_id": "resp_sip_opening",
+                        "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                    },
+                ),
+            )
+            for frame in burst:
+                await runner.send_audio_frame(call_id, frame)
+            if index < len(speech_bursts) - 1:
+                for _ in range(4):
+                    await runner.send_audio_frame(call_id, quiet_frame)
+                await asyncio.sleep(1.65)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+        assert event_types.count("sip_interrupt_candidate") == 3
+        assert event_types.count("sip_interrupt_candidate_expired") == 2
+        assert "sip_ai_playback_echo_deferred" in event_types
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] in {
+            "deferred_speech_episode",
+            "deferred_multi_candidate_turn",
+        }
+        assert pre_stop.payload["sipDeferredEpisodeBurstCount"] >= 3
+        assert pre_stop.payload["sipDeferredEpisodeWallMs"] >= 3000
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_promotes_repeated_echo_guarded_sip_turn_on_same_response() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 12 + [True] * 9 + [False] * 4 + [True] * 12),
+        call_id="call_sip_repeated_echo_guarded_turn",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        hold_timeout_seconds=0.06,
+        recovery_silence_ms=20,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=5200, sample_rate_hz=24000, duration_ms=40)
+    noise_floor_frame = _pcm16_constant_frame(amplitude=520)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    first_burst = _pcm16_constant_frames([1480, 1840, 1650, 2110, 1760, 2320, 1880, 2480, 2030])
+    second_burst = _pcm16_constant_frames([
+        1680,
+        2280,
+        1910,
+        2710,
+        2140,
+        3050,
+        2390,
+        3380,
+        2630,
+        3620,
+        2860,
+        3860,
+    ])
+
+    try:
+        for _ in range(12):
+            runner._sip_barge_in_detector.observe(
+                call_id,
+                noise_floor_frame,
+                now=datetime.now(timezone.utc),
+                interruptible=False,
+            )
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+        for frame in first_burst:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.45)
+
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+        for frame in second_burst:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
+
+        assert event_types.count("sip_interrupt_candidate") >= 2
+        assert "sip_ai_playback_echo_deferred" in event_types
+        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == "echo_guarded_turn_evidence"
+        assert pre_stop.payload["candidateDurationMs"] >= 240
+        assert pre_stop.payload["sipEchoGuardedTurnBurstCount"] >= 2
+        assert pre_stop.payload["sipEchoGuardedTurnVoicedMs"] >= 420
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_echo_guarded_sip_micro_confirmed_local_only_turn() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([False] * 12 + [True] * 14),
+        call_id="call_sip_echo_guarded_micro_confirmed_turn",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    ai_frame = _pcm16_constant_frame(amplitude=5200, sample_rate_hz=24000, duration_ms=40)
+    noise_floor_frame = _pcm16_constant_frame(amplitude=400)
+    speech_frames = _pcm16_constant_frames([
+        6100,
+        7600,
+        6900,
+        8400,
+        7200,
+        9100,
+        7800,
+        6600,
+        5200,
+        3000,
+        2400,
+        1900,
+        1700,
+        1600,
+    ])
+
+    try:
+        for _ in range(12):
+            runner._sip_barge_in_detector.observe(
+                call_id,
+                noise_floor_frame,
+                now=datetime.now(timezone.utc),
+                interruptible=False,
+            )
+        await runner._publish_model_audio_delta(
+            call_id,
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_sip_opening",
+                    "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+                },
+            ),
+        )
+
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_ai_playback_echo_deferred")
+
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_ai_playback_echo_deferred" in event_types
+        assert "sip_interrupt_candidate_expired" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert deferred.payload["candidateDurationMs"] >= 240
+        assert deferred.payload["candidateDurationMs"] <= 320
+        assert deferred.payload["reason"] == "awaiting_ai_playback_echo_guard"
+        assert deferred.payload["sipEchoGuardedTurnBurstCount"] == 1
+        assert deferred.payload["sipEchoGuardedTurnVoicedMs"] >= 240
+        assert deferred.payload["sipEchoGuardedTurnRmsRangeDb"] >= 6.0
+        assert deferred.payload["sipEchoGuardedTurnMaxSnrDb"] >= 20.0
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_expires_stale_deferred_sip_candidate_before_fresh_candidate() -> None:
+    runner, _registry, store, _provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_stale_deferred_fresh_candidate",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    burst_frame = _pcm16_constant_frame(amplitude=6000)
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    fresh_speech_frames = _pcm16_constant_frames([
+        3200,
+        5200,
+        3900,
+        6100,
+        4400,
+        5700,
+        4700,
+        6200,
+        4100,
+        5900,
+        4500,
+        5600,
+        4800,
+        6000,
+        4300,
+        5500,
+        5000,
+        5800,
+        4600,
+        6200,
+        4900,
+        5900,
+        5100,
+        6100,
+    ])
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, burst_frame)
+        for _ in range(3):
+            await runner.send_audio_frame(call_id, quiet_frame)
+
+        await asyncio.sleep(1.15)
+
+        for frame in fresh_speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        candidate_indexes = [
+            index
+            for index, event_type in enumerate(event_types)
+            if event_type == "sip_interrupt_candidate"
+        ]
+        assert len(candidate_indexes) == 2
+        assert event_types.index("sip_interrupt_candidate_expired") < candidate_indexes[1]
+        assert candidate_indexes[1] < event_types.index("sip_pre_stop")
+        assert publisher.stopped_call_ids == [call_id]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_allows_fresh_sip_candidate_after_hold_expiry() -> None:
+    runner, _registry, store, _provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_hold_expiry_fresh_candidate",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        hold_timeout_seconds=0.05,
+        recovery_silence_ms=20,
+    )
+    flat_frame = _pcm16_constant_frame(amplitude=4500)
+    fresh_speech_frames = _pcm16_constant_frames([
+        3200,
+        5200,
+        3900,
+        6100,
+        4400,
+        5700,
+        4700,
+        6200,
+        4100,
+        5900,
+        4500,
+        5600,
+        4800,
+        6000,
+        4300,
+        5500,
+        5000,
+        5800,
+        4600,
+        6200,
+        4900,
+        5900,
+        5100,
+        6100,
+    ])
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, flat_frame)
+
+        for _ in range(20):
+            if any(event.type == "sip_interrupt_candidate_expired" for event in store.list(call_id)):
+                break
+            await asyncio.sleep(0.01)
+
+        assert [event.type for event in store.list(call_id)].count("sip_interrupt_candidate") == 1
+        assert "sip_interrupt_candidate_expired" in [event.type for event in store.list(call_id)]
+
+        for frame in fresh_speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        candidate_indexes = [
+            index
+            for index, event_type in enumerate(event_types)
+            if event_type == "sip_interrupt_candidate"
+        ]
+        assert len(candidate_indexes) == 2
+        assert event_types.index("sip_interrupt_candidate_expired") < candidate_indexes[1]
+        assert candidate_indexes[1] < event_types.index("sip_pre_stop")
+        assert publisher.stopped_call_ids == [call_id]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_holds_unstable_sip_envelope_before_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_unstable_cough_tail",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    frames = _pcm16_constant_frames([2400] * 9 + [7700] * 3 + [1260] * 16)
+
+    try:
+        for frame in frames:
+            await runner.send_audio_frame(call_id, frame)
+        await asyncio.sleep(0.14)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_suppresses_cough_like_hot_burst_with_voiced_tail() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 30),
+        call_id="call_sip_cough_like_burst",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        short_speech_min_duration_ms=120,
+        recovery_silence_ms=20,
+    )
+    burst_frame = _pcm16_constant_frame(amplitude=24000)
+    voiced_tail_frame = _pcm16_constant_frame(amplitude=900)
+
+    try:
+        for _ in range(6):
+            await runner.send_audio_frame(call_id, burst_frame)
+        for _ in range(15):
+            await runner.send_audio_frame(call_id, voiced_tail_frame)
+        await asyncio.sleep(0.14)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" not in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
+        assert "sip_recovery_started" not in event_types
+        assert provider.cancelled_response_count == 0
+        assert provider.created_responses == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_max_hold_does_not_confirm_on_vad_without_snr() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 40),
+        call_id="call_sip_max_hold",
+        clean_window_ms=200,
+        max_hold_ms=60,
+        snr_threshold_db=25.0,
+    )
+    high_snr_frame = _pcm16_constant_frame(amplitude=4000)
+    low_snr_frame = _pcm16_constant_frame(amplitude=900)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, high_snr_frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, low_snr_frame)
+        await asyncio.sleep(0.08)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_rejected" in event_types
+        assert "sip_interrupt_confirmed" not in event_types
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_starts_one_short_recovery_after_sip_rejected() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18 + [False] * 40),
+        call_id="call_sip_recovery",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+        recovery_max_per_turn=1,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_rejected" in event_types
+        assert "sip_recovery_started" in event_types
+        assert provider.created_responses == []
+
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_done",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_opening", "status": "cancelled"}},
+        )
+
+        assert provider.created_responses
+        recovery_input = provider.created_responses[0]
+        assert recovery_input is not None
+        assert "一句简短自然" in recovery_input
+        assert "不要重复整段内容" in recovery_input
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_uses_short_reask_for_sip_confirmed_without_transcript() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_confirmed_without_transcript_recovery",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+        recovery_max_per_turn=1,
+    )
+
+    try:
+        turn = runner._pending_turn(call_id)
+        turn.sip_barge_in_confirmed = True
+        turn.sip_barge_in_confirmed_by = "sip_clean_window"
+        turn.response_requested = False
+        runner._response_lifecycle(call_id).active = True
+
+        await runner._complete_response_and_flush_pending(call_id, provider)
+
+        events = store.list(call_id)
+        recovery = next(event for event in events if event.type == "sip_recovery_started")
+        assert recovery.payload["reason"] == "sip_confirmed_without_transcript"
+        assert provider.created_responses
+        recovery_input = provider.created_responses[0]
+        assert recovery_input is not None
+        assert "一句简短自然" in recovery_input
+        assert "不要重复整段内容" in recovery_input
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_sip_tail_noise_on_same_response_without_pre_stop() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 14 + [False] * 4 + [True] * 9),
+        call_id="call_sip_rejected_same_response_tail",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=10_000,
+        recovery_max_per_turn=1,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    tail_frame = _pcm16_constant_frame(amplitude=1300)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        assert [event.type for event in store.list(call_id)].count("sip_pre_stop") == 0
+        assert "sip_pre_stop_deferred" in [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_rejected" not in [event.type for event in store.list(call_id)]
+
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, tail_frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert event_types.count("sip_pre_stop") == 0
+        assert event_types.count("response_generation_invalidated") == 0
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_allows_new_sip_candidate_after_rejected_recovery() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18 + [False] * 4 + [True] * 22 + [False] * 10),
+        call_id="call_sip_rejected_then_new_candidate",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+        recovery_max_per_turn=1,
+    )
+    first_speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+    second_speech_frames = _pcm16_constant_frames([
+        3300,
+        5200,
+        4000,
+        6100,
+        4500,
+        5700,
+        4800,
+        6200,
+        4200,
+        5900,
+        4600,
+        5600,
+        4900,
+        6000,
+        4400,
+        5500,
+        5100,
+        5800,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+    ai_frame = _pcm16_constant_frame(amplitude=1000, sample_rate_hz=24000, duration_ms=40)
+
+    try:
+        for frame in first_speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        assert [event.type for event in store.list(call_id)].count("sip_pre_stop") == 1
+
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_done",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_opening", "status": "completed"}},
+        )
+        runner._response_lifecycle(call_id).response_generation = (
+            runner._playback_guard(call_id).generation
+        )
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_started",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_recovery", "status": "in_progress"}},
+        )
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_audio_delta",
+            datetime.now(timezone.utc),
+            {
+                "response_id": "resp_sip_recovery",
+                "delta": base64.b64encode(ai_frame.data).decode("ascii"),
+            },
+        )
+        runner._playback_guard(call_id).current_response_audio_published = True
+
+        for frame in second_speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert event_types.count("sip_interrupt_candidate") == 2
+        assert event_types.count("sip_pre_stop") == 2
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_defers_provider_speech_after_weak_local_noise_defer() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 14 + [False] * 20),
+        call_id="call_sip_rejected_provider_speech_not_confirmed",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=10_000,
+        recovery_max_per_turn=1,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_pre_stop" not in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_interrupt_rejected" not in event_types
+
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        assert "sip_interrupt_candidate_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert "sip_provider_speech_started_deferred" in event_types
+        assert event_types.count("response_generation_invalidated") == 0
+        assert publisher.stopped_call_ids == []
+        assert provider.cancelled_response_count == 0
     finally:
         await runner.stop(call_id)
 
@@ -6462,6 +13751,154 @@ async def test_realtime_agent_runner_hard_stops_sip_candidate_after_provider_spe
         assert "playout_queue_flushed" in event_types
         assert "interrupt_audio_stop_completed" in event_types
         assert "interrupt_confirmed" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_does_not_confirm_weak_sip_candidate_from_provider_speech() -> None:
+    runner, _registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_weak_provider_speech_not_confirmed",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    weak_flat_frame = _pcm16_constant_frame(amplitude=1050)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, weak_flat_frame)
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate" in event_types
+        assert "sip_interrupt_candidate_confirmed" not in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert provider.cancelled_response_count == 0
+        assert publisher.stopped_call_ids == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_rejects_short_non_turn_sip_transcript() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 16),
+        call_id="call_sip_short_non_turn_transcript",
+        clean_window_ms=40,
+        max_hold_ms=100,
+        recovery_silence_ms=20,
+    )
+    hot_frame = _pcm16_constant_frame(amplitude=16000)
+
+    try:
+        for _ in range(12):
+            await runner.send_audio_frame(call_id, hot_frame)
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+
+        provider_event = ProviderEvent(type="user_transcript_done", payload={"transcript": "唉。"})
+        trust_decision = runner._decide_realtime_transcript_trust(call_id, provider_event)
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(
+                type=provider_event.type,
+                payload={**provider_event.payload, **trust_decision.as_payload()},
+            ),
+            datetime.now(timezone.utc),
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert trust_decision.commit_decision == "candidate"
+        assert "user_transcript_semantic_rejected" in event_types
+        assert "interrupt_confirmed" not in event_types
+        assert provider.created_responses == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_trusts_short_transcript_after_sip_confirmed() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 20),
+        call_id="call_sip_confirmed_short_transcript",
+        clean_window_ms=40,
+        max_hold_ms=100,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=8000)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, speech_frame)
+        turn = runner._pending_turn(call_id)
+        runner._confirm_sip_barge_in(
+            call_id,
+            turn,
+            confirmed_by="provider_speech_started",
+            reason="user_speech_started_during_ai_audio",
+        )
+
+        provider_event = ProviderEvent(type="user_transcript_done", payload={"transcript": "行。"})
+        trust_decision = runner._decide_realtime_transcript_trust(call_id, provider_event)
+        trusted_payload = trust_decision.as_payload()
+
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(
+                type=provider_event.type,
+                payload={**provider_event.payload, **trusted_payload},
+            ),
+            datetime.now(timezone.utc),
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert trusted_payload["transcriptTrust"] == "trusted"
+        assert trusted_payload["commitDecision"] == "commit"
+        assert "sip_interrupt_candidate_confirmed" in event_types
+        assert "user_transcript_semantic_rejected" not in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_confirms_sip_transcript_with_active_response_before_audio() -> None:
+    runner, registry, store, provider, publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 12),
+        call_id="call_sip_transcript_active_response_before_audio",
+        clean_window_ms=40,
+        max_hold_ms=100,
+    )
+    speech_frame = _pcm16_constant_frame(amplitude=4500)
+
+    try:
+        for _ in range(9):
+            await runner.send_audio_frame(call_id, speech_frame)
+
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        runner._response_lifecycle(call_id).active = True
+        runner._playback_guard(call_id).current_response_audio_published = False
+
+        provider_event = ProviderEvent(type="user_transcript_done", payload={"transcript": "说话呀。"})
+        trust_decision = runner._decide_realtime_transcript_trust(call_id, provider_event)
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(
+                type=provider_event.type,
+                payload={**provider_event.payload, **trust_decision.as_payload()},
+            ),
+            datetime.now(timezone.utc),
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_candidate_confirmed" in event_types
+        assert "interrupt_confirmed" in event_types
+        assert "session_failed" not in event_types
+        assert registry.get(call_id).status == CallSessionStatus.USER_SPEAKING
+        assert publisher.stopped_call_ids == [call_id]
+        assert provider.cancelled_response_count == 1
     finally:
         await runner.stop(call_id)
 
