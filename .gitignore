@@ -86,11 +86,13 @@ devops/nginx/ssl
 deploy/livekit-egress/livekit.yaml
 deploy/livekit-egress/egress.yaml
 deploy/livekit-egress/sip.yaml
+deploy/livekit-egress/livekit.*.local.yaml
+deploy/livekit-egress/egress.*.local.yaml
+deploy/livekit-egress/sip.*.local.yaml
 
 # Local planning and temporary test files
 /agent.md
 /crud.md
-/AGENTS.md
 /docs/superpowers/
 # 本次占位符替换与盖章演示相关文件
 /scripts/demo_word_render_and_seal.py

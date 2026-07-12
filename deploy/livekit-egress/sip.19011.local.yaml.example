@@ -1,0 +1,13 @@
+api_key: CHANGE_ME_LIVEKIT_API_KEY
+api_secret: CHANGE_ME_LIVEKIT_API_SECRET
+ws_url: ws://livekit-19011:7880
+
+redis:
+  address: redis-19011:6379
+
+sip_port: 15180
+rtp_port: 18384-18484
+use_external_ip: false
+
+logging:
+  level: debug

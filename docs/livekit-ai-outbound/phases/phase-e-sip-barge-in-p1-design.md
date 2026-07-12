@@ -82,6 +82,7 @@ SIP 上行音频
 -> 输入隔离，只处理 sip-{call_id} 客户轨
 -> RMS/SNR + impulse noise guard + WebRTC VAD + 持续时间
 -> sip_interrupt_candidate
+-> pre-stop authority 判断
 -> sip_pre_stop，立即 stop_audio
 -> generation gate，阻止旧 AI 音频迟到播放
 -> clean window，默认 300ms
@@ -138,17 +139,23 @@ AI 正在播放
 
 pre-stop 前必须先做冲击噪声过滤。拍手、敲桌、碰麦通常表现为瞬时 peak 很高、持续很短、后续快速回到底噪、VAD 不连续。满足这类特征时，记录 `ignored_impulse_noise` 诊断，不触发 pre-stop。
 
-P1 需要保护“停”“别说了”“不用”等强短句。强短句可能在 clean window 内已经结束，不能仅因为 pre-stop 后很快安静就判定为回声或噪声。
+P1 需要保护“停”“别说了”“不用”等强短句。保护方式不是匹配关键词，而是当本地 SIP 声学证据或 provider speech_started 已经确认这是客户人声后，允许后续短文本通过 transcript trust；不能因为文本只有一两个字且与 AI 音频重叠，就一律判成低可信噪声。
+
+强短句保护不能等同于“所有高能量短声”。默认配置下，120ms 左右的短强声只作为观察证据，不能直接拿到 pre-stop 权限；需要继续到更稳定的本地人声窗口，或被 provider speech_started 佐证后，才进入强打断链路。若出现“过热爆发后能量快速掉到弱尾音”的形态，更接近咳嗽/碰麦/冲击尾音，应先暂缓 pre-stop；如果后续继续形成稳定人声，再升级为 pre-stop，如果很快静音则自然重置，避免先 pre-stop 再 rejected 的听感抖动。
+
+削顶/过热短声不能立刻拿到 pre-stop 权限。若短窗口内 peak 贴近 0 dBFS，且 RMS 明显过高，即使 WebRTC VAD 连续命中，也更可能是喷麦、近场咳嗽或碰麦冲击；P1 应把这种 `clipped_hot_onset` 作为本地语音质量拒绝证据先暂缓 pre-stop。若后续持续形成稳定 VAD + SNR，且最新 peak/RMS 已回到非削顶人声范围，可释放该拒绝证据，避免把电话里常见的响亮短句永久锁死。
+
+连续拍手、咳嗽串和碰麦摩擦不能只靠总时长判断。P1 在 candidate 前需要观察帧级能量包络：如果短窗口内 RMS 范围过大、相邻帧跳变频繁、能量方向多次反复反转，更接近冲击/节律噪声，应压制到静音重置；普通电话短句允许有音节起伏，不能因为 1-2 次 RMS 跳变就吞掉 candidate。平滑连续的人声短句才允许进入 `strong_short_speech_candidate`，持续稳定的人声再进入 `stable_speech_candidate`。pre-stop 之后的 clean window 也不能只看“还有 VAD”，如果能量包络呈现明显 rise-fall-tail，且尾部落到本轮最低能量附近，应判为本地语音质量证据不足，走 rejected。
 
 候选分类：
 
-1. `stable_speech_candidate`：稳定人声，进入 pre-stop + clean window。
-2. `strong_short_speech_candidate`：高置信短人声，进入 pre-stop，但 clean window 静音不直接 rejected。
+1. `stable_speech_candidate`：稳定人声候选；默认 180ms 先记录 candidate。若本地证据是中等音量、SNR 充足、包络平稳且不处在刚结束客户语音的尾音保护窗内，继续稳定到 micro-confirm 时长后进入 pre-stop；否则继续 deferred。
+2. `strong_short_speech_candidate`：高置信短人声，进入 pre-stop + protected hold；后续仍需要 provider speech_started、有效 transcript 或稳定本地人声证据确认，不能只靠“短且响”直接 confirmed。
 3. `impulse_noise`：冲击噪声，不 pre-stop。
 
 播放窗口边界：
 
-1. AI 正在播放时，candidate 达标才触发 pre-stop。
+1. AI 正在播放时，candidate 先进入本地候选；pre-stop authority 达标后才触发 pre-stop。
 2. AI 刚播放完但已无音频可停时，不触发 pre-stop，只进入 echo-tail 保护判断，避免把短尾音当成正式用户输入。
 3. AI 已安静超过 echo-tail 保护窗口后，按普通用户输入处理。
 
@@ -160,7 +167,8 @@ P1 需要保护“停”“别说了”“不用”等强短句。强短句可�
 | `snr_threshold_db` | `10` | 高过底噪的信噪比 |
 | `vad_voiced_duration_ms` | `120` | WebRTC VAD 连续人声时长 |
 | `candidate_min_duration_ms` | `180` | 候选总持续时长 |
-| `short_speech_min_duration_ms` | `120` | 强短句最小保护时长 |
+| `pre_stop_min_duration_ms` | `240` | `stable_speech_candidate` / `strong_short_speech_candidate` 拿到本地停播权限前的 micro-confirm 时长；180ms 只产生候选，不直接 pre-stop |
+| `short_speech_min_duration_ms` | `180` | 强短句最小保护时长；120ms 短强声只观察，不直接 pre-stop |
 | `impulse_noise_max_duration_ms` | `120` | 冲击噪声候选最大时长 |
 | `clean_window_ms` | `300` | pre-stop 后确认窗口 |
 | `max_hold_ms` | `500` | 确认窗口最大保护上限 |
@@ -172,7 +180,24 @@ P1 需要保护“停”“别说了”“不用”等强短句。强短句可�
 
 ## 8. Pre-stop 与 Generation Gate
 
-candidate 达标后，P1 统一执行 pre-stop，不做 duck：
+candidate 达标不等于马上停播。P1 把“发现候选”和“允许停播”拆开：
+
+```text
+sip_interrupt_candidate
+-> stable_speech_candidate 且 candidateDurationMs < pre_stop_min_duration_ms
+-> 即使已有清晰短句证据，也先 sip_pre_stop_deferred
+-> 后续继续稳定到 pre_stop_min_duration_ms 或形成 turn-taking 证据后 sip_pre_stop
+```
+
+默认 `candidate_min_duration_ms=180`、`pre_stop_min_duration_ms=240`。这样 180ms 左右的短声可以被记录为 candidate，但 single-short 证据本身不再等于停播授权：中等音量或清晰偏响、SNR 充足、未达到节律噪声包络阈值、非刚说完尾音窗口的本地人声，需要再经过约 60ms 本地 micro-confirm 才快速 pre-stop；短促强声、热起声回落、低能量边缘声和刚结束客户语音后的同源尾音仍继续 deferred。
+
+为避免“客户刚说完 -> AI 下一句开头 -> SIP 上行尾音/回声又触发 pre-stop”，P1 在 provider `user_speech_stopped` 后保留一个短 tail guard。tail guard 内的本地-only `stable_speech_candidate` 先 deferred；如果 provider speech_started 后续确认，仍可按 provider 确认链路立即强停。
+
+为避免“咳嗽/喷麦初段被识别为可疑 candidate，后续尾音又重新拿到 pre-stop 权限”，P1 对短热爆发的质量拒绝在同一有声段内保留到静音重置。短热爆发尾音只能继续 deferred，不能仅靠后续低幅稳定 VAD 升级为 pre-stop；如果热开头后持续形成稳定人声，且最新 peak/RMS 已恢复到非削顶范围，可在证据稳定后升级。
+
+deferred candidate 也需要有效期。若 candidate 曾因质量证据不足、tail guard 或 rejected_noise guard 被 deferred，超过短有效期后不能再用旧 candidate 升级 pre-stop；必须重新形成新鲜、连续、稳定的本地人声证据，避免低能量噪声在数秒后“补票”打断下一句 AI。
+
+拿到 pre-stop authority 后，P1 统一执行 pre-stop，不做 duck：
 
 ```text
 sip_interrupt_candidate
@@ -203,14 +228,14 @@ candidate 达标
 判断规则：
 
 1. clean window 内 VAD + SNR 仍稳定，判定 `confirmed`。
-2. pre-stop 前已是 `strong_short_speech_candidate` 时，即使 clean window 内声音很快消失，也不直接 rejected；先进入 confirmed，并等待 Qwen final transcript 证明用户语义。
+2. pre-stop 前已是 `strong_short_speech_candidate` 时，即使 clean window 内声音很快消失，也不立即 rejected；进入 protected hold，等待 provider speech_started、有效 final transcript 或稳定本地人声证据。超过 `max_hold_ms` 仍无可靠证据时 rejected。
 3. clean window 内声音很快消失，且 pre-stop 前不是强短句，判定 `rejected_echo_or_tail`。
 4. clean window 内只有短促、不稳定、非连续 VAD 声音，判定 `rejected_noise`。
 5. 超过 `max_hold_ms` 仍不确定时，必须同时满足稳定 VAD、SNR 和累计人声时长达标才 confirmed；否则 rejected。
 
 P1 不展示 clean window 阶段识别文本。
 
-## 10. Confirmed 处理
+## 10. 确认处理
 
 confirmed 表示系统确认“客户正在说话”，但不表示已经拿到最终文本。
 
@@ -226,7 +251,7 @@ confirmed 表示系统确认“客户正在说话”，但不表示已经拿到�
 
 Qwen `user_speech_started` 在 P1 中只作为对照事件，不再决定第一时间停播。
 
-## 11. Rejected 处理
+## 11. 拒绝处理
 
 rejected 表示系统认为本次 candidate 更像回声、尾音、短噪声或误触发。
 
@@ -248,7 +273,8 @@ rejected 表示系统认为本次 candidate 更像回声、尾音、短噪声或
 
 1. 同一轮最多自动续接 1 次。
 2. 连续 rejected 超过 2 次，不再自动续接，进入静默等待或降低敏感度。
-3. 短续接不应提“误触发”“系统判断”。
+3. rejected_noise 后，如果同一个 AI response 尚未切换，后续本地-only `stable_speech_candidate` 先视为同源尾音并 deferred，不能再次 pre-stop；provider speech_started 仍可强停。
+4. 短续接不应提“误触发”“系统判断”。
 
 ## 12. 字幕和正式文本
 
@@ -273,6 +299,7 @@ P1 最小事件：
 | --- | --- |
 | `sip_impulse_noise_ignored` | 高能量短促冲击声被 pre-stop 前过滤 |
 | `sip_interrupt_candidate` | 本地 RMS/SNR + WebRTC VAD 达标 |
+| `sip_pre_stop_deferred` | 候选已出现，但尚未达到本地停播授权时长 |
 | `sip_pre_stop` | 已执行 stop_audio / generation gate |
 | `sip_interrupt_confirmed` | clean window 确认为真人插话 |
 | `sip_interrupt_rejected` | clean window 判定回声/尾音/噪声 |
@@ -290,6 +317,7 @@ P1 最小事件：
   "snrDb": 12.5,
   "vadVoicedMs": 140,
   "candidateDurationMs": 180,
+  "requiredPreStopDurationMs": 240,
   "cleanWindowMs": 300,
   "candidateToStopMs": 120,
   "preStopToDecisionMs": 300,
@@ -310,6 +338,7 @@ AI_CALL_SIP_BARGE_IN_RMS_THRESHOLD_DBFS
 AI_CALL_SIP_BARGE_IN_SNR_THRESHOLD_DB
 AI_CALL_SIP_BARGE_IN_VAD_VOICED_DURATION_MS
 AI_CALL_SIP_BARGE_IN_CANDIDATE_MIN_DURATION_MS
+AI_CALL_SIP_BARGE_IN_PRE_STOP_MIN_DURATION_MS
 AI_CALL_SIP_BARGE_IN_SHORT_SPEECH_MIN_DURATION_MS
 AI_CALL_SIP_BARGE_IN_IMPULSE_NOISE_MAX_DURATION_MS
 AI_CALL_SIP_BARGE_IN_CLEAN_WINDOW_MS
@@ -329,11 +358,15 @@ Web 端先验证状态机，不证明真实 SIP 回声质量。
 
 验证内容：
 
-1. candidate 后能立即 pre-stop。
-2. generation gate 能阻止旧 AI 音频继续播放。
-3. confirmed 后能 cancel response。
-4. rejected 后不会展示客户文本。
-5. final transcript 仍按现有机制展示。
+1. 180ms 清晰调制短句只产生 candidate/deferred；继续稳定到 micro-confirm 时长后才可 pre-stop。
+2. 削顶/过热短声只产生 candidate/deferred，不直接 pre-stop；后续恢复成稳定人声后可释放拒绝。
+3. 普通电话短句允许有限 RMS 起伏，不能被节律噪声包络过早吞掉。
+4. deferred candidate 过期后不能在数秒后升级 pre-stop。
+5. 持续稳定人声达到 pre-stop 授权时长后能 pre-stop。
+6. generation gate 能阻止旧 AI 音频继续播放。
+7. confirmed 后能 cancel response。
+8. rejected 后不会展示客户文本。
+9. final transcript 仍按现有机制展示。
 
 ### 15.2 软电话验证
 

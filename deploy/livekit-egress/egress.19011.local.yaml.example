@@ -1,0 +1,10 @@
+log_level: info
+api_key: CHANGE_ME_LIVEKIT_API_KEY
+api_secret: CHANGE_ME_LIVEKIT_API_SECRET
+ws_url: ws://livekit-19011:7880
+insecure: true
+health_port: 8080
+enable_chrome_sandbox: false
+
+redis:
+  address: redis-19011:6379

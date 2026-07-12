@@ -1,0 +1,26 @@
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 51000
+  port_range_end: 51100
+  use_external_ip: false
+
+redis:
+  address: redis-19011:6379
+
+keys:
+  CHANGE_ME_LIVEKIT_API_KEY: CHANGE_ME_LIVEKIT_API_SECRET
+
+room:
+  auto_create: true
+
+webhook:
+  api_key: CHANGE_ME_LIVEKIT_API_KEY
+  urls:
+    - http://host.docker.internal:19011/ai-call/livekit-webhook
+
+logging:
+  level: info

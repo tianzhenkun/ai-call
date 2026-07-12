@@ -1,0 +1,73 @@
+services:
+  redis-19011:
+    image: redis:7-alpine
+    container_name: ai-call-19011-livekit-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      ai-call-livekit-shared:
+        aliases:
+          - redis-19011
+    volumes:
+      - redis-19011-data:/data
+
+  livekit-19011:
+    image: livekit/livekit-server:latest
+    container_name: ai-call-19011-livekit-server
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      NODE_IP: ${LIVEKIT_19011_NODE_IP:-127.0.0.1}
+    depends_on:
+      - redis-19011
+    networks:
+      ai-call-livekit-shared:
+        aliases:
+          - livekit-19011
+    ports:
+      - "${LIVEKIT_19011_HTTP_PORT:-7890}:7880"
+      - "${LIVEKIT_19011_RTC_TCP_PORT:-7891}:7881"
+      - "${LIVEKIT_19011_UDP_RANGE:-51000-51100}:51000-51100/udp"
+    volumes:
+      - ./livekit.19011.local.yaml:/etc/livekit.yaml:ro
+
+  egress-19011:
+    image: livekit/egress:latest
+    container_name: ai-call-19011-livekit-egress
+    depends_on:
+      - livekit-19011
+      - redis-19011
+    cap_add:
+      - SYS_ADMIN
+    shm_size: "1gb"
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
+    networks:
+      ai-call-livekit-shared:
+        aliases:
+          - egress-19011
+    volumes:
+      - ./egress.19011.local.yaml:/etc/egress.yaml:ro
+
+  livekit-sip-19011:
+    image: livekit/sip:latest
+    container_name: ai-call-19011-livekit-sip
+    depends_on:
+      - livekit-19011
+      - redis-19011
+    command: ["--config", "/etc/sip.yaml"]
+    networks:
+      ai-call-livekit-shared:
+        aliases:
+          - livekit-sip-19011
+    ports:
+      - "${SIP_19011_SIGNALING_PORT:-15180}:15180/udp"
+      - "${SIP_19011_RTP_RANGE:-18384-18484}:18384-18484/udp"
+    volumes:
+      - ./sip.19011.local.yaml:/etc/sip.yaml:ro
+
+networks:
+  ai-call-livekit-shared:
+    external: true
+    name: ${LIVEKIT_19011_DOCKER_NETWORK:-livekit-egress_default}
+
+volumes:
+  redis-19011-data:

@@ -39,3 +39,32 @@ docker logs ai-call-livekit-sip --tail 80
 5. Redis 只在 compose 内部网络暴露，不映射宿主机 `6379`，避免和本机已有 Redis 冲突。
 6. SIP signaling 端口和 RTP 端口范围必须能被 SIP trunk provider 从公网访问；只接通但单向无声时优先检查 SDP 公网地址、RTP 端口、安全组和供应商白名单。
 7. 当前模板服务镜像使用 `latest` 方便本地验证；生产环境应固定 LiveKit Server、Egress 和 SIP 镜像版本。
+
+## 19011 本地隔离栈
+
+当本机同时运行 `19011` 和 `19012` 两条 AI Call 调试线时，不要让两条线共用同一个 LiveKit Server webhook。`docker-compose.19011.yml` 提供 19011 专用 LiveKit / Redis / Egress / SIP service：
+
+- LiveKit HTTP: `7890 -> 7880`
+- LiveKit RTC TCP: `7891 -> 7881`
+- LiveKit RTC UDP: `51000-51100`
+- LiveKit SIP signaling: `15180`
+- LiveKit SIP RTP: `18384-18484`
+- LiveKit webhook: `http://host.docker.internal:19011/ai-call/livekit-webhook`
+
+本地配置文件仍然使用忽略文件，避免提交密钥：
+
+```bash
+cp deploy/livekit-egress/livekit.19011.local.yaml.example deploy/livekit-egress/livekit.19011.local.yaml
+cp deploy/livekit-egress/egress.19011.local.yaml.example deploy/livekit-egress/egress.19011.local.yaml
+cp deploy/livekit-egress/sip.19011.local.yaml.example deploy/livekit-egress/sip.19011.local.yaml
+```
+
+把三个 `.local.yaml` 里的 `CHANGE_ME_*` 改成 `env/.env.dev` 里 19011 使用的 LiveKit API Key / Secret 后启动：
+
+```bash
+docker compose -f deploy/livekit-egress/docker-compose.19011.yml up -d
+```
+
+当前本地 FreeSWITCH 容器已经接在 `livekit-egress_default` 网络上，所以 19011 隔离栈默认复用这个 Docker 网络，只隔离 LiveKit / Redis / Egress / SIP service 自身状态。这样 `freeswitch-local:5089` 仍可作为本地 SIP trunk 目标，同时不会把 19011 的 webhook 发到 19012。
+
+19011 P1 本地联调时，Linphone、FreeSWITCH、本地 SQLite、OSS active 配置和启动环境变量的当前基线见 `docs/livekit-ai-outbound/p1-local-test-baseline.md`。
