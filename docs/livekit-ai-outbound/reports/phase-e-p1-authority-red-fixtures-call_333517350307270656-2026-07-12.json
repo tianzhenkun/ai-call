@@ -1,0 +1,176 @@
+{
+  "description": "Authority regression fixture distilled from real Chinese audio replay for call_333517350307270656, utterance '别说了，挂了吧'. The audio replay produced a first stable candidate at 5220ms, then a second short stable burst at 6840-6880ms. The first candidate should remain echo-guarded, and the second burst should pre-stop once AI playout has clearly receded.",
+  "sourceAudio": {
+    "customerWavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333517350307270656_customer_56460_68460.wav",
+    "aiWavPath": "/private/tmp/ai_call_p1_real_zh_fixtures/call_333517350307270656_customer_56460_68460.ai.wav",
+    "speechStartMs": 1600,
+    "firstStableCandidateMs": 5220,
+    "utterance": "别说了，挂了吧"
+  },
+  "fixtureCoverageGates": {
+    "minSamples": 1,
+    "requiredSourceTypes": {
+      "authority_fixture": 1
+    },
+    "requiredCategories": {
+      "real_zh_echo_guarded_stop_command": 1
+    },
+    "requiredExpectations": {
+      "must_pre_stop_after_candidate": 1
+    }
+  },
+  "authorityFixtures": {
+    "fixture_call_333517_bieshuole_gualeba_echo_guarded_real_audio_authority": {
+      "startedAt": "2026-07-09T07:59:53.844Z",
+      "responseId": "resp_real_zh_call_333517_bieshuole_gualeba",
+      "generation": 0,
+      "playbackTarget": true,
+      "opening": false,
+      "observations": [
+        {
+          "offsetMs": 5220,
+          "recentAiAudio": {
+            "rmsDbfs": -16.14,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 14.18,
+              "rmsRangeDb": 3.76,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -25.61,
+            "noiseFloorDbfs": -36.34,
+            "snrDb": 10.73,
+            "peakDbfs": -16.59,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "real_audio_first_echo_guarded_stop_candidate"
+          }
+        },
+        {
+          "offsetMs": 6840,
+          "recentAiAudio": {
+            "rmsDbfs": -29.88,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.21,
+              "rmsRangeDb": 5.63,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -22.11,
+            "noiseFloorDbfs": -36.34,
+            "snrDb": 14.24,
+            "peakDbfs": -12.73,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "real_audio_second_stop_candidate"
+          }
+        },
+        {
+          "offsetMs": 6860,
+          "recentAiAudio": {
+            "rmsDbfs": -48.88,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.21,
+              "rmsRangeDb": 5.63,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": false,
+            "rmsDbfs": -21.9,
+            "noiseFloorDbfs": -36.34,
+            "snrDb": 14.44,
+            "peakDbfs": -12.26,
+            "vadVoicedMs": 200,
+            "candidateDurationMs": 200,
+            "speechDurationMs": 200,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "real_audio_second_stop_candidate_continued"
+          }
+        },
+        {
+          "offsetMs": 6880,
+          "recentAiAudio": {
+            "rmsDbfs": -55.26,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.21,
+              "rmsRangeDb": 5.63,
+              "rmsDirectionChanges": 3,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": false,
+            "rmsDbfs": -23.58,
+            "noiseFloorDbfs": -36.34,
+            "snrDb": 12.76,
+            "peakDbfs": -13.14,
+            "vadVoicedMs": 220,
+            "candidateDurationMs": 220,
+            "speechDurationMs": 220,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "real_audio_second_stop_candidate_tail"
+          }
+        }
+      ]
+    }
+  },
+  "samples": [
+    {
+      "id": "call_333517_bieshuole_gualeba_echo_guarded_real_audio_must_pre_stop_after_candidate",
+      "callId": "fixture_call_333517_bieshuole_gualeba_echo_guarded_real_audio_authority",
+      "sourceType": "authority_fixture",
+      "category": "real_zh_echo_guarded_stop_command",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-09T07:59:59.064Z",
+      "maxCandidateToPreStopMs": 1800
+    }
+  ]
+}

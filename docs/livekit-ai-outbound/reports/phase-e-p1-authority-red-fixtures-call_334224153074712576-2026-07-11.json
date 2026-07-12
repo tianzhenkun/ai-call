@@ -1,0 +1,140 @@
+{
+  "description": "Known-red authority fixture exported from call_334224153074712576. It isolates the authority-side failure after the first local SIP candidate for a real short customer command: candidate was already present, but authority only pre-stopped after a sparse multi-candidate episode roughly 8.5s later. Detector/raw-audio coverage for this same utterance is tracked separately in /tmp/ai_call_p1_audio_fixtures. This is not a keyword fixture; it fixes the evidence lifecycle shape for the next P1 authority model change.",
+  "fixtureCoverageGates": {
+    "minSamples": 1,
+    "requiredSourceTypes": {
+      "authority_fixture": 1
+    },
+    "requiredCategories": {
+      "short_command_candidate": 1
+    },
+    "requiredExpectations": {
+      "must_pre_stop_after_candidate": 1
+    }
+  },
+  "authorityFixtures": {
+    "fixture_call_334224_short_stop_slow_sparse_turn": {
+      "startedAt": "2026-07-11T06:47:53.818Z",
+      "responseId": "resp_HHz9JDGUxDa371RcSDUNW",
+      "generation": 0,
+      "playbackTarget": true,
+      "opening": false,
+      "observations": [
+        {
+          "offsetMs": 1005,
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 12.11,
+              "rmsRangeDb": 9.64,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -25.95,
+            "noiseFloorDbfs": -38.05,
+            "snrDb": 12.11,
+            "peakDbfs": -17.75,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "call_334224_stop_part_1"
+          }
+        },
+        {
+          "offsetMs": 4930,
+          "detector": {
+            "singleShort": true,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 20.22,
+              "rmsRangeDb": 7.29,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -17.62,
+            "noiseFloorDbfs": -37.84,
+            "snrDb": 20.22,
+            "peakDbfs": -7.99,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "call_334224_stop_part_2"
+          }
+        },
+        {
+          "offsetMs": 9520,
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 17.48,
+              "rmsRangeDb": 6.05,
+              "rmsDirectionChanges": 3,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -20.36,
+            "noiseFloorDbfs": -37.84,
+            "snrDb": 17.48,
+            "peakDbfs": -10.62,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "call_334224_stop_part_3"
+          }
+        }
+      ]
+    }
+  },
+  "samples": [
+    {
+      "id": "call_334224_short_stop_slow_sparse_turn_must_interrupt",
+      "callId": "fixture_call_334224_short_stop_slow_sparse_turn",
+      "sourceType": "authority_fixture",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-11T06:47:54.823Z",
+      "maxCandidateToPreStopMs": 600,
+      "utterance": {
+        "source": "offline_asr",
+        "text": "停。",
+        "callId": "call_334224153074712576"
+      },
+      "turnEvidence": {
+        "shape": "sparse_multi_short_command_with_slow_authority",
+        "candidateOffsetsMs": [1005, 4930, 9520],
+        "observedPreStopOffsetMs": 9520,
+        "observedFailure": "authority waited for a sparse multi-candidate episode after the first local candidate"
+      },
+      "acousticContext": {
+        "speechPattern": "short_command",
+        "recentAiPlayback": true,
+        "noiseFloorDbfs": -37.84
+      }
+    }
+  ]
+}

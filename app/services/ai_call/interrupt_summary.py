@@ -40,7 +40,11 @@ def build_interrupt_summary(call_id: str, events: list[dict[str, Any]]) -> dict[
                 browser_to_provider_samples.append(
                     _milliseconds_between(current_browser_started_at, event_time)
                 )
-        elif event_type in {"interrupt_confirmed", "sip_interrupt_candidate_confirmed"}:
+        elif event_type in {
+            "interrupt_confirmed",
+            "sip_interrupt_candidate_confirmed",
+            "sip_interrupt_confirmed",
+        }:
             if has_open_candidate:
                 confirmed_count += 1
                 has_open_candidate = False

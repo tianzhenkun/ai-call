@@ -1,0 +1,1501 @@
+{
+  "description": "Local P1 SIP barge-in sample matrix for the 19011 ed81 lane. The current samples are a seed set from July 2026 debugging, not a commercial-readiness corpus. coverageGates below are target gates: this file should fail coverage until it is expanded with non-user live calls, synthetic fixtures, and corpus noise mixes.",
+  "coverageGates": {
+    "minSamples": 60,
+    "requiredSourceTypes": {
+      "live_call": 20,
+      "synthetic": 20,
+      "corpus_noise_mix": 20
+    },
+    "requiredCategories": {
+      "near_end_speech": 8,
+      "short_command_candidate": 6,
+      "opening_noise": 6,
+      "opening_fan_noise": 6,
+      "midcall_fan_noise": 6,
+      "continuous_noise": 6,
+      "impulse_noise": 6,
+      "echo_guarded_near_end_speech": 6,
+      "clean_window": 4,
+      "call_end": 4
+    },
+    "requiredExpectations": {
+      "must_interrupt": 15,
+      "must_not_interrupt": 15,
+      "must_defer": 15,
+      "must_pre_stop_after_candidate": 10,
+      "must_resolve_after_candidate": 5
+    }
+  },
+  "fixtureCoverageGates": {
+    "minSamples": 22,
+    "requiredSourceTypes": {
+      "synthetic": 4,
+      "corpus_noise_mix": 1,
+      "authority_fixture": 17
+    },
+    "requiredCategories": {
+      "short_command_candidate": 4,
+      "continuous_noise": 1,
+      "opening_fan_noise": 2,
+      "impulse_noise": 1,
+      "opening_echo_guard": 1,
+      "sustained_near_end_speech": 1,
+      "sparse_short_phrase": 1,
+      "echo_guarded_near_end_speech": 2,
+      "near_end_speech": 1,
+      "short_ack_candidate": 1,
+      "midcall_fan_noise": 2,
+      "single_short_noise": 2,
+      "opening_noise": 2
+    },
+    "requiredExpectations": {
+      "must_interrupt": 4,
+      "must_defer": 10,
+      "must_not_interrupt": 1,
+      "must_pre_stop_after_candidate": 6
+    }
+  },
+  "audioFixtures": {
+    "fixture_synthetic_short_stop": {
+      "startedAt": "2026-07-10T09:00:00Z",
+      "sampleRateHz": 8000,
+      "frameMs": 20,
+      "pcmSegments": [
+        {
+          "durationMs": 400,
+          "amplitude": 3000
+        }
+      ],
+      "vadWindows": [
+        {
+          "startMs": 0,
+          "endMs": 400
+        }
+      ]
+    },
+    "fixture_corpus_continuous_noise": {
+      "startedAt": "2026-07-10T09:01:00Z",
+      "sampleRateHz": 8000,
+      "frameMs": 20,
+      "pcmSegments": [
+        {
+          "durationMs": 400,
+          "amplitude": 1000
+        }
+      ],
+      "vadWindows": [
+        {
+          "startMs": 0,
+          "endMs": 400
+        }
+      ]
+    },
+    "fixture_synthetic_modulated_short_stop": {
+      "startedAt": "2026-07-10T09:02:00Z",
+      "sampleRateHz": 8000,
+      "frameMs": 20,
+      "frameAmplitudes": [
+        3000,
+        3600,
+        2800,
+        4200,
+        3100,
+        3900,
+        3300,
+        4500,
+        3600,
+        4200,
+        3900,
+        3500
+      ],
+      "vadWindows": [
+        {
+          "startMs": 0,
+          "endMs": 240
+        }
+      ]
+    },
+    "fixture_synthetic_opening_fan_noise": {
+      "startedAt": "2026-07-10T09:03:00Z",
+      "sampleRateHz": 8000,
+      "frameMs": 20,
+      "frameAmplitudes": [
+        980,
+        1030,
+        990,
+        1010,
+        1005,
+        995,
+        1020,
+        985,
+        1000,
+        1015,
+        995,
+        1008,
+        1002,
+        992,
+        1012,
+        998,
+        1004,
+        990,
+        1006,
+        996
+      ],
+      "vadWindows": [
+        {
+          "startMs": 0,
+          "endMs": 400
+        }
+      ]
+    },
+    "fixture_synthetic_short_impulse_noise": {
+      "startedAt": "2026-07-10T09:04:00Z",
+      "sampleRateHz": 8000,
+      "frameMs": 20,
+      "frameAmplitudes": [
+        0,
+        16000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "vadWindows": [
+        {
+          "startMs": 20,
+          "endMs": 40
+        }
+      ]
+    }
+  },
+  "authorityFixtures": {
+    "fixture_authority_echo_local_only": {
+      "startedAt": "2026-07-11T10:00:00Z",
+      "decisionOffsetMs": 260,
+      "responseId": "resp_echo_guarded",
+      "generation": 3,
+      "playbackTarget": true,
+      "opening": false,
+      "recentAiAudio": {
+        "rmsDbfs": -22.0,
+        "ageMs": 20
+      },
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 18.5,
+          "rmsRangeDb": 7.0,
+          "rmsDirectionChanges": 1,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -20.5,
+        "noiseFloorDbfs": -40.0,
+        "snrDb": 18.5,
+        "peakDbfs": -12.0,
+        "vadVoicedMs": 260,
+        "candidateDurationMs": 260,
+        "speechDurationMs": 260,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_echo_guarded_local_only"
+      }
+    },
+    "fixture_authority_opening_stale_lifecycle_noise": {
+      "startedAt": "2026-07-11T02:54:10Z",
+      "decisionOffsetMs": 6066,
+      "responseId": "resp_opening",
+      "generation": 0,
+      "playbackTarget": true,
+      "opening": false,
+      "openingStarted": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": true,
+        "preStopLocal": true,
+        "payload": {
+          "maxSnrDb": 20.54,
+          "rmsRangeDb": 11.63,
+          "rmsDirectionChanges": 19,
+          "largeRmsJumpCount": 10,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -16.7,
+        "noiseFloorDbfs": -37.24,
+        "snrDb": 20.54,
+        "peakDbfs": -11.84,
+        "vadVoicedMs": 860,
+        "candidateDurationMs": 860,
+        "speechDurationMs": 860,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_opening_stale_lifecycle_noise"
+      }
+    },
+    "fixture_authority_sustained_stable_local": {
+      "startedAt": "2026-07-11T10:01:00Z",
+      "decisionOffsetMs": 480,
+      "responseId": "resp_sustained",
+      "generation": 4,
+      "playbackTarget": true,
+      "opening": false,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": true,
+        "preStopLocal": true,
+        "payload": {
+          "maxSnrDb": 24.0,
+          "rmsRangeDb": 7.0,
+          "rmsDirectionChanges": 2,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -24.0,
+        "noiseFloorDbfs": -50.0,
+        "snrDb": 24.0,
+        "peakDbfs": -15.0,
+        "vadVoicedMs": 480,
+        "candidateDurationMs": 480,
+        "speechDurationMs": 480,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_sustained_stable_local"
+      }
+    },
+    "fixture_authority_good_ok_understood_sparse_turn": {
+      "startedAt": "2026-07-11T03:22:01.611826Z",
+      "responseId": "resp_YA2lqDw9QH9ZEWwn22RcU",
+      "generation": 6,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "recentAiAudio": {
+            "rmsDbfs": -26.0,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 23.15,
+              "rmsRangeDb": 5.02,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -12.87,
+            "noiseFloorDbfs": -36.01,
+            "snrDb": 23.15,
+            "peakDbfs": -4.94,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_good_ok_understood_part_1"
+          }
+        },
+        {
+          "offsetMs": 3741,
+          "recentAiAudio": {
+            "rmsDbfs": -24.0,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 14.53,
+              "rmsRangeDb": 6.58,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -21.49,
+            "noiseFloorDbfs": -36.01,
+            "snrDb": 14.53,
+            "peakDbfs": -15.23,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_good_ok_understood_part_2"
+          }
+        },
+        {
+          "offsetMs": 6405,
+          "recentAiAudio": {
+            "rmsDbfs": -24.0,
+            "ageMs": 0
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 16.32,
+              "rmsRangeDb": 7.09,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -19.7,
+            "noiseFloorDbfs": -36.01,
+            "snrDb": 16.32,
+            "peakDbfs": -12.97,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_good_ok_understood_part_3"
+          }
+        }
+      ]
+    },
+    "fixture_single_short_noise_high_snr": {
+      "startedAt": "2026-07-08T01:40:55.239283Z",
+      "decisionOffsetMs": 180,
+      "responseId": "resp_YiyuHXoHsoTwFNtJTjZDJ",
+      "generation": 2,
+      "playbackTarget": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 28.6,
+          "rmsRangeDb": 9.61,
+          "rmsDirectionChanges": 3,
+          "largeRmsJumpCount": 1,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -19.93,
+        "noiseFloorDbfs": -48.53,
+        "snrDb": 28.6,
+        "peakDbfs": -13.81,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 180,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_single_short_noise_high_snr"
+      }
+    },
+    "fixture_single_short_noise_low_rms": {
+      "startedAt": "2026-07-08T01:40:59.118913Z",
+      "decisionOffsetMs": 180,
+      "responseId": "resp_BnOBuTXZiCPMRBLkNM5tX",
+      "generation": 4,
+      "playbackTarget": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 12.85,
+          "rmsRangeDb": 7.61,
+          "rmsDirectionChanges": 5,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -31.81,
+        "noiseFloorDbfs": -44.66,
+        "snrDb": 12.85,
+        "peakDbfs": -25.05,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 180,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_single_short_noise_low_rms"
+      }
+    },
+    "fixture_opening_noise_high_snr": {
+      "startedAt": "2026-07-08T08:49:19.109137Z",
+      "decisionOffsetMs": 460,
+      "responseId": "resp_YmPPjBggb8YJl2V1kCLn3",
+      "generation": 0,
+      "playbackTarget": true,
+      "openingStarted": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 30.47,
+          "rmsRangeDb": 15.5,
+          "rmsDirectionChanges": 11,
+          "largeRmsJumpCount": 2,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -18.53,
+        "noiseFloorDbfs": -49.0,
+        "snrDb": 30.47,
+        "peakDbfs": -9.36,
+        "vadVoicedMs": 460,
+        "candidateDurationMs": 460,
+        "speechDurationMs": 460,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_opening_noise_high_snr"
+      }
+    },
+    "fixture_opening_noise_high_peak": {
+      "startedAt": "2026-07-08T08:49:20.969311Z",
+      "decisionOffsetMs": 240,
+      "responseId": "resp_YmPPjBggb8YJl2V1kCLn3",
+      "generation": 1,
+      "playbackTarget": true,
+      "openingStarted": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 30.21,
+          "rmsRangeDb": 22.76,
+          "rmsDirectionChanges": 3,
+          "largeRmsJumpCount": 4,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -18.79,
+        "noiseFloorDbfs": -49.0,
+        "snrDb": 30.21,
+        "peakDbfs": -11.21,
+        "vadVoicedMs": 240,
+        "candidateDurationMs": 240,
+        "speechDurationMs": 240,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_opening_noise_high_peak"
+      }
+    },
+    "fixture_opening_fan_echo_guarded_local_micro_confirm": {
+      "startedAt": "2026-07-10T02:03:05.972191Z",
+      "responseId": "resp_LmrXy1kyOY9Zmr4OdpgcD",
+      "generation": 0,
+      "playbackTarget": true,
+      "openingStarted": true,
+      "observations": [
+        {
+          "offsetMs": 180,
+          "recentAiAudio": {
+            "rmsDbfs": -23.99,
+            "ageMs": 2
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.87,
+              "rmsRangeDb": 7.65,
+              "rmsDirectionChanges": 4,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -31.13,
+            "noiseFloorDbfs": -48.0,
+            "snrDb": 16.87,
+            "peakDbfs": -21.18,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_opening_fan_part_1"
+          }
+        },
+        {
+          "offsetMs": 580,
+          "recentAiAudio": {
+            "rmsDbfs": -23.99,
+            "ageMs": 2
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 19.15,
+              "rmsRangeDb": 7.65,
+              "rmsDirectionChanges": 4,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": false,
+            "rmsDbfs": -28.85,
+            "noiseFloorDbfs": -48.0,
+            "snrDb": 19.15,
+            "peakDbfs": -20.81,
+            "vadVoicedMs": 240,
+            "candidateDurationMs": 240,
+            "speechDurationMs": 240,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_opening_fan_part_2"
+          }
+        }
+      ]
+    },
+    "fixture_authority_echo_guarded_deferred_episode_micro_confirmed": {
+      "startedAt": "2026-07-11T10:02:00Z",
+      "responseId": "resp_echo_guarded_deferred_episode",
+      "generation": 7,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "recentAiAudio": {
+            "rmsDbfs": -26.02,
+            "ageMs": 30
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.16,
+              "rmsRangeDb": 7.67,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -19.47,
+            "noiseFloorDbfs": -35.63,
+            "snrDb": 16.16,
+            "peakDbfs": -12.5,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_echo_guarded_deferred_episode_part_1"
+          }
+        },
+        {
+          "offsetMs": 1499,
+          "recentAiAudio": {
+            "rmsDbfs": -26.02,
+            "ageMs": 30
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 16.16,
+              "rmsRangeDb": 7.67,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": false,
+            "rmsDbfs": -20.08,
+            "noiseFloorDbfs": -35.63,
+            "snrDb": 15.55,
+            "peakDbfs": -10.92,
+            "vadVoicedMs": 240,
+            "candidateDurationMs": 240,
+            "speechDurationMs": 240,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_echo_guarded_deferred_episode_part_2"
+          }
+        }
+      ]
+    },
+    "fixture_midcall_fan_echo_guarded_turn_elevated_noise": {
+      "startedAt": "2026-07-10T03:25:14.670408Z",
+      "responseId": "resp_DfKd1bIwNlRUP2okBsQE6",
+      "generation": 1,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 1340,
+          "recentAiAudio": {
+            "rmsDbfs": -18.61,
+            "ageMs": 4
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 10.62,
+              "rmsRangeDb": 5.37,
+              "rmsDirectionChanges": 3,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -25.38,
+            "noiseFloorDbfs": -36.0,
+            "snrDb": 10.62,
+            "peakDbfs": -17.01,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_midcall_fan_elevated_noise_part_1"
+          }
+        },
+        {
+          "offsetMs": 1700,
+          "recentAiAudio": {
+            "rmsDbfs": -18.61,
+            "ageMs": 4
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 15.98,
+              "rmsRangeDb": 5.93,
+              "rmsDirectionChanges": 5,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -25.08,
+            "noiseFloorDbfs": -36.0,
+            "snrDb": 10.92,
+            "peakDbfs": -18.7,
+            "vadVoicedMs": 240,
+            "candidateDurationMs": 240,
+            "speechDurationMs": 240,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_midcall_fan_elevated_noise_part_2"
+          }
+        }
+      ]
+    },
+    "fixture_midcall_fan_echo_guarded_turn_missing_noise_floor": {
+      "startedAt": "2026-07-10T03:25:16.010408Z",
+      "decisionOffsetMs": 360,
+      "responseId": "resp_DfKd1bIwNlRUP2okBsQE6",
+      "generation": 1,
+      "playbackTarget": true,
+      "opening": false,
+      "recentAiAudio": {
+        "rmsDbfs": -18.61,
+        "ageMs": 4
+      },
+      "turn": {
+        "echoGuardedTurn": {
+          "responseId": "resp_DfKd1bIwNlRUP2okBsQE6",
+          "generation": 1,
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 0,
+          "burstCount": 1,
+          "voicedMs": 180,
+          "currentBurstVoicedMs": 180,
+          "minRmsDbfs": -25.38,
+          "maxRmsDbfs": -25.38,
+          "maxSnrDb": 15.98,
+          "maxRmsRangeDb": 5.37
+        }
+      },
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 15.98,
+          "rmsRangeDb": 5.93,
+          "rmsDirectionChanges": 5,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -25.08,
+        "noiseFloorDbfs": null,
+        "snrDb": 10.92,
+        "peakDbfs": -18.7,
+        "vadVoicedMs": 240,
+        "candidateDurationMs": 240,
+        "speechDurationMs": 240,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_midcall_fan_missing_noise_floor_part_2"
+      }
+    },
+    "fixture_slow_zenmezuo_strong_short": {
+      "startedAt": "2026-07-12T10:00:00Z",
+      "decisionOffsetMs": 180,
+      "responseId": "resp_slow_zenmezuo",
+      "generation": 1,
+      "playbackTarget": true,
+      "detector": {
+        "singleShort": false,
+        "fastLocal": true,
+        "preStopLocal": true,
+        "payload": {
+          "maxSnrDb": 20.06,
+          "rmsRangeDb": 7.02,
+          "rmsDirectionChanges": 1,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -17.83,
+        "noiseFloorDbfs": -37.89,
+        "snrDb": 20.06,
+        "peakDbfs": -9.98,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 180,
+        "frameDurationMs": 20,
+        "candidateClass": "strong_short_speech_candidate",
+        "reason": "fixture_zenmezuo_strong_short"
+      }
+    },
+    "fixture_echo_guarded_near_end_second_frame": {
+      "startedAt": "2026-07-12T10:01:00Z",
+      "responseId": "resp_echo_guarded_near_end_second_frame",
+      "generation": 1,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "recentAiAudio": {
+            "rmsDbfs": -18.0,
+            "ageMs": 20
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 19.18,
+              "rmsRangeDb": 9.24,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -19.34,
+            "noiseFloorDbfs": -38.52,
+            "snrDb": 19.18,
+            "peakDbfs": -8.49,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_echo_guarded_near_end_part_1"
+          }
+        },
+        {
+          "offsetMs": 360,
+          "recentAiAudio": {
+            "rmsDbfs": -24.0,
+            "ageMs": 20
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 20.37,
+              "rmsRangeDb": 9.24,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -18.15,
+            "noiseFloorDbfs": -38.52,
+            "snrDb": 20.37,
+            "peakDbfs": -10.69,
+            "vadVoicedMs": 240,
+            "candidateDurationMs": 240,
+            "speechDurationMs": 240,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_echo_guarded_near_end_part_2"
+          }
+        }
+      ]
+    },
+    "fixture_ting_deferred_episode_micro_confirmed": {
+      "startedAt": "2026-07-12T10:03:00Z",
+      "responseId": "resp_ting_deferred_episode",
+      "generation": 2,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "recentAiAudio": {
+            "rmsDbfs": -24.0,
+            "ageMs": 20
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 12.22,
+              "rmsRangeDb": 9.8,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -22.78,
+            "noiseFloorDbfs": -35.0,
+            "snrDb": 12.22,
+            "peakDbfs": -15.34,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_ting_part_1"
+          }
+        },
+        {
+          "offsetMs": 360,
+          "recentAiAudio": {
+            "rmsDbfs": -26.42,
+            "ageMs": 20
+          },
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 17.08,
+              "rmsRangeDb": 6.45,
+              "rmsDirectionChanges": 6,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -21.53,
+            "noiseFloorDbfs": -35.0,
+            "snrDb": 13.47,
+            "peakDbfs": -14.99,
+            "vadVoicedMs": 300,
+            "candidateDurationMs": 300,
+            "speechDurationMs": 300,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_ting_part_2"
+          }
+        }
+      ]
+    },
+    "fixture_ting_then_strong_short_followup": {
+      "startedAt": "2026-07-12T10:05:00Z",
+      "responseId": "resp_ting_then_strong_short_followup",
+      "generation": 3,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 19.49,
+              "rmsRangeDb": 8.57,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 1,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -23.16,
+            "noiseFloorDbfs": -42.65,
+            "snrDb": 19.49,
+            "peakDbfs": -16.7,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_ting_followup_part_1"
+          }
+        },
+        {
+          "offsetMs": 300,
+          "detector": {
+            "singleShort": false,
+            "fastLocal": true,
+            "preStopLocal": true,
+            "payload": {
+              "maxSnrDb": 24.0,
+              "rmsRangeDb": 8.57,
+              "rmsDirectionChanges": 1,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -18.0,
+            "noiseFloorDbfs": -42.65,
+            "snrDb": 24.0,
+            "peakDbfs": -9.5,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "strong_short_speech_candidate",
+            "reason": "fixture_ting_followup_strong_short"
+          }
+        }
+      ]
+    },
+    "fixture_haode_keyi_deferred_episode_final": {
+      "startedAt": "2026-07-10T03:26:04.490Z",
+      "decisionOffsetMs": 3602,
+      "responseId": "resp_D57VkiQeuzqclhZ7Boqcs",
+      "generation": 4,
+      "playbackTarget": true,
+      "aiPlaybackFrames": [
+        {
+          "offsetMs": 3602,
+          "rmsDbfs": -17.0
+        }
+      ],
+      "turn": {
+        "deferredEpisode": {
+          "responseId": "resp_D57VkiQeuzqclhZ7Boqcs",
+          "generation": 4,
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 3601,
+          "burstCount": 3,
+          "voicedMs": 600,
+          "currentBurstVoicedMs": 180,
+          "minRmsDbfs": -24.0,
+          "maxRmsDbfs": -16.59,
+          "maxSnrDb": 19.03,
+          "maxRmsRangeDb": 7.52,
+          "maxGapMs": 1921
+        }
+      },
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 19.03,
+          "rmsRangeDb": 2.82,
+          "rmsDirectionChanges": 0,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -18.43,
+        "noiseFloorDbfs": -33.0,
+        "snrDb": 14.57,
+        "peakDbfs": -12.5,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 180,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "fixture_haode_keyi_deferred_episode_final"
+      }
+    }
+  },
+  "samples": [
+    {
+      "id": "fixture_synthetic_short_stop_must_interrupt",
+      "callId": "fixture_synthetic_short_stop",
+      "sourceType": "synthetic",
+      "category": "short_command_candidate",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-10T09:00:00.000Z",
+      "maxPreStopLatencyMs": 500
+    },
+    {
+      "id": "fixture_corpus_continuous_noise_must_defer",
+      "callId": "fixture_corpus_continuous_noise",
+      "sourceType": "corpus_noise_mix",
+      "category": "continuous_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T09:01:00.000Z",
+      "windowEndTime": "2026-07-10T09:01:00.500Z"
+    },
+    {
+      "id": "fixture_synthetic_modulated_short_stop_must_interrupt",
+      "callId": "fixture_synthetic_modulated_short_stop",
+      "sourceType": "synthetic",
+      "category": "short_command_candidate",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-10T09:02:00.000Z",
+      "maxPreStopLatencyMs": 300
+    },
+    {
+      "id": "fixture_synthetic_opening_fan_noise_must_defer",
+      "callId": "fixture_synthetic_opening_fan_noise",
+      "sourceType": "synthetic",
+      "category": "opening_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T09:03:00.000Z",
+      "windowEndTime": "2026-07-10T09:03:00.500Z"
+    },
+    {
+      "id": "fixture_synthetic_short_impulse_noise_must_not_interrupt",
+      "callId": "fixture_synthetic_short_impulse_noise",
+      "sourceType": "synthetic",
+      "category": "impulse_noise",
+      "expectation": "must_not_interrupt",
+      "windowStartTime": "2026-07-10T09:04:00.000Z",
+      "windowEndTime": "2026-07-10T09:04:00.300Z"
+    },
+    {
+      "id": "fixture_authority_echo_local_only_must_defer",
+      "callId": "fixture_authority_echo_local_only",
+      "category": "opening_echo_guard",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-11T10:00:00.000Z",
+      "windowEndTime": "2026-07-11T10:00:00.500Z"
+    },
+    {
+      "id": "fixture_authority_opening_stale_lifecycle_noise_must_defer",
+      "callId": "fixture_authority_opening_stale_lifecycle_noise",
+      "category": "opening_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-11T02:54:16.000Z",
+      "windowEndTime": "2026-07-11T02:54:16.200Z"
+    },
+    {
+      "id": "fixture_authority_sustained_stable_local_must_pre_stop",
+      "callId": "fixture_authority_sustained_stable_local",
+      "category": "sustained_near_end_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-11T10:01:00.480Z",
+      "maxCandidateToPreStopMs": 20
+    },
+    {
+      "id": "fixture_authority_good_ok_understood_sparse_turn_must_pre_stop",
+      "callId": "fixture_authority_good_ok_understood_sparse_turn",
+      "category": "sparse_short_phrase",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-11T03:22:08.016Z",
+      "maxCandidateToPreStopMs": 20
+    },
+    {
+      "id": "fixture_single_short_noise_high_snr_must_defer",
+      "callId": "fixture_single_short_noise_high_snr",
+      "category": "single_short_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T01:40:55.300Z",
+      "windowEndTime": "2026-07-08T01:40:55.900Z"
+    },
+    {
+      "id": "fixture_single_short_noise_low_rms_must_defer",
+      "callId": "fixture_single_short_noise_low_rms",
+      "category": "single_short_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T01:40:59.200Z",
+      "windowEndTime": "2026-07-08T01:40:59.800Z"
+    },
+    {
+      "id": "fixture_opening_noise_high_snr_must_defer",
+      "callId": "fixture_opening_noise_high_snr",
+      "category": "opening_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T08:49:19.200Z",
+      "windowEndTime": "2026-07-08T08:49:20.000Z"
+    },
+    {
+      "id": "fixture_opening_noise_high_peak_must_defer",
+      "callId": "fixture_opening_noise_high_peak",
+      "category": "opening_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T08:49:21.100Z",
+      "windowEndTime": "2026-07-08T08:49:21.800Z"
+    },
+    {
+      "id": "fixture_opening_fan_echo_guarded_local_micro_confirm_must_defer",
+      "callId": "fixture_opening_fan_echo_guarded_local_micro_confirm",
+      "category": "opening_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T02:03:06.100Z",
+      "windowEndTime": "2026-07-10T02:03:06.700Z"
+    },
+    {
+      "id": "fixture_authority_echo_guarded_deferred_episode_micro_confirmed_must_pre_stop",
+      "callId": "fixture_authority_echo_guarded_deferred_episode_micro_confirmed",
+      "category": "echo_guarded_near_end_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-11T10:02:00.000Z",
+      "maxCandidateToPreStopMs": 1700
+    },
+    {
+      "id": "fixture_slow_zenmezuo_strong_short_must_interrupt",
+      "callId": "fixture_slow_zenmezuo_strong_short",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-12T10:00:00.000Z",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "fixture_echo_guarded_near_end_second_frame_must_interrupt",
+      "callId": "fixture_echo_guarded_near_end_second_frame",
+      "category": "echo_guarded_near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-12T10:01:00.000Z",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "fixture_ting_deferred_episode_micro_confirmed_must_pre_stop_after_candidate",
+      "callId": "fixture_ting_deferred_episode_micro_confirmed",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-12T10:03:00.000Z",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "fixture_ting_then_strong_short_followup_must_pre_stop_after_candidate",
+      "callId": "fixture_ting_then_strong_short_followup",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-12T10:05:00.000Z",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "fixture_haode_keyi_deferred_episode_final_must_pre_stop_after_candidate",
+      "callId": "fixture_haode_keyi_deferred_episode_final",
+      "category": "short_ack_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T03:26:08.092Z",
+      "maxCandidateToPreStopMs": 20
+    },
+    {
+      "id": "fixture_midcall_fan_echo_guarded_turn_elevated_noise_must_defer",
+      "callId": "fixture_midcall_fan_echo_guarded_turn_elevated_noise",
+      "category": "midcall_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T03:25:16.000Z",
+      "windowEndTime": "2026-07-10T03:25:16.300Z"
+    },
+    {
+      "id": "fixture_midcall_fan_echo_guarded_turn_missing_noise_floor_must_defer",
+      "callId": "fixture_midcall_fan_echo_guarded_turn_missing_noise_floor",
+      "category": "midcall_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T03:25:16.300Z",
+      "windowEndTime": "2026-07-10T03:25:16.600Z"
+    },
+    {
+      "id": "call_333059784225075200_single_short_burst_1_must_defer",
+      "callId": "call_333059784225075200",
+      "category": "single_short_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T01:40:55.300000",
+      "windowEndTime": "2026-07-08T01:40:56.200000"
+    },
+    {
+      "id": "call_333059784225075200_single_short_burst_2_must_defer",
+      "callId": "call_333059784225075200",
+      "category": "single_short_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T01:40:59.100000",
+      "windowEndTime": "2026-07-08T01:40:59.900000"
+    },
+    {
+      "id": "call_333167639641690112_opening_noise_1_must_defer",
+      "callId": "call_333167639641690112",
+      "category": "opening_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T08:49:19.000000",
+      "windowEndTime": "2026-07-08T08:49:19.900000"
+    },
+    {
+      "id": "call_333167639641690112_opening_noise_2_must_defer",
+      "callId": "call_333167639641690112",
+      "category": "opening_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-08T08:49:20.900000",
+      "windowEndTime": "2026-07-08T08:49:21.800000"
+    },
+    {
+      "id": "call_333167639641690112_zenmezuo_must_interrupt",
+      "callId": "call_333167639641690112",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-08T08:50:01.837611",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333167639641690112_naxieren_must_interrupt",
+      "callId": "call_333167639641690112",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-08T08:50:12.637611",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333513524133138432_nihao_haode_must_interrupt",
+      "callId": "call_333513524133138432",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T07:43:47.470705",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333513524133138432_bieshuole_must_interrupt",
+      "callId": "call_333513524133138432",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T07:44:21.130705",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333517350307270656_tingyixia_must_interrupt",
+      "callId": "call_333517350307270656",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T07:59:47.684747",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333517350307270656_bieshuole_gualeba_must_interrupt",
+      "callId": "call_333517350307270656",
+      "category": "near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T07:59:54.844747",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333533194026348544_opening_short_candidate_must_defer",
+      "callId": "call_333533194026348544",
+      "category": "opening_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-09T09:01:59.600000",
+      "windowEndTime": "2026-07-09T09:02:00.200000"
+    },
+    {
+      "id": "call_333533194026348544_xing_haode_liaojiele_must_interrupt",
+      "callId": "call_333533194026348544",
+      "category": "echo_guarded_near_end_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T09:02:14.169022",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333533194026348544_confirmed_pre_stop_must_resolve",
+      "callId": "call_333533194026348544",
+      "category": "clean_window",
+      "expectation": "must_confirm_or_reject",
+      "windowStartTime": "2026-07-09T09:02:21.900000",
+      "windowEndTime": "2026-07-09T09:02:22.300000"
+    },
+    {
+      "id": "call_333551735128162304_repeated_bieshuole_must_interrupt",
+      "callId": "call_333551735128162304",
+      "category": "repeated_deferred_echo_guarded_speech",
+      "expectation": "must_interrupt",
+      "speechStartTime": "2026-07-09T10:15:58.145198",
+      "maxPreStopLatencyMs": 600
+    },
+    {
+      "id": "call_333790178132156416_opening_fan_must_not_interrupt",
+      "callId": "call_333790178132156416",
+      "category": "opening_fan_noise",
+      "expectation": "must_not_interrupt",
+      "windowStartTime": "2026-07-10T02:03:06.000000",
+      "windowEndTime": "2026-07-10T02:03:07.100000"
+    },
+    {
+      "id": "call_333790178132156416_ting_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333790178132156416",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T02:03:34.773093",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333790178132156416_haode_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333790178132156416",
+      "category": "protected_fast_local_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T02:03:26.191941",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333790178132156416_xing_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333790178132156416",
+      "category": "protected_fast_local_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T02:03:51.853702",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333790178132156416_en_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333790178132156416",
+      "category": "protected_fast_local_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T02:03:59.592934",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333790178132156416_yihouzaishuoba_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333790178132156416",
+      "category": "protected_fast_local_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T02:04:09.171919",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333810711039770624_opening_fan_candidate_must_defer",
+      "callId": "call_333810711039770624",
+      "category": "opening_fan_noise",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-10T03:24:38.900000",
+      "windowEndTime": "2026-07-10T03:24:39.100000"
+    },
+    {
+      "id": "call_333810711039770624_midcall_fan_must_not_interrupt",
+      "callId": "call_333810711039770624",
+      "category": "midcall_fan_noise",
+      "expectation": "must_not_interrupt",
+      "windowStartTime": "2026-07-10T03:25:16.000000",
+      "windowEndTime": "2026-07-10T03:25:16.900000"
+    },
+    {
+      "id": "call_333810711039770624_ting_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333810711039770624",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T03:25:35.490923",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333810711039770624_haode_keyi_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333810711039770624",
+      "category": "short_ack_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T03:26:04.490698",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333873150332776448_haole_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333873150332776448",
+      "category": "protected_fast_local_speech",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T07:33:13.392326",
+      "maxCandidateToPreStopMs": 500
+    },
+    {
+      "id": "call_333873150332776448_budarao_candidate_must_resolve_after_candidate",
+      "callId": "call_333873150332776448",
+      "category": "echo_guarded_near_end_speech",
+      "expectation": "must_resolve_after_candidate",
+      "candidateTime": "2026-07-10T07:33:20.673490",
+      "maxCandidateToResolutionMs": 500
+    },
+    {
+      "id": "call_333873150332776448_ting_candidate_must_pre_stop_after_candidate",
+      "callId": "call_333873150332776448",
+      "category": "short_command_candidate",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-10T07:33:49.353330",
+      "maxCandidateToPreStopMs": 500
+    }
+  ]
+}
