@@ -40,6 +40,8 @@ class AiCallRecordRepository:
         participant_identity: str,
         status: str,
         started_at: datetime,
+        callee_phone_number_hash: str | None = None,
+        callee_phone_number_masked: str | None = None,
     ) -> AiCallRecordModel:
         record = AiCallRecordModel(
             id=generate_snowflake_id(),
@@ -49,6 +51,8 @@ class AiCallRecordRepository:
             entry_type=entry_type,
             room_name=room_name,
             participant_identity=participant_identity,
+            callee_phone_number_hash=callee_phone_number_hash,
+            callee_phone_number_masked=callee_phone_number_masked,
             status=status,
             started_at=started_at,
         )
@@ -60,6 +64,27 @@ class AiCallRecordRepository:
     async def get_record(self, call_id: str) -> AiCallRecordModel | None:
         result = await self.db.execute(
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_active_sip_record_by_callee_hash(
+        self,
+        *,
+        callee_phone_number_hash: str,
+        active_statuses: set[str],
+    ) -> AiCallRecordModel | None:
+        if not callee_phone_number_hash or not active_statuses:
+            return None
+        result = await self.db.execute(
+            select(AiCallRecordModel)
+            .where(
+                AiCallRecordModel.entry_type == "sip_outbound",
+                AiCallRecordModel.callee_phone_number_hash == callee_phone_number_hash,
+                AiCallRecordModel.status.in_(active_statuses),
+                AiCallRecordModel.ended_at.is_(None),
+            )
+            .order_by(desc(AiCallRecordModel.started_at), desc(AiCallRecordModel.id))
+            .limit(1)
         )
         return result.scalar_one_or_none()
 

@@ -161,32 +161,15 @@ class LiveKitSipClient:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         try:
-            from google.protobuf.duration_pb2 import Duration
             from livekit import api
-            from livekit.protocol import sip
+
+            request = _build_official_create_sip_participant_request(payload)
         except Exception as exc:
             raise AiCallError(
                 error_id="sip_sdk_unavailable",
                 msg="LiveKit SIP SDK 不可用",
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             ) from exc
-
-        request = sip.CreateSIPParticipantRequest(
-            room_name=payload.room_name,
-            participant_identity=payload.participant_identity,
-            sip_call_to=payload.sip_call_to,
-            sip_number=payload.sip_number,
-            wait_until_answered=payload.wait_until_answered,
-            ringing_timeout=Duration(seconds=payload.ringing_timeout_seconds),
-        )
-        outbound_trunk_config = None
-        if not payload.sip_trunk_id:
-            outbound_trunk_config = sip.SIPOutboundConfig(
-                hostname=payload.trunk_hostname,
-                destination_country=payload.destination_country,
-                auth_username=payload.auth_username,
-                auth_password=payload.auth_password,
-            )
 
         client = api.LiveKitAPI(
             url=self.livekit_url,
@@ -197,8 +180,6 @@ class LiveKitSipClient:
             return await client.sip.create_sip_participant(
                 request,
                 timeout=self._request_timeout_seconds(payload),
-                trunk_id=payload.sip_trunk_id or None,
-                outbound_trunk_config=outbound_trunk_config,
             )
         except AiCallError:
             raise
@@ -207,6 +188,7 @@ class LiveKitSipClient:
                 error_id="sip_create_participant_failed",
                 msg="LiveKit SIP Participant 创建失败",
                 status_code=status.HTTP_502_BAD_GATEWAY,
+                details=_safe_exception_details(exc),
             ) from exc
         finally:
             await client.aclose()
@@ -299,6 +281,32 @@ def validate_sip_outbound_preflight(
     return SipOutboundPreflightResult(ok=True)
 
 
+def _build_official_create_sip_participant_request(payload: CreateSipParticipantPayload):
+    from google.protobuf.duration_pb2 import Duration
+    from livekit.protocol import sip
+
+    request = sip.CreateSIPParticipantRequest(
+        room_name=payload.room_name,
+        participant_identity=payload.participant_identity,
+        sip_call_to=payload.sip_call_to,
+        sip_number=payload.sip_number,
+        wait_until_answered=payload.wait_until_answered,
+        ringing_timeout=Duration(seconds=payload.ringing_timeout_seconds),
+    )
+    if payload.sip_trunk_id:
+        request.sip_trunk_id = payload.sip_trunk_id
+    else:
+        request.trunk.CopyFrom(
+            sip.SIPOutboundConfig(
+                hostname=payload.trunk_hostname,
+                destination_country=payload.destination_country,
+                auth_username=payload.auth_username,
+                auth_password=payload.auth_password,
+            )
+        )
+    return request
+
+
 def _preflight_failed(
     failure_reason: str,
     stage: str,
@@ -314,6 +322,31 @@ def _preflight_failed(
 
 def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _safe_exception_details(exc: Exception) -> dict[str, str]:
+    raw_message = str(exc).strip()
+    details = {"rawErrorType": exc.__class__.__name__}
+    if raw_message:
+        details["rawErrorMessage"] = _sanitize_error_message(raw_message)[:500]
+    return details
+
+
+def _sanitize_error_message(value: str) -> str:
+    sanitized = re.sub(r"\+?\d{5,20}", lambda match: _mask_digits(match.group(0)), value)
+    return re.sub(
+        r"(?i)(authorization|token|api[_-]?key|secret|password)=\S+",
+        r"\1=<redacted>",
+        sanitized,
+    )
+
+
+def _mask_digits(value: str) -> str:
+    prefix = "+" if value.startswith("+") else ""
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) <= 7:
+        return "***"
+    return f"{prefix}{digits[:3]}****{digits[-4:]}"
 
 
 def _valid_port_range(value: str) -> bool:
