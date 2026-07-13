@@ -28,11 +28,11 @@
     }
   },
   "fixtureCoverageGates": {
-    "minSamples": 22,
+    "minSamples": 23,
     "requiredSourceTypes": {
       "synthetic": 4,
       "corpus_noise_mix": 1,
-      "authority_fixture": 17
+      "authority_fixture": 18
     },
     "requiredCategories": {
       "short_command_candidate": 4,
@@ -47,13 +47,14 @@
       "short_ack_candidate": 1,
       "midcall_fan_noise": 2,
       "single_short_noise": 2,
-      "opening_noise": 2
+      "opening_noise": 2,
+      "live_elevated_noise_short_ack": 1
     },
     "requiredExpectations": {
       "must_interrupt": 4,
       "must_defer": 10,
       "must_not_interrupt": 1,
-      "must_pre_stop_after_candidate": 6
+      "must_pre_stop_after_candidate": 7
     }
   },
   "audioFixtures": {
@@ -796,6 +797,43 @@
         "reason": "fixture_midcall_fan_missing_noise_floor_part_2"
       }
     },
+    "fixture_call_334820_elevated_noise_short_ack_live_state": {
+      "startedAt": "2026-07-12T22:16:29.381Z",
+      "responseId": "resp_SR5MXPgCTVeFr9qsTJNps",
+      "generation": 2,
+      "playbackTarget": true,
+      "observations": [
+        {
+          "offsetMs": 0,
+          "detector": {
+            "singleShort": false,
+            "fastLocal": false,
+            "preStopLocal": false,
+            "payload": {
+              "maxSnrDb": 14.95,
+              "rmsRangeDb": 8.49,
+              "rmsDirectionChanges": 2,
+              "largeRmsJumpCount": 0,
+              "speechQualityRejection": null
+            }
+          },
+          "observation": {
+            "active": true,
+            "candidate": true,
+            "rmsDbfs": -23.15,
+            "noiseFloorDbfs": -36.76,
+            "snrDb": 13.6,
+            "peakDbfs": -13.34,
+            "vadVoicedMs": 180,
+            "candidateDurationMs": 180,
+            "speechDurationMs": 180,
+            "frameDurationMs": 20,
+            "candidateClass": "stable_speech_candidate",
+            "reason": "fixture_call_334820_short_ack_part_1"
+          }
+        }
+      ]
+    },
     "fixture_slow_zenmezuo_strong_short": {
       "startedAt": "2026-07-12T10:00:00Z",
       "decisionOffsetMs": 180,
@@ -1280,6 +1318,15 @@
       "expectation": "must_defer",
       "windowStartTime": "2026-07-10T03:25:16.300Z",
       "windowEndTime": "2026-07-10T03:25:16.600Z"
+    },
+    {
+      "id": "fixture_call_334820_elevated_noise_short_ack_live_state_must_pre_stop",
+      "callId": "fixture_call_334820_elevated_noise_short_ack_live_state",
+      "sourceType": "authority_fixture",
+      "category": "live_elevated_noise_short_ack",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-12T22:16:29.381Z",
+      "maxCandidateToPreStopMs": 20
     },
     {
       "id": "call_333059784225075200_single_short_burst_1_must_defer",

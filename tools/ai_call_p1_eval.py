@@ -476,6 +476,9 @@ def _build_authority_fixture_report(*, call_id: str, fixture: Any) -> dict[str, 
         turn=turn,
         trigger_timestamp=trigger_timestamp,
         observation=observation,
+        shadow_observations=_authority_fixture_shadow_observations(
+            fixture.get("shadowObservations")
+        ),
     )
     authority_payload = runner._sip_pre_stop_authority_payload(decision)
     return build_p1_evaluation(
@@ -610,6 +613,9 @@ async def _build_authority_fixture_observation_episode_report(
             provider=provider,
             trigger_timestamp=current_event_timestamp,
             observation=observation,
+            shadow_observations=_authority_fixture_shadow_observations(
+                raw_entry.get("shadowObservations", fixture.get("shadowObservations"))
+            ),
         )
 
     return build_p1_evaluation(
@@ -733,6 +739,60 @@ def _authority_fixture_observation(
         candidate_class=_optional_str(raw_observation.get("candidateClass")),
         reason=str(raw_observation.get("reason") or "authority_fixture"),
     )
+
+
+def _authority_fixture_shadow_observations(raw_observations: Any) -> list[Any]:
+    from app.services.ai_call.sip_vad_shadow import SipVadShadowObservation
+
+    if raw_observations is None:
+        return []
+    if not isinstance(raw_observations, list):
+        raise RuntimeError("sample matrix authorityFixture shadowObservations must be a list")
+
+    observations: list[SipVadShadowObservation] = []
+    for index, raw_observation in enumerate(raw_observations):
+        if not isinstance(raw_observation, dict):
+            raise RuntimeError(
+                f"sample matrix authorityFixture shadowObservations[{index}] must be an object"
+            )
+        window_start_ms = _optional_positive_int(raw_observation.get("windowStartMs"))
+        window_end_ms = _optional_positive_int(raw_observation.get("windowEndMs"))
+        duration_ms = _optional_positive_int(raw_observation.get("durationMs"))
+        if duration_ms is None and window_start_ms is not None and window_end_ms is not None:
+            duration_ms = max(0, window_end_ms - window_start_ms)
+        observations.append(
+            SipVadShadowObservation(
+                active=bool(raw_observation.get("active", False)),
+                started=bool(raw_observation.get("started", False)),
+                ended=bool(raw_observation.get("ended", False)),
+                duration_ms=duration_ms or 0,
+                frame_duration_ms=_positive_int(
+                    raw_observation.get("frameDurationMs"),
+                    default=20,
+                ),
+                confidence=_optional_float(raw_observation.get("confidence")),
+                analyzed=(
+                    bool(raw_observation["analyzed"])
+                    if "analyzed" in raw_observation
+                    else None
+                ),
+                buffer_duration_ms=_optional_positive_int(
+                    raw_observation.get("bufferDurationMs")
+                ),
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+                detection_lag_ms=_optional_positive_int(
+                    raw_observation.get("detectionLagMs")
+                ),
+                speech_end_lag_ms=_optional_positive_int(
+                    raw_observation.get("speechEndLagMs")
+                ),
+                detector=str(raw_observation.get("detector") or "unknown"),
+                error_type=_optional_str(raw_observation.get("errorType")),
+                error_message=_optional_str(raw_observation.get("errorMessage")),
+            )
+        )
+    return observations
 
 
 def _authority_fixture_turn(
@@ -1380,6 +1440,12 @@ def _positive_int(value: Any, *, default: int | None = None) -> int:
     if result < 0:
         raise RuntimeError("sample matrix expected a positive integer")
     return result
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value)
 
 
 def _pcm16_amplitude(value: Any) -> int:

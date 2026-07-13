@@ -1,0 +1,156 @@
+{
+  "description": "Local-only audio authority probe matrix for call_334885037324660736 Chinese short utterances. Audio files are intentionally kept under /tmp and are not committed; regenerate them with tools/ai_call_export_p1_audio_fixture.py before replaying on a fresh machine.",
+  "localAudioFixtureGeneration": {
+    "outputDir": "/tmp/ai_call_p1_shadow_audio",
+    "commands": [
+      "python tools/ai_call_export_p1_audio_fixture.py --base-url http://127.0.0.1:19011 --call-id call_334885037324660736 --start-ms 38800 --end-ms 41000 --category authority_cn_short_positive --expectation must_pre_stop_after_candidate --source-type live_call_audio_probe --output-dir /tmp/ai_call_p1_shadow_audio --include-ai-track",
+      "python tools/ai_call_export_p1_audio_fixture.py --base-url http://127.0.0.1:19011 --call-id call_334885037324660736 --start-ms 48600 --end-ms 50800 --category authority_cn_short_positive --expectation must_pre_stop_after_candidate --source-type live_call_audio_probe --output-dir /tmp/ai_call_p1_shadow_audio --include-ai-track",
+      "python tools/ai_call_export_p1_audio_fixture.py --base-url http://127.0.0.1:19011 --call-id call_334885037324660736 --start-ms 64800 --end-ms 67000 --category authority_cn_short_positive --expectation must_pre_stop_after_candidate --source-type live_call_audio_probe --output-dir /tmp/ai_call_p1_shadow_audio --include-ai-track",
+      "python tools/ai_call_export_p1_audio_fixture.py --base-url http://127.0.0.1:19011 --call-id call_334885037324660736 --start-ms 79200 --end-ms 83000 --category authority_cn_short_positive --expectation must_pre_stop_after_candidate --source-type live_call_audio_probe --output-dir /tmp/ai_call_p1_shadow_audio --include-ai-track"
+    ]
+  },
+  "fixtureCoverageGates": {
+    "minSamples": 4,
+    "requiredSourceTypes": {
+      "audio_authority_fixture": 4
+    },
+    "requiredCategories": {
+      "authority_cn_short_positive": 4
+    },
+    "requiredExpectations": {
+      "must_pre_stop_after_candidate": 4
+    }
+  },
+  "audioFixtures": {
+    "call_334885037324660736_customer_38800_41000": {
+      "startedAt": "2026-07-13T02:34:17.295Z",
+      "sampleRateHz": 16000,
+      "frameMs": 20,
+      "wavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_38800_41000.wav",
+      "vadWindows": [
+        {
+          "startMs": 260,
+          "endMs": 2200
+        }
+      ],
+      "aiWavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_38800_41000.ai.wav",
+      "authorityReplay": true,
+      "playbackTarget": true,
+      "responseId": "resp_call_334885037324660736_customer_38800_41000",
+      "generation": 1,
+      "utterance": "好的。"
+    },
+    "call_334885037324660736_customer_48600_50800": {
+      "startedAt": "2026-07-13T02:34:27.095Z",
+      "sampleRateHz": 16000,
+      "frameMs": 20,
+      "wavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_48600_50800.wav",
+      "vadWindows": [
+        {
+          "startMs": 280,
+          "endMs": 2200
+        }
+      ],
+      "aiWavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_48600_50800.ai.wav",
+      "authorityReplay": true,
+      "playbackTarget": true,
+      "responseId": "resp_call_334885037324660736_customer_48600_50800",
+      "generation": 1,
+      "utterance": "特价率。"
+    },
+    "call_334885037324660736_customer_64800_67000": {
+      "startedAt": "2026-07-13T02:34:43.295Z",
+      "sampleRateHz": 16000,
+      "frameMs": 20,
+      "wavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_64800_67000.wav",
+      "vadWindows": [
+        {
+          "startMs": 300,
+          "endMs": 2200
+        }
+      ],
+      "aiWavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_64800_67000.ai.wav",
+      "authorityReplay": true,
+      "playbackTarget": true,
+      "responseId": "resp_call_334885037324660736_customer_64800_67000",
+      "generation": 1,
+      "utterance": "好的，知道了。"
+    },
+    "call_334885037324660736_customer_79200_83000": {
+      "startedAt": "2026-07-13T02:34:57.695Z",
+      "sampleRateHz": 16000,
+      "frameMs": 20,
+      "wavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_79200_83000.wav",
+      "vadWindows": [
+        {
+          "startMs": 200,
+          "endMs": 3800
+        }
+      ],
+      "aiWavPath": "/tmp/ai_call_p1_shadow_audio/call_334885037324660736_customer_79200_83000.ai.wav",
+      "authorityReplay": true,
+      "playbackTarget": true,
+      "responseId": "resp_call_334885037324660736_customer_79200_83000",
+      "generation": 1,
+      "utterance": "我要挂了吧挂了吧。"
+    }
+  },
+  "samples": [
+    {
+      "id": "call_334885037324660736_customer_38800_41000_authority_cn_short_positive_must_pre_stop_after_candidate",
+      "callId": "call_334885037324660736_customer_38800_41000",
+      "sourceType": "audio_authority_fixture",
+      "evaluationSource": "audio_authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:17.555Z",
+      "maxCandidateToPreStopMs": 500,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "好的。"
+      }
+    },
+    {
+      "id": "call_334885037324660736_customer_48600_50800_authority_cn_short_positive_must_pre_stop_after_candidate",
+      "callId": "call_334885037324660736_customer_48600_50800",
+      "sourceType": "audio_authority_fixture",
+      "evaluationSource": "audio_authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:27.375Z",
+      "maxCandidateToPreStopMs": 500,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "特价率。"
+      }
+    },
+    {
+      "id": "call_334885037324660736_customer_64800_67000_authority_cn_short_positive_must_pre_stop_after_candidate",
+      "callId": "call_334885037324660736_customer_64800_67000",
+      "sourceType": "audio_authority_fixture",
+      "evaluationSource": "audio_authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:43.595Z",
+      "maxCandidateToPreStopMs": 500,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "好的，知道了。"
+      }
+    },
+    {
+      "id": "call_334885037324660736_customer_79200_83000_authority_cn_short_positive_must_pre_stop_after_candidate",
+      "callId": "call_334885037324660736_customer_79200_83000",
+      "sourceType": "audio_authority_fixture",
+      "evaluationSource": "audio_authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:57.895Z",
+      "maxCandidateToPreStopMs": 500,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "我要挂了吧挂了吧。"
+      }
+    }
+  ]
+}

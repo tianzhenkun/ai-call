@@ -1,0 +1,524 @@
+{
+  "description": "Decision-point authority fixture pairs distilled from the latest two 19011 SIP P1 red sample pool calls. Negative fan/noise fixtures must stay deferred; positive Chinese short-utterance fixtures should pre-stop quickly but may remain red until a cross-sample authority fix is made.",
+  "generatedAt": "2026-07-13T03:08:10Z",
+  "policy": {
+    "type": "authority_fixture_pairs",
+    "runtimeCodeChange": false,
+    "audioFixtureStatus": "not_committed_recording_urls_or_audio; use temporary /tmp audio exports only for local acoustic comparison",
+    "promotionRule": "A runtime authority change may be considered only if it turns repeated red positive/negative fixtures green without regressing the existing green fixture-only matrix."
+  },
+  "fixtureCoverageGates": {
+    "minSamples": 10,
+    "requiredSourceTypes": {
+      "authority_fixture": 10
+    },
+    "requiredCategories": {
+      "authority_fan_noise_negative": 5,
+      "authority_cn_short_positive": 4,
+      "authority_clean_stable_positive_control": 1
+    },
+    "requiredExpectations": {
+      "must_defer": 5,
+      "must_pre_stop_after_candidate": 5
+    }
+  },
+  "authorityFixtures": {
+    "fixture_call_334882_echo_guarded_noise_decision_negative": {
+      "startedAt": "2026-07-13T02:23:28.071",
+      "decisionOffsetMs": 739,
+      "responseId": "resp_OTX4lvJHOqiapBJHHfOPr",
+      "generation": 1,
+      "playbackTarget": true,
+      "description": "Decision point for a fan/noise echo-guarded false pre-stop; should defer.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 21.73,
+          "rmsRangeDb": 6.86,
+          "rmsDirectionChanges": 4,
+          "largeRmsJumpCount": 1
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -33.68,
+        "noiseFloorDbfs": -44.0,
+        "snrDb": 10.32,
+        "peakDbfs": -28.08,
+        "vadVoicedMs": 240,
+        "candidateDurationMs": 240,
+        "speechDurationMs": 283,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "echo_guarded_noise_decision"
+      },
+      "turn": {
+        "echoGuardedTurn": {
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 738,
+          "burstCount": 2,
+          "voicedMs": 440,
+          "currentBurstVoicedMs": 240,
+          "maxSnrDb": 21.73,
+          "maxRmsRangeDb": 10.25
+        }
+      },
+      "recentAiAudio": {
+        "rmsDbfs": -31.0,
+        "ageMs": 20
+      }
+    },
+    "fixture_call_334882_deferred_episode_noise_decision_negative": {
+      "startedAt": "2026-07-13T02:23:31.856",
+      "decisionOffsetMs": 3452,
+      "responseId": "resp_NilPQLKXseTA3pH4gy6FD",
+      "generation": 2,
+      "playbackTarget": true,
+      "description": "Decision point for a fan/noise deferred episode false pre-stop; should defer.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 24.55,
+          "rmsRangeDb": 14.13,
+          "rmsDirectionChanges": 3,
+          "largeRmsJumpCount": 3
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -28.56,
+        "noiseFloorDbfs": -44.0,
+        "snrDb": 15.44,
+        "peakDbfs": -20.98,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 157,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "deferred_episode_noise_decision"
+      },
+      "turn": {
+        "deferredEpisode": {
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 3450,
+          "burstCount": 3,
+          "voicedMs": 540,
+          "currentBurstVoicedMs": 180,
+          "maxSnrDb": 24.55,
+          "maxRmsRangeDb": 14.13,
+          "maxGapMs": 1749
+        }
+      }
+    },
+    "fixture_call_334882_elevated_compact_noise_decision_negative": {
+      "startedAt": "2026-07-13T02:24:10.192",
+      "decisionOffsetMs": 2559,
+      "responseId": "resp_RYB8gmlMrHY8llcjI3oNd",
+      "generation": 10,
+      "playbackTarget": true,
+      "description": "Decision point for elevated-noise compact two-burst false pre-stop; should defer.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 20.55,
+          "rmsRangeDb": 10.21,
+          "rmsDirectionChanges": 5,
+          "largeRmsJumpCount": 1
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -15.65,
+        "noiseFloorDbfs": -36.2,
+        "snrDb": 20.55,
+        "peakDbfs": -8.6,
+        "vadVoicedMs": 260,
+        "candidateDurationMs": 260,
+        "speechDurationMs": 270,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "elevated_compact_noise_decision"
+      },
+      "turn": {
+        "deferredEpisode": {
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 2557,
+          "burstCount": 2,
+          "voicedMs": 440,
+          "currentBurstVoicedMs": 260,
+          "maxSnrDb": 20.55,
+          "maxRmsRangeDb": 10.21,
+          "maxGapMs": 2485
+        }
+      }
+    },
+    "fixture_call_334882_sparse_noise_decision_negative": {
+      "startedAt": "2026-07-13T02:24:25.618",
+      "decisionOffsetMs": 3500,
+      "responseId": "resp_IRAGXrZClwD6Y8X95nGDt",
+      "generation": 13,
+      "playbackTarget": true,
+      "description": "Decision point for sparse multi-candidate fan/noise false pre-stop; should defer.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 16.1,
+          "rmsRangeDb": 6.1,
+          "rmsDirectionChanges": 5,
+          "largeRmsJumpCount": 1
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -19.29,
+        "noiseFloorDbfs": -35.38,
+        "snrDb": 16.1,
+        "peakDbfs": -13.27,
+        "vadVoicedMs": 240,
+        "candidateDurationMs": 240,
+        "speechDurationMs": 418,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "sparse_multi_candidate_noise_decision"
+      },
+      "turn": {
+        "deferredEpisode": {
+          "firstOffsetMs": 0,
+          "lastOffsetMs": 3498,
+          "burstCount": 3,
+          "voicedMs": 700,
+          "currentBurstVoicedMs": 240,
+          "maxSnrDb": 16.1,
+          "maxRmsRangeDb": 6.1,
+          "maxGapMs": 2152
+        }
+      }
+    },
+    "fixture_call_334885_clear_short_noise_decision_negative": {
+      "startedAt": "2026-07-13T02:34:00.005",
+      "decisionOffsetMs": 19,
+      "responseId": "resp_JXDD6FHZKkVXYhw3sTMFd",
+      "generation": 2,
+      "playbackTarget": true,
+      "description": "Decision point for clear-short modulated fan/noise false pre-stop; should defer.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 15.87,
+          "rmsRangeDb": 7.03,
+          "rmsDirectionChanges": 3,
+          "largeRmsJumpCount": 0
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -28.13,
+        "noiseFloorDbfs": -44.0,
+        "snrDb": 15.87,
+        "peakDbfs": -21.2,
+        "vadVoicedMs": 200,
+        "candidateDurationMs": 200,
+        "speechDurationMs": 181,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "clear_short_modulated_noise_decision"
+      }
+    },
+    "fixture_call_334885_haode_short_ack_decision_positive": {
+      "startedAt": "2026-07-13T02:34:18.000",
+      "decisionOffsetMs": 0,
+      "responseId": "resp_RST5qHOOsuPtATS1GDqaT",
+      "generation": 3,
+      "playbackTarget": true,
+      "description": "Decision point for “好的。”; should authorize faster than waiting for later speech.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 23.17,
+          "rmsRangeDb": 6.4,
+          "rmsDirectionChanges": 1,
+          "largeRmsJumpCount": 1
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -20.83,
+        "noiseFloorDbfs": -44.0,
+        "snrDb": 23.17,
+        "peakDbfs": -13.59,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 158,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "haode_short_ack_decision"
+      }
+    },
+    "fixture_call_334885_tejialv_short_content_decision_positive": {
+      "startedAt": "2026-07-13T02:34:27.846",
+      "decisionOffsetMs": 0,
+      "responseId": "resp_Ke6z7ckchbFA1zjhM7Y33",
+      "generation": 5,
+      "playbackTarget": true,
+      "description": "Decision point for “特价率。”; should not rely only on later provider confirmation.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 17.88,
+          "rmsRangeDb": 5.92,
+          "rmsDirectionChanges": 3,
+          "largeRmsJumpCount": 0
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -21.12,
+        "noiseFloorDbfs": -39.0,
+        "snrDb": 17.88,
+        "peakDbfs": -12.84,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 166,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "tejialv_short_content_decision"
+      },
+      "recentAiAudio": {
+        "rmsDbfs": -24.0,
+        "ageMs": 20
+      }
+    },
+    "fixture_call_334885_haode_zhidaole_decision_positive": {
+      "startedAt": "2026-07-13T02:34:44.067",
+      "decisionOffsetMs": 0,
+      "responseId": "resp_QXLzcDfOlWH3jlj2pNhSk",
+      "generation": 6,
+      "playbackTarget": true,
+      "description": "Decision point for “好的，知道了。”; should authorize before later multi-candidate evidence.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 25.27,
+          "rmsRangeDb": 7.43,
+          "rmsDirectionChanges": 0,
+          "largeRmsJumpCount": 0
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -13.73,
+        "noiseFloorDbfs": -39.0,
+        "snrDb": 25.27,
+        "peakDbfs": -5.45,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 170,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "haode_zhidaole_decision"
+      }
+    },
+    "fixture_call_334885_call_end_phrase_decision_positive": {
+      "startedAt": "2026-07-13T02:34:58.430",
+      "decisionOffsetMs": 0,
+      "responseId": "resp_DGwT4pv9sQ2M8KSjy9gB8",
+      "generation": 8,
+      "playbackTarget": true,
+      "description": "Decision point for “我要挂了吧挂了吧。”; should pre-stop before semantic call-end scheduling.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": false,
+        "preStopLocal": false,
+        "payload": {
+          "maxSnrDb": 24.25,
+          "rmsRangeDb": 11.54,
+          "rmsDirectionChanges": 2,
+          "largeRmsJumpCount": 1
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -14.75,
+        "noiseFloorDbfs": -39.0,
+        "snrDb": 24.25,
+        "peakDbfs": -5.34,
+        "vadVoicedMs": 180,
+        "candidateDurationMs": 180,
+        "speechDurationMs": 199,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "call_end_phrase_decision"
+      }
+    },
+    "fixture_authority_clean_stable_customer_speech_positive_control": {
+      "startedAt": "2026-07-13T02:34:22.468Z",
+      "decisionOffsetMs": 0,
+      "responseId": "resp_clean_stable_positive_control",
+      "generation": 3,
+      "playbackTarget": true,
+      "description": "Harness positive control: clean stable customer speech should authorize pre-stop.",
+      "detector": {
+        "singleShort": false,
+        "fastLocal": true,
+        "preStopLocal": true,
+        "payload": {
+          "maxSnrDb": 26.0,
+          "rmsRangeDb": 7.0,
+          "rmsDirectionChanges": 2,
+          "largeRmsJumpCount": 0,
+          "speechQualityRejection": null
+        }
+      },
+      "observation": {
+        "active": true,
+        "candidate": true,
+        "rmsDbfs": -24.0,
+        "noiseFloorDbfs": -50.0,
+        "snrDb": 26.0,
+        "peakDbfs": -15.0,
+        "vadVoicedMs": 480,
+        "candidateDurationMs": 480,
+        "speechDurationMs": 480,
+        "frameDurationMs": 20,
+        "candidateClass": "stable_speech_candidate",
+        "reason": "clean_stable_customer_speech_positive_control"
+      }
+    }
+  },
+  "samples": [
+    {
+      "id": "authority_call_334882_echo_guarded_noise_must_defer",
+      "callId": "fixture_call_334882_echo_guarded_noise_decision_negative",
+      "sourceType": "authority_fixture",
+      "category": "authority_fan_noise_negative",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-13T02:23:28.810",
+      "windowEndTime": "2026-07-13T02:23:29.310"
+    },
+    {
+      "id": "authority_call_334882_deferred_episode_noise_must_defer",
+      "callId": "fixture_call_334882_deferred_episode_noise_decision_negative",
+      "sourceType": "authority_fixture",
+      "category": "authority_fan_noise_negative",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-13T02:23:35.308",
+      "windowEndTime": "2026-07-13T02:23:35.808"
+    },
+    {
+      "id": "authority_call_334882_elevated_compact_noise_must_defer",
+      "callId": "fixture_call_334882_elevated_compact_noise_decision_negative",
+      "sourceType": "authority_fixture",
+      "category": "authority_fan_noise_negative",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-13T02:24:12.751",
+      "windowEndTime": "2026-07-13T02:24:13.251"
+    },
+    {
+      "id": "authority_call_334882_sparse_noise_must_defer",
+      "callId": "fixture_call_334882_sparse_noise_decision_negative",
+      "sourceType": "authority_fixture",
+      "category": "authority_fan_noise_negative",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-13T02:24:29.118",
+      "windowEndTime": "2026-07-13T02:24:29.618"
+    },
+    {
+      "id": "authority_call_334885_clear_short_noise_must_defer",
+      "callId": "fixture_call_334885_clear_short_noise_decision_negative",
+      "sourceType": "authority_fixture",
+      "category": "authority_fan_noise_negative",
+      "expectation": "must_defer",
+      "windowStartTime": "2026-07-13T02:34:00.024",
+      "windowEndTime": "2026-07-13T02:34:00.524"
+    },
+    {
+      "id": "authority_call_334885_haode_short_ack_must_pre_stop_fast",
+      "callId": "fixture_call_334885_haode_short_ack_decision_positive",
+      "sourceType": "authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:18.000",
+      "maxCandidateToPreStopMs": 700,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "好的。"
+      }
+    },
+    {
+      "id": "authority_call_334885_tejialv_short_content_must_pre_stop_fast",
+      "callId": "fixture_call_334885_tejialv_short_content_decision_positive",
+      "sourceType": "authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:27.846",
+      "maxCandidateToPreStopMs": 700,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "特价率。"
+      }
+    },
+    {
+      "id": "authority_call_334885_haode_zhidaole_must_pre_stop_fast",
+      "callId": "fixture_call_334885_haode_zhidaole_decision_positive",
+      "sourceType": "authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:44.067",
+      "maxCandidateToPreStopMs": 700,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "好的，知道了。"
+      }
+    },
+    {
+      "id": "authority_call_334885_call_end_phrase_must_pre_stop_fast",
+      "callId": "fixture_call_334885_call_end_phrase_decision_positive",
+      "sourceType": "authority_fixture",
+      "category": "authority_cn_short_positive",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:58.430",
+      "maxCandidateToPreStopMs": 700,
+      "utterance": {
+        "source": "offline_customer_track_asr",
+        "text": "我要挂了吧挂了吧。"
+      }
+    },
+    {
+      "id": "authority_clean_stable_customer_speech_positive_control",
+      "callId": "fixture_authority_clean_stable_customer_speech_positive_control",
+      "sourceType": "authority_fixture",
+      "category": "authority_clean_stable_positive_control",
+      "expectation": "must_pre_stop_after_candidate",
+      "candidateTime": "2026-07-13T02:34:22.468Z",
+      "maxCandidateToPreStopMs": 700,
+      "acousticContext": {
+        "speechPattern": "clean_stable_customer_speech"
+      }
+    }
+  ]
+}

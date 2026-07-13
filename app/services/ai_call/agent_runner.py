@@ -99,6 +99,7 @@ BUSINESS_HANDOFF_CONFIRMATION_TOOL_RESULT = (
 )
 CALL_END_FINAL_RESPONSE_TOOL_RESULT = "已记录。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
 CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "已记录。系统将结束通话，不要再生成额外回复。"
+CALL_END_REJECTED_TOOL_RESULT = "未确认用户要求结束通话。请继续按用户刚才的话推进对话，不要结束通话。"
 BROWSER_INTERRUPT_REASONS = {
     "browser_speech_segment_candidate_during_ai_audio",
     "browser_speech_segment_strong_during_ai_audio",
@@ -153,6 +154,7 @@ SIP_DEFERRED_TURN_MAX_WALL_MS = 20000
 SIP_DEFERRED_TURN_ECHO_GUARD_MIN_WALL_MS = 3000
 SIP_DEFERRED_TURN_MIN_RMS_RANGE_DB = 6.0
 SIP_DEFERRED_TURN_MIN_SNR_DB = 10.0
+SIP_REJECTED_PRE_STOP_PROVIDER_CONFIRM_GRACE_SECONDS = 1.0
 SIP_ECHO_GUARDED_TURN_MAX_GAP_SECONDS = 12.0
 SIP_ECHO_GUARDED_TURN_MAX_WALL_MS = 16000
 SIP_ECHO_GUARDED_TURN_SAME_BURST_GAP_SECONDS = 0.35
@@ -171,6 +173,7 @@ SIP_ECHO_GUARDED_LOCAL_DEFERRED_MAX_WALL_MS = 2600
 SIP_ECHO_GUARDED_LOCAL_DEFERRED_MAX_GAP_MS = 2600
 SIP_ECHO_GUARDED_LOCAL_DEFERRED_MAX_AI_DOMINANCE_DB = 1.0
 SIP_ECHO_GUARDED_LOCAL_DEFERRED_PRE_STOP_MIN_UPLINK_ABOVE_AI_DB = 3.0
+SIP_ECHO_GUARDED_COMPACT_SHORT_PHRASE_MIN_UPLINK_ABOVE_AI_DB = 2.0
 SIP_TURN_CLUSTER_RECOVERABLE_QUALITY_REJECTIONS = frozenset({
     "clipped_hot_onset",
     "short_hot_onset_drop",
@@ -183,6 +186,7 @@ SIP_SINGLE_SHORT_MAX_RMS_DBFS = -12.0
 SIP_SINGLE_SHORT_MIN_SNR_DB = 16.0
 SIP_SINGLE_SHORT_MAX_DIRECTION_CHANGES = 4
 SIP_ELEVATED_NOISE_FLOOR_DBFS = -38.0
+SIP_BORDERLINE_ELEVATED_NOISE_FLOOR_DBFS = SIP_ELEVATED_NOISE_FLOOR_DBFS - 3.0
 SIP_UNSTABLE_LOCAL_ENVELOPE_MIN_RMS_RANGE_DB = 12.0
 SIP_UNSTABLE_LOCAL_ENVELOPE_MIN_DIRECTION_CHANGES = 4
 SIP_UNSTABLE_LOCAL_ENVELOPE_MIN_LARGE_JUMPS = 4
@@ -194,6 +198,14 @@ SIP_ELEVATED_NOISE_SPARSE_TURN_MODULATED_MIN_DIRECTION_CHANGES = 2
 SIP_CLEAR_SHORT_MODULATED_MIN_RMS_RANGE_DB = 6.0
 SIP_CLEAR_SHORT_MODULATED_MIN_SNR_DB = 12.0
 SIP_CLEAR_SHORT_MODULATED_MAX_LARGE_JUMPS = 1
+SIP_CLEAR_SHORT_NOISE_LOW_SNR_MAX_DB = SIP_SINGLE_SHORT_MIN_SNR_DB
+SIP_CLEAR_SHORT_NOISE_LOUD_MIN_SNR_DB = 20.0
+SIP_CLEAR_SHORT_NOISE_LOUD_MIN_RMS_DBFS = -24.0
+SIP_CLEAR_SHORT_NOISE_LOUD_MIN_DIRECTION_CHANGES = 3
+SIP_ELEVATED_NOISE_CLEAR_SHORT_MIN_RMS_RANGE_DB = 8.0
+SIP_ELEVATED_NOISE_CLEAR_SHORT_MIN_SNR_DB = 13.0
+SIP_ELEVATED_NOISE_CLEAR_SHORT_MAX_SNR_DB = 18.0
+SIP_ELEVATED_NOISE_CLEAR_SHORT_MAX_RMS_DBFS = -20.5
 SIP_AI_PLAYBACK_ECHO_UPLINK_MARGIN_DB = 6.0
 SIP_REALTIME_SHADOW_PRE_STOP_MIN_WINDOW_MS = 360
 SIP_REALTIME_SHADOW_PRE_STOP_MAX_WINDOW_MS = 1800
@@ -501,6 +513,7 @@ class PendingUserTurn:
     sip_single_short_pre_stop_evidence: bool = False
     sip_provider_speech_confirmable: bool = False
     sip_interrupt_rejected: bool = False
+    sip_interrupt_rejected_at: datetime | None = None
     sip_recovery_count: int = 0
     sip_turn_cluster_response_id: str | None = None
     sip_turn_cluster_first_at: datetime | None = None
@@ -1491,6 +1504,11 @@ class RealtimeCallAgentRunner:
             call_id,
             observation,
         )
+        clear_short_noise_risk = (
+            self._sip_clear_short_noise_risk(call_id, observation)
+            if has_clear_short
+            else None
+        )
         has_strong_stable_local = (
             has_stable_local
             and observation.candidate_duration_ms
@@ -1569,6 +1587,27 @@ class RealtimeCallAgentRunner:
                 )
             )
             if echo_guarded_turn_payload is not None:
+                if self._is_sip_opening_pre_stop_guard_active(
+                    call_id=call_id,
+                    trigger_timestamp=trigger_timestamp,
+                ):
+                    return SipPreStopAuthorityDecision(
+                        action="defer",
+                        reason="awaiting_opening_pre_stop_authority",
+                        required_duration_ms=required_duration_ms,
+                        extra_payload=echo_guarded_turn_payload,
+                    )
+                if self._has_sip_echo_guarded_turn_noise_risk(call_id, observation):
+                    payload = dict(echo_guarded_turn_payload)
+                    payload["sipEchoGuardedTurnNoiseRisk"] = (
+                        "low_current_snr_echo_guarded_turn"
+                    )
+                    return SipPreStopAuthorityDecision(
+                        action="defer",
+                        reason="awaiting_ai_playback_echo_guard",
+                        required_duration_ms=required_duration_ms,
+                        extra_payload=payload,
+                    )
                 return SipPreStopAuthorityDecision(
                     action="pre_stop",
                     reason=SIP_BARGE_IN_INTERRUPT_REASON,
@@ -1651,8 +1690,27 @@ class RealtimeCallAgentRunner:
                         required_duration_ms=required_duration_ms,
                         extra_payload=echo_guard_deferred_episode_payload,
                     )
+                compact_short_phrase_payload = (
+                    self._sip_echo_guarded_compact_short_phrase_pre_stop_extra_payload(
+                        call_id=call_id,
+                        payload=echo_guard_deferred_episode_payload,
+                        observation=observation,
+                    )
+                )
+                if compact_short_phrase_payload is not None:
+                    return SipPreStopAuthorityDecision(
+                        action="pre_stop",
+                        reason=SIP_BARGE_IN_INTERRUPT_REASON,
+                        required_duration_ms=min(
+                            required_duration_ms,
+                            observation.candidate_duration_ms,
+                        ),
+                        evidence="echo_guarded_compact_short_phrase",
+                        extra_payload=compact_short_phrase_payload,
+                    )
                 if self._should_defer_sip_compact_deferred_episode(
                     echo_guard_deferred_episode_payload,
+                    call_id=call_id,
                     turn=turn,
                     observation=observation,
                     required_duration_ms=required_duration_ms,
@@ -1765,8 +1823,25 @@ class RealtimeCallAgentRunner:
             )
 
         if has_deferred_episode:
+            if self._has_sip_deferred_episode_noise_risk(
+                call_id=call_id,
+                turn=turn,
+                observation=observation,
+                payload=deferred_episode_payload,
+            ):
+                payload = dict(deferred_episode_payload)
+                payload["sipDeferredEpisodeNoiseRisk"] = (
+                    "low_confidence_or_elevated_noise_deferred_turn"
+                )
+                return SipPreStopAuthorityDecision(
+                    action="defer",
+                    reason="awaiting_pre_stop_authority",
+                    required_duration_ms=required_duration_ms,
+                    extra_payload=payload,
+                )
             if self._should_defer_sip_compact_deferred_episode(
                 deferred_episode_payload,
+                call_id=call_id,
                 turn=turn,
                 observation=observation,
                 required_duration_ms=required_duration_ms,
@@ -1822,6 +1897,58 @@ class RealtimeCallAgentRunner:
                 reason=SIP_BARGE_IN_INTERRUPT_REASON,
                 required_duration_ms=fast_local_required_duration_ms,
                 evidence=evidence,
+                extra_payload=short_evidence_payload,
+            )
+
+        if has_clear_short and opening_pre_stop_guard_active:
+            return SipPreStopAuthorityDecision(
+                action="defer",
+                reason="awaiting_opening_pre_stop_authority",
+                required_duration_ms=observation.candidate_duration_ms,
+                extra_payload=short_evidence_payload,
+            )
+
+        if has_clear_short and self._has_sip_elevated_noise_clear_short_pre_stop_evidence(
+            call_id,
+            observation,
+        ):
+            payload = dict(short_evidence_payload)
+            payload["sipElevatedNoiseClearShortEvidence"] = True
+            return SipPreStopAuthorityDecision(
+                action="pre_stop",
+                reason=SIP_BARGE_IN_INTERRUPT_REASON,
+                required_duration_ms=observation.candidate_duration_ms,
+                evidence="elevated_noise_clear_short_modulated_burst",
+                extra_payload=payload,
+            )
+
+        if has_clear_short and (
+            has_elevated_noise_short_burst_risk
+            or has_elevated_noise_local_only_risk
+        ):
+            return SipPreStopAuthorityDecision(
+                action="defer",
+                reason="awaiting_authorized_pre_stop_evidence",
+                required_duration_ms=observation.candidate_duration_ms,
+                extra_payload=short_evidence_payload,
+            )
+
+        if has_clear_short and clear_short_noise_risk is not None:
+            payload = dict(short_evidence_payload)
+            payload["sipClearShortNoiseRisk"] = clear_short_noise_risk
+            return SipPreStopAuthorityDecision(
+                action="defer",
+                reason="awaiting_authorized_pre_stop_evidence",
+                required_duration_ms=observation.candidate_duration_ms,
+                extra_payload=payload,
+            )
+
+        if has_clear_short:
+            return SipPreStopAuthorityDecision(
+                action="pre_stop",
+                reason=SIP_BARGE_IN_INTERRUPT_REASON,
+                required_duration_ms=observation.candidate_duration_ms,
+                evidence="clear_short_modulated_burst",
                 extra_payload=short_evidence_payload,
             )
 
@@ -1929,14 +2056,53 @@ class RealtimeCallAgentRunner:
         if payload is None:
             return False
         return payload.get("sipDeferredEpisodeEvidence") in {
+            "ai_receded_compact_two_burst_turn",
             "compact_two_burst_turn",
             "elevated_noise_compact_two_burst_turn",
         }
+
+    def _has_sip_deferred_episode_noise_risk(
+        self,
+        *,
+        call_id: str,
+        turn: PendingUserTurn,
+        observation: SipBargeInObservation,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if payload is None:
+            return False
+        if observation.rms_dbfs is None or observation.snr_db is None:
+            return False
+        detector = self._sip_barge_in_detector
+        diagnostics = detector.latest_observation_payload(call_id) if detector is not None else {}
+        has_sparse_speech_anchor = (
+            turn.sip_deferred_episode_max_rms_dbfs is not None
+            and turn.sip_deferred_episode_max_rms_dbfs
+            >= SIP_SINGLE_SHORT_MIN_RMS_DBFS + 1.5
+            and turn.sip_deferred_episode_max_snr_db is not None
+            and turn.sip_deferred_episode_max_snr_db
+            >= SIP_SINGLE_SHORT_MIN_SNR_DB + 0.5
+        )
+        large_jumps = diagnostics.get("largeRmsJumpCount")
+        if (
+            observation.rms_dbfs <= -24.0
+            and observation.snr_db < SIP_SINGLE_SHORT_MIN_SNR_DB
+            and isinstance(large_jumps, int)
+            and large_jumps >= 2
+            and not has_sparse_speech_anchor
+        ):
+            return True
+        if payload.get("sipDeferredEpisodeEvidence") != "sparse_multi_candidate_turn":
+            return False
+        if not self._has_sip_marginal_elevated_noise_turn_risk(observation):
+            return False
+        return not has_sparse_speech_anchor
 
     def _should_defer_sip_compact_deferred_episode(
         self,
         payload: dict[str, Any] | None,
         *,
+        call_id: str,
         turn: PendingUserTurn,
         observation: SipBargeInObservation,
         required_duration_ms: int,
@@ -1949,12 +2115,81 @@ class RealtimeCallAgentRunner:
             and payload.get("sipDeferredEpisodeEvidence")
             == "elevated_noise_compact_two_burst_turn"
         )
+        ai_receded_compact = (
+            payload is not None
+            and payload.get("sipDeferredEpisodeEvidence")
+            == "ai_receded_compact_two_burst_turn"
+        )
+        if ai_receded_compact:
+            if self._has_sip_marginal_elevated_noise_turn_risk(observation):
+                wall_ms = payload.get("sipDeferredEpisodeWallMs")
+                detector = self._sip_barge_in_detector
+                diagnostics = (
+                    detector.latest_observation_payload(call_id)
+                    if detector is not None
+                    else {}
+                )
+                direction_changes = diagnostics.get("rmsDirectionChanges")
+                has_short_tail = (
+                    isinstance(wall_ms, int)
+                    and wall_ms < round(SIP_TURN_CLUSTER_MAX_GAP_SECONDS * 1000)
+                )
+                has_over_modulated_tail = (
+                    isinstance(direction_changes, int)
+                    and direction_changes > SIP_SINGLE_SHORT_MAX_DIRECTION_CHANGES
+                )
+                if has_short_tail or has_over_modulated_tail:
+                    payload["sipAiRecededCompactTurnNoiseRisk"] = (
+                        "short_or_over_modulated_tail_under_elevated_noise"
+                    )
+                    return True
+            return echo_guarded and observation.candidate_duration_ms < required_duration_ms
         if not self._has_sip_strong_compact_deferred_episode_anchor(
             turn,
             elevated_noise=elevated_noise_compact,
         ):
             return True
         return echo_guarded and observation.candidate_duration_ms < required_duration_ms
+
+    def _sip_echo_guarded_compact_short_phrase_pre_stop_extra_payload(
+        self,
+        *,
+        call_id: str,
+        payload: dict[str, Any],
+        observation: SipBargeInObservation,
+    ) -> dict[str, Any] | None:
+        if (
+            payload.get("sipDeferredEpisodeEvidence")
+            != "elevated_noise_compact_two_burst_turn"
+        ):
+            return None
+        if (
+            payload.get("sipElevatedNoiseCompactTurnEvidence")
+            != "strong_current_modulated_two_burst"
+        ):
+            return None
+        if observation.rms_dbfs is None:
+            return None
+        if observation.rms_dbfs < SIP_SINGLE_SHORT_MIN_RMS_DBFS + 4.0:
+            return None
+        ai_rms_dbfs = self._last_ai_audio_rms_dbfs.get(call_id)
+        if ai_rms_dbfs is None:
+            return None
+        uplink_above_ai_db = observation.rms_dbfs - ai_rms_dbfs
+        if (
+            uplink_above_ai_db
+            < SIP_ECHO_GUARDED_COMPACT_SHORT_PHRASE_MIN_UPLINK_ABOVE_AI_DB
+        ):
+            return None
+        pre_stop_payload = dict(payload)
+        pre_stop_payload["sipEchoGuardedCompactShortPhraseEvidence"] = (
+            "loud_modulated_two_burst"
+        )
+        pre_stop_payload["sipUplinkAboveAiPlaybackDb"] = round(uplink_above_ai_db, 2)
+        pre_stop_payload[
+            "sipEchoGuardedCompactShortPhraseMinUplinkAboveAiPlaybackDb"
+        ] = SIP_ECHO_GUARDED_COMPACT_SHORT_PHRASE_MIN_UPLINK_ABOVE_AI_DB
+        return pre_stop_payload
 
     @staticmethod
     def _has_sip_strong_compact_deferred_episode_anchor(
@@ -3798,6 +4033,22 @@ class RealtimeCallAgentRunner:
             "sipEchoGuardedTurnMaxSnrDb": round(turn.sip_echo_guarded_turn_max_snr_db, 2),
         }
 
+    def _has_sip_echo_guarded_turn_noise_risk(
+        self,
+        call_id: str,
+        observation: SipBargeInObservation,
+    ) -> bool:
+        if observation.rms_dbfs is None or observation.snr_db is None:
+            return False
+        if observation.rms_dbfs > -30.0:
+            return False
+        if observation.snr_db >= SIP_ECHO_GUARDED_TURN_MIN_SNR_DB:
+            return False
+        detector = self._sip_barge_in_detector
+        diagnostics = detector.latest_observation_payload(call_id) if detector is not None else {}
+        direction_changes = diagnostics.get("rmsDirectionChanges")
+        return isinstance(direction_changes, int) and direction_changes >= 2
+
     def _sip_echo_guarded_local_pre_stop_extra_payload(
         self,
         *,
@@ -4075,6 +4326,8 @@ class RealtimeCallAgentRunner:
         )
         if observation.snr_db < min_snr_db:
             return False
+        if observation.rms_dbfs >= SIP_SINGLE_SHORT_MIN_RMS_DBFS:
+            return False
         detector = self._sip_barge_in_detector
         if detector is None:
             return False
@@ -4090,15 +4343,102 @@ class RealtimeCallAgentRunner:
             return False
         if not isinstance(large_jumps, int):
             return False
+        if direction_changes > SIP_SINGLE_SHORT_MAX_DIRECTION_CHANGES:
+            return False
         min_rms_range_db = max(
             self.sip_barge_in_config.turn_taking_min_range_db + 2.0,
             SIP_CLEAR_SHORT_MODULATED_MIN_RMS_RANGE_DB,
         )
+        if rms_range_db < min_rms_range_db or direction_changes < 1:
+            return False
+        if large_jumps <= SIP_CLEAR_SHORT_MODULATED_MAX_LARGE_JUMPS:
+            return True
         return (
-            rms_range_db >= min_rms_range_db
+            large_jumps == SIP_CLEAR_SHORT_MODULATED_MAX_LARGE_JUMPS + 1
+            and direction_changes >= 2
+            and observation.rms_dbfs <= -24.0
+            and observation.snr_db < SIP_SINGLE_SHORT_MIN_SNR_DB + 6.0
+            and rms_range_db >= min_rms_range_db + 2.0
+        )
+
+    def _has_sip_elevated_noise_clear_short_pre_stop_evidence(
+        self,
+        call_id: str,
+        observation: SipBargeInObservation,
+    ) -> bool:
+        if not self._has_sip_elevated_noise_short_burst_risk(observation):
+            return False
+        if not self._has_sip_clear_short_modulated_pre_stop_evidence(call_id, observation):
+            return False
+        if observation.rms_dbfs is None or observation.snr_db is None:
+            return False
+        if observation.rms_dbfs > SIP_ELEVATED_NOISE_CLEAR_SHORT_MAX_RMS_DBFS:
+            return False
+        if not (
+            SIP_ELEVATED_NOISE_CLEAR_SHORT_MIN_SNR_DB
+            <= observation.snr_db
+            <= SIP_ELEVATED_NOISE_CLEAR_SHORT_MAX_SNR_DB
+        ):
+            return False
+        detector = self._sip_barge_in_detector
+        if detector is None:
+            return False
+        diagnostics = detector.latest_observation_payload(call_id)
+        rms_range_db = diagnostics.get("rmsRangeDb")
+        direction_changes = diagnostics.get("rmsDirectionChanges")
+        large_jumps = diagnostics.get("largeRmsJumpCount")
+        return (
+            isinstance(rms_range_db, int | float)
+            and isinstance(direction_changes, int)
+            and isinstance(large_jumps, int)
+            and rms_range_db >= SIP_ELEVATED_NOISE_CLEAR_SHORT_MIN_RMS_RANGE_DB
             and direction_changes >= 1
             and large_jumps <= SIP_CLEAR_SHORT_MODULATED_MAX_LARGE_JUMPS
         )
+
+    def _sip_clear_short_noise_risk(
+        self,
+        call_id: str,
+        observation: SipBargeInObservation,
+    ) -> str | None:
+        if observation.rms_dbfs is None or observation.snr_db is None:
+            return None
+        detector = self._sip_barge_in_detector
+        if detector is None:
+            return None
+        diagnostics = detector.latest_observation_payload(call_id)
+        direction_changes = diagnostics.get("rmsDirectionChanges")
+        large_jumps = diagnostics.get("largeRmsJumpCount")
+        if not isinstance(direction_changes, int) or not isinstance(large_jumps, int):
+            return None
+        if (
+            large_jumps > SIP_CLEAR_SHORT_MODULATED_MAX_LARGE_JUMPS
+            and observation.snr_db < SIP_CLEAR_SHORT_NOISE_LOW_SNR_MAX_DB
+        ):
+            return "choppy_low_snr_short_burst"
+        if (
+            observation.rms_dbfs <= -24.0
+            and observation.snr_db < SIP_CLEAR_SHORT_NOISE_LOUD_MIN_SNR_DB - 2.0
+        ):
+            return "low_energy_short_burst"
+        if (
+            observation.snr_db >= SIP_CLEAR_SHORT_NOISE_LOUD_MIN_SNR_DB
+            and observation.rms_dbfs >= SIP_CLEAR_SHORT_NOISE_LOUD_MIN_RMS_DBFS
+            and direction_changes < SIP_CLEAR_SHORT_NOISE_LOUD_MIN_DIRECTION_CHANGES
+        ):
+            return "loud_low_modulation_short_burst"
+        if (
+            observation.noise_floor_dbfs is not None
+            and observation.noise_floor_dbfs >= SIP_BORDERLINE_ELEVATED_NOISE_FLOOR_DBFS
+            and observation.snr_db < SIP_ELEVATED_NOISE_MARGINAL_TURN_MIN_SNR_DB + 1.0
+            and observation.rms_dbfs >= SIP_CLEAR_SHORT_NOISE_LOUD_MIN_RMS_DBFS
+            and not self._has_sip_elevated_noise_clear_short_pre_stop_evidence(
+                call_id,
+                observation,
+            )
+        ):
+            return "borderline_high_noise_short_burst"
+        return None
 
     def _has_sip_elevated_noise_short_burst_risk(
         self,
@@ -4540,7 +4880,12 @@ class RealtimeCallAgentRunner:
         turn.response_requested = True
         self._cancel_sip_barge_in_task_nowait(call_id)
         payload = self._sip_clean_window_payload(call_id, turn, decision="rejected", reason=reason)
-        self._append_event(call_id, "sip_interrupt_rejected", "agent", payload)
+        turn.sip_interrupt_rejected_at = self._append_event(
+            call_id,
+            "sip_interrupt_rejected",
+            "agent",
+            payload,
+        )
         self._schedule_sip_recovery(call_id, turn, provider, reason=reason)
 
     def _schedule_sip_recovery(
@@ -4932,6 +5277,18 @@ class RealtimeCallAgentRunner:
         if turn.stopped_at is not None and not turn.response_requested:
             turn.stopped_at = None
         turn.started_at = timestamp
+        if self._should_confirm_recent_rejected_sip_pre_stop_from_provider(
+            session,
+            previous_turn,
+            timestamp,
+        ):
+            await self._confirm_recent_rejected_sip_pre_stop_from_provider(
+                call_id=call_id,
+                provider=provider,
+                turn=previous_turn,
+                timestamp=timestamp,
+            )
+            return
         if self._is_redundant_sip_provider_speech_started_while_response_pending(
             call_id,
             session,
@@ -5054,6 +5411,89 @@ class RealtimeCallAgentRunner:
                 reason=decision.reason,
             )
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+
+    def _should_confirm_recent_rejected_sip_pre_stop_from_provider(
+        self,
+        session: CallSession,
+        turn: PendingUserTurn | None,
+        timestamp: datetime,
+    ) -> bool:
+        if turn is None or not self._is_sip_participant(session):
+            return False
+        if (
+            not turn.sip_interrupt_rejected
+            or not turn.sip_pre_stop_requested
+            or turn.sip_pre_stop_at is None
+            or turn.sip_interrupt_rejected_at is None
+        ):
+            return False
+        elapsed_seconds = (timestamp - turn.sip_interrupt_rejected_at).total_seconds()
+        return 0 <= elapsed_seconds <= SIP_REJECTED_PRE_STOP_PROVIDER_CONFIRM_GRACE_SECONDS
+
+    async def _confirm_recent_rejected_sip_pre_stop_from_provider(
+        self,
+        *,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        turn: PendingUserTurn,
+        timestamp: datetime,
+    ) -> None:
+        self._pending_user_turns[call_id] = turn
+        self._cancel_sip_recovery_task_nowait(call_id)
+        recovery_pending = self._clear_pending_sip_recovery_response(call_id)
+        turn.response_requested = False
+        turn.stopped_at = None
+        turn.started_at = timestamp
+        turn.sip_interrupt_rejected = False
+        turn.sip_barge_in_requested = True
+        turn.sip_barge_in_expires_at = timestamp + timedelta(
+            seconds=self.sip_barge_in_hold_timeout_seconds,
+        )
+        rejected_at = turn.sip_interrupt_rejected_at
+        elapsed_ms = (
+            round(max(0.0, (timestamp - rejected_at).total_seconds() * 1000))
+            if rejected_at is not None
+            else None
+        )
+        self._append_event(
+            call_id,
+            "sip_rejected_pre_stop_late_provider_confirmed",
+            "agent",
+            {
+                "reason": "provider_speech_started_after_rejected_pre_stop",
+                "confirmedBy": "provider_speech_started",
+                "rejectedToProviderSpeechMs": elapsed_ms,
+                "providerConfirmGraceMs": round(
+                    SIP_REJECTED_PRE_STOP_PROVIDER_CONFIRM_GRACE_SECONDS * 1000
+                ),
+                "recoveryPendingCleared": recovery_pending,
+            },
+        )
+        self._confirm_sip_barge_in(
+            call_id,
+            turn,
+            confirmed_by="provider_speech_started",
+            reason="user_speech_started_during_ai_audio",
+        )
+        await self._confirm_interrupt(
+            call_id,
+            provider,
+            timestamp,
+            reason="user_speech_started_during_ai_audio",
+        )
+        turn.interrupt_confirmed = True
+
+    def _clear_pending_sip_recovery_response(self, call_id: str) -> bool:
+        lifecycle = self._response_lifecycle(call_id)
+        if (
+            not lifecycle.pending_create
+            or lifecycle.pending_input_text != SIP_SHORT_RECOVERY_INPUT_TEXT
+        ):
+            return False
+        lifecycle.pending_create = False
+        lifecycle.pending_input_text = None
+        lifecycle.pending_response_is_opening = False
+        return True
 
     def _is_redundant_sip_provider_speech_started_while_response_pending(
         self,
@@ -5195,6 +5635,34 @@ class RealtimeCallAgentRunner:
             )
             return
 
+        ignore_payload = self._call_end_tool_ignore_payload(call_id, tool_reason)
+        if ignore_payload is not None:
+            ignored_payload = {
+                "toolCallId": tool_call_id,
+                "toolReason": tool_reason,
+                "endReason": end_reason,
+                **ignore_payload,
+            }
+            self._append_event(
+                call_id,
+                "call_end_tool_ignored",
+                "agent",
+                ignored_payload,
+            )
+            try:
+                await provider.submit_tool_result(tool_call_id, CALL_END_REJECTED_TOOL_RESULT)
+            except Exception as exc:
+                self._append_event(
+                    call_id,
+                    "agent_error",
+                    "agent",
+                    {
+                        "message": f"提交结束通话工具拒绝结果失败: {exc}",
+                        "toolCallId": tool_call_id,
+                    },
+                )
+            return
+
         self._pending_call_end_intents.pop(call_id, None)
         final_audio_already_spoken = self._has_current_response_audio(call_id)
         if call_id not in self._pending_call_ends:
@@ -5239,6 +5707,30 @@ class RealtimeCallAgentRunner:
                     "toolCallId": tool_call_id,
                 },
             )
+
+    def _call_end_tool_ignore_payload(
+        self,
+        call_id: str,
+        tool_reason: str,
+    ) -> dict[str, Any] | None:
+        if tool_reason != "customer_end":
+            return None
+        if call_id in self._pending_call_end_intents:
+            return None
+        turn = self._pending_user_turns.get(call_id)
+        transcript = turn.transcript if turn is not None else ""
+        if not transcript:
+            return None
+        decision = self.call_end_decision_service.decide(transcript)
+        if decision.action == "explicit_end":
+            return None
+        return {
+            "reason": "customer_end_without_explicit_customer_intent",
+            "localDecisionAction": decision.action,
+            "localDecisionReason": decision.reason,
+            "localDecisionConfidence": decision.confidence,
+            "transcriptPreview": self._text_preview(transcript),
+        }
 
     def _interrupt_pending_call_end(self, call_id: str, reason: str) -> None:
         pending_call_end = self._pending_call_ends.pop(call_id, None)
@@ -6406,6 +6898,7 @@ class RealtimeCallAgentRunner:
         )
         turn.sip_provider_speech_confirmable = False
         turn.sip_interrupt_rejected = False
+        turn.sip_interrupt_rejected_at = None
 
     def _append_event(
         self,

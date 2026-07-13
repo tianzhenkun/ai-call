@@ -22,6 +22,7 @@ class SipBargeInConfig:
     max_hold_ms: int = 500
     echo_tail_window_ms: int = 500
     noise_floor_initial_dbfs: float = -50.0
+    noise_floor_interruptible_max_dbfs: float = -44.0
     impulse_peak_rms_gap_db: float = 18.0
     strong_short_min_rms_dbfs: float = -16.0
     strong_short_max_rms_dbfs: float = -9.0
@@ -216,7 +217,11 @@ class SipBargeInDetector:
 
         if rms_dbfs < self.min_rms_dbfs:
             if not is_voiced:
-                self._update_noise_floor(state, rms_dbfs)
+                self._update_noise_floor(
+                    state,
+                    rms_dbfs,
+                    max_dbfs=self.config.noise_floor_interruptible_max_dbfs,
+                )
             self._reset_activity(call_id)
             return SipBargeInObservation(
                 active=False,
@@ -878,13 +883,21 @@ class SipBargeInDetector:
         return value_db - floor_db
 
     @staticmethod
-    def _update_noise_floor(state: _SipBargeInState, rms_dbfs: float) -> None:
+    def _update_noise_floor(
+        state: _SipBargeInState,
+        rms_dbfs: float,
+        *,
+        max_dbfs: float | None = None,
+    ) -> None:
         if math.isinf(rms_dbfs):
             return
-        state.noise_floor_dbfs = min(
+        updated = min(
             max(rms_dbfs, state.noise_floor_dbfs),
             state.noise_floor_dbfs + 1.0,
         )
+        if max_dbfs is not None and state.noise_floor_dbfs <= max_dbfs:
+            updated = min(updated, max_dbfs)
+        state.noise_floor_dbfs = updated
 
     def _is_vad_speech(self, frame: PcmAudioFrame) -> bool:
         try:

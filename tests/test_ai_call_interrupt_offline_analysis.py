@@ -2595,6 +2595,110 @@ def test_p1_eval_cli_builds_sample_matrix_from_authority_fixtures_without_fetchi
     assert payload["samples"][2]["evidence"]["outcome"] == "pre_stop_pending"
 
 
+def test_p1_eval_authority_fixture_replays_shadow_assisted_short_speech(
+    tmp_path,
+) -> None:
+    matrix_path = tmp_path / "p1_matrix_authority_fixture_shadow_short_speech.json"
+    matrix_path.write_text(
+        json.dumps(
+            {
+                "fixtureCoverageGates": {
+                    "minSamples": 1,
+                    "requiredCategories": {"shadow_short_speech": 1},
+                    "requiredSourceTypes": {"authority_fixture": 1},
+                    "requiredExpectations": {"must_pre_stop_after_candidate": 1},
+                },
+                "authorityFixtures": {
+                    "fixture_authority_shadow_short_speech": {
+                        "startedAt": "2026-07-13T02:34:18.000Z",
+                        "decisionOffsetMs": 240,
+                        "responseId": "resp_shadow_short_speech",
+                        "generation": 3,
+                        "playbackTarget": True,
+                        "detector": {
+                            "singleShort": False,
+                            "fastLocal": False,
+                            "preStopLocal": False,
+                            "payload": {
+                                "maxSnrDb": 23.17,
+                                "rmsRangeDb": 6.4,
+                                "rmsDirectionChanges": 1,
+                                "largeRmsJumpCount": 1,
+                                "speechQualityRejection": None,
+                            },
+                        },
+                        "shadowObservations": [
+                            {
+                                "active": True,
+                                "started": True,
+                                "ended": False,
+                                "detector": "fsmn_shadow",
+                                "analyzed": True,
+                                "durationMs": 20,
+                                "frameDurationMs": 20,
+                                "confidence": 0.91,
+                                "bufferDurationMs": 1200,
+                                "windowStartMs": 640,
+                                "windowEndMs": 1180,
+                                "detectionLagMs": 560,
+                                "speechEndLagMs": 20,
+                            }
+                        ],
+                        "observation": {
+                            "active": True,
+                            "candidate": True,
+                            "rmsDbfs": -20.83,
+                            "noiseFloorDbfs": -44.0,
+                            "snrDb": 23.17,
+                            "peakDbfs": -13.59,
+                            "vadVoicedMs": 240,
+                            "candidateDurationMs": 240,
+                            "speechDurationMs": 240,
+                            "frameDurationMs": 20,
+                            "candidateClass": "stable_speech_candidate",
+                            "reason": "fixture_shadow_short_speech",
+                        },
+                    }
+                },
+                "samples": [
+                    {
+                        "id": "authority_shadow_short_speech_must_pre_stop",
+                        "callId": "fixture_authority_shadow_short_speech",
+                        "category": "shadow_short_speech",
+                        "expectation": "must_pre_stop_after_candidate",
+                        "candidateTime": "2026-07-13T02:34:18.000Z",
+                        "maxCandidateToPreStopMs": 700,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_get_json(url: str, _timeout_seconds: float) -> dict[str, Any]:
+        raise AssertionError(f"unexpected API fetch for authority fixture matrix: {url}")
+
+    stdout = io.StringIO()
+    exit_code = run_p1_eval(
+        [
+            "--sample-matrix",
+            str(matrix_path),
+            "--fixture-only",
+            "--json",
+        ],
+        get_json=fake_get_json,
+        stdout=stdout,
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert payload["summary"]["failed"] == 0
+    evidence = payload["samples"][0]["evidence"]
+    assert evidence["candidateToPreStopMs"] == 240
+    assert evidence["outcome"] == "pre_stop_pending"
+
+
 def test_p1_eval_authority_fixture_detector_implements_runner_reset_hooks() -> None:
     from tools.ai_call_p1_eval import _AuthorityFixtureDetector
 

@@ -661,6 +661,61 @@ def test_sip_barge_in_detector_does_not_learn_floor_from_loud_non_voiced_tail() 
     assert observations[-1].candidate_class == "stable_speech_candidate"
 
 
+def test_sip_barge_in_detector_caps_interruptible_floor_from_fragmented_control_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
+
+    detector = SipBargeInDetector(
+        config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+            noise_floor_initial_dbfs=-50.0,
+            noise_floor_interruptible_max_dbfs=-44.0,
+        ),
+        vad=FakeVad([False] * 30 + [True] * 12),
+    )
+    call_id = "call_fragmented_control_speech_floor_guard"
+    started_at = datetime.now(timezone.utc)
+
+    for index in range(30):
+        detector.observe(
+            call_id,
+            _pcm16_constant_frame(amplitude=400),
+            now=started_at + timedelta(milliseconds=20 * index),
+            interruptible=True,
+        )
+
+    floor_payload = detector.latest_observation_payload(call_id)
+    speech_frames = _pcm16_constant_frames([
+        944,
+        1780,
+        1780,
+        1970,
+        1970,
+        1900,
+        1980,
+        1800,
+        1000,
+        830,
+        740,
+    ])
+    observations = [
+        detector.observe(
+            call_id,
+            frame,
+            now=started_at + timedelta(milliseconds=600 + 20 * index),
+            interruptible=True,
+        )
+        for index, frame in enumerate(speech_frames)
+    ]
+
+    assert floor_payload["noiseFloorDbfs"] == -44.0
+    assert any(observation.candidate for observation in observations)
+    assert observations[-1].candidate_class == "stable_speech_candidate"
+
+
 def test_sip_barge_in_detector_ignores_impulse_noise_before_pre_stop() -> None:
     from app.services.ai_call.sip_barge_in import SipBargeInConfig, SipBargeInDetector
 
@@ -3154,6 +3209,77 @@ async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_pl
         "model_response_done",
         "call_end_scheduled",
     ]
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_ignores_customer_end_tool_after_short_ack() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    call_id = "call_end_short_ack_guard"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"browser-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        user_turn_stability_delay_seconds=0,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    await runner.start(session)
+    await provider.emit(
+        ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+    )
+    await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+    await provider.emit(
+        ProviderEvent(type="user_transcript_done", payload={"transcript": "行。"})
+    )
+    await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.wait_for(_wait_until(lambda: provider.created_responses == [None]), timeout=1)
+    await provider.emit(
+        ProviderEvent(
+            type="tool_call_done",
+            payload={
+                "call_id": "tool_short_ack",
+                "name": "schedule_call_end",
+                "arguments": json.dumps({"reason": "customer_end"}),
+            },
+        )
+    )
+    await asyncio.wait_for(_wait_until(lambda: provider.submitted_tool_results), timeout=1)
+    await provider.close_events()
+    await runner.wait(call_id)
+
+    events = store.list(call_id)
+    event_types = [event.type for event in events]
+    ignored_event = next(event for event in events if event.type == "call_end_tool_ignored")
+    assert scheduler_calls == []
+    assert provider.submitted_tool_results == [
+        (
+            "tool_short_ack",
+            "未确认用户要求结束通话。请继续按用户刚才的话推进对话，不要结束通话。",
+        )
+    ]
+    assert ignored_event.payload["reason"] == "customer_end_without_explicit_customer_intent"
+    assert ignored_event.payload["localDecisionReason"] == "not_explicit_call_end"
+    assert ignored_event.payload["transcriptPreview"] == "行。"
+    assert "call_end_tool_requested" not in event_types
+    assert "call_end_scheduled" not in event_types
 
 
 @pytest.mark.anyio
@@ -10191,6 +10317,815 @@ def test_realtime_agent_runner_pre_stops_fast_strong_short_local_speech() -> Non
     assert decision.extra_payload["sipShortSpeechEvidence"] == "strong_short_local_speech"
 
 
+def test_realtime_agent_runner_defers_low_energy_clear_short_modulated_local_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_clear_short_modulated_local_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-30.1,
+        noise_floor_dbfs=-44.0,
+        snr_db=13.9,
+        peak_dbfs=-21.0,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 6.43,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+    assert decision.required_duration_ms == 180
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+    assert decision.extra_payload["sipClearShortNoiseRisk"] == "low_energy_short_burst"
+
+
+def test_realtime_agent_runner_pre_stops_moderate_clear_short_continue_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_moderate_clear_short_continue_speech"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-25.44,
+        noise_floor_dbfs=-44.0,
+        snr_db=18.56,
+        peak_dbfs=-16.6,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 10.9,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 2,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "clear_short_modulated_burst"
+    assert decision.required_duration_ms == 180
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+
+
+def test_realtime_agent_runner_pre_stops_elevated_noise_clear_short_ack_speech() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_elevated_noise_clear_short_ack"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-23.15,
+        noise_floor_dbfs=-36.76,
+        snr_db=13.6,
+        peak_dbfs=-13.34,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334820_short_ack_part_1",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 14.95,
+        "rmsRangeDb": 8.49,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "elevated_noise_clear_short_modulated_burst"
+    assert decision.required_duration_ms == 180
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+    assert decision.extra_payload["sipElevatedNoiseClearShortEvidence"] is True
+
+
+def test_realtime_agent_runner_pre_stops_echo_guarded_compact_short_phrase() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_echo_guarded_compact_short_phrase"
+    started_at = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id="resp_echo_guarded_compact_short_phrase",
+    )
+    turn = PendingUserTurn()
+
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.08,
+        noise_floor_dbfs=-33.27,
+        snr_db=14.19,
+        peak_dbfs=-9.13,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="call_334205_next_time_1",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 14.19,
+        "rmsRangeDb": 3.87,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=started_at,
+        observation=first_observation,
+    )
+
+    second_timestamp = started_at + timedelta(milliseconds=2439)
+    second_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-14.53,
+        noise_floor_dbfs=-33.27,
+        snr_db=18.74,
+        peak_dbfs=-6.05,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="call_334205_next_time_2",
+    )
+    runner._last_ai_audio_rms_dbfs[call_id] = -16.75
+    runner._last_ai_audio_published_at[call_id] = second_timestamp - timedelta(
+        milliseconds=8,
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 18.74,
+        "rmsRangeDb": 7.74,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=second_timestamp,
+        observation=second_observation,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=second_timestamp,
+        observation=second_observation,
+    )
+
+    assert decision.action == "pre_stop"
+    assert decision.evidence == "echo_guarded_compact_short_phrase"
+    assert decision.required_duration_ms == 180
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == (
+        "elevated_noise_compact_two_burst_turn"
+    )
+    assert decision.extra_payload["sipEchoGuardedCompactShortPhraseEvidence"] == (
+        "loud_modulated_two_burst"
+    )
+    assert decision.extra_payload["sipUplinkAboveAiPlaybackDb"] == 2.22
+
+
+def test_realtime_agent_runner_defers_echo_guarded_compact_short_phrase_when_ai_dominates() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_echo_guarded_compact_short_phrase_ai_dominates"
+    started_at = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id="resp_echo_guarded_compact_short_phrase_ai_dominates",
+    )
+    turn = PendingUserTurn()
+
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.08,
+        noise_floor_dbfs=-33.27,
+        snr_db=14.19,
+        peak_dbfs=-9.13,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_echo_compact_ai_dominates_part_1",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 14.19,
+        "rmsRangeDb": 3.87,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=started_at,
+        observation=first_observation,
+    )
+
+    second_timestamp = started_at + timedelta(milliseconds=2439)
+    second_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-14.9,
+        noise_floor_dbfs=-33.27,
+        snr_db=18.74,
+        peak_dbfs=-6.05,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_echo_compact_ai_dominates_part_2",
+    )
+    runner._last_ai_audio_rms_dbfs[call_id] = -14.0
+    runner._last_ai_audio_published_at[call_id] = second_timestamp - timedelta(
+        milliseconds=8,
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 18.74,
+        "rmsRangeDb": 7.74,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=second_timestamp,
+        observation=second_observation,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=second_timestamp,
+        observation=second_observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_ai_playback_echo_guard"
+    assert decision.extra_payload["sipAiPlaybackEchoGuardEscapedBy"] == (
+        "elevated_noise_compact_two_burst_turn"
+    )
+    assert "sipEchoGuardedCompactShortPhraseEvidence" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_midcall_fan_under_elevated_noise_floor() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_midcall_fan_elevated_noise_guard"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-25.38,
+        noise_floor_dbfs=-36.0,
+        snr_db=10.62,
+        peak_dbfs=-17.01,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_midcall_fan_elevated_noise_part_1",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 10.62,
+        "rmsRangeDb": 5.37,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert "sipElevatedNoiseClearShortEvidence" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_clear_short_choppy_low_snr_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_clear_short_choppy_low_snr_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-30.27,
+        noise_floor_dbfs=-44.0,
+        snr_db=13.73,
+        peak_dbfs=-21.07,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334831_false_clear_short_noise_cluster",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 10.75,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 2,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+    assert decision.extra_payload["sipClearShortNoiseRisk"] == "choppy_low_snr_short_burst"
+
+
+def test_realtime_agent_runner_defers_clear_short_loud_low_modulation_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_clear_short_loud_low_modulation_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-21.71,
+        noise_floor_dbfs=-44.0,
+        snr_db=22.29,
+        peak_dbfs=-12.51,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334831_false_clear_short_noise_loud",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 9.8,
+        "rmsDirectionChanges": 2,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+    assert decision.extra_payload["sipClearShortNoiseRisk"] == "loud_low_modulation_short_burst"
+
+
+def test_realtime_agent_runner_defers_clear_short_borderline_high_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_clear_short_borderline_high_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-21.21,
+        noise_floor_dbfs=-39.04,
+        snr_db=17.82,
+        peak_dbfs=-14.33,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334874_borderline_high_noise_clear_short",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 17.82,
+        "rmsRangeDb": 7.19,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_authorized_pre_stop_evidence"
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+    assert decision.extra_payload["sipClearShortNoiseRisk"] == (
+        "borderline_high_noise_short_burst"
+    )
+
+
+def test_realtime_agent_runner_defers_high_snr_single_short_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_high_snr_single_short_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-19.93,
+        noise_floor_dbfs=-48.53,
+        snr_db=28.6,
+        peak_dbfs=-13.81,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_single_short_noise_high_snr",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 28.6,
+        "rmsRangeDb": 9.61,
+        "rmsDirectionChanges": 3,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert "sipShortSpeechEvidence" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_choppy_low_rms_single_short_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_choppy_low_rms_single_short_noise"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-31.81,
+        noise_floor_dbfs=-44.66,
+        snr_db=12.85,
+        peak_dbfs=-25.05,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_single_short_noise_low_rms",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 12.85,
+        "rmsRangeDb": 7.61,
+        "rmsDirectionChanges": 5,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert "sipShortSpeechEvidence" not in decision.extra_payload
+
+
+def test_realtime_agent_runner_defers_clear_short_modulated_local_speech_during_opening() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_clear_short_modulated_opening_guard"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._response_lifecycle(call_id).current_response_is_opening = True
+    turn = PendingUserTurn()
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-30.1,
+        noise_floor_dbfs=-44.0,
+        snr_db=13.9,
+        peak_dbfs=-21.0,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="sip_uplink_speech_during_ai_audio",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "rmsRangeDb": 6.43,
+        "rmsDirectionChanges": 1,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+    assert decision.extra_payload["sipShortSpeechEvidence"] == "clear_short_modulated_burst"
+
+
+def test_realtime_agent_runner_defers_opening_echo_guarded_turn_evidence() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_opening_echo_guarded_turn_evidence"
+    now = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(runner, call_id)
+    runner._response_lifecycle(call_id).current_response_is_opening = True
+    runner._last_ai_audio_rms_dbfs[call_id] = -23.99
+    runner._last_ai_audio_published_at[call_id] = now - timedelta(milliseconds=2)
+    guard = runner._playback_guard(call_id)
+    turn = PendingUserTurn()
+    turn.sip_echo_guarded_turn_response_id = guard.current_response_id
+    turn.sip_echo_guarded_turn_generation = guard.generation
+    turn.sip_echo_guarded_turn_first_at = now - timedelta(milliseconds=400)
+    turn.sip_echo_guarded_turn_last_at = now - timedelta(milliseconds=400)
+    turn.sip_echo_guarded_turn_burst_count = 1
+    turn.sip_echo_guarded_turn_voiced_ms = 180
+    turn.sip_echo_guarded_turn_current_burst_voiced_ms = 180
+    turn.sip_echo_guarded_turn_min_rms_dbfs = -31.13
+    turn.sip_echo_guarded_turn_max_rms_dbfs = -31.13
+    turn.sip_echo_guarded_turn_max_snr_db = 16.87
+    turn.sip_echo_guarded_turn_max_rms_range_db = 7.65
+    observation = SipBargeInObservation(
+        active=True,
+        candidate=False,
+        rms_dbfs=-28.85,
+        noise_floor_dbfs=-48.0,
+        snr_db=19.15,
+        peak_dbfs=-20.81,
+        vad_voiced_ms=240,
+        candidate_duration_ms=240,
+        speech_duration_ms=240,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_opening_fan_part_2",
+    )
+    runner._sip_barge_in_detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 19.15,
+        "rmsRangeDb": 7.65,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    })
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=now,
+        observation=observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_opening_pre_stop_authority"
+    assert decision.extra_payload["sipEchoGuardedTurnBurstCount"] == 2
+    assert decision.extra_payload["sipEchoGuardedTurnVoicedMs"] == 420
+
+
 def test_realtime_agent_runner_defers_sub_480ms_local_only_fast_speech() -> None:
     runner = RealtimeCallAgentRunner(
         provider_factory=lambda _session: FakeRealtimeProvider([]),
@@ -11126,6 +12061,111 @@ def test_realtime_agent_runner_defers_elevated_noise_compact_two_burst_episode_w
         "elevated_noise_compact_two_burst_turn"
     )
     assert decision.extra_payload["sipDeferredEpisodeBurstCount"] == 2
+
+
+def test_realtime_agent_runner_defers_ai_receded_compact_turn_under_high_noise() -> None:
+    from app.services.ai_call.sip_barge_in import SipBargeInConfig
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: FakeRealtimeProvider([]),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+        sip_barge_in_config=SipBargeInConfig(
+            rms_threshold_dbfs=-36.0,
+            snr_threshold_db=10.0,
+            vad_voiced_duration_ms=120,
+            candidate_min_duration_ms=180,
+            pre_stop_min_duration_ms=240,
+        ),
+    )
+    call_id = "call_sip_ai_receded_compact_turn_high_noise"
+    started_at = datetime.now(timezone.utc)
+    _mark_sip_authority_playback_target(
+        runner,
+        call_id,
+        response_id="resp_ai_receded_compact_turn_high_noise",
+    )
+    turn = PendingUserTurn()
+    detector = _StaticSipAuthorityDetector({
+        "maxSnrDb": 11.8,
+        "rmsRangeDb": 1.88,
+        "rmsDirectionChanges": 4,
+        "largeRmsJumpCount": 0,
+        "speechQualityRejection": None,
+    })
+    runner._sip_barge_in_detector = detector
+    first_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-24.02,
+        noise_floor_dbfs=-35.81,
+        snr_db=11.8,
+        peak_dbfs=-19.59,
+        vad_voiced_ms=180,
+        candidate_duration_ms=180,
+        speech_duration_ms=180,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334874_ai_receded_part_1",
+    )
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=started_at,
+        observation=first_observation,
+    )
+
+    current_timestamp = started_at + timedelta(milliseconds=825)
+    current_observation = SipBargeInObservation(
+        active=True,
+        candidate=True,
+        rms_dbfs=-23.61,
+        noise_floor_dbfs=-35.81,
+        snr_db=12.2,
+        peak_dbfs=-18.92,
+        vad_voiced_ms=220,
+        candidate_duration_ms=220,
+        speech_duration_ms=220,
+        frame_duration_ms=20,
+        candidate_class="stable_speech_candidate",
+        reason="fixture_call_334874_ai_receded_part_2",
+    )
+    runner._last_ai_audio_rms_dbfs[call_id] = -31.0
+    runner._last_ai_audio_published_at[call_id] = current_timestamp - timedelta(
+        milliseconds=30,
+    )
+    detector.payload = {
+        "maxSnrDb": 16.6,
+        "rmsRangeDb": 5.64,
+        "rmsDirectionChanges": 5,
+        "largeRmsJumpCount": 1,
+        "speechQualityRejection": None,
+    }
+    runner._record_sip_deferred_episode_observation(
+        call_id=call_id,
+        turn=turn,
+        timestamp=current_timestamp,
+        observation=current_observation,
+    )
+
+    decision = runner._decide_sip_pre_stop_authority(
+        call_id=call_id,
+        turn=turn,
+        trigger_timestamp=current_timestamp,
+        observation=current_observation,
+    )
+
+    assert decision.action == "defer"
+    assert decision.reason == "awaiting_pre_stop_authority"
+    assert decision.extra_payload["sipDeferredEpisodeEvidence"] == (
+        "ai_receded_compact_two_burst_turn"
+    )
+    assert decision.extra_payload["sipAiRecededCompactTurnEvidence"] == (
+        "two_burst_modulated_tail_after_echo_guard"
+    )
+    assert decision.extra_payload["sipAiRecededCompactTurnNoiseRisk"] == (
+        "short_or_over_modulated_tail_under_elevated_noise"
+    )
 
 
 def test_realtime_agent_runner_promotes_sparse_deferred_sip_turn_evidence() -> None:
@@ -13447,6 +14487,68 @@ async def test_realtime_agent_runner_starts_one_short_recovery_after_sip_rejecte
         assert recovery_input is not None
         assert "一句简短自然" in recovery_input
         assert "不要重复整段内容" in recovery_input
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_confirms_recent_rejected_sip_pre_stop_from_late_provider_speech() -> None:
+    runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
+        vad=FakeVad([True] * 18 + [False] * 40),
+        call_id="call_sip_rejected_late_provider_confirm",
+        clean_window_ms=40,
+        max_hold_ms=80,
+        recovery_silence_ms=20,
+        recovery_max_per_turn=1,
+    )
+    speech_frames = _pcm16_constant_frames([
+        3200,
+        4300,
+        5400,
+        4700,
+        3600,
+        4400,
+        5200,
+        4700,
+        5500,
+        5200,
+        4700,
+        4300,
+        5100,
+        4600,
+        5400,
+        4900,
+        5700,
+        5000,
+    ])
+    quiet_frame = _pcm16_constant_frame(amplitude=50)
+
+    try:
+        for frame in speech_frames:
+            await runner.send_audio_frame(call_id, frame)
+        for _ in range(4):
+            await runner.send_audio_frame(call_id, quiet_frame)
+        await asyncio.sleep(0.12)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_interrupt_rejected" in event_types
+        assert "sip_recovery_started" in event_types
+        assert provider.created_responses == []
+
+        await runner._handle_user_speech_started(call_id, provider, datetime.now(timezone.utc))
+        await runner._apply_provider_event(
+            call_id,
+            provider,
+            "model_response_done",
+            datetime.now(timezone.utc),
+            {"response": {"id": "resp_sip_opening", "status": "cancelled"}},
+        )
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert "sip_rejected_pre_stop_late_provider_confirmed" in event_types
+        assert "sip_interrupt_candidate_confirmed" in event_types
+        assert "interrupt_confirmed" in event_types
+        assert provider.created_responses == []
     finally:
         await runner.stop(call_id)
 
