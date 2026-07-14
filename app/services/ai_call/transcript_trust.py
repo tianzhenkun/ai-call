@@ -18,6 +18,8 @@ CANDIDATE_TRANSCRIPT = "candidate"
 REJECT_TRANSCRIPT = "reject"
 
 TURN_TAKING_SHORT_UTTERANCES = frozenset({
+    "有",
+    "有的",
     "好",
     "好的",
     "行",
@@ -94,9 +96,9 @@ def decide_realtime_transcript_trust(
 
     if (
         during_ai_audio
-        and has_interrupt_candidate
         and len(normalized) <= 2
         and normalized in NON_TURN_SHORT_UTTERANCES
+        and not has_reliable_user_audio
     ):
         return RealtimeTranscriptTrustDecision(
             trust=LOW_CONFIDENCE_TRANSCRIPT,
@@ -108,7 +110,6 @@ def decide_realtime_transcript_trust(
 
     if (
         during_ai_audio
-        and has_interrupt_candidate
         and len(normalized) <= 2
         and normalized not in TURN_TAKING_SHORT_UTTERANCES
         and not has_reliable_user_audio

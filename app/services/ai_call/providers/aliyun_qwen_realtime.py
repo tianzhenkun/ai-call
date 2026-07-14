@@ -91,6 +91,9 @@ REQUEST_HANDOFF_TOOL = {
 }
 
 DEFAULT_REALTIME_TOOLS = [SCHEDULE_CALL_END_TOOL, REQUEST_HANDOFF_TOOL]
+QWEN_WEBSOCKET_PING_INTERVAL_SECONDS = 20.0
+QWEN_WEBSOCKET_PING_TIMEOUT_SECONDS = 120.0
+QWEN_WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +284,12 @@ async def _default_websocket_factory(
     except ImportError as exc:
         raise RuntimeError("缺少 websockets 依赖，无法连接 Qwen Realtime WebSocket") from exc
 
-    connect_kwargs: dict[str, Any] = {"additional_headers": headers}
+    connect_kwargs: dict[str, Any] = {
+        "additional_headers": headers,
+        "ping_interval": QWEN_WEBSOCKET_PING_INTERVAL_SECONDS,
+        "ping_timeout": QWEN_WEBSOCKET_PING_TIMEOUT_SECONDS,
+        "close_timeout": QWEN_WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
+    }
     try:
         if "proxy" in inspect.signature(websockets.connect).parameters:
             connect_kwargs["proxy"] = None
