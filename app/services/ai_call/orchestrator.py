@@ -11,7 +11,10 @@ from fastapi import status
 
 from app.config.setting import Settings
 from app.core.logger import log
-from app.services.ai_call.agent_runner import RealtimeCallAgentRunner
+from app.services.ai_call.agent_runner import (
+    NO_BARGE_USER_TURN_STABILITY_DELAY_SECONDS,
+    RealtimeCallAgentRunner,
+)
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.livekit_audio_transport import LiveKitRoomAudioTransport
@@ -30,8 +33,16 @@ from app.services.ai_call.session_registry import (
 from app.services.ai_call.sip_barge_in import SipBargeInConfig
 from app.utils.id_util import generate_snowflake_id
 
-
 END_CLEANUP_TIMEOUT_SECONDS = 1.0
+TERMINAL_BROWSER_EVENT_TYPES = frozenset(
+    {
+        "browser_disconnect",
+        "browser_first_audio",
+        "browser_audio_input_diagnostics",
+        "browser_user_speech_started",
+        "browser_user_speech_segment",
+    }
+)
 
 
 class LiveKitRoomManagerProtocol(Protocol):
@@ -93,6 +104,9 @@ class AiCallRuntimeConfig:
     vad_threshold: float
     vad_silence_duration_ms: int
     user_turn_stability_delay_seconds: float = 0.35
+    no_barge_user_turn_stability_delay_seconds: float = (
+        NO_BARGE_USER_TURN_STABILITY_DELAY_SECONDS
+    )
     handoff_prompt_constraint_enabled: bool = True
     barge_in_enabled: bool = True
     sip_barge_in_enabled: bool = True
@@ -322,6 +336,9 @@ class AiCallOrchestrator:
             metrics_by_call_id=self.metrics_by_call_id,
             audio_transport=audio_transport,
             user_turn_stability_delay_seconds=(self.config.user_turn_stability_delay_seconds),
+            no_barge_user_turn_stability_delay_seconds=(
+                self.config.no_barge_user_turn_stability_delay_seconds
+            ),
             handoff_prompt_constraint_enabled=(self.config.handoff_prompt_constraint_enabled),
             sip_barge_in_enabled=self.config.sip_barge_in_enabled,
             sip_barge_in_min_rms_dbfs=self.config.sip_barge_in_min_rms_dbfs,
@@ -854,15 +871,35 @@ class AiCallOrchestrator:
         payload: dict[str, Any] | None = None,
     ) -> BrowserEventReportResult:
         session = self.registry.get(call_id)
+        reported_at = timestamp or utc_now()
+        event_payload = dict(payload or {})
+        event_payload["reportedAt"] = reported_at.isoformat()
         if session.status not in RUNNING_STATUSES:
+            if event_type in TERMINAL_BROWSER_EVENT_TYPES and session.status in {
+                CallSessionStatus.COMPLETED,
+                CallSessionStatus.FAILED,
+            }:
+                event_payload["terminalSessionStatus"] = session.status.value
+                event = self.event_store.append(
+                    call_id=call_id,
+                    type=event_type,
+                    source="browser",
+                    payload=event_payload,
+                )
+                session.last_event_at = event.timestamp
+                return BrowserEventReportResult(
+                    event_id=event.event_id,
+                    call_id=event.call_id,
+                    type=event.type,
+                    timestamp=event.timestamp,
+                    source=event.source,
+                    payload=event.payload,
+                )
             raise AiCallError(
                 error_id="invalid_session_state",
                 msg="当前会话状态不允许该操作",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        reported_at = timestamp or utc_now()
-        event_payload = dict(payload or {})
-        event_payload["reportedAt"] = reported_at.isoformat()
         should_start_opening = False
         should_record_browser_speech_candidate = False
         should_record_browser_speech_segment = False

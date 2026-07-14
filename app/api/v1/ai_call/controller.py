@@ -40,6 +40,7 @@ from .schema import (
     RecordDetailOut,
     RecordEventListOut,
     RecordingOut,
+    SemanticAnalysisOut,
     SessionStatusOut,
     TokenOut,
     VoiceProfileCreateRequest,
@@ -372,6 +373,35 @@ async def get_record_interrupt_summary_controller(
 ) -> JSONResponse:
     result = await service.get_record_interrupt_summary(call_id)
     return SuccessResponse(data=InterruptSummaryOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/records/{callId}/semantic-analysis",
+    summary="查询通话语义分析",
+    response_model=ResponseSchema[SemanticAnalysisOut | None],
+)
+async def get_record_semantic_analysis_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.get_record_semantic_analysis(call_id)
+    return SuccessResponse(
+        data=SemanticAnalysisOut.model_validate(result) if result else None,
+        msg="查询成功",
+    )
+
+
+@AiCallRouter.post(
+    "/records/{callId}/semantic-analysis/reanalyze",
+    summary="重新生成通话语义分析",
+    response_model=ResponseSchema[SemanticAnalysisOut],
+)
+async def reanalyze_record_semantic_analysis_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    result = await service.reanalyze_record_semantic_analysis(call_id)
+    return SuccessResponse(data=SemanticAnalysisOut.model_validate(result), msg="重分析完成")
 
 
 @AiCallRouter.get(

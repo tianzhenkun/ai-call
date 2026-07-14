@@ -257,6 +257,8 @@ class RecordOut(AiCallBaseSchema):
     call_id: str
     business_type: str | None = None
     business_id: str | None = None
+    scene_code: str | None = None
+    prompt_source_key: str | None = None
     entry_type: str
     room_name: str | None = None
     participant_identity: str | None = None
@@ -305,6 +307,23 @@ class InterruptSummaryOut(AiCallBaseSchema):
     agent_start_failed: bool
     verdict: str
     issues: list[str]
+
+
+class SemanticAnalysisOut(AiCallBaseSchema):
+    id: str | None = None
+    call_id: str
+    scene_code: str | None = None
+    analysis_scene_code: str
+    analysis_status: str
+    analysis_result: dict[str, Any] | None = None
+    analysis_error: str | None = None
+    analysis_retry_count: int
+    analysis_started_at: datetime | None = None
+    analysis_finished_at: datetime | None = None
+    transcript_hash: str | None = None
+    transcript_snapshot: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class RecordingTrackOut(AiCallBaseSchema):

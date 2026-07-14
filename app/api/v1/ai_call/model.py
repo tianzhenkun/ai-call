@@ -48,6 +48,16 @@ class AiCallRecordModel(MappedBase):
         nullable=True,
         comment="上游业务ID",
     )
+    scene_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="业务场景编码",
+    )
+    prompt_source_key: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="提示词来源键",
+    )
     entry_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -514,6 +524,113 @@ class AiCallAsrJobModel(MappedBase):
         nullable=True,
         comment="失败摘要",
     )
+
+
+class AiCallSemanticAnalysisModel(MappedBase):
+    """AI Call 通话后语义分析记录表。"""
+
+    __tablename__ = "ai_call_semantic_analysis"
+    __table_args__ = (
+        UniqueConstraint(
+            "call_id",
+            "analysis_scene_code",
+            name="uk_ai_call_semantic_call_scene",
+        ),
+        Index("idx_ai_call_semantic_call_id", "call_id"),
+        Index("idx_ai_call_semantic_status_updated", "analysis_status", "updated_at"),
+        Index("idx_ai_call_semantic_scene_status", "scene_code", "analysis_status"),
+        {"comment": "AI Call 通话后语义分析记录表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        comment="雪花主键",
+    )
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
+    scene_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="业务场景编码",
+    )
+    analysis_scene_code: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="分析场景编码",
+    )
+    analysis_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="分析状态：0待分析/1分析中/2成功/3失败/4无有效用户输入",
+    )
+    analysis_result: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="五字段语义分析 JSON",
+    )
+    analysis_error: Mapped[str | None] = mapped_column(
+        String(1000),
+        nullable=True,
+        comment="分析错误或无需分析原因",
+    )
+    analysis_retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="分析失败重试次数",
+    )
+    analysis_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="分析开始时间",
+    )
+    analysis_finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="分析结束时间",
+    )
+    transcript_hash: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="转写快照哈希",
+    )
+    transcript_snapshot_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="本次分析使用的转写快照 JSON",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="创建时间",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="更新时间",
+    )
+
+    @property
+    def analysis_result_dict(self) -> dict[str, Any] | None:
+        if not self.analysis_result:
+            return None
+        try:
+            value = json.loads(self.analysis_result)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    @property
+    def transcript_snapshot_dict(self) -> dict[str, Any] | None:
+        if not self.transcript_snapshot_json:
+            return None
+        try:
+            value = json.loads(self.transcript_snapshot_json)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
 
 
 class AiCallHandoffModel(MappedBase):

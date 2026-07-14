@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import status
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
@@ -55,6 +56,10 @@ from app.services.ai_call.prompt_config import (
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
 from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
+from app.services.ai_call.semantic_analysis import (
+    AiCallSemanticAnalysisService,
+    build_default_semantic_analyzer,
+)
 from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
 from app.services.ai_call.system_prompt_player import LiveKitSystemPromptPlayer
 from app.services.ai_call.voice_profile import (
@@ -70,6 +75,7 @@ if TYPE_CHECKING:
     from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
     from app.services.ai_call.handoff_trigger_service import AiCallHandoffTriggerWorker
     from app.services.ai_call.offline_asr_service import AiCallOfflineAsrWorker
+    from app.services.ai_call.semantic_analysis import AiCallSemanticAnalysisWorker
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +159,15 @@ class AiCallService:
                 business_params=business_params or {},
                 debug_prompt=None,
             )
+            await self.record_service.update_prompt_context(
+                call_id,
+                scene_code=scene_code,
+                prompt_source_key=(
+                    prompt_effective_config.prompt_source_key
+                    if prompt_effective_config is not None
+                    else None
+                ),
+            )
             result = await self.orchestrator.create_web_session(
                 voice=resolved_voice,
                 prompt=None,
@@ -228,6 +243,15 @@ class AiCallService:
                 scene_code=scene_code,
                 business_params=business_params or {},
                 debug_prompt=None,
+            )
+            await self.record_service.update_prompt_context(
+                call_id,
+                scene_code=scene_code,
+                prompt_source_key=(
+                    prompt_effective_config.prompt_source_key
+                    if prompt_effective_config is not None
+                    else None
+                ),
             )
             room_session = await self.orchestrator.create_sip_session(
                 voice=resolved_voice,
@@ -497,8 +521,19 @@ class AiCallService:
     ) -> BrowserEventReportResult:
         try:
             if event_type == "browser_disconnect" and self.recording_service is not None:
-                await self.orchestrator.get_session(call_id)
-                await self.recording_service.stop_for_session(call_id)
+                session = await self.orchestrator.get_session(call_id)
+                if session.status in RUNNING_STATUSES:
+                    try:
+                        await self.recording_service.stop_for_session(call_id)
+                    except OperationalError as exc:
+                        if not _is_sqlite_database_locked(exc):
+                            raise
+                        log.warning(
+                            "AI Call 浏览器断开录音停止遇到 SQLite 写锁，已降级为后台收尾: "
+                            "callId={}, message={}",
+                            call_id,
+                            str(exc),
+                        )
             elif event_type == "browser_ready":
                 await self._start_browser_ready_recording_tracks(call_id)
             result = await self.orchestrator.report_browser_event(
@@ -512,7 +547,10 @@ class AiCallService:
         if self.record_service is not None:
             if event_type == "browser_ready":
                 await self.record_service.mark_answered(call_id, result.timestamp)
-            elif event_type == "browser_disconnect":
+            elif (
+                event_type == "browser_disconnect"
+                and result.payload.get("terminalSessionStatus") is None
+            ):
                 await self.record_service.complete_session(
                     call_id,
                     end_reason="browser_disconnect",
@@ -674,6 +712,30 @@ class AiCallService:
             call_id,
             [self.record_service.event_to_dict(row) for row in rows],
         )
+
+    async def get_record_semantic_analysis(self, call_id: str) -> dict | None:
+        repository = self._ensure_prompt_repository()
+        analysis = await repository.get_semantic_analysis(call_id=call_id)
+        if analysis is None:
+            return None
+        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+
+    async def reanalyze_record_semantic_analysis(self, call_id: str) -> dict:
+        repository = self._ensure_prompt_repository()
+        record = await repository.get_record(call_id)
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        service = AiCallSemanticAnalysisService(
+            repository,
+            analyzer=_manual_semantic_analyzer(),
+        )
+        analysis = await service.reanalyze_call_once(
+            call_id=call_id,
+            scene_code=record.scene_code,
+            reference_date=date.today().isoformat(),
+            now=datetime.now(timezone.utc),
+        )
+        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
 
     async def get_recording(self, call_id: str) -> dict | None:
         self._ensure_recording_service()
@@ -1492,6 +1554,7 @@ _default_dialogue_persistence_worker: AiCallDialoguePersistenceWorker | None = N
 _default_handoff_exception_manager: AiCallHandoffExceptionManager | None = None
 _default_handoff_trigger_worker: AiCallHandoffTriggerWorker | None = None
 _default_offline_asr_worker: AiCallOfflineAsrWorker | None = None
+_default_semantic_analysis_worker: AiCallSemanticAnalysisWorker | None = None
 
 
 def configure_ai_call_event_persistence(
@@ -1529,9 +1592,35 @@ def configure_ai_call_offline_asr(worker: AiCallOfflineAsrWorker | None) -> None
     _default_offline_asr_worker = worker
 
 
+def configure_ai_call_semantic_analysis(worker: AiCallSemanticAnalysisWorker | None) -> None:
+    global _default_semantic_analysis_worker
+    _default_semantic_analysis_worker = worker
+
+
+def _manual_semantic_analyzer() -> Any | None:
+    if _default_semantic_analysis_worker is not None:
+        return _default_semantic_analysis_worker.analyzer
+    return build_default_semantic_analyzer(
+        base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+        api_key=settings.EFFECTIVE_POST_ANALYSIS_API_KEY or settings.EFFECTIVE_LLM_API_KEY,
+        model=(
+            settings.AI_CALL_SEMANTIC_ANALYSIS_MODEL
+            or settings.POST_ANALYSIS_MODEL
+            or settings.LLM_MODEL
+            or "qwen-plus"
+        ),
+        timeout_seconds=settings.AI_CALL_SEMANTIC_ANALYSIS_TIMEOUT_SECONDS,
+    )
+
+
 def enqueue_ai_call_offline_asr(call_id: str) -> None:
     if _default_offline_asr_worker is not None:
         _default_offline_asr_worker.enqueue(call_id)
+
+
+def enqueue_ai_call_semantic_analysis(call_id: str, scene_code: str | None = None) -> None:
+    if _default_semantic_analysis_worker is not None:
+        _default_semantic_analysis_worker.enqueue(call_id, scene_code=scene_code)
 
 
 def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService:
@@ -1727,6 +1816,9 @@ def _ensure_default_handoff_exception_manager(
             unavailable_prompt_audio_path=_strip_or_none(
                 settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH
             ),
+            unavailable_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT
+            ),
         )
     return _default_handoff_exception_manager
 
@@ -1736,6 +1828,10 @@ def _strip_or_none(value) -> str | None:
         return None
     stripped = str(value).strip()
     return stripped or None
+
+
+def _is_sqlite_database_locked(exc: OperationalError) -> bool:
+    return "database is locked" in str(exc).lower()
 
 
 def _bool_or_false(value) -> bool:

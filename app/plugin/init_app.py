@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     """
     ai_call_event_worker = await _start_ai_call_event_worker()
     ai_call_dialogue_worker = await _start_ai_call_dialogue_worker()
+    ai_call_semantic_analysis_worker = await _start_ai_call_semantic_analysis_worker()
     ai_call_offline_asr_worker = await _start_ai_call_offline_asr_worker()
     ai_call_recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
     ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
             await _stop_ai_call_event_worker(ai_call_event_worker)
             await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
             await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+            await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
             await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
         return
 
@@ -77,6 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         await _stop_ai_call_event_worker(ai_call_event_worker)
         await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
         await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+        await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
         await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
         log.error(f"❌ 应用初始化失败: {e!s}")
         raise SystemExit(1)
@@ -88,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         await _stop_ai_call_event_worker(ai_call_event_worker)
         await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
         await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
+        await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
         await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
 
     try:
@@ -208,10 +212,61 @@ async def _stop_ai_call_handoff_trigger_worker(worker) -> None:
     log.info("✅ AI Call 转人工自动触发 worker 已关闭")
 
 
+async def _start_ai_call_semantic_analysis_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_SEMANTIC_ANALYSIS_ENABLED:
+        return None
+    from app.api.v1.ai_call.service import configure_ai_call_semantic_analysis
+    from app.core.database import async_db_session
+    from app.services.ai_call.semantic_analysis import (
+        AiCallSemanticAnalysisWorker,
+        build_default_semantic_analyzer,
+    )
+
+    analyzer = build_default_semantic_analyzer(
+        base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+        api_key=settings.EFFECTIVE_POST_ANALYSIS_API_KEY or settings.EFFECTIVE_LLM_API_KEY,
+        model=(
+            settings.AI_CALL_SEMANTIC_ANALYSIS_MODEL
+            or settings.POST_ANALYSIS_MODEL
+            or settings.LLM_MODEL
+            or "qwen-plus"
+        ),
+        timeout_seconds=settings.AI_CALL_SEMANTIC_ANALYSIS_TIMEOUT_SECONDS,
+    )
+    if analyzer is None:
+        configure_ai_call_semantic_analysis(None)
+        log.warning("AI Call 语义分析 worker 未启动：模型 base_url/api_key/model 未完整配置")
+        return None
+
+    worker = AiCallSemanticAnalysisWorker(
+        async_db_session,
+        analyzer=analyzer,
+        enabled=settings.AI_CALL_SEMANTIC_ANALYSIS_ENABLED,
+        queue_max_size=settings.AI_CALL_SEMANTIC_ANALYSIS_QUEUE_MAX_SIZE,
+    )
+    await worker.start()
+    configure_ai_call_semantic_analysis(worker)
+    log.info("✅ AI Call 语义分析 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_semantic_analysis_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_semantic_analysis
+
+    configure_ai_call_semantic_analysis(None)
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 语义分析 worker 已关闭")
+
+
 async def _start_ai_call_offline_asr_worker():
     if not settings.SQL_DB_ENABLE or not settings.AI_CALL_OFFLINE_ASR_ENABLED:
         return None
-    from app.api.v1.ai_call.service import configure_ai_call_offline_asr
+    from app.api.v1.ai_call.service import (
+        configure_ai_call_offline_asr,
+        enqueue_ai_call_semantic_analysis,
+    )
     from app.core.database import async_db_session
     from app.services.ai_call.offline_asr_service import (
         AiCallOfflineAsrWorker,
@@ -231,6 +286,7 @@ async def _start_ai_call_offline_asr_worker():
         provider=provider,
         enabled=settings.AI_CALL_OFFLINE_ASR_ENABLED,
         queue_max_size=settings.AI_CALL_OFFLINE_ASR_QUEUE_MAX_SIZE,
+        on_call_ready_for_semantic_analysis=enqueue_ai_call_semantic_analysis,
     )
     await worker.start()
     configure_ai_call_offline_asr(worker)
