@@ -616,6 +616,7 @@ class PendingCallEnd:
     end_reason: str
     final_response_started: bool = False
     scheduled: bool = False
+    local_explicit_intent: bool = False
 
 
 @dataclass(slots=True)
@@ -5663,6 +5664,9 @@ class RealtimeCallAgentRunner:
                 )
             return
 
+        has_local_customer_end_intent = (
+            tool_reason == "customer_end" and call_id in self._pending_call_end_intents
+        )
         self._pending_call_end_intents.pop(call_id, None)
         final_audio_already_spoken = self._has_current_response_audio(call_id)
         if call_id not in self._pending_call_ends:
@@ -5670,7 +5674,10 @@ class RealtimeCallAgentRunner:
                 tool_call_id=tool_call_id,
                 tool_reason=tool_reason,
                 end_reason=end_reason,
-                final_response_started=final_audio_already_spoken,
+                final_response_started=(
+                    final_audio_already_spoken or has_local_customer_end_intent
+                ),
+                local_explicit_intent=has_local_customer_end_intent,
             )
             self._append_event(
                 call_id,
@@ -5681,6 +5688,7 @@ class RealtimeCallAgentRunner:
                     "toolReason": tool_reason,
                     "endReason": end_reason,
                     "finalAudioAlreadySpoken": final_audio_already_spoken,
+                    "localExplicitIntent": has_local_customer_end_intent,
                 },
             )
         pending_call_end = self._pending_call_ends[call_id]
@@ -6760,7 +6768,12 @@ class RealtimeCallAgentRunner:
         if turn.response_requested or turn.stopped_at is None or not turn.transcript:
             return
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
-        if self._maybe_schedule_explicit_call_end_without_response(call_id, turn):
+        if await self._maybe_schedule_explicit_call_end_without_response(
+            call_id,
+            provider,
+            turn,
+            timestamp,
+        ):
             return
         if self.user_turn_stability_delay_seconds <= 0:
             await self._request_response_from_turn(call_id, provider, turn)
@@ -6805,10 +6818,12 @@ class RealtimeCallAgentRunner:
             if self._turn_response_tasks.get(call_id) is asyncio.current_task():
                 self._turn_response_tasks.pop(call_id, None)
 
-    def _maybe_schedule_explicit_call_end_without_response(
+    async def _maybe_schedule_explicit_call_end_without_response(
         self,
         call_id: str,
+        provider: RealtimeProviderProtocol,
         turn: PendingUserTurn,
+        timestamp: datetime,
     ) -> bool:
         if call_id not in self._pending_call_end_intents:
             return False
@@ -6818,13 +6833,48 @@ class RealtimeCallAgentRunner:
         turn.response_requested = True
         self._cancel_turn_response_task_nowait(call_id)
 
-        session = self.registry.get(call_id)
-        if session.status == CallSessionStatus.USER_SPEAKING:
-            self.registry.transition(call_id, CallSessionStatus.WAITING)
-            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        await self._stop_ai_for_explicit_call_end(call_id, provider, timestamp)
+        self._move_running_session_to_connected_for_call_end(call_id)
 
         self._schedule_pending_call_end_nowait(call_id)
         return True
+
+    async def _stop_ai_for_explicit_call_end(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        timestamp: datetime,
+    ) -> None:
+        if (
+            self.registry.get(call_id).status != CallSessionStatus.AI_SPEAKING
+            and not self._has_active_model_response(call_id)
+        ):
+            return
+        await self._invalidate_audio_for_interrupt_candidate(
+            call_id=call_id,
+            provider=provider,
+            trigger_timestamp=timestamp,
+            source="agent",
+            reason="explicit_customer_end",
+        )
+        guard = self._playback_guard(call_id)
+        guard.awaiting_response_start_after_interrupt = False
+        guard.suppress_audio_until = None
+
+    def _move_running_session_to_connected_for_call_end(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.CONNECTED:
+            return
+        if session.status in {
+            CallSessionStatus.USER_SPEAKING,
+            CallSessionStatus.AI_THINKING,
+            CallSessionStatus.AI_SPEAKING,
+            CallSessionStatus.INTERRUPTED,
+        }:
+            self.registry.transition(call_id, CallSessionStatus.WAITING)
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        elif session.status == CallSessionStatus.WAITING:
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
 
     async def _request_response_from_turn(
         self,
@@ -7478,6 +7528,7 @@ class RealtimeCallAgentRunner:
             tool_reason="customer_end",
             end_reason="customer_end",
             final_response_started=True,
+            local_explicit_intent=True,
         )
         self._append_event(
             call_id,
@@ -7501,6 +7552,11 @@ class RealtimeCallAgentRunner:
             return
         if not pending_call_end.final_response_started:
             return
+        if pending_call_end.local_explicit_intent and self.registry.get(call_id).status not in {
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
+            self._move_running_session_to_connected_for_call_end(call_id)
         if self.registry.get(call_id).status in {
             CallSessionStatus.AI_SPEAKING,
             CallSessionStatus.USER_SPEAKING,

@@ -3721,6 +3721,79 @@ async def test_realtime_agent_runner_schedules_explicit_customer_end_without_ext
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_fast_ends_explicit_customer_end_during_ai_audio() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
+    scheduler_calls: list[tuple[str, str]] = []
+    call_id = "call_end_explicit_during_ai_audio"
+    output_pcm = b"\x01\x02" * 240
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"browser-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        user_turn_stability_delay_seconds=0,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    try:
+        await runner.start(session)
+        await provider.emit(
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_started",
+                payload={"response": {"id": "resp_long_goodbye"}},
+            )
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_long_goodbye",
+                    "delta": base64.b64encode(output_pcm).decode("ascii"),
+                },
+            )
+        )
+        await provider.emit(
+            ProviderEvent(type="user_transcript_done", payload={"transcript": "挂了吧。"})
+        )
+        await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+        await asyncio.sleep(0)
+
+        event_types = [event.type for event in store.list(call_id)]
+        assert scheduler_calls == [(call_id, "customer_end")]
+        assert provider.created_responses == []
+        assert provider.cancelled_response_count == 1
+        assert publisher.stopped_call_ids == [call_id]
+        assert "call_end_intent_detected" in event_types
+        assert "call_end_tool_missing" in event_types
+        assert "response_generation_invalidated" in event_types
+        assert "interrupt_audio_stop_requested" in event_types
+        assert "call_end_scheduled" in event_types
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("transcript", "call_id"),
     [

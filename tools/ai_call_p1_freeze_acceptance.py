@@ -38,11 +38,13 @@ RUFF_FILES = [
     "tools/ai_call_p1_eval.py",
     "tools/ai_call_p1_freeze_acceptance.py",
     "tests/test_ai_call_interrupt_offline_analysis.py",
+    "tests/test_ai_call_phase_a_core.py",
     "app/services/ai_call/agent_runner.py",
 ]
 
 DIFF_CHECK_FILES = [
     "app/services/ai_call/agent_runner.py",
+    "tests/test_ai_call_phase_a_core.py",
     "tests/test_ai_call_interrupt_offline_analysis.py",
     "tools/ai_call_p1_eval.py",
     "tools/ai_call_p1_freeze_acceptance.py",
@@ -106,6 +108,20 @@ def run(
         _print_step("focused pytest", stdout)
         failed |= not _gate_command(
             [sys.executable, "-m", "pytest", "tests/test_ai_call_interrupt_offline_analysis.py", "-q"],
+            stdout=stdout,
+            stderr=stderr,
+        )
+        _print_step("phase-a call-end focused pytest", stdout)
+        failed |= not _gate_command(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "tests/test_ai_call_phase_a_core.py",
+                "-q",
+                "-k",
+                "call_end or no_barge or low_trust or short_overlap",
+            ],
             stdout=stdout,
             stderr=stderr,
         )

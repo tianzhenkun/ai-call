@@ -161,8 +161,9 @@ observation
 配套工程验证：
 
 1. `tests/test_ai_call_interrupt_offline_analysis.py` focused pytest 必须通过。
-2. `tools/ai_call_p1_eval.py` 必须支持 `authorityFixtures.*.shadowObservations` 回放，但 shadow 证据只能来自真实 shadow 事件或明确构造的 fixture，不能口头补证。
-3. `py_compile` 和 `git diff --check` 必须通过。
+2. `tests/test_ai_call_phase_a_core.py -k 'call_end or no_barge or low_trust or short_overlap'` 必须通过，用来覆盖明确客户结束意图、no-barge 尾音和低可信转写边界。
+3. `tools/ai_call_p1_eval.py` 必须支持 `authorityFixtures.*.shadowObservations` 回放，但 shadow 证据只能来自真实 shadow 事件或明确构造的 fixture，不能口头补证。
+4. `py_compile` 和 `git diff --check` 必须通过。
 
 固定验收入口：
 
@@ -175,10 +176,11 @@ observation
 1. 默认主矩阵 fixture-only gate。
 2. 本地 audio authority probe gate。
 3. 最新两通 authority fixture pairs gate，并只允许 4 个已登记的 single-snapshot 诊断红点。
-4. focused pytest。
-5. `ruff check --no-fix`。
-6. `py_compile`。
-7. `git diff --check`。
+4. offline focused pytest。
+5. Phase A call-end focused pytest。
+6. `ruff check --no-fix`。
+7. `py_compile`。
+8. `git diff --check`。
 
 freeze candidate 的当前结论：
 
