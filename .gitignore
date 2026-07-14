@@ -109,3 +109,7 @@ deploy/livekit-egress/sip.yaml
 .claude/
 /app/rpa/litigation/court_storage_state.json
 /app/rpa/litigation/runs/
+
+# AI Call 可由验收工具重新生成的静态报告副本
+/static/ai-call/reports/
+/docs/livekit-ai-outbound/reports/*.html
