@@ -98,6 +98,86 @@ def test_provider_compare_reports_webrtc_main_and_fsmn_main_replay(tmp_path: Pat
     )
 
 
+def test_provider_compare_replays_live_interruptible_timeline(tmp_path: Path) -> None:
+    windows_file = tmp_path / "fsmn-report.json"
+    windows_file.write_text(
+        json.dumps({"vadWindows": [{"startMs": 0, "endMs": 400}]}),
+        encoding="utf-8",
+    )
+
+    def fake_get_json(url: str, timeout_seconds: float) -> dict[str, Any]:
+        _ = timeout_seconds
+        if url.endswith("/ai-call/records/call_timeline/recording"):
+            return {
+                "code": 200,
+                "data": {
+                    "tracks": [
+                        {
+                            "trackRole": "customer",
+                            "playUrl": "https://audio.test/customer.ogg",
+                            "startedAt": "2026-07-14T00:00:00Z",
+                        }
+                    ],
+                },
+            }
+        if url.endswith("/ai-call/records/call_timeline/events?limit=1000"):
+            return {
+                "code": 200,
+                "data": {
+                    "rows": [
+                        {
+                            "eventType": "model_response_started",
+                            "eventTime": "2026-07-14T00:00:00.100Z",
+                        },
+                        {
+                            "eventType": "sip_interrupt_candidate",
+                            "eventTime": "2026-07-14T00:00:00.260Z",
+                        },
+                        {
+                            "eventType": "model_response_done",
+                            "eventTime": "2026-07-14T00:00:00.300Z",
+                        },
+                    ]
+                },
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    stdout = io.StringIO()
+    exit_code = run(
+        [
+            "--base-url",
+            "http://127.0.0.1:19011/ai-call-api/v1",
+            "--call-id",
+            "call_timeline",
+            "--fsmn-report-file",
+            str(windows_file),
+            "--sample-rate",
+            "8000",
+            "--live-timeline",
+            "--json",
+        ],
+        get_json=fake_get_json,
+        decode_audio=lambda url, sample_rate_hz, timeout_seconds: _pcm_for_amplitudes(
+            [3000] * 20
+        ),
+        webrtc_vad_factory=lambda: SequenceVoiceActivityDetector([True] * 20),
+        stdout=stdout,
+    )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert report["timeline"] == {
+        "mode": "live_events",
+        "aiTailMs": 600,
+        "interruptibleWindowCount": 1,
+        "interruptibleDurationMs": 300,
+        "interruptibleWindows": [{"startMs": 100, "endMs": 400}],
+    }
+    assert report["live"]["candidateOffsetsMs"] == [260]
+    assert report["providers"]["webrtc_main"]["firstCandidateMs"] == 260
+    assert report["providers"]["fsmn_main"]["firstCandidateMs"] == 260
+
+
 def test_provider_compare_scores_labeled_local_benchmark(tmp_path: Path) -> None:
     speech_path = tmp_path / "speech.wav"
     noise_path = tmp_path / "noise.wav"

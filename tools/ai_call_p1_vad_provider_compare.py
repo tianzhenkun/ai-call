@@ -21,6 +21,7 @@ from app.services.ai_call.sip_barge_in import (
 )
 from app.services.ai_call.sip_barge_in_replay import (
     SipBargeInProviderReplayReport,
+    SipBargeInReplayFrame,
     SipVadReplayProvider,
     SpeechWindow,
     WindowVoiceActivityDetector,
@@ -31,6 +32,8 @@ from app.services.ai_call.sip_barge_in_replay import (
 GetJson = Callable[[str, float], dict[str, Any]]
 DecodeAudio = Callable[[str, int, float], bytes]
 VadFactory = Callable[[], VoiceActivityDetectorProtocol]
+
+LIVE_TIMELINE_AI_TAIL_MS = 600
 
 
 class FsmnDetectorProtocol(Protocol):
@@ -82,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument("--frame-ms", type=int, default=20)
     parser.add_argument("--webrtc-mode", type=int, default=2)
+    parser.add_argument(
+        "--live-timeline",
+        action="store_true",
+        help=(
+            "With --call-id, replay only during model response windows reconstructed "
+            "from live events."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print raw JSON report.")
     return parser
 
@@ -104,6 +115,8 @@ def run(
 
     try:
         if args.benchmark_file:
+            if args.live_timeline:
+                raise RuntimeError("--live-timeline requires --call-id")
             report = (
                 _build_benchmark_onset_diagnosis(
                     benchmark_path=Path(args.benchmark_file),
@@ -366,7 +379,7 @@ def _build_benchmark_onset_diagnosis(
         else int(sample.get("speechStartMs") or 0)
     )
     first_candidate_ms = min(
-        [offset for offset in web_rtc_offsets + fsmn_offsets + agreement_offsets],
+        web_rtc_offsets + fsmn_offsets + agreement_offsets,
         default=duration_ms,
     )
     to_ms = (
@@ -840,6 +853,21 @@ def _build_single_report(
         sample_rate_hz=args.sample_rate,
         frame_duration_ms=args.frame_ms,
     )
+    timeline = {"mode": "always_interruptible"}
+    live_events: list[dict[str, Any]] = []
+    if args.live_timeline:
+        live_events = _events_for_call(
+            base_url,
+            call_id,
+            args.timeout_seconds,
+            get_json,
+        )
+        frames, timeline = _apply_live_interruptible_timeline(
+            frames=frames,
+            events=live_events,
+            track_started_at=customer_track.get("startedAt"),
+            frame_ms=args.frame_ms,
+        )
     fsmn_windows = (
         _load_fsmn_windows(Path(args.fsmn_report_file), call_id=call_id)
         if args.fsmn_report_file
@@ -873,6 +901,19 @@ def _build_single_report(
             "frameMs": args.frame_ms,
             "frameCount": len(frames),
             "customerTrackObjectName": customer_track.get("objectName"),
+        },
+        "timeline": timeline,
+        "live": {
+            "candidateOffsetsMs": _live_event_offsets_ms(
+                live_events,
+                event_type="sip_interrupt_candidate",
+                track_started_at=customer_track.get("startedAt"),
+            ),
+            "preStopOffsetsMs": _live_event_offsets_ms(
+                live_events,
+                event_type="sip_pre_stop",
+                track_started_at=customer_track.get("startedAt"),
+            ),
         },
         "fsmn": {
             "windows": len(speech_windows),
@@ -969,6 +1010,141 @@ def _recording_for_call(
     if not isinstance(response, dict):
         raise RuntimeError("recording response missing data")
     return response
+
+
+def _events_for_call(
+    base_url: str,
+    call_id: str,
+    timeout_seconds: float,
+    get_json: GetJson,
+) -> list[dict[str, Any]]:
+    response = _unwrap_data(
+        get_json(f"{base_url}/ai-call/records/{call_id}/events?limit=1000", timeout_seconds)
+    )
+    rows = response.get("rows") if isinstance(response, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("event response missing data.rows")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _apply_live_interruptible_timeline(
+    *,
+    frames: Sequence[SipBargeInReplayFrame],
+    events: Sequence[dict[str, Any]],
+    track_started_at: Any,
+    frame_ms: int,
+) -> tuple[list[SipBargeInReplayFrame], dict[str, Any]]:
+    track_start = _required_timestamp(track_started_at, field="customer track startedAt")
+    duration_ms = len(frames) * frame_ms
+    windows = _live_interruptible_windows(
+        events=events,
+        track_start=track_start,
+        duration_ms=duration_ms,
+    )
+    timeline_frames: list[SipBargeInReplayFrame] = []
+    window_index = 0
+    for frame in frames:
+        frame_end_ms = frame.offset_ms + frame_ms
+        while window_index < len(windows) and windows[window_index][1] <= frame.offset_ms:
+            window_index += 1
+        interruptible = (
+            window_index < len(windows)
+            and windows[window_index][0] < frame_end_ms
+            and windows[window_index][1] > frame.offset_ms
+        )
+        timeline_frames.append(
+            SipBargeInReplayFrame(
+                offset_ms=frame.offset_ms,
+                frame=frame.frame,
+                interruptible=interruptible,
+            )
+        )
+    return timeline_frames, {
+        "mode": "live_events",
+        "aiTailMs": LIVE_TIMELINE_AI_TAIL_MS,
+        "interruptibleWindowCount": len(windows),
+        "interruptibleDurationMs": sum(end_ms - start_ms for start_ms, end_ms in windows),
+        "interruptibleWindows": [
+            {"startMs": start_ms, "endMs": end_ms} for start_ms, end_ms in windows
+        ],
+    }
+
+
+def _live_interruptible_windows(
+    *,
+    events: Sequence[dict[str, Any]],
+    track_start: datetime,
+    duration_ms: int,
+) -> list[tuple[int, int]]:
+    active_start_ms: int | None = None
+    windows: list[tuple[int, int]] = []
+    sorted_events = sorted(events, key=lambda event: str(event.get("eventTime") or ""))
+    for event in sorted_events:
+        event_type = str(event.get("eventType") or "")
+        if event_type not in {"model_response_started", "model_response_done"}:
+            continue
+        event_time = _optional_timestamp(event.get("eventTime"))
+        if event_time is None:
+            continue
+        offset_ms = round((event_time - track_start).total_seconds() * 1000)
+        if event_type == "model_response_started":
+            if active_start_ms is None:
+                active_start_ms = offset_ms
+            continue
+        if active_start_ms is None:
+            continue
+        windows.append((active_start_ms, offset_ms + LIVE_TIMELINE_AI_TAIL_MS))
+        active_start_ms = None
+    if active_start_ms is not None:
+        windows.append((active_start_ms, duration_ms))
+
+    clipped = [
+        (max(0, start_ms), min(duration_ms, end_ms))
+        for start_ms, end_ms in windows
+        if end_ms > 0 and start_ms < duration_ms and end_ms > start_ms
+    ]
+    merged: list[tuple[int, int]] = []
+    for start_ms, end_ms in clipped:
+        if merged and start_ms <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_ms))
+        else:
+            merged.append((start_ms, end_ms))
+    return merged
+
+
+def _live_event_offsets_ms(
+    events: Sequence[dict[str, Any]],
+    *,
+    event_type: str,
+    track_started_at: Any,
+) -> list[int]:
+    if not events:
+        return []
+    track_start = _required_timestamp(track_started_at, field="customer track startedAt")
+    offsets: list[int] = []
+    for event in events:
+        if event.get("eventType") != event_type:
+            continue
+        event_time = _optional_timestamp(event.get("eventTime"))
+        if event_time is not None:
+            offsets.append(round((event_time - track_start).total_seconds() * 1000))
+    return sorted(offset for offset in offsets if offset >= 0)
+
+
+def _required_timestamp(value: Any, *, field: str) -> datetime:
+    timestamp = _optional_timestamp(value)
+    if timestamp is None:
+        raise RuntimeError(f"{field} is required for --live-timeline")
+    return timestamp
+
+
+def _optional_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _customer_track(recording: dict[str, Any]) -> dict[str, Any]:
