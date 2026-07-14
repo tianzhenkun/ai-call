@@ -86,6 +86,53 @@ class RuleBasedHandoffIntentClassifier:
         "真人聊",
         "人来接",
     )
+    PRODUCT_FOLLOW_UP_PATTERNS = (
+        "怎么联系",
+        "如何联系",
+        "联系方式",
+        "联系谁",
+        "谁联系",
+        "有没有人接",
+        "有人接吗",
+        "怎么联系我",
+        "怎么联系你们",
+        "你们怎么联系",
+        "联系我",
+        "给我联系",
+        "给我回电",
+        "回头联系",
+        "后续联系",
+        "到时候联系",
+    )
+    PRODUCT_FOLLOW_UP_ROLE_TERMS = (
+        "客服",
+        "顾问",
+        "产品顾问",
+        "销售",
+    )
+    PRODUCT_FOLLOW_UP_ACTION_TERMS = (
+        "联系",
+        "沟通",
+        "一起聊",
+        "聊吧",
+    )
+    PRODUCT_CONSULTATION_PATTERNS = (
+        "有demo",
+        "demo吗",
+        "安排demo",
+        "产品演示",
+        "安排演示",
+        "演示一下",
+        "试用",
+        "怎么合作",
+        "合作方式",
+        "想合作",
+        "报价",
+        "多少钱",
+        "价格",
+        "费用",
+        "收费",
+    )
     HUMAN_ROLE_TERMS = (
         "客户经理",
         "客户顾问",
@@ -157,6 +204,22 @@ class RuleBasedHandoffIntentClassifier:
                 summary="用户明确要求联系人工角色",
                 source="rule_fallback",
             )
+        if self._matches_product_follow_up_intent(normalized):
+            return HandoffIntentResult(
+                matched=True,
+                confidence=0.95,
+                reason="business_escalation",
+                summary="用户表达产品合作推进或顾问沟通意向",
+                source="rule_fallback",
+            )
+        if self._matches_product_consultation(normalized):
+            return HandoffIntentResult(
+                matched=False,
+                confidence=0.95,
+                reason="not_handoff",
+                summary="用户只是咨询产品信息或演示安排",
+                source="rule_fallback",
+            )
         return HandoffIntentResult(
             matched=False,
             confidence=0.4,
@@ -183,6 +246,18 @@ class RuleBasedHandoffIntentClassifier:
             if any(f"{role}{suffix}" in normalized for suffix in cls.ROLE_REQUEST_SUFFIXES):
                 return True
         return False
+
+    @classmethod
+    def _matches_product_follow_up_intent(cls, normalized: str) -> bool:
+        if any(pattern in normalized for pattern in cls.PRODUCT_FOLLOW_UP_PATTERNS):
+            return True
+        return any(role in normalized for role in cls.PRODUCT_FOLLOW_UP_ROLE_TERMS) and any(
+            action in normalized for action in cls.PRODUCT_FOLLOW_UP_ACTION_TERMS
+        )
+
+    @classmethod
+    def _matches_product_consultation(cls, normalized: str) -> bool:
+        return any(pattern in normalized for pattern in cls.PRODUCT_CONSULTATION_PATTERNS)
 
 
 class OpenAICompatibleHandoffIntentClassifier:
@@ -272,9 +347,15 @@ class CompositeHandoffIntentClassifier:
         self,
         primary: HandoffIntentClassifierProtocol | None,
         fallback: HandoffIntentClassifierProtocol,
+        primary_timeout_seconds: float | None = None,
     ) -> None:
         self.primary = primary
         self.fallback = fallback
+        self.primary_timeout_seconds = (
+            max(0.05, primary_timeout_seconds)
+            if primary_timeout_seconds is not None
+            else None
+        )
 
     async def classify(self, *, transcript: str) -> HandoffIntentResult:
         fallback_result = await self.fallback.classify(transcript=transcript)
@@ -282,7 +363,12 @@ class CompositeHandoffIntentClassifier:
             return fallback_result
         if self.primary is not None:
             try:
-                return await self.primary.classify(transcript=transcript)
+                if self.primary_timeout_seconds is None:
+                    return await self.primary.classify(transcript=transcript)
+                return await asyncio.wait_for(
+                    self.primary.classify(transcript=transcript),
+                    timeout=self.primary_timeout_seconds,
+                )
             except Exception as exc:
                 log.warning(
                     "转人工语义分类失败，使用兜底分类: errorType={}, message={}",
@@ -309,6 +395,7 @@ def build_default_handoff_intent_classifier(
                 timeout_seconds=timeout_seconds,
             ),
             fallback,
+            primary_timeout_seconds=timeout_seconds * 0.8,
         )
     return fallback
 
