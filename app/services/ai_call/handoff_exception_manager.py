@@ -35,6 +35,8 @@ class SystemPromptPlayerProtocol(Protocol):
 
 RecordingServiceFactory = Callable[[AiCallRecordRepository], AiCallRecordingService | None]
 
+DEFAULT_UNAVAILABLE_PROMPT_TEXT = "当前暂时没有人工接入，我先帮您记录需求，稍后安排顾问联系您。"
+
 
 class AiCallHandoffExceptionManager:
     """B3.1 转人工失败/超时后的提示音和自动结束协调器。"""
@@ -53,6 +55,7 @@ class AiCallHandoffExceptionManager:
         waiting_tone_audio_path: str | Path | None = None,
         waiting_tone_interval_seconds: float = 0.0,
         unavailable_prompt_audio_path: str | Path | None = None,
+        unavailable_prompt_text: str | None = DEFAULT_UNAVAILABLE_PROMPT_TEXT,
     ) -> None:
         self.orchestrator = orchestrator
         self.session_factory = session_factory
@@ -73,6 +76,7 @@ class AiCallHandoffExceptionManager:
             if unavailable_prompt_audio_path
             else None
         )
+        self.unavailable_prompt_text = self._strip_prompt_text(unavailable_prompt_text)
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._closure_tasks: dict[str, asyncio.Task] = {}
         self._waiting_tone_tasks: dict[str, asyncio.Task] = {}
@@ -414,6 +418,13 @@ class AiCallHandoffExceptionManager:
             handoff_status=handoff_status,
             payload=payload,
         )
+        if runtime_close_mode != "orchestrator":
+            self.orchestrator.event_store.append(
+                call_id=call_id,
+                type="session_completed",
+                source="orchestrator",
+                payload={"endReason": call_end_reason},
+            )
 
     async def _close_runtime_after_exception(
         self,
@@ -557,6 +568,7 @@ class AiCallHandoffExceptionManager:
             handoff_status=handoff_status,
             audio_path=self.unavailable_prompt_audio_path,
             event_prefix="handoff_unavailable_prompt",
+            event_payload=self._unavailable_prompt_event_payload(),
         )
 
     async def _play_prompt_audio(
@@ -568,15 +580,19 @@ class AiCallHandoffExceptionManager:
         handoff_status: str,
         audio_path: Path,
         event_prefix: str,
+        event_payload: dict[str, Any] | None = None,
     ) -> None:
         if self.system_prompt_player is None:
             return
+        base_payload = {"audioFile": audio_path.name}
+        if event_payload:
+            base_payload.update(event_payload)
         self._record_handoff_event(
             call_id=call_id,
             event_type=f"{event_prefix}_started",
             handoff_id=handoff_id,
             handoff_status=handoff_status,
-            payload={"audioFile": audio_path.name},
+            payload=base_payload,
             source="system",
         )
         try:
@@ -594,7 +610,7 @@ class AiCallHandoffExceptionManager:
                 handoff_id=handoff_id,
                 handoff_status=handoff_status,
                 payload={
-                    "audioFile": audio_path.name,
+                    **base_payload,
                     "errorType": type(exc).__name__,
                     "message": str(exc),
                 },
@@ -606,9 +622,14 @@ class AiCallHandoffExceptionManager:
             event_type=f"{event_prefix}_done",
             handoff_id=handoff_id,
             handoff_status=handoff_status,
-            payload={"audioFile": audio_path.name},
+            payload=base_payload,
             source="system",
         )
+
+    def _unavailable_prompt_event_payload(self) -> dict[str, Any]:
+        if self.unavailable_prompt_text is None:
+            return {}
+        return {"promptText": self.unavailable_prompt_text}
 
     def _record_handoff_event(
         self,
@@ -653,3 +674,10 @@ class AiCallHandoffExceptionManager:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _strip_prompt_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None

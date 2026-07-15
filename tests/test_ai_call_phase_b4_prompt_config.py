@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -217,6 +218,308 @@ def test_prompt_profile_schema_accepts_barge_in_enabled() -> None:
     assert request.barge_in_enabled is True
 
 
+def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-product-intro-seed-postgres.sql"
+    )
+    seed_sql = seed_path.read_text(encoding="utf-8")
+
+    assert "'intro_geo'" in seed_sql
+    assert "不要一上来对客户讲" in seed_sql
+    assert "专业但易懂的表达" in seed_sql
+    assert "统一问题集观察主流 AI 平台" in seed_sql
+    assert "统一品牌事实和产品口径" in seed_sql
+    assert "不直接报价或承诺" in seed_sql
+    assert "预约产品顾问具体沟通" in seed_sql
+    assert "合同审查" in seed_sql
+    assert "即使用户点名合同审查，也不要介绍、评价或对比合同审查能力" in seed_sql
+    assert "灵宸还有其他 AI 产品" in seed_sql
+    assert "全产品线" in seed_sql
+    assert "PR 稿、摘要、短视频脚本或关键词策略" in seed_sql
+    assert "普通产品问题先直接回答" in seed_sql
+    assert "不要每个回答都用预约顾问收尾" in seed_sql
+    assert "不说“不少客户反馈”等无依据优势" in seed_sql
+    assert "持续监控的闭环能力" in seed_sql
+    assert "默认每次回复控制在 1 到 2 句" in seed_sql
+    assert "先答核心问题" in seed_sql
+    assert "尽量控制在 40 到 60 个汉字" in seed_sql
+    assert "短确认" in seed_sql
+    assert "不要重复上一轮解释" in seed_sql
+    assert "不要一次性把完整方法、指标、渠道和顾问安排都说完" in seed_sql
+    assert "用户明确说“回复太长”“短一点”“一句话说清”" in seed_sql
+    assert "不要补充顾问安排、合作推进或新的追问" in seed_sql
+    assert "不要称呼客户，不要追加“需要顾问沟通吗”这类追问" in seed_sql
+    assert "GEO 帮企业看清 AI 是否准确介绍、引用和推荐品牌" in seed_sql
+    assert "客户要求“说简单点”时，用“先看 AI 怎么介绍企业、再整理官方资料、再改成 AI 更容易引用的内容”" in seed_sql
+    assert "天气、日期、股市" in seed_sql
+    assert "不回答具体内容" in seed_sql
+    assert "不要说“马上为您转接”" in seed_sql
+    assert "如果当前没有人工接入，稍后会安排顾问联系" in seed_sql
+    assert "不要列举平台名称、不要展开方法、指标、技术细节或产品名" in seed_sql
+    assert "后续方便让顾问联系您吗" in seed_sql
+    assert "没空时不要解释 GEO、AI、品牌推荐或任何产品价值" in seed_sql
+    assert "只称“其他产品线”，不要复述“合同审查”这个产品名" in seed_sql
+    assert "不要说“马上为您转接”“请稍候”或暗示顾问已经接通" in seed_sql
+    assert "我先帮您记录顾问沟通意向，如果当前没有人工接入，稍后会安排顾问联系您" in seed_sql
+    assert "不能承诺一定排名、一定被模型推荐或一定周期见效" in seed_sql
+    assert "用户问“效果怎么看”“有什么指标”这类普通指标问题时" in seed_sql
+    assert "包含“错误回答占比”" in seed_sql
+    assert "不要主动提顾问、基线评估、试点或优化节奏" in seed_sql
+    assert "不给任何固定周期或区间" in seed_sql
+    assert "GEO 可能被语音识别成“机油”“CEO”“Z O”" in seed_sql
+    assert "如果语境涉及产品、服务、怎么做、技术方案、效果、SEO、AI 搜索、品牌曝光、合作或试用" in seed_sql
+    assert "优先理解为 GEO 生成式引擎优化" in seed_sql
+    assert "用户说“机油具体怎么做”这类高置信表达时，不要只澄清" in seed_sql
+    assert "按“GEO 具体怎么做”直接回答" in seed_sql
+    assert "您说的是 GEO 生成式引擎优化这块吗" in seed_sql
+    assert "想简单介绍一下 GEO 生成式引擎优化服务" in seed_sql
+
+
+def test_intro_overseas_seed_uses_overseas_growth_agent_boundaries() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-product-intro-seed-postgres.sql"
+    )
+    seed_sql = seed_path.read_text(encoding="utf-8")
+    overseas_block = seed_sql.split("'intro_overseas'", maxsplit=1)[1].split(
+        "'intro_geo'",
+        maxsplit=1,
+    )[0]
+
+    assert "海外获客智能体" in overseas_block
+    assert "Sales in" not in overseas_block
+    assert "想简单介绍一下我们的海外获客智能体" in overseas_block
+    assert "固定线索数量" in overseas_block
+    assert "固定回复率" in overseas_block
+    assert "固定成交率" in overseas_block
+    assert "固定周期见效" in overseas_block
+    assert "CRM、邮箱、LinkedIn、API、Webhook、Excel/CSV/JSON 导出" in overseas_block
+    assert "属于可评估方向" in overseas_block
+    assert "不要直接说“可以”或“一定支持”" in overseas_block
+    assert "不要说“能导出 Excel”“可以导出 Excel”" in overseas_block
+    assert "首句必须说明“属于可评估方向”" in overseas_block
+    assert "自动群发、绕过平台规则" in overseas_block
+    assert "数据来源、触达方式、隐私合规、系统接入、价格、试用、案例" in overseas_block
+    assert "天气、日期、股市" in overseas_block
+    assert "不回答具体内容" in overseas_block
+    assert "没空、在开会、只有半分钟" in overseas_block
+    assert "回复最多 60 个汉字" in overseas_block
+    assert "如果当前没有人工接入，稍后会安排顾问联系" in overseas_block
+    assert "false" in overseas_block
+
+
+def test_intro_contract_seed_uses_contract_intelligent_review_boundaries() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-product-intro-seed-postgres.sql"
+    )
+    seed_sql = seed_path.read_text(encoding="utf-8")
+    contract_block = seed_sql.split("'intro_contract'", maxsplit=1)[1].split(
+        "'intro_document'",
+        maxsplit=1,
+    )[0]
+
+    assert "合同智能审查" in contract_block
+    assert "想简单介绍一下我们的合同智能审查产品" in contract_block
+    assert "DeepLaw" in contract_block
+    assert "智律引擎" in contract_block
+    assert "不直接给法律意见" in contract_block
+    assert "不承诺百分百准确" in contract_block
+    assert "不承诺零风险、零漏审、零纠纷" in contract_block
+    assert "一定胜诉或一定避免损失" in contract_block
+    assert "客户样本合同验证" in contract_block
+    assert "Word 审查报告属于可评估方向" in contract_block
+    assert "不要说“可以导出 Word”“能导出 Word”" in contract_block
+    assert "OA、CRM、API" in contract_block
+    assert "数据隔离、权限控制、加密存储、可控部署" in contract_block
+    assert "天气、日期、股市" in contract_block
+    assert "不回答具体内容" in contract_block
+    assert "如果当前没有人工接入，稍后会安排顾问联系" in contract_block
+    assert "false" in contract_block
+
+
+def test_intro_document_seed_uses_cross_border_document_review_boundaries() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-product-intro-seed-postgres.sql"
+    )
+    seed_sql = seed_path.read_text(encoding="utf-8")
+    document_block = seed_sql.split("'intro_document'", maxsplit=1)[1].split(
+        "'intro_overseas'",
+        maxsplit=1,
+    )[0]
+
+    assert "跨境单证智能审核" in document_block
+    assert "想简单介绍一下我们的跨境单证智能审核产品" in document_block
+    assert "信用证、汇票、发票、提单、保单、箱单" in document_block
+    assert "UCP600" in document_block
+    assert "ISBP" in document_block
+    assert "不承诺完全替代人工审核" in document_block
+    assert "不承诺百分百识别准确" in document_block
+    assert "不承诺零风险、零漏审、零拒付" in document_block
+    assert "数据安全、系统接入、私有化、本地化、价格、试用、案例" in document_block
+    assert "产品顾问确认" in document_block
+    assert "46A 缺单" in document_block
+    assert "不要直接说“能查”" in document_block
+    assert "不给任何固定周期或区间" in document_block
+    assert "属于可评估方向" in document_block
+    assert "天气、日期、股市" in document_block
+    assert "不回答具体内容" in document_block
+    assert "false" in document_block
+
+
+def test_intro_geo_batch_cases_cover_guardrails() -> None:
+    cases_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/testdata/intro_geo_prompt_cases.jsonl"
+    )
+    cases = [
+        json.loads(line)
+        for line in cases_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(cases) >= 30
+    assert {case["sceneCode"] for case in cases} == {"intro_geo"}
+    assert all(isinstance(case["turns"], list) and case["turns"] for case in cases)
+    assert all(isinstance(case["expected"], list) and case["expected"] for case in cases)
+    assert all(isinstance(case["forbidden"], list) and case["forbidden"] for case in cases)
+
+    categories = {case["category"] for case in cases}
+    assert {
+        "commercial_boundary",
+        "technical_boundary",
+        "effect_boundary",
+        "clarity",
+        "off_topic",
+        "prompt_injection",
+        "deep_followup",
+        "term_recognition",
+    }.issubset(categories)
+
+    expected_text = "\n".join(
+        item
+        for case in cases
+        for item in case["expected"]
+    )
+    forbidden_text = "\n".join(
+        item
+        for case in cases
+        for item in case["forbidden"]
+    )
+    assert "专业但易懂" in expected_text
+    assert "不继续堆内部术语" in expected_text
+    assert "普通产品问题先直接答清楚" in expected_text
+    assert "转人工无人接入时说明稍后会安排顾问联系" in expected_text
+    assert "把“机油”按 GEO 生成式引擎优化理解" in expected_text
+    assert "把“CEO”按 GEO 理解" in expected_text
+    assert "提供天气预报" in forbidden_text
+    assert "告诉客户明天日期" in forbidden_text
+    assert "编造价格" in forbidden_text
+    assert "承诺 30 天推荐" in forbidden_text
+    assert "普通问题每次都引导顾问" in forbidden_text
+    assert "重复审计诊断、知识库治理、内容资产、公域触点等术语" in forbidden_text
+    assert "围绕汽车机油回答" in forbidden_text
+    assert "马上为您转接" in forbidden_text
+    assert "请稍候" in forbidden_text
+
+
+def test_intro_overseas_candidate_prompt_assets_cover_guardrails() -> None:
+    root = Path(__file__).resolve().parents[1]
+    instructions_path = root / "docs/livekit-ai-outbound/candidate-prompts/intro_overseas-v1.md"
+    knowledge_card_path = root / "docs/livekit-ai-outbound/overseas-growth-knowledge-card.md"
+    cases_path = root / "docs/livekit-ai-outbound/testdata/intro_overseas_prompt_cases.jsonl"
+
+    instructions = instructions_path.read_text(encoding="utf-8")
+    knowledge_card = knowledge_card_path.read_text(encoding="utf-8")
+    cases = [
+        json.loads(line)
+        for line in cases_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert "海外获客智能体" in instructions
+    assert "Sales in" not in instructions
+    assert "固定线索数量" in instructions
+    assert "固定回复率" in instructions
+    assert "固定成交结果" in instructions
+    assert "数据来源、触达方式、隐私合规、系统接入、价格、试用、案例" in instructions
+    assert "不要说“能导出 Excel”“可以导出 Excel”" in instructions
+    assert "天气、日期、股市" in instructions
+    assert "海外获客智能体知识卡 v1" in knowledge_card
+    assert "Sales in" not in knowledge_card
+    assert "目标客户画像" in knowledge_card
+    assert "线索发现与评分" in knowledge_card
+    assert "客户洞察" in knowledge_card
+    assert "个性化触达" in knowledge_card
+    assert "CRM" in knowledge_card
+
+    assert len(cases) >= 20
+    assert {case["sceneCode"] for case in cases} == {"intro_overseas"}
+    categories = {case["category"] for case in cases}
+    assert {
+        "overseas_availability",
+        "overseas_basic",
+        "overseas_method",
+        "overseas_metrics",
+        "overseas_data_compliance",
+        "overseas_integration",
+        "overseas_commercial",
+        "overseas_boundary",
+        "overseas_off_topic",
+    }.issubset(categories)
+
+
+def test_intro_document_candidate_prompt_assets_cover_guardrails() -> None:
+    root = Path(__file__).resolve().parents[1]
+    instructions_path = root / "docs/livekit-ai-outbound/candidate-prompts/intro_document-v1.md"
+    knowledge_card_path = root / "docs/livekit-ai-outbound/cross_border_document_knowledge_card.md"
+    cases_path = root / "docs/livekit-ai-outbound/testdata/intro_document_prompt_cases.jsonl"
+
+    instructions = instructions_path.read_text(encoding="utf-8")
+    knowledge_card = knowledge_card_path.read_text(encoding="utf-8")
+    cases = [
+        json.loads(line)
+        for line in cases_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert "跨境单证智能审核" in instructions
+    assert "跨境单证智能审核知识卡 v1" in knowledge_card
+    assert "UCP600" in instructions
+    assert "ISBP" in instructions
+    assert "信用证、汇票、发票、提单、保单、箱单" in instructions
+    assert "不承诺完全替代人工审核" in instructions
+    assert "不承诺百分百识别准确" in instructions
+    assert "不承诺零风险、零漏审、零拒付" in instructions
+    assert "数据安全、系统接入、私有化、本地化、价格、试用、案例" in instructions
+    assert "产品顾问确认" in instructions
+    assert "天气、日期、股市" in instructions
+    assert "跨境单证智能审核" in knowledge_card
+    assert "完整性审核" in knowledge_card
+    assert "单据自身审核" in knowledge_card
+    assert "信用证关联审核" in knowledge_card
+    assert "单单一致性审核" in knowledge_card
+    assert "自然语言规则配置" in knowledge_card
+
+    assert len(cases) >= 24
+    assert {case["sceneCode"] for case in cases} == {"intro_document"}
+    categories = {case["category"] for case in cases}
+    assert {
+        "document_availability",
+        "document_basic",
+        "document_method",
+        "document_rules",
+        "document_metrics",
+        "document_data_security",
+        "document_integration",
+        "document_commercial",
+        "document_boundary",
+        "document_off_topic",
+    }.issubset(categories)
+
+
 @pytest.mark.anyio
 async def test_recov_collection_postgres_store_renders_prompt_and_opening() -> None:
     connection = FakeRecovPostgresConnection()
@@ -321,6 +624,8 @@ async def test_prompt_components_include_runtime_common_constraints(b4_service) 
     assert components["rows"][0]["name"] == "平台关键约束"
     assert "当前日期：" in components["rows"][0]["content"]
     assert "Asia/Shanghai" in components["rows"][0]["content"]
+    assert "暂时没有人工接入" in components["rows"][1]["content"]
+    assert "稍后安排顾问联系" in components["rows"][1]["content"]
     assert "schedule_call_end" in components["rows"][2]["content"]
     assert "仅当上下文明确表明通话已适合结束" in components["rows"][2]["content"]
     assert "必须调用 schedule_call_end" in components["rows"][2]["content"]
@@ -351,6 +656,8 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     assert preview["bargeInEnabled"] is False
     assert "平台关键约束" in preview["instructions"]
     assert "当前日期：" in preview["instructions"]
+    assert "不得代替客户使用第一人称表达客户需求" in preview["instructions"]
+    assert "不要把客户未说出的" in preview["instructions"]
     assert "转人工能力约束" in preview["instructions"]
     assert "业务话术" in preview["instructions"]
     assert "你正在联系张总" in preview["instructions"]

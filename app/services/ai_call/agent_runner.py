@@ -16,6 +16,7 @@ from app.services.ai_call.call_end_decision_service import (
     CallEndDecision,
     RuleBasedCallEndDecisionService,
 )
+from app.services.ai_call.dialogue_merge import normalize_dialogue_text
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.metrics import CallMetrics
 from app.services.ai_call.prompt_config import (
@@ -100,6 +101,164 @@ BUSINESS_HANDOFF_CONFIRMATION_TOOL_RESULT = (
 CALL_END_FINAL_RESPONSE_TOOL_RESULT = "已记录。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
 CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "已记录。系统将结束通话，不要再生成额外回复。"
 CALL_END_REJECTED_TOOL_RESULT = "未确认用户要求结束通话。请继续按用户刚才的话推进对话，不要结束通话。"
+CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT = (
+    "未确认客户要结束通话。请继续回应客户刚才的问题或做一个必要澄清。"
+)
+TASK_COMPLETED_REJECTED_TOOL_RESULT = (
+    "未确认客户已同意后续联系或演示。请继续澄清下一步，不要结束通话。"
+)
+CALL_END_FINAL_RESPONSE_TOOL_RESULTS_BY_REASON = {
+    "customer_end": (
+        "请直接回复：“好的，那我先不打扰您了，祝您工作顺利。”"
+        "不要添加其他内容，不要再提出问题。"
+    ),
+    "task_completed": (
+        "请直接回复：“好的，我已经记录，稍后会有顾问联系您。”"
+        "不要添加其他内容，不要再提出问题。"
+    ),
+}
+CALL_END_USER_TURN_GRACE_SECONDS = 1.0
+AI_QUESTION_ANSWER_WINDOW_SECONDS = 3.0
+NO_BARGE_USER_TURN_STABILITY_DELAY_SECONDS = 1.2
+CALL_END_ACKNOWLEDGEMENT_TEXTS = frozenset({
+    "好",
+    "好的",
+    "好的好的",
+    "好知道了",
+    "知道了",
+    "嗯",
+    "嗯嗯",
+    "嗯好的",
+    "行",
+    "可以",
+})
+TASK_COMPLETED_AMBIGUOUS_TEXTS = CALL_END_ACKNOWLEDGEMENT_TEXTS | frozenset({
+    "方便",
+    "知道",
+    "知道了",
+    "可以知道了",
+    "是",
+    "是的",
+    "对",
+    "对的",
+})
+TASK_COMPLETED_NEGATIVE_PATTERNS = (
+    "不用联系",
+    "不要联系",
+    "别联系",
+    "先不联系",
+    "不需要联系",
+    "不用顾问",
+    "不要顾问",
+    "不用沟通",
+    "不要沟通",
+    "不安排",
+    "不要安排",
+)
+TASK_COMPLETED_NEXT_STEP_PATTERNS = (
+    "顾问联系",
+    "联系我",
+    "后续联系",
+    "稍后联系",
+    "回头联系",
+    "电话联系",
+    "线上沟通",
+    "线上会议",
+    "安排沟通",
+    "约个",
+    "约一下",
+    "约时间",
+    "安排演示",
+    "产品演示",
+    "看看演示",
+    "发资料",
+    "把资料发",
+    "加微信",
+    "留电话",
+)
+NO_BARGE_FOLLOWUP_ACKNOWLEDGEMENT_TEXTS = frozenset({
+    "嗯",
+    "嗯嗯",
+    "好",
+    "好的",
+    "行",
+    "可以",
+    "方便",
+    "你好",
+    "有",
+    "有的",
+    "对",
+    "对的",
+    "是",
+})
+NO_BARGE_FOLLOWUP_SUBSTANTIVE_HINTS = frozenset({
+    "吗",
+    "么",
+    "呢",
+    "怎么",
+    "什么",
+    "准",
+    "不准",
+    "测试",
+    "平台",
+    "demo",
+    "演示",
+    "上传",
+    "效果",
+    "价格",
+    "试用",
+    "合同",
+    "审核",
+    "流程",
+    "联系",
+    "顾问",
+})
+CALL_END_TERMINAL_TAIL_MAX_CHARS = 6
+CALL_END_STRONG_CONTINUATION_TEXTS = frozenset({
+    "等会",
+    "等一下",
+    "等等",
+    "先等",
+    "别挂",
+    "不要挂",
+    "先别挂",
+})
+CALL_END_STRONG_CONTINUATION_PATTERNS = (
+    "还有",
+    "不对",
+    "不是",
+    "问一下",
+)
+CALL_END_TERMINAL_TIME_HINT_PATTERNS = (
+    "今天",
+    "明天",
+    "后天",
+    "上午",
+    "中午",
+    "下午",
+    "晚上",
+    "周一",
+    "周二",
+    "周三",
+    "周四",
+    "周五",
+    "周六",
+    "周日",
+    "星期",
+)
+PHONE_RESPONSE_BREVITY_INSTRUCTIONS = (
+    "电话单轮回复约束：\n"
+    "- 每次回复尽量控制在 10-15 秒内。\n"
+    "- 默认不超过 2 句话，优先一句结论加一个问题。\n"
+    "- 不要一次性展开多步骤长篇说明；用户要求详细说明时，也要分轮讲，每轮只讲一个重点。"
+)
+FINAL_ROLE_BOUNDARY_INSTRUCTIONS = (
+    "最终角色边界复核：\n"
+    "- 你正在以 AI 助手或业务专员身份和客户通话，只能说产品方应该说的话。\n"
+    "- 不得用“我们这边”“我这边”模拟客户说话，不得替客户补充客户公司的背景、痛点、需求或疑问。\n"
+    "- 客户短句只能按字面理解，不得把“好的”“有”“嗯”扩写成客户已确认痛点、需求或态度。\n"
+    "- 如果客户只说“方便”“你好”“嗯”等简短确认，应继续用助手身份介绍一个产品价值点或追问一个业务问题。"
+)
 BROWSER_INTERRUPT_REASONS = {
     "browser_speech_segment_candidate_during_ai_audio",
     "browser_speech_segment_strong_during_ai_audio",
@@ -260,6 +419,10 @@ def _agent_runner_runtime_diagnostics() -> dict[str, object]:
 
 
 AGENT_RUNNER_RUNTIME_DIAGNOSTICS = _agent_runner_runtime_diagnostics()
+
+
+class ProviderTransportError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +647,10 @@ class PendingUserTurn:
     started_at: datetime | None = None
     stopped_at: datetime | None = None
     transcript_parts: list[str] = field(default_factory=list)
+    transcript_merge_start_index: int | None = None
+    no_barge_overlap_stopped_during_ai_response: bool = False
+    no_barge_unstarted_response_deferred: bool = False
+    current_speech_semantic_rejected: bool = False
     response_requested: bool = False
     interrupt_candidate: bool = False
     interrupt_confirmed: bool = False
@@ -563,6 +730,9 @@ class PendingUserTurn:
     browser_segment_rms_dbfs: float | None = None
     browser_segment_remote_audio_active: bool | None = None
     browser_segment_remote_audio_rms_dbfs: float | None = None
+    browser_segment_observed_at: datetime | None = None
+    browser_segment_ended_at: datetime | None = None
+    call_end_acknowledged: bool = False
 
     @property
     def transcript(self) -> str:
@@ -586,6 +756,7 @@ class SipPreStopAuthorityDecision:
 @dataclass(slots=True)
 class ResponseLifecycle:
     active: bool = False
+    active_started_at: datetime | None = None
     cancel_pending: bool = False
     cancel_race_ignore_until: datetime | None = None
     pending_create: bool = False
@@ -655,6 +826,7 @@ class RealtimeCallAgentRunner:
         sip_vad_shadow_enabled: bool = False,
         sip_vad_shadow_detector: SipVadShadowDetectorProtocol | None = None,
         user_turn_stability_delay_seconds: float = 0.35,
+        no_barge_user_turn_stability_delay_seconds: float = 0.0,
         handoff_prompt_constraint_enabled: bool = False,
         call_end_decision_service: RuleBasedCallEndDecisionService | None = None,
         call_end_scheduler: CallEndScheduler | None = None,
@@ -689,6 +861,10 @@ class RealtimeCallAgentRunner:
         self._sip_vad_shadow_detector = sip_vad_shadow_detector
         self._sip_vad_shadow_failed_call_ids: set[str] = set()
         self.user_turn_stability_delay_seconds = max(0.0, user_turn_stability_delay_seconds)
+        self.no_barge_user_turn_stability_delay_seconds = max(
+            0.0,
+            no_barge_user_turn_stability_delay_seconds,
+        )
         self.handoff_prompt_constraint_enabled = handoff_prompt_constraint_enabled
         self.call_end_decision_service = (
             call_end_decision_service or RuleBasedCallEndDecisionService()
@@ -722,11 +898,14 @@ class RealtimeCallAgentRunner:
         self._playback_guards: dict[str, PlaybackGuard] = {}
         self._pending_call_ends: dict[str, PendingCallEnd] = {}
         self._pending_call_end_intents: dict[str, PendingCallEndIntent] = {}
+        self._pending_call_end_defer_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
         self._sip_barge_in_tasks: dict[str, asyncio.Task[None]] = {}
         self._sip_clean_window_tasks: dict[str, asyncio.Task[None]] = {}
         self._sip_recovery_tasks: dict[str, asyncio.Task[None]] = {}
+        self._provider_transport_diagnostics: dict[str, dict[str, Any]] = {}
+        self._last_ai_question_completed_at: dict[str, datetime] = {}
 
     def runtime_diagnostics(self) -> dict[str, object]:
         return dict(AGENT_RUNNER_RUNTIME_DIAGNOSTICS)
@@ -734,8 +913,22 @@ class RealtimeCallAgentRunner:
     async def start(self, session: CallSession) -> None:
         provider = self.provider_factory(session)
         self._providers[session.call_id] = provider
+        state = self._provider_transport_state(session.call_id)
+        state.update({
+            "providerClass": f"{type(provider).__module__}.{type(provider).__name__}",
+            "providerCreatedAt": self._utcnow_text(),
+        })
         await provider.connect()
-        await provider.update_session(self._session_config(session))
+        state["providerConnectedAt"] = self._utcnow_text()
+        session_config = self._session_config(session)
+        await provider.update_session(session_config)
+        state.update({
+            "providerSessionUpdatedAt": self._utcnow_text(),
+            "sessionVoice": session_config.voice,
+            "sessionVadType": session_config.vad_type,
+            "sessionVadThreshold": session_config.vad_threshold,
+            "sessionVadSilenceDurationMs": session_config.vad_silence_duration_ms,
+        })
         self._tasks[session.call_id] = asyncio.create_task(
             self._consume_provider_events(session.call_id, provider)
         )
@@ -748,6 +941,7 @@ class RealtimeCallAgentRunner:
     async def stop(self, call_id: str) -> None:
         await self._cancel_playout_task(call_id)
         await self._cancel_turn_response_task(call_id)
+        await self._cancel_pending_call_end_defer_task(call_id)
         await self._cancel_browser_audio_hold_task(call_id)
         await self._cancel_browser_pre_stop_task(call_id)
         await self._cancel_sip_barge_in_task(call_id)
@@ -785,6 +979,8 @@ class RealtimeCallAgentRunner:
         self._playback_guards.pop(call_id, None)
         self._pending_call_ends.pop(call_id, None)
         self._pending_call_end_intents.pop(call_id, None)
+        self._provider_transport_diagnostics.pop(call_id, None)
+        self._last_ai_question_completed_at.pop(call_id, None)
         if self._sip_barge_in_detector is not None:
             self._sip_barge_in_detector.reset(call_id)
         if self._sip_vad_shadow_detector is not None:
@@ -829,7 +1025,12 @@ class RealtimeCallAgentRunner:
         provider = self._providers[call_id]
         await self._maybe_handle_sip_barge_in_audio(call_id, provider, frame)
         for chunk in self.audio_bridge.iter_qwen_input_chunks(frame):
-            await provider.send_audio(chunk)
+            try:
+                await provider.send_audio(chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ProviderTransportError(str(exc)) from exc
 
     async def start_opening(self, call_id: str) -> None:
         provider = self._providers[call_id]
@@ -850,7 +1051,27 @@ class RealtimeCallAgentRunner:
     ) -> None:
         try:
             async for frame in audio_transport.receive_audio_frames(call_id):
-                await self.send_audio_frame(call_id, frame)
+                self._record_provider_audio_send_attempt(call_id, frame)
+                try:
+                    await self.send_audio_frame(call_id, frame)
+                except asyncio.CancelledError:
+                    raise
+                except ProviderTransportError as exc:
+                    self._record_provider_audio_send_error(call_id, exc)
+                    self._fail_running_session(
+                        call_id,
+                        end_reason="provider_transport_error",
+                        failure_stage="provider_audio_send",
+                        failure_message=f"模型音频上行传输异常: {exc}",
+                        extra_payload={
+                            "providerTransport": self._provider_transport_snapshot(
+                                call_id,
+                                error_source="provider_audio_send",
+                            ),
+                        },
+                    )
+                    return
+                self._record_provider_audio_send_success(call_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5018,6 +5239,7 @@ class RealtimeCallAgentRunner:
                     "provider",
                     event_payload,
                 )
+                self._record_provider_event(call_id, provider_event.type, event_timestamp)
                 if handler_event.type == "user_speech_started":
                     await self._handle_user_speech_started(call_id, provider, event_timestamp)
                 elif handler_event.type == "user_speech_stopped":
@@ -5044,11 +5266,18 @@ class RealtimeCallAgentRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._record_provider_event_stream_error(call_id, exc)
             self._fail_running_session(
                 call_id,
-                end_reason="model_error",
+                end_reason="provider_transport_error",
                 failure_stage="provider_event_stream",
-                failure_message=f"模型事件流异常: {exc}",
+                failure_message=f"模型事件流传输异常: {exc}",
+                extra_payload={
+                    "providerTransport": self._provider_transport_snapshot(
+                        call_id,
+                        error_source="provider_event_stream",
+                    ),
+                },
             )
 
     async def record_browser_speech_candidate(
@@ -5134,6 +5363,10 @@ class RealtimeCallAgentRunner:
             CallSessionStatus.FAILED,
         }:
             return False
+        turn = self._pending_turn(call_id, reset_if_finished=True)
+        if turn.started_at is None:
+            turn.started_at = trigger_timestamp
+        self._record_browser_segment_evidence(turn, payload, trigger_timestamp)
         if not self._is_barge_in_enabled_for_session(session):
             return False
 
@@ -5155,10 +5388,6 @@ class RealtimeCallAgentRunner:
         if session.status != CallSessionStatus.AI_SPEAKING:
             return False
 
-        turn = self._pending_turn(call_id, reset_if_finished=True)
-        if turn.started_at is None:
-            turn.started_at = trigger_timestamp
-        self._record_browser_segment_evidence(turn, payload)
         candidate_created = self._mark_interrupt_candidate(
             call_id=call_id,
             turn=turn,
@@ -5218,7 +5447,7 @@ class RealtimeCallAgentRunner:
         elif event_type == "model_response_started":
             if session.status == CallSessionStatus.READY:
                 session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
-            self._mark_response_started(call_id, payload)
+            self._mark_response_started(call_id, payload, timestamp)
         elif event_type == "user_speech_started" and session.status == CallSessionStatus.CONNECTED:
             self.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
         elif (
@@ -5227,19 +5456,27 @@ class RealtimeCallAgentRunner:
         ):
             metrics.mark_user_speech_stopped(timestamp)
             self.registry.transition(call_id, CallSessionStatus.AI_THINKING)
-        elif event_type == "model_audio_delta" and session.status in {
-            CallSessionStatus.CONNECTED,
-            CallSessionStatus.AI_THINKING,
-        }:
-            self._cancel_playout_task_nowait(call_id)
-            metrics.mark_model_audio_delta(timestamp)
-            self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+        elif event_type == "model_audio_delta":
+            if (
+                session.status == CallSessionStatus.USER_SPEAKING
+                and not self._is_barge_in_enabled_for_session(session)
+            ):
+                session = self.registry.transition(call_id, CallSessionStatus.AI_THINKING)
+            if session.status in {
+                CallSessionStatus.CONNECTED,
+                CallSessionStatus.AI_THINKING,
+            }:
+                self._cancel_playout_task_nowait(call_id)
+                metrics.mark_model_audio_delta(timestamp)
+                self.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
         elif (
             event_type == "model_response_done" and session.status == CallSessionStatus.AI_SPEAKING
         ):
+            self._mark_ai_question_completed(call_id, payload, timestamp)
             self._complete_ai_speaking_after_playout(call_id)
             await self._complete_response_and_flush_pending(call_id, provider)
         elif event_type == "model_response_done":
+            self._mark_ai_question_completed(call_id, payload, timestamp)
             await self._complete_response_and_flush_pending(call_id, provider)
         elif event_type == "model_error":
             if not self._ignore_provider_cancel_race_error(call_id, payload, timestamp):
@@ -5527,7 +5764,37 @@ class RealtimeCallAgentRunner:
             self._last_sip_provider_speech_stopped_at[call_id] = timestamp
         self._playback_guard(call_id).user_speech_active = False
         turn = self._pending_turn(call_id)
+        if turn.current_speech_semantic_rejected:
+            turn.current_speech_semantic_rejected = False
+            if (
+                turn.no_barge_unstarted_response_deferred
+                and turn.transcript
+                and not turn.response_requested
+            ):
+                turn.stopped_at = timestamp
+                turn.transcript_merge_start_index = None
+                self._append_event(
+                    call_id,
+                    "no_barge_deferred_response_recovered_after_rejected_overlap",
+                    "agent",
+                    {"reason": "semantic_rejected_short_overlap"},
+                )
+                await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
+                return
+            turn.stopped_at = None
+            if not turn.transcript and not turn.response_requested:
+                self._ignore_empty_turn(call_id, turn, "semantic_rejected_transcript")
+            return
         turn.stopped_at = timestamp
+        session = self.registry.get(call_id)
+        if (
+            not self._is_barge_in_enabled_for_session(session)
+            and self._has_active_model_response(call_id)
+        ):
+            turn.no_barge_overlap_stopped_during_ai_response = True
+        if turn.call_end_acknowledged:
+            self._complete_acknowledged_call_end_turn(call_id)
+            return
         await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
         if not turn.transcript and not turn.response_requested:
             self._ignore_empty_turn(call_id, turn, "no_valid_transcript")
@@ -5558,23 +5825,34 @@ class RealtimeCallAgentRunner:
                     "commitDecision": provider_event.payload.get("commitDecision"),
                 },
             )
+            self._mark_current_no_barge_speech_semantically_rejected(call_id)
             return
         call_end_decision: CallEndDecision | None = None
         if provider_event.type == "user_transcript_done":
             call_end_decision = self.call_end_decision_service.decide(text)
+        if self._acknowledge_pending_call_end_if_closing_ack(call_id, text):
+            return
+        if self._ignore_no_barge_call_end_tail_transcript(call_id, text):
+            return
         if call_end_decision is not None and call_end_decision.action == "explicit_end":
             self._record_call_end_intent(call_id, text, call_end_decision)
         else:
             self._pending_call_end_intents.pop(call_id, None)
             self._interrupt_pending_call_end(call_id, "user_transcript_after_call_end_tool")
         turn = self._pending_turn(call_id)
+        should_queue_no_barge_followup = (
+            provider_event.type == "user_transcript_done"
+            and self._should_queue_no_barge_followup_response(call_id, turn, text)
+        )
         if provider_event.type == "user_transcript_done" or (
             provider_event.type == "user_transcript_delta"
             and ("text" in provider_event.payload or "stash" in provider_event.payload)
         ):
-            turn.transcript_parts = [text]
+            self._replace_or_merge_turn_transcript(turn, text)
         else:
             turn.transcript_parts.append(text)
+        if should_queue_no_barge_followup:
+            self._queue_no_barge_followup_response(call_id, text)
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
         await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
 
@@ -5603,6 +5881,85 @@ class RealtimeCallAgentRunner:
                 "transcriptPreview": self._text_preview(transcript),
             },
         )
+
+    def _mark_current_no_barge_speech_semantically_rejected(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return
+        turn = self._pending_user_turns.get(call_id)
+        if turn is None or turn.response_requested:
+            return
+        turn.current_speech_semantic_rejected = True
+        turn.stopped_at = None
+        self._cancel_turn_response_task_nowait(call_id)
+
+    def _ignore_no_barge_call_end_tail_transcript(self, call_id: str, text: str) -> bool:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return False
+        pending_call_end = self._pending_call_ends.get(call_id)
+        if pending_call_end is None or not pending_call_end.final_response_started:
+            return False
+        if (
+            not self._has_active_model_response(call_id)
+            and session.status != CallSessionStatus.AI_SPEAKING
+        ):
+            return False
+        call_end_decision = self.call_end_decision_service.decide(text)
+        tail_reason: str | None = None
+        if call_end_decision.action == "explicit_end":
+            tail_reason = "explicit_customer_end_tail"
+        elif self._is_terminal_call_end_tail_fragment(
+            pending_call_end,
+            text,
+            call_end_decision,
+        ):
+            tail_reason = "terminal_tail_fragment_after_customer_end"
+        else:
+            return False
+        self._pending_call_end_intents.pop(call_id, None)
+        turn = self._pending_turn(call_id)
+        turn.transcript_parts = [text]
+        turn.stopped_at = None
+        turn.response_requested = True
+        self._cancel_turn_response_task_nowait(call_id)
+        self._append_event(
+            call_id,
+            "call_end_tail_ignored",
+            "agent",
+            {
+                "toolCallId": pending_call_end.tool_call_id,
+                "toolReason": pending_call_end.tool_reason,
+                "endReason": pending_call_end.end_reason,
+                "reason": tail_reason,
+                "transcriptPreview": self._text_preview(text),
+            },
+        )
+        return True
+
+    def _is_terminal_call_end_tail_fragment(
+        self,
+        pending_call_end: PendingCallEnd,
+        text: str,
+        decision: CallEndDecision,
+    ) -> bool:
+        if pending_call_end.tool_reason != "customer_end":
+            return False
+        if decision.action == "not_end":
+            return False
+        stripped = text.strip()
+        if stripped.endswith(("?", "？")):
+            return False
+        normalized = self._normalize_call_end_acknowledgement(text)
+        if not normalized:
+            return False
+        if normalized in CALL_END_STRONG_CONTINUATION_TEXTS:
+            return False
+        if any(pattern in normalized for pattern in CALL_END_STRONG_CONTINUATION_PATTERNS):
+            return False
+        if len(normalized) > CALL_END_TERMINAL_TAIL_MAX_CHARS:
+            return False
+        return any(pattern in normalized for pattern in CALL_END_TERMINAL_TIME_HINT_PATTERNS)
 
     async def _handle_tool_call_done(
         self,
@@ -5637,6 +5994,10 @@ class RealtimeCallAgentRunner:
             return
 
         ignore_payload = self._call_end_tool_ignore_payload(call_id, tool_reason)
+        if ignore_payload is None and not self._accepts_call_end_tool(call_id, tool_reason):
+            ignore_payload = {
+                "reason": self._call_end_tool_rejection_reason(tool_reason),
+            }
         if ignore_payload is not None:
             ignored_payload = {
                 "toolCallId": tool_call_id,
@@ -5651,7 +6012,14 @@ class RealtimeCallAgentRunner:
                 ignored_payload,
             )
             try:
-                await provider.submit_tool_result(tool_call_id, CALL_END_REJECTED_TOOL_RESULT)
+                await provider.submit_tool_result(
+                    tool_call_id,
+                    self._call_end_rejected_tool_result(
+                        tool_reason,
+                        rejection_reason=ignore_payload["reason"],
+                    ),
+                )
+                self._queue_response_create(call_id)
             except Exception as exc:
                 self._append_event(
                     call_id,
@@ -5674,9 +6042,7 @@ class RealtimeCallAgentRunner:
                 tool_call_id=tool_call_id,
                 tool_reason=tool_reason,
                 end_reason=end_reason,
-                final_response_started=(
-                    final_audio_already_spoken or has_local_customer_end_intent
-                ),
+                final_response_started=final_audio_already_spoken,
                 local_explicit_intent=has_local_customer_end_intent,
             )
             self._append_event(
@@ -5698,7 +6064,7 @@ class RealtimeCallAgentRunner:
             await provider.submit_tool_result(
                 tool_call_id,
                 (
-                    CALL_END_FINAL_RESPONSE_TOOL_RESULT
+                    self._call_end_final_response_tool_result(tool_reason)
                     if should_create_final_response
                     else CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT
                 ),
@@ -5716,6 +6082,53 @@ class RealtimeCallAgentRunner:
                 },
             )
 
+    @staticmethod
+    def _call_end_final_response_tool_result(tool_reason: str) -> str:
+        return CALL_END_FINAL_RESPONSE_TOOL_RESULTS_BY_REASON.get(
+            tool_reason,
+            CALL_END_FINAL_RESPONSE_TOOL_RESULT,
+        )
+
+    def _accepts_call_end_tool(self, call_id: str, tool_reason: str) -> bool:
+        if tool_reason == "task_completed":
+            return self._accepts_task_completed_tool(call_id)
+        if tool_reason != "customer_end":
+            return False
+        if call_id in self._pending_call_ends:
+            return True
+        return call_id in self._pending_call_end_intents
+
+    @staticmethod
+    def _call_end_tool_rejection_reason(tool_reason: str) -> str:
+        if tool_reason == "task_completed":
+            return "task_completed_without_next_step_signal"
+        return "customer_end_without_terminal_user_signal"
+
+    @staticmethod
+    def _call_end_rejected_tool_result(
+        tool_reason: str,
+        *,
+        rejection_reason: str,
+    ) -> str:
+        if tool_reason == "task_completed":
+            return TASK_COMPLETED_REJECTED_TOOL_RESULT
+        if rejection_reason == "customer_end_without_terminal_user_signal":
+            return CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT
+        return CALL_END_REJECTED_TOOL_RESULT
+
+    def _accepts_task_completed_tool(self, call_id: str) -> bool:
+        if call_id in self._pending_call_ends:
+            return True
+        turn = self._pending_user_turns.get(call_id)
+        if turn is None:
+            return False
+        normalized = self._normalize_call_end_acknowledgement(turn.transcript)
+        if not normalized or normalized in TASK_COMPLETED_AMBIGUOUS_TEXTS:
+            return False
+        if any(pattern in normalized for pattern in TASK_COMPLETED_NEGATIVE_PATTERNS):
+            return False
+        return any(pattern in normalized for pattern in TASK_COMPLETED_NEXT_STEP_PATTERNS)
+
     def _call_end_tool_ignore_payload(
         self,
         call_id: str,
@@ -5732,8 +6145,14 @@ class RealtimeCallAgentRunner:
         decision = self.call_end_decision_service.decide(transcript)
         if decision.action == "explicit_end":
             return None
+        normalized = self._normalize_call_end_acknowledgement(transcript)
+        reason = (
+            "customer_end_without_explicit_customer_intent"
+            if normalized in CALL_END_ACKNOWLEDGEMENT_TEXTS
+            else "customer_end_without_terminal_user_signal"
+        )
         return {
-            "reason": "customer_end_without_explicit_customer_intent",
+            "reason": reason,
             "localDecisionAction": decision.action,
             "localDecisionReason": decision.reason,
             "localDecisionConfidence": decision.confidence,
@@ -5742,6 +6161,7 @@ class RealtimeCallAgentRunner:
 
     def _interrupt_pending_call_end(self, call_id: str, reason: str) -> None:
         pending_call_end = self._pending_call_ends.pop(call_id, None)
+        self._cancel_pending_call_end_defer_task_nowait(call_id)
         if pending_call_end is None or pending_call_end.scheduled:
             return
         self._append_event(
@@ -5912,12 +6332,14 @@ class RealtimeCallAgentRunner:
         self,
         turn: PendingUserTurn,
         payload: dict[str, Any],
+        observed_at: datetime | None = None,
     ) -> None:
         duration_ms = self._payload_int(payload, "durationMs")
         current_duration_ms = turn.browser_segment_duration_ms or -1
         if duration_ms is not None and duration_ms < current_duration_ms:
             return
-        turn.browser_segment_phase = self._payload_str(payload, "phase")
+        phase = self._payload_str(payload, "phase")
+        turn.browser_segment_phase = phase
         turn.browser_segment_duration_ms = duration_ms
         turn.browser_segment_snr_db = self._payload_float(payload, "snrDb")
         turn.browser_segment_hot_frame_count = self._payload_int(payload, "hotFrameCount")
@@ -5929,6 +6351,61 @@ class RealtimeCallAgentRunner:
         turn.browser_segment_remote_audio_rms_dbfs = self._payload_float(
             payload,
             "remoteAudioRmsDbfs",
+        )
+        if observed_at is not None:
+            turn.browser_segment_observed_at = observed_at
+            if phase == "ended":
+                turn.browser_segment_ended_at = observed_at
+
+    @staticmethod
+    def _replace_or_merge_turn_transcript(turn: PendingUserTurn, text: str) -> None:
+        merge_start = turn.transcript_merge_start_index
+        if merge_start is None:
+            turn.transcript_parts = [text]
+            return
+        merge_start = max(0, min(merge_start, len(turn.transcript_parts)))
+        turn.transcript_parts[merge_start:] = [text]
+        turn.transcript_merge_start_index = None
+
+    def _should_queue_no_barge_followup_response(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+        text: str,
+    ) -> bool:
+        session = self.registry.get(call_id)
+        return (
+            not self._is_barge_in_enabled_for_session(session)
+            and self._has_active_model_response(call_id)
+            and turn.response_requested
+            and turn.transcript_merge_start_index is not None
+            and self._is_substantive_no_barge_followup(text)
+        )
+
+    @staticmethod
+    def _is_substantive_no_barge_followup(text: str) -> bool:
+        normalized = normalize_dialogue_text(text)
+        if not normalized or normalized in NO_BARGE_FOLLOWUP_ACKNOWLEDGEMENT_TEXTS:
+            return False
+        if len(normalized) <= 2:
+            return False
+        if len(normalized) >= 6:
+            return True
+        return any(hint in normalized for hint in NO_BARGE_FOLLOWUP_SUBSTANTIVE_HINTS)
+
+    def _queue_no_barge_followup_response(self, call_id: str, text: str) -> None:
+        lifecycle = self._response_lifecycle(call_id)
+        if lifecycle.pending_create:
+            return
+        self._queue_response_create(call_id)
+        self._append_event(
+            call_id,
+            "no_barge_overlap_followup_response_queued",
+            "agent",
+            {
+                "reason": "substantive_followup_during_ai_response",
+                "transcriptPreview": self._text_preview(text),
+            },
         )
 
     def _browser_segment_decision_context(
@@ -6765,9 +7242,17 @@ class RealtimeCallAgentRunner:
         timestamp: datetime,
     ) -> None:
         turn = self._pending_turn(call_id)
-        if turn.response_requested or turn.stopped_at is None or not turn.transcript:
+        if (
+            turn.response_requested
+            or turn.stopped_at is None
+            or not turn.transcript
+            or turn.transcript_merge_start_index is not None
+        ):
+            return
+        if self._should_defer_no_barge_response_until_model_done(call_id):
             return
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+        stability_delay_seconds = self._turn_response_stability_delay_seconds(call_id)
         if await self._maybe_schedule_explicit_call_end_without_response(
             call_id,
             provider,
@@ -6775,7 +7260,7 @@ class RealtimeCallAgentRunner:
             timestamp,
         ):
             return
-        if self.user_turn_stability_delay_seconds <= 0:
+        if stability_delay_seconds <= 0:
             await self._request_response_from_turn(call_id, provider, turn)
             return
         # 给用户话尾一个很短的稳定窗口，避免断句或补字触发多次 response.create。
@@ -6789,9 +7274,17 @@ class RealtimeCallAgentRunner:
                 provider,
                 turn,
                 stopped_at,
+                stability_delay_seconds,
             ),
             name=f"ai-call-turn-response-{call_id}",
         )
+
+    def _turn_response_stability_delay_seconds(self, call_id: str) -> float:
+        delay_seconds = self.user_turn_stability_delay_seconds
+        session = self.registry.get(call_id)
+        if not self._is_barge_in_enabled_for_session(session):
+            delay_seconds = max(delay_seconds, self.no_barge_user_turn_stability_delay_seconds)
+        return delay_seconds
 
     async def _request_response_after_turn_stability(
         self,
@@ -6799,17 +7292,25 @@ class RealtimeCallAgentRunner:
         provider: RealtimeProviderProtocol,
         turn: PendingUserTurn,
         stopped_at: datetime,
+        stability_delay_seconds: float,
     ) -> None:
         try:
-            await asyncio.sleep(self.user_turn_stability_delay_seconds)
+            await asyncio.sleep(stability_delay_seconds)
             if self._pending_user_turns.get(call_id) is not turn:
                 return
-            if turn.stopped_at != stopped_at or turn.response_requested or not turn.transcript:
+            if (
+                turn.stopped_at != stopped_at
+                or turn.response_requested
+                or not turn.transcript
+                or turn.transcript_merge_start_index is not None
+            ):
                 return
             if self.registry.get(call_id).status in {
                 CallSessionStatus.COMPLETED,
                 CallSessionStatus.FAILED,
             }:
+                return
+            if self._should_defer_no_barge_response_until_model_done(call_id):
                 return
             await self._request_response_from_turn(call_id, provider, turn)
         except asyncio.CancelledError:
@@ -6825,6 +7326,9 @@ class RealtimeCallAgentRunner:
         turn: PendingUserTurn,
         timestamp: datetime,
     ) -> bool:
+        session = self.registry.get(call_id)
+        if not self._is_barge_in_enabled_for_session(session):
+            return False
         if call_id not in self._pending_call_end_intents:
             return False
         self._promote_missing_call_end_tool(call_id)
@@ -6882,7 +7386,16 @@ class RealtimeCallAgentRunner:
         provider: RealtimeProviderProtocol,
         turn: PendingUserTurn,
     ) -> None:
-        if turn.response_requested or turn.stopped_at is None or not turn.transcript:
+        if (
+            turn.response_requested
+            or turn.stopped_at is None
+            or not turn.transcript
+            or turn.transcript_merge_start_index is not None
+        ):
+            return
+        if self._should_defer_no_barge_response_until_model_done(call_id):
+            return
+        if self._should_wait_for_no_barge_user_speech(call_id):
             return
         if self._defer_sip_response_release_if_needed(call_id):
             turn.response_requested = True
@@ -6921,6 +7434,14 @@ class RealtimeCallAgentRunner:
         if session.status == CallSessionStatus.USER_SPEAKING:
             self.registry.transition(call_id, CallSessionStatus.WAITING)
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        self._schedule_pending_call_end_nowait(call_id)
+
+    def _complete_acknowledged_call_end_turn(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if session.status == CallSessionStatus.USER_SPEAKING:
+            self.registry.transition(call_id, CallSessionStatus.WAITING)
+            self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        self._schedule_pending_call_end_nowait(call_id)
 
     def _clear_sip_provisional_turn_state(
         self,
@@ -6966,6 +7487,71 @@ class RealtimeCallAgentRunner:
         )
         self.registry.get(call_id).last_event_at = event.timestamp
         return event.timestamp
+
+    @staticmethod
+    def _utcnow_text() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _provider_transport_state(self, call_id: str) -> dict[str, Any]:
+        return self._provider_transport_diagnostics.setdefault(call_id, {})
+
+    def _record_provider_event(
+        self,
+        call_id: str,
+        event_type: str,
+        event_timestamp: datetime,
+    ) -> None:
+        state = self._provider_transport_state(call_id)
+        state["lastProviderEventType"] = event_type
+        state["lastProviderEventAt"] = event_timestamp.isoformat()
+
+    def _record_provider_audio_send_attempt(
+        self,
+        call_id: str,
+        frame: PcmAudioFrame,
+    ) -> None:
+        state = self._provider_transport_state(call_id)
+        state["lastProviderAudioSendAttemptAt"] = self._utcnow_text()
+        state["lastProviderAudioFrameBytes"] = len(frame.data)
+        state["lastProviderAudioFrameSampleRateHz"] = frame.sample_rate_hz
+        state["lastProviderAudioFrameChannels"] = frame.channels
+        state["lastProviderAudioFrameSampleWidthBytes"] = frame.sample_width_bytes
+
+    def _record_provider_audio_send_success(self, call_id: str) -> None:
+        self._provider_transport_state(call_id)["lastProviderAudioSendSucceededAt"] = (
+            self._utcnow_text()
+        )
+
+    def _record_provider_audio_send_error(
+        self,
+        call_id: str,
+        exc: Exception,
+    ) -> None:
+        cause = exc.__cause__ if isinstance(exc, ProviderTransportError) and exc.__cause__ else exc
+        state = self._provider_transport_state(call_id)
+        state["lastProviderAudioSendErrorAt"] = self._utcnow_text()
+        state["lastProviderAudioSendErrorMessage"] = str(exc)
+        state["lastProviderAudioSendErrorType"] = type(cause).__name__
+
+    def _record_provider_event_stream_error(
+        self,
+        call_id: str,
+        exc: Exception,
+    ) -> None:
+        state = self._provider_transport_state(call_id)
+        state["lastProviderEventStreamErrorAt"] = self._utcnow_text()
+        state["lastProviderEventStreamErrorMessage"] = str(exc)
+        state["lastProviderEventStreamErrorType"] = type(exc).__name__
+
+    def _provider_transport_snapshot(
+        self,
+        call_id: str,
+        *,
+        error_source: str,
+    ) -> dict[str, Any]:
+        snapshot = dict(self._provider_transport_state(call_id))
+        snapshot["errorSource"] = error_source
+        return snapshot
 
     def _event_payload(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         event_payload = dict(payload)
@@ -7060,7 +7646,9 @@ class RealtimeCallAgentRunner:
             return "stale_generation"
         if response_id and guard.current_response_id and response_id != guard.current_response_id:
             return "non_current_response"
-        if guard.user_speech_active:
+        if guard.user_speech_active and self._is_barge_in_enabled_for_session(
+            self.registry.get(call_id)
+        ):
             return "user_speech_active"
         if self._is_audio_suppressed(call_id):
             return "suppressed_after_interrupt"
@@ -7189,6 +7777,40 @@ class RealtimeCallAgentRunner:
         lifecycle = self._response_lifecycle(call_id)
         return lifecycle.active or lifecycle.cancel_pending
 
+    def _should_continue_no_barge_overlap_turn(self, call_id: str) -> bool:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return False
+        if not self._has_active_model_response(call_id):
+            return False
+        turn = self._pending_user_turns.get(call_id)
+        return turn is not None and turn.response_requested and bool(turn.transcript)
+
+    def _split_unmaterialized_no_barge_overlap_turn_if_needed(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return
+        guard = self._playback_guard(call_id)
+        if not guard.user_speech_active:
+            return
+        turn = self._pending_user_turns.get(call_id)
+        if (
+            turn is None
+            or not turn.response_requested
+            or turn.transcript_merge_start_index is None
+        ):
+            return
+        merge_start = max(0, min(turn.transcript_merge_start_index, len(turn.transcript_parts)))
+        if len(turn.transcript_parts) != merge_start:
+            return
+        self._pending_user_turns[call_id] = PendingUserTurn(started_at=turn.started_at)
+        self._append_event(
+            call_id,
+            "no_barge_overlap_turn_split_after_ai_done",
+            "agent",
+            {"reason": "transcript_arrived_after_ai_response_done"},
+        )
+
     def _has_current_response_audio(self, call_id: str) -> bool:
         return self._response_lifecycle(call_id).active and (
             self._playback_guard(call_id).current_response_audio_published
@@ -7202,11 +7824,16 @@ class RealtimeCallAgentRunner:
         now = datetime.now(timezone.utc)
         session = self.registry.get(call_id)
         turn = self._pending_turn(call_id)
-        during_ai_audio = (
-            session.status == CallSessionStatus.AI_SPEAKING
-            or self._has_recent_ai_audio(call_id, now)
-            or self._has_active_model_response(call_id)
-        )
+        if self._turn_completed_before_active_response(call_id, turn):
+            during_ai_audio = False
+        elif self._is_short_answer_to_recent_ai_question(call_id, provider_event):
+            during_ai_audio = False
+        else:
+            during_ai_audio = (
+                session.status == CallSessionStatus.AI_SPEAKING
+                or self._has_recent_ai_audio(call_id, now)
+                or self._has_active_model_response(call_id)
+            )
         return decide_realtime_transcript_trust(
             self._transcript_text(provider_event),
             during_ai_audio=during_ai_audio,
@@ -7214,6 +7841,25 @@ class RealtimeCallAgentRunner:
             has_reliable_user_audio=self._has_reliable_short_transcript_audio_evidence(turn),
             payload=provider_event.payload,
         )
+
+    def _turn_completed_before_active_response(
+        self,
+        call_id: str,
+        turn: PendingUserTurn,
+    ) -> bool:
+        completed_at = turn.stopped_at
+        if (
+            turn.browser_segment_ended_at is not None
+            and self._has_reliable_short_transcript_audio_evidence(turn)
+            and (completed_at is None or turn.browser_segment_ended_at < completed_at)
+        ):
+            completed_at = turn.browser_segment_ended_at
+        if completed_at is None:
+            return False
+        active_started_at = self._response_lifecycle(call_id).active_started_at
+        if active_started_at is None:
+            return False
+        return completed_at <= active_started_at
 
     @staticmethod
     def _has_reliable_short_transcript_audio_evidence(turn: PendingUserTurn) -> bool:
@@ -7266,6 +7912,61 @@ class RealtimeCallAgentRunner:
         else:
             value = payload.get("delta")
         return value.strip() if isinstance(value, str) else ""
+
+    def _is_short_answer_to_recent_ai_question(
+        self,
+        call_id: str,
+        provider_event: ProviderEvent,
+    ) -> bool:
+        if self._has_active_model_response(call_id):
+            return False
+        question_completed_at = self._last_ai_question_completed_at.get(call_id)
+        if question_completed_at is None:
+            return False
+        elapsed_seconds = (datetime.now(timezone.utc) - question_completed_at).total_seconds()
+        if elapsed_seconds < 0 or elapsed_seconds > AI_QUESTION_ANSWER_WINDOW_SECONDS:
+            return False
+        text = self._transcript_text(provider_event)
+        normalized = "".join(ch for ch in text if ch not in " \t\r\n，,。.!！?？")
+        return 0 < len(normalized) <= 2
+
+    def _mark_ai_question_completed(
+        self,
+        call_id: str,
+        payload: dict[str, Any],
+        timestamp: datetime,
+    ) -> None:
+        text = self._model_response_transcript(payload)
+        if self._looks_like_ai_question(text):
+            self._last_ai_question_completed_at[call_id] = timestamp
+        else:
+            self._last_ai_question_completed_at.pop(call_id, None)
+
+    @classmethod
+    def _model_response_transcript(cls, payload: dict[str, Any]) -> str:
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            return ""
+        parts: list[str] = []
+        output = response.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    value = part.get("transcript") or part.get("text")
+                    if isinstance(value, str) and value:
+                        parts.append(value)
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _looks_like_ai_question(text: str) -> bool:
+        return bool(text.strip().endswith(("?", "？")))
 
     async def _confirm_interrupt(
         self,
@@ -7375,6 +8076,7 @@ class RealtimeCallAgentRunner:
             )
             return False
         lifecycle.active = True
+        lifecycle.active_started_at = datetime.now(timezone.utc)
         lifecycle.cancel_pending = False
         lifecycle.cancel_race_ignore_until = None
         lifecycle.pending_create = False
@@ -7390,20 +8092,43 @@ class RealtimeCallAgentRunner:
         guard.current_response_audio_published = False
         return True
 
+    def _should_defer_no_barge_response_until_model_done(self, call_id: str) -> bool:
+        session = self.registry.get(call_id)
+        return (
+            not self._is_barge_in_enabled_for_session(session)
+            and self._has_active_model_response(call_id)
+        )
+
+    def _should_wait_for_no_barge_user_speech(self, call_id: str) -> bool:
+        session = self.registry.get(call_id)
+        return (
+            not self._is_barge_in_enabled_for_session(session)
+            and self._playback_guard(call_id).user_speech_active
+        )
+
     def _queue_response_create(self, call_id: str, input_text: str | None = None) -> None:
         lifecycle = self._response_lifecycle(call_id)
         lifecycle.pending_create = True
         if input_text:
             lifecycle.pending_input_text = input_text
 
-    def _mark_response_started(self, call_id: str, payload: dict[str, Any]) -> None:
+    def _mark_response_started(
+        self,
+        call_id: str,
+        payload: dict[str, Any],
+        timestamp: datetime | None = None,
+    ) -> None:
+        timestamp = timestamp or datetime.now(timezone.utc)
         lifecycle = self._response_lifecycle(call_id)
         lifecycle.active = True
+        lifecycle.active_started_at = timestamp
         guard = self._playback_guard(call_id)
         response_id = self._response_id_from_payload(payload)
         guard.current_response_id = response_id
         guard.current_response_generation = lifecycle.response_generation
         guard.current_response_audio_published = False
+        if self._defer_unstarted_no_barge_response_for_active_user(call_id, response_id):
+            return
         if response_id and guard.current_response_generation != guard.generation:
             guard.cancelled_response_ids.add(response_id)
             self._append_event(
@@ -7424,6 +8149,33 @@ class RealtimeCallAgentRunner:
         pending_call_end = self._pending_call_ends.get(call_id)
         if pending_call_end is not None:
             pending_call_end.final_response_started = True
+
+    def _defer_unstarted_no_barge_response_for_active_user(
+        self,
+        call_id: str,
+        response_id: str | None,
+    ) -> bool:
+        session = self.registry.get(call_id)
+        guard = self._playback_guard(call_id)
+        if self._is_barge_in_enabled_for_session(session) or not guard.user_speech_active:
+            return False
+        turn = self._pending_user_turns.get(call_id)
+        if turn is None:
+            turn = self._pending_turn(call_id)
+        if response_id:
+            guard.cancelled_response_ids.add(response_id)
+        turn.no_barge_unstarted_response_deferred = True
+        turn.response_requested = False
+        self._append_event(
+            call_id,
+            "no_barge_unstarted_response_deferred",
+            "agent",
+            {
+                "reason": "user_resumed_before_response_audio",
+                "responseId": response_id,
+            },
+        )
+        return True
 
     def _promote_stopped_turn_for_model_response(self, call_id: str) -> None:
         guard = self._playback_guard(call_id)
@@ -7447,6 +8199,7 @@ class RealtimeCallAgentRunner:
         guard = self._playback_guard(call_id)
         cancel_was_pending = lifecycle.cancel_pending or guard.cancel_requested
         lifecycle.active = False
+        lifecycle.active_started_at = None
         lifecycle.cancel_pending = False
         lifecycle.current_response_is_opening = False
         guard.cancel_requested = False
@@ -7457,6 +8210,8 @@ class RealtimeCallAgentRunner:
                 return
             self._promote_missing_call_end_tool(call_id)
             self._schedule_pending_call_end_nowait(call_id)
+            return
+        if self._drop_unmaterialized_no_barge_pending_response_if_needed(call_id):
             return
         if self.registry.get(call_id).status in {
             CallSessionStatus.COMPLETED,
@@ -7515,6 +8270,68 @@ class RealtimeCallAgentRunner:
         )
         return True
 
+    def _drop_unmaterialized_no_barge_pending_response_if_needed(self, call_id: str) -> bool:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return False
+        lifecycle = self._response_lifecycle(call_id)
+        if not lifecycle.pending_create or lifecycle.pending_input_text:
+            return False
+        turn = self._pending_user_turns.get(call_id)
+        if (
+            turn is None
+            or not turn.response_requested
+            or turn.transcript_merge_start_index is None
+        ):
+            return False
+        merge_start = max(0, min(turn.transcript_merge_start_index, len(turn.transcript_parts)))
+        if len(turn.transcript_parts) > merge_start:
+            return False
+        lifecycle.pending_create = False
+        lifecycle.pending_input_text = None
+        self._append_event(
+            call_id,
+            "no_barge_unmaterialized_pending_response_dropped",
+            "agent",
+            {"reason": "response_already_requested_for_turn"},
+        )
+        return True
+
+    async def _maybe_schedule_deferred_no_barge_turn(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+    ) -> bool:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return False
+        turn = self._pending_user_turns.get(call_id)
+        if (
+            turn is None
+            or turn.response_requested
+            or turn.stopped_at is None
+            or not turn.transcript
+            or turn.transcript_merge_start_index is not None
+        ):
+            return False
+        if (
+            turn.no_barge_overlap_stopped_during_ai_response
+            and not turn.no_barge_unstarted_response_deferred
+        ):
+            self._append_event(
+                call_id,
+                "no_barge_overlap_waiting_for_followup",
+                "agent",
+                {"reason": "overlap_turn_finished_before_ai_done"},
+            )
+            return False
+        await self._maybe_schedule_response_from_turn(
+            call_id,
+            provider,
+            datetime.now(timezone.utc),
+        )
+        return True
+
     def _promote_missing_call_end_tool(self, call_id: str) -> None:
         if call_id in self._pending_call_ends:
             return
@@ -7565,6 +8382,14 @@ class RealtimeCallAgentRunner:
             return
         if self.call_end_scheduler is None:
             return
+        defer_reason = self._call_end_user_turn_deferral_reason(call_id)
+        if defer_reason is not None:
+            self._defer_pending_call_end_for_user_turn(
+                call_id,
+                pending_call_end,
+                reason=defer_reason,
+            )
+            return
 
         pending_call_end.scheduled = True
         self._append_event(
@@ -7590,6 +8415,123 @@ class RealtimeCallAgentRunner:
                     "toolCallId": pending_call_end.tool_call_id,
                 },
             )
+
+    def _call_end_user_turn_deferral_reason(self, call_id: str) -> str | None:
+        session = self.registry.get(call_id)
+        if self._is_barge_in_enabled_for_session(session):
+            return None
+        if self._playback_guard(call_id).user_speech_active:
+            return "user_speech_active"
+        turn = self._pending_user_turns.get(call_id)
+        if turn is None or turn.response_requested:
+            return None
+        if turn.call_end_acknowledged:
+            return None
+        if turn.transcript:
+            return "user_transcript_pending_response"
+        if turn.started_at is None:
+            return None
+        if turn.stopped_at is None:
+            return "user_speech_waiting_for_stop"
+        grace = self._call_end_user_turn_grace_seconds()
+        if datetime.now(timezone.utc) - turn.stopped_at <= timedelta(seconds=grace):
+            return "user_speech_waiting_for_transcript"
+        return None
+
+    def _defer_pending_call_end_for_user_turn(
+        self,
+        call_id: str,
+        pending_call_end: PendingCallEnd,
+        *,
+        reason: str,
+    ) -> None:
+        existing_task = self._pending_call_end_defer_tasks.get(call_id)
+        if existing_task is not None and not existing_task.done():
+            return
+        delay_seconds = self._call_end_user_turn_grace_seconds()
+        if not pending_call_end.deferred_for_user_turn:
+            pending_call_end.deferred_for_user_turn = True
+            self._append_event(
+                call_id,
+                "call_end_deferred_for_user_turn",
+                "agent",
+                {
+                    "reason": reason,
+                    "retryAfterSeconds": delay_seconds,
+                    "toolCallId": pending_call_end.tool_call_id,
+                    "toolReason": pending_call_end.tool_reason,
+                    "endReason": pending_call_end.end_reason,
+                },
+            )
+        self._pending_call_end_defer_tasks[call_id] = asyncio.create_task(
+            self._retry_pending_call_end_after_user_turn_grace(
+                call_id,
+                pending_call_end,
+                delay_seconds,
+            ),
+            name=f"ai-call-end-user-turn-grace-{call_id}",
+        )
+
+    async def _retry_pending_call_end_after_user_turn_grace(
+        self,
+        call_id: str,
+        pending_call_end: PendingCallEnd,
+        delay_seconds: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+            if self._pending_call_ends.get(call_id) is not pending_call_end:
+                return
+            if pending_call_end.scheduled:
+                return
+            if self._pending_call_end_defer_tasks.get(call_id) is asyncio.current_task():
+                self._pending_call_end_defer_tasks.pop(call_id, None)
+            self._schedule_pending_call_end_nowait(call_id)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._pending_call_end_defer_tasks.get(call_id) is asyncio.current_task():
+                self._pending_call_end_defer_tasks.pop(call_id, None)
+
+    def _call_end_user_turn_grace_seconds(self) -> float:
+        return max(
+            CALL_END_USER_TURN_GRACE_SECONDS,
+            self.user_turn_stability_delay_seconds,
+        )
+
+    def _acknowledge_pending_call_end_if_closing_ack(
+        self,
+        call_id: str,
+        transcript: str,
+    ) -> bool:
+        pending_call_end = self._pending_call_ends.get(call_id)
+        if pending_call_end is None:
+            return False
+        normalized = self._normalize_call_end_acknowledgement(transcript)
+        if normalized not in CALL_END_ACKNOWLEDGEMENT_TEXTS:
+            return False
+        self._pending_call_end_intents.pop(call_id, None)
+        turn = self._pending_turn(call_id)
+        turn.transcript_parts = [transcript]
+        turn.call_end_acknowledged = True
+        self._append_event(
+            call_id,
+            "call_end_acknowledged",
+            "agent",
+            {
+                "toolCallId": pending_call_end.tool_call_id,
+                "toolReason": pending_call_end.tool_reason,
+                "endReason": pending_call_end.end_reason,
+                "transcriptPreview": self._text_preview(transcript),
+            },
+        )
+        return True
+
+    @staticmethod
+    def _normalize_call_end_acknowledgement(text: str) -> str:
+        return "".join(
+            char.lower() for char in text.strip() if char not in " \t\r\n，。！？,.!?；;：:、"
+        )
 
     @staticmethod
     def _mark_provider_cancel_race_window(lifecycle: ResponseLifecycle) -> None:
@@ -7653,21 +8595,25 @@ class RealtimeCallAgentRunner:
         end_reason: str,
         failure_stage: str,
         failure_message: str,
+        extra_payload: dict[str, Any] | None = None,
     ) -> None:
         self._clear_response_lifecycle(call_id)
         session = self.registry.get(call_id)
         if session.status in {CallSessionStatus.COMPLETED, CallSessionStatus.FAILED}:
             return
         self.registry.transition(call_id, CallSessionStatus.FAILED)
+        payload: dict[str, Any] = {
+            "endReason": end_reason,
+            "failureStage": failure_stage,
+            "failureMessage": failure_message,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
         self._append_event(
             call_id,
             "session_failed",
             "agent",
-            {
-                "endReason": end_reason,
-                "failureStage": failure_stage,
-                "failureMessage": failure_message,
-            },
+            payload,
         )
         if self.call_end_scheduler is None:
             return
@@ -7781,6 +8727,21 @@ class RealtimeCallAgentRunner:
         except asyncio.CancelledError:
             pass
 
+    def _cancel_pending_call_end_defer_task_nowait(self, call_id: str) -> None:
+        task = self._pending_call_end_defer_tasks.pop(call_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _cancel_pending_call_end_defer_task(self, call_id: str) -> None:
+        task = self._pending_call_end_defer_tasks.pop(call_id, None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     def _session_config(self, session: CallSession) -> QwenRealtimeSessionConfig:
         effective_instructions = self._config_value(session.effective_config, "instructions", None)
         if effective_instructions is None:
@@ -7797,7 +8758,9 @@ class RealtimeCallAgentRunner:
                 )
         else:
             instructions = str(effective_instructions)
+        instructions = self._with_phone_response_brevity_instructions(instructions)
         instructions = self._with_call_end_tool_instructions(instructions)
+        instructions = self._with_final_role_boundary_instructions(instructions)
         return QwenRealtimeSessionConfig(
             voice=str(self._config_value(session.effective_config, "voice", "Tina")),
             instructions=instructions,
@@ -7822,6 +8785,24 @@ class RealtimeCallAgentRunner:
         if not clean_instructions:
             return CALL_END_TOOL_INSTRUCTIONS
         return f"{clean_instructions}\n\n{CALL_END_TOOL_INSTRUCTIONS}"
+
+    @staticmethod
+    def _with_phone_response_brevity_instructions(instructions: str) -> str:
+        clean_instructions = instructions.strip()
+        if PHONE_RESPONSE_BREVITY_INSTRUCTIONS in clean_instructions:
+            return clean_instructions
+        if not clean_instructions:
+            return PHONE_RESPONSE_BREVITY_INSTRUCTIONS
+        return f"{clean_instructions}\n\n{PHONE_RESPONSE_BREVITY_INSTRUCTIONS}"
+
+    @staticmethod
+    def _with_final_role_boundary_instructions(instructions: str) -> str:
+        clean_instructions = instructions.strip()
+        if FINAL_ROLE_BOUNDARY_INSTRUCTIONS in clean_instructions:
+            return clean_instructions
+        if not clean_instructions:
+            return FINAL_ROLE_BOUNDARY_INSTRUCTIONS
+        return f"{clean_instructions}\n\n{FINAL_ROLE_BOUNDARY_INSTRUCTIONS}"
 
     @staticmethod
     def _config_value(config: Any, key: str, default: Any) -> Any:

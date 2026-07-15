@@ -1,0 +1,146 @@
+{
+  "mode": "semantic_acceptance",
+  "baseUrl": "http://127.0.0.1:19012",
+  "entryType": "web",
+  "requested": 1,
+  "sourceTotal": null,
+  "summary": {
+    "calls": 1,
+    "passed": 1,
+    "review": 0,
+    "failed": 0,
+    "high": 0,
+    "reviewIssues": 0,
+    "fetchFailed": 0,
+    "verdict": "PASS"
+  },
+  "calls": [
+    {
+      "callId": "call_333406123335614464",
+      "record": {
+        "callId": "call_333406123335614464",
+        "entryType": "web",
+        "sceneCode": "intro_document",
+        "promptSourceKey": "intro_document",
+        "status": "completed",
+        "endReason": "customer_end",
+        "startedAt": "2026-07-09T00:36:54.189030",
+        "endedAt": "2026-07-09T00:39:27.934803",
+        "durationMs": 150800
+      },
+      "verdict": "PASS",
+      "highIssueCount": 0,
+      "reviewIssueCount": 0,
+      "timelineAudit": {
+        "callId": "call_333406123335614464",
+        "passed": true,
+        "record": {
+          "callId": "call_333406123335614464",
+          "entryType": "web",
+          "sceneCode": "intro_document",
+          "promptSourceKey": "intro_document",
+          "status": "completed",
+          "endReason": "customer_end",
+          "startedAt": "2026-07-09T00:36:54.189030",
+          "endedAt": "2026-07-09T00:39:27.934803",
+          "durationMs": 150800
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 1,
+          "speechIntervalCount": 15,
+          "modelResponseCount": 12,
+          "staleAudioDropCount": 50,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 28
+        },
+        "issues": [],
+        "coveredOverlaps": [
+          {
+            "callId": "call_333406123335614464",
+            "eventTime": "2026-07-09T00:38:32.040300",
+            "responseId": "resp_XGnVigolrugbr334CLIzy",
+            "speechStartTime": "2026-07-09T00:38:31.848414",
+            "speechStopTime": "2026-07-09T00:38:32.885121",
+            "deltaMsFromSpeechStart": 192,
+            "coveredBy": [
+              {
+                "eventType": "no_barge_unstarted_response_deferred",
+                "eventTime": "2026-07-09T00:38:32.040332",
+                "reason": "user_resumed_before_response_audio"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.389208",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.480461",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.580380",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.672952",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.763782",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-09T00:38:32.868489",
+                "reason": "cancelled_response"
+              }
+            ]
+          }
+        ]
+      },
+      "semanticSnapshot": {
+        "callId": "call_333406123335614464",
+        "sceneCode": "intro_document",
+        "turnCount": 26,
+        "userTurnCount": 16,
+        "assistantTurnCount": 10,
+        "recordOnlyUserTurnCount": 8,
+        "usableUserSignalCount": 8,
+        "unsupportedStrongFactTurnCount": 1,
+        "fallbackToRealtime": true,
+        "realtimeSupplementedCount": 11,
+        "offlineAsrQualityRejectedCount": 3,
+        "qualitySignals": [
+          "source_conflict",
+          "source_fallback",
+          "realtime_supplement",
+          "offline_asr_quality_rejected"
+        ],
+        "qualityReasons": [
+          "offline_asr_span_realtime_divergence",
+          "offline_asr_shadowed_by_richer_realtime"
+        ],
+        "source": "stored_semantic_analysis"
+      },
+      "snapshotComparison": {
+        "storedPresent": true,
+        "storedDiffersFromRebuilt": true
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "ae411462baf8eb5675a4fa95b3c99841022e9c74187c4301ac0dd8b80f102dc0"
+      },
+      "qualityIssues": []
+    }
+  ],
+  "failedCalls": []
+}

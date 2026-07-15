@@ -1,0 +1,89 @@
+{
+  "mode": "semantic_acceptance",
+  "baseUrl": "http://127.0.0.1:19012",
+  "entryType": "web",
+  "requested": 1,
+  "sourceTotal": null,
+  "summary": {
+    "calls": 1,
+    "passed": 1,
+    "review": 0,
+    "failed": 0,
+    "high": 0,
+    "reviewIssues": 0,
+    "fetchFailed": 0,
+    "verdict": "PASS"
+  },
+  "calls": [
+    {
+      "callId": "call_333159447668371456",
+      "record": {
+        "callId": "call_333159447668371456",
+        "entryType": "web",
+        "sceneCode": "intro_document",
+        "promptSourceKey": "intro_document",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T08:16:42.127121",
+        "endedAt": "2026-07-08T08:18:01.960003",
+        "durationMs": 75921
+      },
+      "verdict": "PASS",
+      "highIssueCount": 0,
+      "reviewIssueCount": 0,
+      "timelineAudit": {
+        "callId": "call_333159447668371456",
+        "passed": true,
+        "record": {
+          "callId": "call_333159447668371456",
+          "entryType": "web",
+          "sceneCode": "intro_document",
+          "promptSourceKey": "intro_document",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T08:16:42.127121",
+          "endedAt": "2026-07-08T08:18:01.960003",
+          "durationMs": 75921
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 7,
+          "modelResponseCount": 6,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 14
+        },
+        "issues": [],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333159447668371456",
+        "sceneCode": "intro_document",
+        "turnCount": 12,
+        "userTurnCount": 7,
+        "assistantTurnCount": 5,
+        "recordOnlyUserTurnCount": 4,
+        "usableUserSignalCount": 3,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 5,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "7a7884896adc1f8f75ae953d9426ba07c7a4a29632173b78e8afd47229469a10"
+      },
+      "qualityIssues": []
+    }
+  ],
+  "failedCalls": []
+}

@@ -1,0 +1,1112 @@
+{
+  "mode": "semantic_acceptance",
+  "baseUrl": "http://127.0.0.1:19012",
+  "entryType": "web",
+  "requested": 10,
+  "sourceTotal": 18,
+  "summary": {
+    "calls": 10,
+    "passed": 1,
+    "review": 1,
+    "failed": 8,
+    "high": 13,
+    "reviewIssues": 25,
+    "fetchFailed": 0,
+    "verdict": "FAIL"
+  },
+  "calls": [
+    {
+      "callId": "call_333159447668371456",
+      "record": {
+        "callId": "call_333159447668371456",
+        "entryType": "web",
+        "sceneCode": "intro_document",
+        "promptSourceKey": "intro_document",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T08:16:42.127121",
+        "endedAt": "2026-07-08T08:18:01.960003",
+        "durationMs": 75921
+      },
+      "verdict": "PASS",
+      "highIssueCount": 0,
+      "reviewIssueCount": 0,
+      "timelineAudit": {
+        "callId": "call_333159447668371456",
+        "passed": true,
+        "record": {
+          "callId": "call_333159447668371456",
+          "entryType": "web",
+          "sceneCode": "intro_document",
+          "promptSourceKey": "intro_document",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T08:16:42.127121",
+          "endedAt": "2026-07-08T08:18:01.960003",
+          "durationMs": 75921
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 7,
+          "modelResponseCount": 6,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 14
+        },
+        "issues": [],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333159447668371456",
+        "sceneCode": "intro_document",
+        "turnCount": 12,
+        "userTurnCount": 7,
+        "assistantTurnCount": 5,
+        "recordOnlyUserTurnCount": 4,
+        "usableUserSignalCount": 3,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 5,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "7a7884896adc1f8f75ae953d9426ba07c7a4a29632173b78e8afd47229469a10"
+      },
+      "qualityIssues": []
+    },
+    {
+      "callId": "call_333155283616481280",
+      "record": {
+        "callId": "call_333155283616481280",
+        "entryType": "web",
+        "sceneCode": "intro_overseas",
+        "promptSourceKey": "intro_overseas",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T08:00:09.340466",
+        "endedAt": "2026-07-08T08:02:57.039213",
+        "durationMs": 165022
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 3,
+      "timelineAudit": {
+        "callId": "call_333155283616481280",
+        "passed": false,
+        "record": {
+          "callId": "call_333155283616481280",
+          "entryType": "web",
+          "sceneCode": "intro_overseas",
+          "promptSourceKey": "intro_overseas",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T08:00:09.340466",
+          "endedAt": "2026-07-08T08:02:57.039213",
+          "durationMs": 165022
+        },
+        "summary": {
+          "issueCount": 1,
+          "highSeverityCount": 1,
+          "coveredOverlapCount": 2,
+          "speechIntervalCount": 18,
+          "modelResponseCount": 13,
+          "staleAudioDropCount": 64,
+          "slowFirstAudioCount": 1,
+          "dialogueSegmentCount": 33
+        },
+        "issues": [
+          {
+            "type": "slow_ai_first_audio_after_customer_turn",
+            "severity": "high",
+            "callId": "call_333155283616481280",
+            "eventTime": "2026-07-08T08:02:39.475564",
+            "customerStopTime": "2026-07-08T08:02:39.475564",
+            "firstAudioTime": "2026-07-08T08:02:52.182220",
+            "nextCustomerSpeechTime": "2026-07-08T08:02:48.595503",
+            "customerStopToFirstAudioMs": 12707,
+            "customerStopToNextActivityMs": 9120,
+            "reason": "slow_response_audio_after_customer_turn"
+          }
+        ],
+        "coveredOverlaps": [
+          {
+            "callId": "call_333155283616481280",
+            "eventTime": "2026-07-08T08:01:38.297679",
+            "responseId": "resp_CS6K8G6E2M3GrEtIRDDyV",
+            "speechStartTime": "2026-07-08T08:01:38.116713",
+            "speechStopTime": "2026-07-08T08:01:39.543906",
+            "deltaMsFromSpeechStart": 181,
+            "coveredBy": [
+              {
+                "eventType": "no_barge_unstarted_response_deferred",
+                "eventTime": "2026-07-08T08:01:38.297719",
+                "reason": "user_resumed_before_response_audio"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:38.675943",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:38.747993",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:38.855371",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:38.942207",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.035135",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.134651",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.221280",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.323758",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.393388",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.435585",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.485949",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:01:39.528206",
+                "reason": "cancelled_response"
+              }
+            ]
+          },
+          {
+            "callId": "call_333155283616481280",
+            "eventTime": "2026-07-08T08:02:38.786104",
+            "responseId": "resp_T2T7LZEGoGY8gg6XPSd8Y",
+            "speechStartTime": "2026-07-08T08:02:38.597414",
+            "speechStopTime": "2026-07-08T08:02:39.475564",
+            "deltaMsFromSpeechStart": 189,
+            "coveredBy": [
+              {
+                "eventType": "no_barge_unstarted_response_deferred",
+                "eventTime": "2026-07-08T08:02:38.786152",
+                "reason": "user_resumed_before_response_audio"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:02:39.174832",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:02:39.276712",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:02:39.369054",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T08:02:39.457742",
+                "reason": "cancelled_response"
+              }
+            ]
+          }
+        ]
+      },
+      "semanticSnapshot": {
+        "callId": "call_333155283616481280",
+        "sceneCode": "intro_overseas",
+        "turnCount": 30,
+        "userTurnCount": 18,
+        "assistantTurnCount": 12,
+        "recordOnlyUserTurnCount": 12,
+        "usableUserSignalCount": 6,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 14,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "d39036e922dcaf679ee2eeabf0d64572f87fb96f77f66c9d7312a54bb153e869"
+      },
+      "qualityIssues": [
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "你们什么时候找这个海外的客户啊？",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "先看线索量还是触达建议",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333151411657326592",
+      "record": {
+        "callId": "call_333151411657326592",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T07:44:46.193238",
+        "endedAt": "2026-07-08T07:47:20.615966",
+        "durationMs": 151919
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 2,
+      "timelineAudit": {
+        "callId": "call_333151411657326592",
+        "passed": true,
+        "record": {
+          "callId": "call_333151411657326592",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T07:44:46.193238",
+          "endedAt": "2026-07-08T07:47:20.615966",
+          "durationMs": 151919
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 14,
+          "modelResponseCount": 10,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 23
+        },
+        "issues": [],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333151411657326592",
+        "sceneCode": "intro_contract",
+        "turnCount": 23,
+        "userTurnCount": 14,
+        "assistantTurnCount": 9,
+        "recordOnlyUserTurnCount": 10,
+        "usableUserSignalCount": 4,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 13,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "523344ef5610c8ca2b0c8a59f5d22e348f002033afe3a9a5b12e5a8b38f515bf"
+      },
+      "qualityIssues": [
+        {
+          "type": "assistant_text_leaked_into_semantic_result",
+          "severity": "high",
+          "turnSeq": 13,
+          "matchedText": "主要是短期合作协议",
+          "reason": "stored semantic result contains text from assistant turn"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "你们的准确率怎么样啊",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333144718539116544",
+      "record": {
+        "callId": "call_333144718539116544",
+        "entryType": "web",
+        "sceneCode": "intro_geo",
+        "promptSourceKey": "intro_geo",
+        "status": "completed",
+        "endReason": "customer_end",
+        "startedAt": "2026-07-08T07:18:10.429199",
+        "endedAt": "2026-07-08T07:21:05.862540",
+        "durationMs": 172951
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 3,
+      "timelineAudit": {
+        "callId": "call_333144718539116544",
+        "passed": false,
+        "record": {
+          "callId": "call_333144718539116544",
+          "entryType": "web",
+          "sceneCode": "intro_geo",
+          "promptSourceKey": "intro_geo",
+          "status": "completed",
+          "endReason": "customer_end",
+          "startedAt": "2026-07-08T07:18:10.429199",
+          "endedAt": "2026-07-08T07:21:05.862540",
+          "durationMs": 172951
+        },
+        "summary": {
+          "issueCount": 1,
+          "highSeverityCount": 1,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 18,
+          "modelResponseCount": 13,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 1,
+          "dialogueSegmentCount": 32
+        },
+        "issues": [
+          {
+            "type": "slow_ai_first_audio_after_customer_turn",
+            "severity": "high",
+            "callId": "call_333144718539116544",
+            "eventTime": "2026-07-08T07:20:33.285780",
+            "customerStopTime": "2026-07-08T07:20:33.285780",
+            "firstAudioTime": "2026-07-08T07:20:46.970307",
+            "nextCustomerSpeechTime": "2026-07-08T07:20:43.378475",
+            "customerStopToFirstAudioMs": 13685,
+            "customerStopToNextActivityMs": 10093,
+            "reason": "call_end_tool_ignored_before_next_audio"
+          }
+        ],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333144718539116544",
+        "sceneCode": "intro_geo",
+        "turnCount": 30,
+        "userTurnCount": 19,
+        "assistantTurnCount": 11,
+        "recordOnlyUserTurnCount": 10,
+        "usableUserSignalCount": 9,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 16,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "d16c0c8e28cd0c13bc90319cedb868766c20201e4bbc7f4a95a0e1070c20b0ba"
+      },
+      "qualityIssues": [
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "第不赛个",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "Come没窝吗",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333134408060080128",
+      "record": {
+        "callId": "call_333134408060080128",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "customer_end",
+        "startedAt": "2026-07-08T06:37:12.219191",
+        "endedAt": "2026-07-08T06:39:39.062321",
+        "durationMs": 141408
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 1,
+      "timelineAudit": {
+        "callId": "call_333134408060080128",
+        "passed": false,
+        "record": {
+          "callId": "call_333134408060080128",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "customer_end",
+          "startedAt": "2026-07-08T06:37:12.219191",
+          "endedAt": "2026-07-08T06:39:39.062321",
+          "durationMs": 141408
+        },
+        "summary": {
+          "issueCount": 1,
+          "highSeverityCount": 1,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 10,
+          "modelResponseCount": 8,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 20
+        },
+        "issues": [
+          {
+            "callId": "call_333134408060080128",
+            "eventTime": "2026-07-08T06:39:12.148599",
+            "responseId": "resp_OcDB49VqRjXewQrI5MQpw",
+            "speechStartTime": "2026-07-08T06:39:12.083407",
+            "speechStopTime": "2026-07-08T06:39:14.338510",
+            "deltaMsFromSpeechStart": 65,
+            "type": "ai_started_during_customer_speech",
+            "severity": "high"
+          }
+        ],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333134408060080128",
+        "sceneCode": "intro_contract",
+        "turnCount": 18,
+        "userTurnCount": 11,
+        "assistantTurnCount": 7,
+        "recordOnlyUserTurnCount": 6,
+        "usableUserSignalCount": 5,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 8,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "ea221758b856a022ea18deb07314112c3d320da3eff7ef0fe67711c4a737c3ad"
+      },
+      "qualityIssues": [
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333076563464048640",
+      "record": {
+        "callId": "call_333076563464048640",
+        "entryType": "web",
+        "sceneCode": "intro_geo",
+        "promptSourceKey": "intro_geo",
+        "status": "completed",
+        "endReason": "web_user_end",
+        "startedAt": "2026-07-08T02:47:20.993217",
+        "endedAt": "2026-07-08T02:50:07.202405",
+        "durationMs": 163904
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 5,
+      "timelineAudit": {
+        "callId": "call_333076563464048640",
+        "passed": false,
+        "record": {
+          "callId": "call_333076563464048640",
+          "entryType": "web",
+          "sceneCode": "intro_geo",
+          "promptSourceKey": "intro_geo",
+          "status": "completed",
+          "endReason": "web_user_end",
+          "startedAt": "2026-07-08T02:47:20.993217",
+          "endedAt": "2026-07-08T02:50:07.202405",
+          "durationMs": 163904
+        },
+        "summary": {
+          "issueCount": 1,
+          "highSeverityCount": 1,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 13,
+          "modelResponseCount": 10,
+          "staleAudioDropCount": 34,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 26
+        },
+        "issues": [
+          {
+            "type": "unexpected_stale_audio_drop",
+            "severity": "high",
+            "callId": "call_333076563464048640",
+            "eventTime": "2026-07-08T02:50:06.169155",
+            "firstEventTime": "2026-07-08T02:50:06.169155",
+            "lastEventTime": "2026-07-08T02:50:06.175843",
+            "responseId": "resp_FbqFhiqePzpn8YtrPaIJ6",
+            "reason": "session_not_ai_speaking",
+            "dropCount": 34,
+            "deltaBytes": 510720
+          }
+        ],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333076563464048640",
+        "sceneCode": "intro_geo",
+        "turnCount": 24,
+        "userTurnCount": 15,
+        "assistantTurnCount": 9,
+        "recordOnlyUserTurnCount": 8,
+        "usableUserSignalCount": 7,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 11,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "3797a919c9a6a3b5e808df7262cbfae3065a7b2257c13e2bc178342c6016b427"
+      },
+      "qualityIssues": [
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "有demo吗？",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "可以测试吗？",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "你不之前有别的公司接入你们产品吗？",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "你在那里吧？",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333071141309095936",
+      "record": {
+        "callId": "call_333071141309095936",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T02:25:48.250892",
+        "endedAt": "2026-07-08T02:28:09.328155",
+        "durationMs": 138831
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 3,
+      "timelineAudit": {
+        "callId": "call_333071141309095936",
+        "passed": true,
+        "record": {
+          "callId": "call_333071141309095936",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T02:25:48.250892",
+          "endedAt": "2026-07-08T02:28:09.328155",
+          "durationMs": 138831
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 12,
+          "modelResponseCount": 9,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 24
+        },
+        "issues": [],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333071141309095936",
+        "sceneCode": "intro_contract",
+        "turnCount": 23,
+        "userTurnCount": 15,
+        "assistantTurnCount": 8,
+        "recordOnlyUserTurnCount": 6,
+        "usableUserSignalCount": 9,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 11,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "3f3a06f15f43ead0a18b5cd2247e2d1ab8b48a58d41663f0547b597840c6e53e"
+      },
+      "qualityIssues": [
+        {
+          "type": "record_only_user_text_leaked_into_semantic_result",
+          "severity": "high",
+          "turnSeq": 22,
+          "matchedText": "可以的以后再说吧",
+          "reason": "stored semantic result contains record_only user text"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "把我的核桃上了，上去看一下效果",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "我强把我的核桃上了，上去看一下效果",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333054662788419584",
+      "record": {
+        "callId": "call_333054662788419584",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-08T01:20:19.465888",
+        "endedAt": "2026-07-08T01:21:32.200664",
+        "durationMs": 69895
+      },
+      "verdict": "REVIEW",
+      "highIssueCount": 0,
+      "reviewIssueCount": 5,
+      "timelineAudit": {
+        "callId": "call_333054662788419584",
+        "passed": true,
+        "record": {
+          "callId": "call_333054662788419584",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-08T01:20:19.465888",
+          "endedAt": "2026-07-08T01:21:32.200664",
+          "durationMs": 69895
+        },
+        "summary": {
+          "issueCount": 0,
+          "highSeverityCount": 0,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 8,
+          "modelResponseCount": 7,
+          "staleAudioDropCount": 0,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 16
+        },
+        "issues": [],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333054662788419584",
+        "sceneCode": "intro_contract",
+        "turnCount": 13,
+        "userTurnCount": 7,
+        "assistantTurnCount": 6,
+        "recordOnlyUserTurnCount": 5,
+        "usableUserSignalCount": 2,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 5,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "07ae5b185d110dcdca5da216744b924304944fe25eec72d79ab135a6022c1670"
+      },
+      "qualityIssues": [
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "强大一点",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "费时费力",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "强大一点",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "可以了",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    },
+    {
+      "callId": "call_333047300754763776",
+      "record": {
+        "callId": "call_333047300754763776",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "customer_end",
+        "startedAt": "2026-07-08T00:51:04.219420",
+        "endedAt": "2026-07-08T00:53:02.782643",
+        "durationMs": 115443
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 4,
+      "reviewIssueCount": 0,
+      "timelineAudit": {
+        "callId": "call_333047300754763776",
+        "passed": false,
+        "record": {
+          "callId": "call_333047300754763776",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "customer_end",
+          "startedAt": "2026-07-08T00:51:04.219420",
+          "endedAt": "2026-07-08T00:53:02.782643",
+          "durationMs": 115443
+        },
+        "summary": {
+          "issueCount": 4,
+          "highSeverityCount": 4,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 9,
+          "modelResponseCount": 9,
+          "staleAudioDropCount": 96,
+          "slowFirstAudioCount": 2,
+          "dialogueSegmentCount": 17
+        },
+        "issues": [
+          {
+            "type": "unexpected_stale_audio_drop",
+            "severity": "high",
+            "callId": "call_333047300754763776",
+            "eventTime": "2026-07-08T00:51:36.785423",
+            "firstEventTime": "2026-07-08T00:51:36.785423",
+            "lastEventTime": "2026-07-08T00:51:39.464028",
+            "responseId": "resp_Vc97oxBzvfz4NhLrwJ6id",
+            "reason": "session_not_ai_speaking",
+            "dropCount": 46,
+            "deltaBytes": 698880
+          },
+          {
+            "type": "unexpected_stale_audio_drop",
+            "severity": "high",
+            "callId": "call_333047300754763776",
+            "eventTime": "2026-07-08T00:52:30.345984",
+            "firstEventTime": "2026-07-08T00:52:30.345984",
+            "lastEventTime": "2026-07-08T00:52:33.047819",
+            "responseId": "resp_SW5n3oBVfFgIApXbVqpHH",
+            "reason": "session_not_ai_speaking",
+            "dropCount": 50,
+            "deltaBytes": 756480
+          },
+          {
+            "type": "slow_ai_first_audio_after_customer_turn",
+            "severity": "high",
+            "callId": "call_333047300754763776",
+            "eventTime": "2026-07-08T00:51:38.835271",
+            "customerStopTime": "2026-07-08T00:51:38.835271",
+            "firstAudioTime": "2026-07-08T00:51:54.482821",
+            "nextCustomerSpeechTime": "2026-07-08T00:51:52.051444",
+            "customerStopToFirstAudioMs": 15648,
+            "customerStopToNextActivityMs": 13216,
+            "reason": "slow_response_audio_after_customer_turn"
+          },
+          {
+            "type": "slow_ai_first_audio_after_customer_turn",
+            "severity": "high",
+            "callId": "call_333047300754763776",
+            "eventTime": "2026-07-08T00:52:30.919254",
+            "customerStopTime": "2026-07-08T00:52:30.919254",
+            "firstAudioTime": "2026-07-08T00:52:41.483831",
+            "nextCustomerSpeechTime": "2026-07-08T00:52:38.772728",
+            "customerStopToFirstAudioMs": 10565,
+            "customerStopToNextActivityMs": 7853,
+            "reason": "slow_response_audio_after_customer_turn"
+          }
+        ],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333047300754763776",
+        "sceneCode": "intro_contract",
+        "turnCount": 15,
+        "userTurnCount": 9,
+        "assistantTurnCount": 6,
+        "recordOnlyUserTurnCount": 7,
+        "usableUserSignalCount": 2,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 7,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "a70b61523d3835c5e582e1f0a53c407d05677ea1a7fe4f423f9910d9d03dc8d8"
+      },
+      "qualityIssues": []
+    },
+    {
+      "callId": "call_333005895715184640",
+      "record": {
+        "callId": "call_333005895715184640",
+        "entryType": "web",
+        "sceneCode": "intro_geo",
+        "promptSourceKey": "intro_geo",
+        "status": "completed",
+        "endReason": "normal_completed",
+        "startedAt": "2026-07-07T22:06:32.488428",
+        "endedAt": "2026-07-07T22:08:58.955711",
+        "durationMs": 143777
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 3,
+      "reviewIssueCount": 3,
+      "timelineAudit": {
+        "callId": "call_333005895715184640",
+        "passed": false,
+        "record": {
+          "callId": "call_333005895715184640",
+          "entryType": "web",
+          "sceneCode": "intro_geo",
+          "promptSourceKey": "intro_geo",
+          "status": "completed",
+          "endReason": "normal_completed",
+          "startedAt": "2026-07-07T22:06:32.488428",
+          "endedAt": "2026-07-07T22:08:58.955711",
+          "durationMs": 143777
+        },
+        "summary": {
+          "issueCount": 2,
+          "highSeverityCount": 2,
+          "coveredOverlapCount": 0,
+          "speechIntervalCount": 12,
+          "modelResponseCount": 11,
+          "staleAudioDropCount": 59,
+          "slowFirstAudioCount": 0,
+          "dialogueSegmentCount": 27
+        },
+        "issues": [
+          {
+            "callId": "call_333005895715184640",
+            "eventTime": "2026-07-07T22:06:46.066694",
+            "responseId": "resp_CGQSoQI9DghZVuEXx76kH",
+            "speechStartTime": "2026-07-07T22:06:45.963470",
+            "speechStopTime": "2026-07-07T22:06:47.215845",
+            "deltaMsFromSpeechStart": 103,
+            "type": "ai_started_during_customer_speech",
+            "severity": "high"
+          },
+          {
+            "type": "unexpected_stale_audio_drop",
+            "severity": "high",
+            "callId": "call_333005895715184640",
+            "eventTime": "2026-07-07T22:07:54.890629",
+            "firstEventTime": "2026-07-07T22:07:54.890629",
+            "lastEventTime": "2026-07-07T22:07:58.217838",
+            "responseId": "resp_N4qVBfayDb65VtZRIKmaW",
+            "reason": "session_not_ai_speaking",
+            "dropCount": 59,
+            "deltaBytes": 894720
+          }
+        ],
+        "coveredOverlaps": []
+      },
+      "semanticSnapshot": {
+        "callId": "call_333005895715184640",
+        "sceneCode": "intro_geo",
+        "turnCount": 22,
+        "userTurnCount": 13,
+        "assistantTurnCount": 9,
+        "recordOnlyUserTurnCount": 6,
+        "usableUserSignalCount": 7,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 7,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "788ba9587f102d38c982bc010fa4086efcaa324e039bee3d5cad11430861623d"
+      },
+      "qualityIssues": [
+        {
+          "type": "semantic_result_changed_by_evidence_gate",
+          "severity": "high",
+          "reason": "current semantic evidence gate would change stored result"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "AI是否推荐品牌",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "semantic_result_quote_absent_from_rebuilt_user_turns",
+          "severity": "review",
+          "matchedText": "那种优化吧",
+          "reason": "stored semantic result quotes user text absent from rebuilt snapshot"
+        },
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    }
+  ],
+  "failedCalls": []
+}

@@ -190,10 +190,14 @@ class Settings(BaseSettings):
     AI_CALL_OFFLINE_ASR_ENABLED: bool = True
     AI_CALL_OFFLINE_ASR_PROVIDER: Literal["dashscope_paraformer"] = "dashscope_paraformer"
     AI_CALL_OFFLINE_ASR_MODEL: str = "paraformer-v2"
-    AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS: str = "zh,en"
+    AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS: str = "zh"
     AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS: float = 300.0
     AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS: float = 2.0
     AI_CALL_OFFLINE_ASR_QUEUE_MAX_SIZE: int = 1000
+    AI_CALL_SEMANTIC_ANALYSIS_ENABLED: bool = True
+    AI_CALL_SEMANTIC_ANALYSIS_MODEL: str = ""
+    AI_CALL_SEMANTIC_ANALYSIS_TIMEOUT_SECONDS: float = 30.0
+    AI_CALL_SEMANTIC_ANALYSIS_QUEUE_MAX_SIZE: int = 1000
     AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS: float = 0.35
     AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-waiting.wav"
@@ -205,6 +209,9 @@ class Settings(BaseSettings):
     AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS: float = 0.0
     AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-unavailable.wav"
+    )
+    AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT: str = (
+        "当前暂时没有人工接入，我先帮您记录需求，稍后安排顾问联系您。"
     )
     AI_CALL_HANDOFF_TIMEOUT_SECONDS: int = 30
     AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED: bool = True

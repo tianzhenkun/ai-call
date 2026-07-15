@@ -20,9 +20,9 @@ from app.api.v1.ai_call.service import AiCallService
 from app.config.setting import Settings, settings
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
+from app.services.ai_call import livekit_sip as livekit_sip_module
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
-from app.services.ai_call import livekit_sip as livekit_sip_module
 from app.services.ai_call.livekit_room import BrowserRoomToken
 from app.services.ai_call.livekit_sip import (
     CreateSipParticipantPayload,
@@ -144,6 +144,7 @@ class FakeRecordService:
         self.failed_sessions: list[dict[str, object]] = []
         self.active_sip_records_by_callee_hash: dict[str, object] = {}
         self.active_sip_record_lookups: list[str] = []
+        self.prompt_context_updates: list[dict[str, object]] = []
 
     async def create_sip_record(
         self,
@@ -167,6 +168,19 @@ class FakeRecordService:
     async def mark_status(self, call_id: str, status: str | CallSessionStatus) -> None:
         status_value = status.value if isinstance(status, CallSessionStatus) else status
         self.status_updates.append((call_id, status_value))
+
+    async def update_prompt_context(
+        self,
+        call_id: str,
+        *,
+        scene_code: str | None,
+        prompt_source_key: str | None,
+    ) -> None:
+        self.prompt_context_updates.append({
+            "call_id": call_id,
+            "scene_code": scene_code,
+            "prompt_source_key": prompt_source_key,
+        })
 
     async def mark_answered(self, call_id: str, answered_at) -> None:
         self.answered_updates.append((call_id, answered_at))
@@ -676,6 +690,13 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
         }
     ]
     assert record_service.status_updates == [(result.call_id, "ready")]
+    assert record_service.prompt_context_updates == [
+        {
+            "call_id": result.call_id,
+            "scene_code": "intro_geo",
+            "prompt_source_key": "intro_geo",
+        }
+    ]
     assert record_service.answered_updates
     assert record_service.answered_updates[0][0] == result.call_id
     assert record_service.failed_sessions == []

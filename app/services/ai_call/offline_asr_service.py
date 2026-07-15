@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
@@ -21,6 +21,9 @@ from app.services.ai_call.dialogue_merge import (
     QWEN_REALTIME_SOURCE,
     is_duplicate_dialogue_segment,
 )
+
+HUMAN_AGENT_SPEAKER_TYPE = "human_agent"
+OFFLINE_ASR_TRACK_ROLES = frozenset({CUSTOMER_SPEAKER_TYPE, HUMAN_AGENT_SPEAKER_TYPE})
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,7 +303,7 @@ class AiCallOfflineAsrService:
         self,
         track: AiCallRecordingTrackModel,
     ) -> tuple[int, list[_PreparedAsrSegment]] | None:
-        if track.track_role != CUSTOMER_SPEAKER_TYPE:
+        if track.track_role not in OFFLINE_ASR_TRACK_ROLES:
             return None
         if track.status != "completed" or track.oss_id is None:
             return None
@@ -509,10 +512,12 @@ class AiCallOfflineAsrWorker:
         provider: OfflineAsrProviderProtocol,
         enabled: bool = True,
         queue_max_size: int = 1000,
+        on_call_ready_for_semantic_analysis: Callable[[str], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.provider = provider
         self.enabled = enabled
+        self.on_call_ready_for_semantic_analysis = on_call_ready_for_semantic_analysis
         self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max(1, queue_max_size))
         self.dropped_count = 0
         self.processed_count = 0
@@ -592,6 +597,20 @@ class AiCallOfflineAsrWorker:
             )
             await service.process_call(call_id)
             await db.commit()
+        self._notify_semantic_analysis_ready(call_id)
+
+    def _notify_semantic_analysis_ready(self, call_id: str) -> None:
+        if self.on_call_ready_for_semantic_analysis is None:
+            return
+        try:
+            self.on_call_ready_for_semantic_analysis(call_id)
+        except Exception as exc:
+            log.warning(
+                "AI Call 离线 ASR 已完成但语义分析入队失败: callId={}, errorType={}, message={}",
+                call_id,
+                type(exc).__name__,
+                str(exc),
+            )
 
 
 def parse_language_hints(value: str | Sequence[str] | None) -> list[str]:

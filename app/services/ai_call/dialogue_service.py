@@ -24,10 +24,12 @@ from app.services.ai_call.transcript_trust import (
 )
 
 PERSISTED_DIALOGUE_STATUSES = frozenset({"final", "interrupted", "failed"})
+TERMINAL_DIALOGUE_RECORD_STATUSES = frozenset({"completed", "failed"})
 SHORT_ASR_NOISE_MAX_DURATION_MS = 100
 SHORT_ASR_NOISE_MAX_TEXT_LENGTH = 2
 SHORT_ASR_REAL_AUDIO_MIN_SPAN_MS = 300
 REALTIME_ASR_PREFIX_DUPLICATE_START_GAP_MS = 1500
+UNHEARD_AUDIO_DROP_REASONS = frozenset({"session_not_ai_speaking"})
 VALID_SHORT_CUSTOMER_UTTERANCES = frozenset({
     "嗯",
     "好",
@@ -105,6 +107,8 @@ class AiCallDialogueRuntimeStore:
         self._merged_key_targets: dict[tuple[str, str, str], tuple[str, str, str]] = {}
         self._interrupted_ai_source_ids_by_call: dict[str, set[str]] = {}
         self._interrupted_ai_response_ids_by_call: dict[str, set[str]] = {}
+        self._unheard_ai_source_ids_by_call: dict[str, set[str]] = {}
+        self._unheard_ai_response_ids_by_call: dict[str, set[str]] = {}
         self._ai_source_ids_by_response_id: dict[str, dict[str, set[str]]] = {}
         self._next_no_by_call: dict[str, int] = {}
         self._persist_listeners: list[Callable[[DialogueSegmentSnapshot], None]] = []
@@ -161,6 +165,9 @@ class AiCallDialogueRuntimeStore:
         elif event.type == "user_transcript_failed":
             self._fail_customer_transcript(event)
         elif event.type == "ai_transcript_delta":
+            if self._is_unheard_ai_source_event(event):
+                self._suppress_unheard_ai_pending(event)
+                return
             self._apply_text_delta(
                 event,
                 speaker_type="ai",
@@ -169,6 +176,9 @@ class AiCallDialogueRuntimeStore:
                 replace=False,
             )
         elif event.type == "ai_transcript_done":
+            if self._is_unheard_ai_source_event(event):
+                self._suppress_unheard_ai_pending(event)
+                return
             done_text = self._ai_transcript_text(event.payload)
             pending = None
             if done_text:
@@ -188,11 +198,16 @@ class AiCallDialogueRuntimeStore:
             self._finalize_stable_customer_turn(event.call_id, event.timestamp)
         elif event.type == "model_response_done":
             self._finalize_stable_customer_turn(event.call_id, event.timestamp)
+            if self._is_unheard_ai_source_event(event):
+                self._suppress_unheard_ai_pending(event)
+                return
             if not self._should_ignore_model_response_done(event):
                 status = (
                     "interrupted" if self._is_interrupted_ai_source_event(event) else "final"
                 )
                 self._finalize_event_pending(event, "ai", status)
+        elif event.type == "stale_audio_dropped":
+            self._mark_unheard_ai_source(event)
         elif event.type == "response_generation_invalidated":
             self._mark_interrupted_ai_source(event)
             self._mark_finalized_interrupted_ai_sources(event)
@@ -207,6 +222,7 @@ class AiCallDialogueRuntimeStore:
             segment
             for segment in self._segments_by_call.get(call_id, [])
             if segment.text or segment.segment_status == "failed"
+            if not self._is_unheard_ai_source_id(call_id, segment.source_segment_id)
         ]
 
     def _apply_text_delta(
@@ -263,7 +279,21 @@ class AiCallDialogueRuntimeStore:
             key = self._resolve_key((event.call_id, speaker_type, source_segment_id))
             pending = self._pending_for_key(key)
             if pending is not None:
+                if pending.finalized:
+                    self._suppress_unfinalized_response_siblings(
+                        event,
+                        speaker_type=speaker_type,
+                        keep_source_segment_id=source_segment_id,
+                        keep_text=pending.snapshot.text,
+                    )
+                    return
                 self._finalize_segment(pending, event.timestamp, status)
+                self._suppress_unfinalized_response_siblings(
+                    event,
+                    speaker_type=speaker_type,
+                    keep_source_segment_id=source_segment_id,
+                    keep_text=pending.snapshot.text,
+                )
                 return
         self._finalize_pending(event.call_id, speaker_type, event.timestamp, status)
 
@@ -687,6 +717,96 @@ class AiCallDialogueRuntimeStore:
                 source_ids
             )
 
+    def _mark_unheard_ai_source(self, event: AiCallEvent) -> None:
+        if not self._is_unheard_audio_drop(event):
+            return
+        response_id = self._response_id(event)
+        if response_id:
+            self._unheard_ai_response_ids_by_call.setdefault(event.call_id, set()).add(
+                response_id
+            )
+            for source_id in self._ai_source_ids_by_response_id.get(event.call_id, {}).get(
+                response_id,
+                set(),
+            ):
+                self._mark_unheard_ai_source_id(event.call_id, source_id)
+        source_segment_id = self._item_source_segment_id(event.payload)
+        if source_segment_id:
+            self._mark_unheard_ai_source_id(event.call_id, source_segment_id)
+
+    def _suppress_unheard_ai_pending(self, event: AiCallEvent) -> None:
+        source_segment_id = self._source_segment_id(event)
+        if source_segment_id:
+            self._mark_unheard_ai_source_id(event.call_id, source_segment_id)
+        response_id = self._response_id(event)
+        if not response_id:
+            return
+        self._unheard_ai_response_ids_by_call.setdefault(event.call_id, set()).add(response_id)
+        for source_id in self._ai_source_ids_by_response_id.get(event.call_id, {}).get(
+            response_id,
+            set(),
+        ):
+            self._mark_unheard_ai_source_id(event.call_id, source_id)
+
+    def _mark_unheard_ai_source_id(self, call_id: str, source_segment_id: str) -> None:
+        self._unheard_ai_source_ids_by_call.setdefault(call_id, set()).add(source_segment_id)
+        pending = self._pending_for_key((call_id, "ai", source_segment_id))
+        if pending is not None:
+            pending.suppress_persist = True
+
+    def _suppress_unfinalized_response_siblings(
+        self,
+        event: AiCallEvent,
+        *,
+        speaker_type: str,
+        keep_source_segment_id: str,
+        keep_text: str,
+    ) -> None:
+        if speaker_type != "ai":
+            return
+        response_id = self._response_id(event)
+        if not response_id:
+            return
+        source_ids = self._ai_source_ids_by_response_id.get(event.call_id, {}).get(
+            response_id,
+            set(),
+        )
+        for source_id in tuple(source_ids):
+            if source_id == keep_source_segment_id:
+                continue
+            pending = self._pending_for_key((event.call_id, "ai", source_id))
+            if pending is None or pending.finalized:
+                continue
+            if not self._can_suppress_ai_response_sibling(pending.snapshot.text, keep_text):
+                continue
+            pending.suppress_persist = True
+            self._remove_snapshot(pending.snapshot)
+            active_key = self._active_key_by_call_speaker.get((event.call_id, "ai"))
+            if active_key == (event.call_id, "ai", source_id):
+                self._active_key_by_call_speaker.pop((event.call_id, "ai"), None)
+
+    def _remove_snapshot(self, snapshot: DialogueSegmentSnapshot) -> None:
+        rows = self._segments_by_call.get(snapshot.call_id)
+        if not rows:
+            return
+        try:
+            rows.remove(snapshot)
+        except ValueError:
+            return
+
+    @classmethod
+    def _can_suppress_ai_response_sibling(cls, sibling_text: str, keep_text: str) -> bool:
+        sibling = cls._normalize_text(sibling_text)
+        keep = cls._normalize_text(keep_text)
+        if not sibling or not keep:
+            return True
+        return sibling == keep or sibling in keep or keep in sibling
+
+    @staticmethod
+    def _is_unheard_audio_drop(event: AiCallEvent) -> bool:
+        reason = event.payload.get("reason")
+        return isinstance(reason, str) and reason in UNHEARD_AUDIO_DROP_REASONS
+
     def _finalize_interrupted_ai_pending(self, event: AiCallEvent) -> None:
         key = self._active_key_by_call_speaker.get((event.call_id, "ai"))
         if key is None:
@@ -737,6 +857,21 @@ class AiCallDialogueRuntimeStore:
     def _is_interrupted_ai_source_id(self, call_id: str, source_segment_id: str) -> bool:
         return source_segment_id in self._interrupted_ai_source_ids_by_call.get(call_id, set())
 
+    def _is_unheard_ai_source_event(self, event: AiCallEvent) -> bool:
+        source_segment_id = self._source_segment_id(event)
+        if source_segment_id and self._is_unheard_ai_source_id(
+            event.call_id,
+            source_segment_id,
+        ):
+            return True
+        response_id = self._response_id(event)
+        if not response_id:
+            return False
+        return response_id in self._unheard_ai_response_ids_by_call.get(event.call_id, set())
+
+    def _is_unheard_ai_source_id(self, call_id: str, source_segment_id: str) -> bool:
+        return source_segment_id in self._unheard_ai_source_ids_by_call.get(call_id, set())
+
     def _remember_ai_response_source(
         self,
         event: AiCallEvent,
@@ -752,6 +887,8 @@ class AiCallDialogueRuntimeStore:
             response_id,
             set(),
         ).add(source_segment_id)
+        if self._is_unheard_ai_source_event(event):
+            self._mark_unheard_ai_source_id(event.call_id, source_segment_id)
 
     @staticmethod
     def _source_segment_id(event: AiCallEvent) -> str | None:
@@ -772,6 +909,17 @@ class AiCallDialogueRuntimeStore:
                         return str(item["id"])[:128]
             if response.get("id"):
                 return str(response["id"])[:128]
+        return None
+
+    @staticmethod
+    def _item_source_segment_id(payload: dict[str, Any]) -> str | None:
+        for key in ("item_id", "itemId"):
+            value = payload.get(key)
+            if value:
+                return str(value)[:128]
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("id"):
+            return str(item["id"])[:128]
         return None
 
     @staticmethod
@@ -974,6 +1122,9 @@ class AiCallDialogueService:
 
     async def list_preview_segments(self, call_id: str) -> dict[str, Any]:
         if self.runtime_store is not None:
+            record = await self.repository.get_record(call_id)
+            if record is not None and record.status in TERMINAL_DIALOGUE_RECORD_STATUSES:
+                return await self._persisted_segment_list(call_id)
             rows = self.runtime_store.list_preview(call_id)
             if rows:
                 rows = self._canonical_preview_segments(rows)
@@ -981,6 +1132,9 @@ class AiCallDialogueService:
                     "rows": [row.as_dict() for row in rows],
                     "total": len(rows),
                 }
+        return await self._persisted_segment_list(call_id)
+
+    async def _persisted_segment_list(self, call_id: str) -> dict[str, Any]:
         rows = await self.list_persisted_segments(call_id)
         return {
             "rows": [self.segment_to_dict(row) for row in rows],
@@ -1040,6 +1194,9 @@ class AiCallDialogueService:
             ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
                 row,
                 rows,
+            ) or AiCallDialogueService._is_offline_customer_shadowed_by_realtime(
+                row,
+                realtime_rows,
             ):
                 continue
             if row.source == QWEN_REALTIME_SOURCE and row.speaker_type == "ai" and any(
@@ -1091,6 +1248,9 @@ class AiCallDialogueService:
             ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
                 row,
                 rows,
+            ) or AiCallDialogueService._is_offline_customer_shadowed_by_realtime(
+                row,
+                realtime_rows,
             ):
                 continue
             if row.source == QWEN_REALTIME_SOURCE and row.speaker_type == "ai" and any(
@@ -1181,9 +1341,48 @@ class AiCallDialogueService:
             candidate.source == QWEN_REALTIME_SOURCE
             and candidate.speaker_type == "ai"
             and not AiCallDialogueService._is_interrupted_realtime_ai_fragment(candidate)
+            and not AiCallDialogueService._has_duplicate_ai_finished_before(
+                row,
+                candidate,
+                rows,
+            )
             and AiCallDialogueService._time_ranges_overlap(row, candidate)
             for candidate in rows
         )
+
+    @staticmethod
+    def _has_duplicate_ai_finished_before(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        candidate: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        rows: list[AiCallDialogueSegmentModel] | list[DialogueSegmentSnapshot],
+    ) -> bool:
+        row_start = row.started_at
+        if row_start is None:
+            return False
+        for duplicate in rows:
+            if duplicate is candidate:
+                continue
+            if (
+                duplicate.source != QWEN_REALTIME_SOURCE
+                or duplicate.speaker_type != "ai"
+                or AiCallDialogueService._is_interrupted_realtime_ai_fragment(duplicate)
+            ):
+                continue
+            if not is_duplicate_dialogue_segment(
+                speaker_type=candidate.speaker_type,
+                text=AiCallDialogueService._dialogue_text(candidate),
+                started_at=candidate.started_at,
+                ended_at=candidate.ended_at,
+                candidate_speaker_type=duplicate.speaker_type,
+                candidate_text=AiCallDialogueService._dialogue_text(duplicate),
+                candidate_started_at=duplicate.started_at,
+                candidate_ended_at=duplicate.ended_at,
+            ):
+                continue
+            duplicate_end = duplicate.ended_at or duplicate.started_at
+            if duplicate_end is not None and duplicate_end <= row_start:
+                return True
+        return False
 
     @staticmethod
     def _is_realtime_customer_prefix_fragment(
@@ -1217,6 +1416,20 @@ class AiCallDialogueService:
             ):
                 return True
         return False
+
+    @staticmethod
+    def _is_offline_customer_shadowed_by_realtime(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        realtime_rows: list[AiCallDialogueSegmentModel] | list[DialogueSegmentSnapshot],
+    ) -> bool:
+        if row.source != OFFLINE_ASR_SOURCE or row.speaker_type != "customer":
+            return False
+        return any(
+            candidate.source == QWEN_REALTIME_SOURCE
+            and candidate.speaker_type == "customer"
+            and AiCallDialogueService._time_ranges_overlap(row, candidate)
+            for candidate in realtime_rows
+        )
 
     @staticmethod
     def _is_interrupted_realtime_ai_fragment(

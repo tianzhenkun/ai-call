@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Select, asc, desc, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -11,16 +12,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
-    AiCallHandoffAgentModel,
     AiCallEventModel,
+    AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallPromptProfileModel,
     AiCallRecordingModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
     AiCallVoiceProfileModel,
 )
 from app.utils.id_util import generate_snowflake_id
+
+DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE = "ai_call_semantic_analysis"
+SEMANTIC_ANALYSIS_STATUS_PENDING = "0"
+SEMANTIC_ANALYSIS_STATUS_RUNNING = "1"
+SEMANTIC_ANALYSIS_STATUS_SUCCEEDED = "2"
+SEMANTIC_ANALYSIS_STATUS_FAILED = "3"
+SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT = "4"
 
 
 class AiCallRecordRepository:
@@ -35,6 +44,8 @@ class AiCallRecordRepository:
         call_id: str,
         business_type: str | None,
         business_id: str | None,
+        scene_code: str | None = None,
+        prompt_source_key: str | None = None,
         entry_type: str,
         room_name: str,
         participant_identity: str,
@@ -48,6 +59,8 @@ class AiCallRecordRepository:
             call_id=call_id,
             business_type=business_type,
             business_id=business_id,
+            scene_code=scene_code,
+            prompt_source_key=prompt_source_key,
             entry_type=entry_type,
             room_name=room_name,
             participant_identity=participant_identity,
@@ -601,6 +614,174 @@ class AiCallRecordRepository:
         )
         return list(result.scalars().all())
 
+    async def ensure_semantic_analysis_record(
+        self,
+        *,
+        call_id: str,
+        scene_code: str | None,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+    ) -> AiCallSemanticAnalysisModel:
+        existing = await self.get_semantic_analysis(
+            call_id=call_id,
+            analysis_scene_code=analysis_scene_code,
+        )
+        if existing is not None:
+            if scene_code and existing.scene_code != scene_code:
+                existing.scene_code = scene_code
+                existing.updated_at = datetime.now(timezone.utc)
+                await self.db.flush()
+                await self.db.refresh(existing)
+            return existing
+
+        now = datetime.now(timezone.utc)
+        analysis = AiCallSemanticAnalysisModel(
+            id=generate_snowflake_id(),
+            call_id=call_id,
+            scene_code=scene_code,
+            analysis_scene_code=analysis_scene_code,
+            analysis_status=SEMANTIC_ANALYSIS_STATUS_PENDING,
+            analysis_retry_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        self.db.add(analysis)
+        await self.db.flush()
+        await self.db.refresh(analysis)
+        return analysis
+
+    async def get_semantic_analysis(
+        self,
+        *,
+        call_id: str,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+    ) -> AiCallSemanticAnalysisModel | None:
+        result = await self.db.execute(
+            select(AiCallSemanticAnalysisModel).where(
+                AiCallSemanticAnalysisModel.call_id == call_id,
+                AiCallSemanticAnalysisModel.analysis_scene_code == analysis_scene_code,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def claim_semantic_analysis(
+        self,
+        *,
+        call_id: str,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+        now: datetime | None = None,
+        max_retry_count: int = 3,
+        retry_cooldown_minutes: int = 10,
+        force: bool = False,
+    ) -> AiCallSemanticAnalysisModel | None:
+        analysis = await self.get_semantic_analysis(
+            call_id=call_id,
+            analysis_scene_code=analysis_scene_code,
+        )
+        if analysis is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        if not force and not self._semantic_analysis_claimable(
+            analysis,
+            now=now,
+            max_retry_count=max_retry_count,
+            retry_cooldown_minutes=retry_cooldown_minutes,
+        ):
+            return None
+
+        analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_RUNNING
+        analysis.analysis_started_at = now
+        analysis.analysis_finished_at = None
+        analysis.analysis_error = None
+        analysis.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(analysis)
+        return analysis
+
+    async def update_semantic_analysis_success(
+        self,
+        *,
+        call_id: str,
+        analysis_result: dict,
+        transcript_snapshot_json: str,
+        transcript_hash: str,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+        now: datetime | None = None,
+    ) -> AiCallSemanticAnalysisModel | None:
+        analysis = await self.get_semantic_analysis(
+            call_id=call_id,
+            analysis_scene_code=analysis_scene_code,
+        )
+        if analysis is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+        analysis.analysis_result = json.dumps(analysis_result, ensure_ascii=False)
+        analysis.analysis_error = None
+        analysis.analysis_finished_at = now
+        analysis.transcript_snapshot_json = transcript_snapshot_json
+        analysis.transcript_hash = transcript_hash
+        analysis.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(analysis)
+        return analysis
+
+    async def update_semantic_analysis_failed(
+        self,
+        *,
+        call_id: str,
+        analysis_error: str,
+        transcript_snapshot_json: str | None = None,
+        transcript_hash: str | None = None,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+        now: datetime | None = None,
+    ) -> AiCallSemanticAnalysisModel | None:
+        analysis = await self.get_semantic_analysis(
+            call_id=call_id,
+            analysis_scene_code=analysis_scene_code,
+        )
+        if analysis is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_FAILED
+        analysis.analysis_error = analysis_error
+        analysis.analysis_retry_count = int(analysis.analysis_retry_count or 0) + 1
+        analysis.analysis_finished_at = now
+        if transcript_snapshot_json is not None:
+            analysis.transcript_snapshot_json = transcript_snapshot_json
+        if transcript_hash is not None:
+            analysis.transcript_hash = transcript_hash
+        analysis.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(analysis)
+        return analysis
+
+    async def update_semantic_analysis_no_user_input(
+        self,
+        *,
+        call_id: str,
+        analysis_error: str,
+        transcript_snapshot_json: str,
+        transcript_hash: str,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+        now: datetime | None = None,
+    ) -> AiCallSemanticAnalysisModel | None:
+        analysis = await self.get_semantic_analysis(
+            call_id=call_id,
+            analysis_scene_code=analysis_scene_code,
+        )
+        if analysis is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT
+        analysis.analysis_error = analysis_error
+        analysis.analysis_finished_at = now
+        analysis.transcript_snapshot_json = transcript_snapshot_json
+        analysis.transcript_hash = transcript_hash
+        analysis.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(analysis)
+        return analysis
+
     async def create_prompt_profile(self, **values) -> AiCallPromptProfileModel:
         now = datetime.now(timezone.utc)
         profile = AiCallPromptProfileModel(
@@ -1020,3 +1201,22 @@ class AiCallRecordRepository:
     def _chunks(values: list[str], size: int):
         for index in range(0, len(values), size):
             yield values[index : index + size]
+
+    @staticmethod
+    def _semantic_analysis_claimable(
+        analysis: AiCallSemanticAnalysisModel,
+        *,
+        now: datetime,
+        max_retry_count: int,
+        retry_cooldown_minutes: int,
+    ) -> bool:
+        if analysis.analysis_status == SEMANTIC_ANALYSIS_STATUS_PENDING:
+            return True
+        if analysis.analysis_status != SEMANTIC_ANALYSIS_STATUS_FAILED:
+            return False
+        if int(analysis.analysis_retry_count or 0) >= max_retry_count:
+            return False
+        updated_at = analysis.updated_at
+        if updated_at.tzinfo is None and now.tzinfo is not None:
+            updated_at = updated_at.replace(tzinfo=now.tzinfo)
+        return updated_at <= now - timedelta(minutes=retry_cooldown_minutes)

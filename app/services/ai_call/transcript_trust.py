@@ -18,6 +18,8 @@ CANDIDATE_TRANSCRIPT = "candidate"
 REJECT_TRANSCRIPT = "reject"
 
 TURN_TAKING_SHORT_UTTERANCES = frozenset({
+    "有",
+    "有的",
     "好",
     "好的",
     "行",

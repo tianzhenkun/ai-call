@@ -103,6 +103,7 @@ PERSISTED_EVENT_TYPES = frozenset({
     "model_response_started",
     "model_session_started",
     "model_session_updated",
+    "no_barge_unstarted_response_deferred",
     "opening_started",
     "playout_queue_flushed",
     "provider_event_unmapped",
@@ -224,6 +225,19 @@ class AiCallRecordService:
         return await self.repository.update_record(
             call_id,
             status=self._status_value(status),
+        )
+
+    async def update_prompt_context(
+        self,
+        call_id: str,
+        *,
+        scene_code: str | None,
+        prompt_source_key: str | None,
+    ) -> AiCallRecordModel | None:
+        return await self.repository.update_record(
+            call_id,
+            scene_code=scene_code,
+            prompt_source_key=prompt_source_key,
         )
 
     async def mark_answered(
@@ -355,6 +369,8 @@ class AiCallRecordService:
             "callId": record.call_id,
             "businessType": record.business_type,
             "businessId": record.business_id,
+            "sceneCode": record.scene_code,
+            "promptSourceKey": record.prompt_source_key,
             "entryType": record.entry_type,
             "roomName": record.room_name,
             "participantIdentity": record.participant_identity,

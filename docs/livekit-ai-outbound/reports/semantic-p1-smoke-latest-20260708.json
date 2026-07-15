@@ -1,0 +1,139 @@
+{
+  "mode": "semantic_acceptance",
+  "baseUrl": "http://127.0.0.1:19012",
+  "entryType": "web",
+  "requested": 1,
+  "sourceTotal": null,
+  "summary": {
+    "calls": 1,
+    "passed": 0,
+    "review": 0,
+    "failed": 1,
+    "high": 1,
+    "reviewIssues": 1,
+    "fetchFailed": 0,
+    "verdict": "FAIL"
+  },
+  "calls": [
+    {
+      "callId": "call_333182159408410624",
+      "record": {
+        "callId": "call_333182159408410624",
+        "entryType": "web",
+        "sceneCode": "intro_contract",
+        "promptSourceKey": "intro_contract",
+        "status": "completed",
+        "endReason": "customer_end",
+        "startedAt": "2026-07-08T09:46:57.028243",
+        "endedAt": "2026-07-08T09:50:37.242688",
+        "durationMs": 217051
+      },
+      "verdict": "FAIL",
+      "highIssueCount": 1,
+      "reviewIssueCount": 1,
+      "timelineAudit": {
+        "callId": "call_333182159408410624",
+        "passed": false,
+        "record": {
+          "callId": "call_333182159408410624",
+          "entryType": "web",
+          "sceneCode": "intro_contract",
+          "promptSourceKey": "intro_contract",
+          "status": "completed",
+          "endReason": "customer_end",
+          "startedAt": "2026-07-08T09:46:57.028243",
+          "endedAt": "2026-07-08T09:50:37.242688",
+          "durationMs": 217051
+        },
+        "summary": {
+          "issueCount": 1,
+          "highSeverityCount": 1,
+          "coveredOverlapCount": 1,
+          "speechIntervalCount": 14,
+          "modelResponseCount": 16,
+          "staleAudioDropCount": 52,
+          "slowFirstAudioCount": 1,
+          "dialogueSegmentCount": 30
+        },
+        "issues": [
+          {
+            "type": "slow_ai_first_audio_after_customer_turn",
+            "severity": "high",
+            "callId": "call_333182159408410624",
+            "eventTime": "2026-07-08T09:47:32.737044",
+            "customerStopTime": "2026-07-08T09:47:32.737044",
+            "firstAudioTime": "2026-07-08T09:47:37.896957",
+            "nextCustomerSpeechTime": "2026-07-08T09:48:00.584651",
+            "customerStopToFirstAudioMs": 5160,
+            "customerStopToNextActivityMs": 5160,
+            "reason": "slow_response_audio_after_customer_turn"
+          }
+        ],
+        "coveredOverlaps": [
+          {
+            "callId": "call_333182159408410624",
+            "eventTime": "2026-07-08T09:47:31.756609",
+            "responseId": "resp_DBADNMjvNgaUBEdtcYN6r",
+            "speechStartTime": "2026-07-08T09:47:31.551124",
+            "speechStopTime": "2026-07-08T09:47:32.737044",
+            "deltaMsFromSpeechStart": 205,
+            "coveredBy": [
+              {
+                "eventType": "no_barge_unstarted_response_deferred",
+                "eventTime": "2026-07-08T09:47:31.756637",
+                "reason": "user_resumed_before_response_audio"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T09:47:32.539607",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T09:47:32.618842",
+                "reason": "cancelled_response"
+              },
+              {
+                "eventType": "stale_audio_dropped",
+                "eventTime": "2026-07-08T09:47:32.711095",
+                "reason": "cancelled_response"
+              }
+            ]
+          }
+        ]
+      },
+      "semanticSnapshot": {
+        "callId": "call_333182159408410624",
+        "sceneCode": "intro_contract",
+        "turnCount": 25,
+        "userTurnCount": 12,
+        "assistantTurnCount": 13,
+        "recordOnlyUserTurnCount": 5,
+        "usableUserSignalCount": 7,
+        "unsupportedStrongFactTurnCount": 0,
+        "fallbackToRealtime": false,
+        "realtimeSupplementedCount": 8,
+        "offlineAsrQualityRejectedCount": 0,
+        "qualitySignals": [
+          "realtime_supplement"
+        ],
+        "qualityReasons": []
+      },
+      "storedSemanticAnalysis": {
+        "present": true,
+        "analysisStatus": "2",
+        "hasResult": true,
+        "hasTranscriptSnapshot": true,
+        "transcriptHash": "06797381572167cd2a9e3c746882f8d534b872278fb274641082bc5766cafe64"
+      },
+      "qualityIssues": [
+        {
+          "type": "stale_stored_transcript_snapshot",
+          "severity": "review",
+          "reason": "stored transcript snapshot differs from snapshot rebuilt by current code"
+        }
+      ]
+    }
+  ],
+  "failedCalls": []
+}
