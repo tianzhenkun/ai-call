@@ -1,6 +1,6 @@
 # Phase F：SIP 呼入 Dispatch-driven Worker 正式设计
 
-最后更新：2026-07-14
+最后更新：2026-07-15
 
 ## 1. 文档定位
 
@@ -8,7 +8,9 @@
 
 Phase F 只解决一个问题：
 
-> 当客户拨打公司公开号码时，self-hosted LiveKit SIP 能把每通来电送入独立 Room，并通过 dispatch-driven Agent worker 启动现有 Qwen Realtime 通话能力，最终复用 P1 打断、录音、对话、转人工、事件和通话后分析闭环。
+> 当客户拨打公司公开号码时，self-hosted LiveKit SIP 能把每通来电送入独立 Room，并通过 dispatch-driven Agent worker 启动现有 Qwen Realtime AI 接待能力，最终形成 P1 打断、混音录音、客户/AI 分轨、对话、事件和通话后语义分析闭环。
+
+Phase F 的产品边界是 **AI-only 呼入接待**：本阶段不转人工，不建设排队、技能组、坐席分配或完整坐席中心。
 
 Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API 进程内临时启动 Agent 的过渡运行链路。
 
@@ -19,9 +21,7 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 1. [phase-a-e2e-core-engine.md](phase-a-e2e-core-engine.md)
 2. [phase-e-sip-minimal-entry-design.md](phase-e-sip-minimal-entry-design.md)
 3. [phase-e-sip-barge-in-p1-design.md](phase-e-sip-barge-in-p1-design.md)
-4. [phase-b3-minimal-handoff-design.md](phase-b3-minimal-handoff-design.md)
-5. [phase-b5-handoff-semantic-snapshot-contract.md](phase-b5-handoff-semantic-snapshot-contract.md)
-6. 当前代码中的 `app/api/v1/ai_call/`、`app/services/ai_call/` 和 `deploy/livekit-egress/`
+4. 当前代码中的 `app/api/v1/ai_call/`、`app/services/ai_call/` 和 `deploy/livekit-egress/`
 
 ## 2. 目标、约束和成功标准
 
@@ -30,9 +30,9 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 1. 支持真实号码呼入，并为每通电话创建独立 LiveKit Room。
 2. 通过 LiveKit explicit agent dispatch 将每通呼入分配给可用 Agent worker。
 3. 每通通话由独立 Job 持有 Room、Qwen 和实时媒体生命周期。
-4. 复用现有 `RealtimeCallAgentRunner`、Qwen Realtime、SIP P1、录音、对话、转人工和通话结束能力。
+4. 复用现有 `RealtimeCallAgentRunner`、Qwen Realtime、SIP P1、录音、对话和通话结束能力。
 5. 支持多个 worker、并发通话、优雅发布和单通故障隔离。
-6. 保证来电认领、webhook、worker 重启和控制命令具有幂等性。
+6. 保证来电认领、webhook、worker 重启、录音后处理和语义分析具有幂等性。
 7. 呼入初始定位为“公司综合接待”，同一通话内可以切换业务主题，不因主题切换重建 Room 或 Qwen Session。
 
 ### 2.2 已知约束
@@ -42,7 +42,7 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 3. 当前实时运行链由 API 进程内的 `AiCallOrchestrator` 主动创建和持有。
 4. 当前 `InMemorySessionRegistry`、`InMemoryEventStore` 和 Runner 内部任务均为进程内状态，不能直接作为多 worker 的跨进程事实源。
 5. 当前 `LiveKitRoomAudioTransport` 会自行签 Token、连接 Room 和断开 Room，不能直接用于已经由 `JobContext` 持有的 Room。
-6. 当前转人工控制会直接调用 API 进程中的 Orchestrator；呼入 worker 化后必须补跨进程控制边界。
+6. 当前 event/dialogue listener 主要在 API 进程绑定；呼入 worker 化后必须在 worker 侧建立独立持久化边界。
 7. Qwen Realtime Session 无法在 worker 崩溃后原样恢复，正式设计不能承诺模型会话无感续接。
 
 ### 2.3 成功标准
@@ -51,9 +51,9 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 2. 客户接通后能听到开场白，并与 Qwen 完成双向语音对话。
 3. AI 播放期间客户插话时，现有 SIP P1 打断策略不退化。
 4. 录音、分轨、对话文本、关键事件和通话后语义分析可按 `call_id` 查询。
-5. 转人工后 AI 停止播放，坐席加入同一 Room 后能与客户双向通话。
-6. 客户挂机、系统挂断、worker 失败和 Room 结束都能进入明确终态。
-7. 重复 webhook、Job 重派和控制命令重试不产生重复记录或重复副作用。
+5. 混音录音、客户分轨和 AI 分轨均能最终关闭并可查询，语义分析产出可回溯原始对话证据的回访信息。
+6. 客户挂机、AI 主动结束、worker 失败和 Room 结束都能进入明确终态。
+7. 重复 webhook、Job 重派、录音补偿和语义分析重试不产生重复记录或重复副作用。
 8. 双 worker 部署和滚动发布不主动中断已有通话。
 
 ## 3. 当前代码事实
@@ -78,7 +78,7 @@ AiCallService
 2. `AiCallOrchestrator.create_sip_session(...)` 创建 SIP 外呼 Room 和 Agent。
 3. `LiveKitSipClient.create_participant(...)` 只负责外呼 `CreateSIPParticipant`。
 4. `LiveKitRoomAudioTransport.start(...)` 在连接 Room 前记录目标 participant identity，并只接收该 identity 的音轨。
-5. `RealtimeCallAgentRunner` 已包含 Qwen 连接、音频桥、播放、P1 打断、结束判断和转人工挂起能力。
+5. `RealtimeCallAgentRunner` 已包含 Qwen 连接、音频桥、播放、P1 打断和结束判断能力。
 6. `CallSession` 当前未携带 `entry_type`，SIP 特性仍存在 identity 约定依赖。
 
 ### 3.2 当前持久化能力
@@ -88,14 +88,14 @@ AiCallService
 1. `ai_call_record`：保存 `call_id`、`entry_type`、Room、用户 participant identity、状态和终态。
 2. `ai_call_event`：保存低频关键事件，`event_id` 唯一。
 3. `ai_call_recording` 和 `ai_call_recording_track`：保存混音与分参与方录音。
-4. 对话文本、handoff 和语义分析相关表及服务。
-5. 录音和语义分析 reconciliation worker。
+4. 对话文本和语义分析相关表及服务。
+5. 录音 reconciliation worker，以及语义分析进程内队列 worker 和数据库状态/重试地基。
 
 当前缺口：
 
 1. `ai_call_record` 只有 SIP 外呼被叫号码字段，没有呼入主叫号码和被叫号码语义字段。
 2. 没有 SIP 呼入幂等键、trunk ID、dispatch rule ID 的稳定字段。
-3. 没有跨进程实时控制命令表。
+3. 没有完整的语义分析 reconciliation 扫描器，无法自动发现队列丢失、进程重启或长时间 `running` 造成的漏跑。
 4. worker 进程内产生的事件和对话不能依赖 API 进程中的内存 listener 自动持久化。
 
 ### 3.3 当前 webhook
@@ -134,7 +134,7 @@ Phase F 采用：
 5. [Job lifecycle](https://docs.livekit.io/agents/server/job/)
 6. [Self-hosting](https://docs.livekit.io/transport/self-hosting/)
 
-`JobContext` 只负责 Job 和 Room 边界，不替代项目现有的 P1、录音、转人工、事件、语义分析和业务状态机。
+`JobContext` 只负责 Job 和 Room 边界，不替代项目现有的 P1、录音、事件、语义分析和业务状态机。
 
 ## 5. 第一性原理与设计结论
 
@@ -154,7 +154,7 @@ Phase F 的核心结论：
 2. 呼入正常启动由 dispatch rule + AgentServer 完成，不由 webhook 启动。
 3. worker 使用 `JobContext` 持有 Room，不再由 API 进程持有呼入实时任务。
 4. Qwen、P1、播放、打断和通话结束继续由现有 Runner 负责。
-5. API 继续负责查询、坐席操作、Token 签发和业务持久化入口，但不直接访问呼入 Runner 内存。
+5. API 继续负责通话、录音、对话和语义分析查询，但不直接访问呼入 Runner 内存。
 6. webhook 负责外部事实、孤儿通话发现和终态补偿。
 7. trunk 和 dispatch rule 由部署或运维显式创建；应用只读校验，不自动创建、更新或删除电话基础设施。
 
@@ -168,8 +168,8 @@ Phase F 的核心结论：
 4. 入站 SIP participant 识别、allowlist 校验和幂等认领。
 5. `entry_type=sip_inbound` 通话记录和号码脱敏字段。
 6. 复用现有 Qwen Realtime Runner 和 SIP P1。
-7. 复用现有录音、对话、handoff、事件和通话后分析。
-8. API 与 worker 之间的持久化控制命令。
+7. 复用现有混音录音、客户/AI 分轨、对话、事件和通话后分析。
+8. 录音 reconciliation、offline ASR 和语义分析 reconciliation 闭环。
 9. `participant_joined`、`participant_left`、`room_finished` webhook reconciliation。
 10. 多 worker、重启、重复事件和故障场景验收。
 
@@ -180,11 +180,12 @@ Phase F 的核心结论：
 3. 不重写 Qwen Realtime provider。
 4. 不迁移到 STT -> LLM -> TTS 三段式模型。
 5. 不做完整 IVR、按键导航和多级菜单。
-6. 不做排队、技能组、坐席分配和完整坐席中心。
+6. 不做转人工、排队、技能组、坐席分配和完整坐席中心。
 7. 不做多租户 trunk/rule 动态管理。
 8. 不做 SIP REFER 或运营商级呼叫转移。
 9. 不让应用自动创建、修改或删除 trunk / dispatch rule。
 10. 不承诺 worker 崩溃后 Qwen Session 无感恢复。
+11. 不在本阶段承诺 50 CPS 或万级并发；只完成可量化的首版并发基线和水平扩展验证。
 
 ## 7. 总体架构
 
@@ -200,7 +201,7 @@ flowchart TB
   AgentServer --> Job["Per-call JobContext"]
 
   Job --> Claim["SipInboundClaimService<br/>校验 / 幂等认领"]
-  Claim --> Record["ai_call_record<br/>entry_type=sip_inbound"]
+  Claim --> Database["AI Call DB<br/>record / event / dialogue / analysis"]
   Job --> Transport["JobContextRoomAudioTransport"]
   Transport --> Room
   Job --> Runner["RealtimeCallAgentRunner"]
@@ -209,15 +210,15 @@ flowchart TB
 
   Room --> Egress["LiveKit Egress"]
   Egress --> Recording["录音 / 分轨 / OSS"]
+  Recording --> PostCall["recording reconcile<br/>offline ASR / semantic analysis"]
+  PostCall --> Database
+  Job --> Persistence["event / dialogue persistence"]
+  Persistence --> Database
 
-  Api["AI Call API"] --> Record
-  Api --> Command["ai_call_command"]
-  Command --> Job
-  Api --> Token["坐席 Room Token"]
-  Token --> Room
+  Api["AI Call API<br/>查询 / 运维"] --> Database
 
   Webhook["LiveKit webhook"] --> Reconcile["Webhook reconciliation"]
-  Reconcile --> Record
+  Reconcile --> Database
 ```
 
 ## 8. 组件职责
@@ -226,12 +227,13 @@ flowchart TB
 |---|---|---|
 | inbound trunk | 号码、SIP 来源、认证、安全边界 | 业务场景、Qwen、数据库 |
 | dispatch rule | 为 caller 选 Room、触发指定 Agent | 启动业务记录、处理 P1 |
-| AgentServer | worker 注册、Job 分配、进程隔离、优雅退出 | 业务状态、录音、handoff |
-| JobContext entrypoint | 连接 Room、识别 caller、组织单通生命周期 | 维护全局坐席队列 |
+| AgentServer | worker 注册、Job 分配、进程隔离、优雅退出 | 业务状态、录音、语义分析 |
+| JobContext entrypoint | 连接 Room、识别 caller、组织单通生命周期 | 全局 trunk 管理、批处理 |
 | SipInboundClaimService | 校验 attributes、生成幂等键、创建或返回 call record | 创建 trunk/rule |
 | JobContextRoomAudioTransport | 绑定 `ctx.room`、订阅 caller、发布 AI 音轨 | 签发独立 Room Token |
-| RealtimeCallAgentRunner | Qwen、播放、P1、话轮、结束、挂起 | 管理 trunk/rule |
-| AI Call API | 查询、坐席操作、Token、控制命令 | 直接持有呼入 Runner |
+| RealtimeCallAgentRunner | Qwen、播放、P1、话轮、结束 | 管理 trunk/rule |
+| 通话后处理 worker | 录音对账、offline ASR、语义分析和漏跑补偿 | 持有实时 Qwen Session |
+| AI Call API | 通话、录音、对话、语义分析查询和运维入口 | 直接持有呼入 Runner |
 | webhook reconciler | 外部事实、异常补偿、终态对账 | 正常启动 Agent |
 
 ## 9. Trunk 和 Dispatch Rule 设计
@@ -356,7 +358,7 @@ sequenceDiagram
 11. worker 启动 Egress 录音，并记录实际 SIP participant identity 和实际 Agent identity。
 12. worker 启动 Qwen Runner 和 JobContext Room transport。
 13. caller 音轨和 AI 音轨准备完成后，worker 播放开场白。
-14. 通话中沿用现有 Qwen、P1、handoff 和结束状态机。
+14. 通话中沿用现有 Qwen、P1 和结束状态机。
 15. caller 离开后，worker 先收敛实时任务，再停止录音并写通话终态。
 16. webhook 对 `participant_left` 和 `room_finished` 做最终补偿。
 
@@ -454,7 +456,7 @@ Phase F 复用现有 `CallSessionStatus`，不为 SIP 呼入另建一套通话�
 | `ai_thinking` | Qwen 正在处理 |
 | `ai_speaking` | AI 正在播放 |
 | `interrupted` | AI 输出被确认打断 |
-| `waiting` | AI 因转人工等原因挂起 |
+| `waiting` | 保留现有枚举兼容；AI-only 呼入正常流程不进入该状态 |
 | `ending` | 正在关闭 Qwen、音轨、录音和任务 |
 | `completed` | 正常终态 |
 | `failed` | 技术或策略失败终态 |
@@ -489,32 +491,7 @@ Phase F 复用现有 `CallSessionStatus`，不为 SIP 呼入另建一套通话�
 3. `sip_trunk_id + started_at` 普通索引，用于线路排障。
 4. 第一版不新增 SIP 呼入专表。
 
-### 14.2 新增 `ai_call_command`
-
-呼入 worker 和 API 不共享内存，需要一张持久化命令表。
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---:|---|
-| `id` | `bigint` | 是 | 雪花主键 |
-| `command_id` | `varchar(64)` | 是 | 命令业务 ID，唯一 |
-| `call_id` | `varchar(64)` | 是 | 目标通话 |
-| `command_type` | `varchar(32)` | 是 | 命令类型 |
-| `payload_json` | `text` | 否 | 脱敏后的命令参数 |
-| `status` | `varchar(20)` | 是 | `pending/claimed/succeeded/failed/expired` |
-| `created_at` | `timestamp with time zone` | 是 | 创建时间 |
-| `claimed_at` | `timestamp with time zone` | 否 | worker 认领时间 |
-| `completed_at` | `timestamp with time zone` | 否 | 执行完成时间 |
-| `error_message` | `varchar(500)` | 否 | 脱敏后的失败摘要 |
-
-第一版命令仅包括：
-
-1. `suspend_for_handoff`
-2. `resume_after_handoff`
-3. `end_call`
-
-命令表不替代 `ai_call_event`：命令表表达“要求执行什么及结果”，事件表表达“实际上发生了什么”。
-
-### 14.3 不新增运行态主表
+### 14.2 不新增运行态主表
 
 LiveKit 已经负责 Job 分配和 worker ownership，Phase F 第一版不再复制一套完整 worker ownership 表。
 
@@ -522,7 +499,25 @@ LiveKit 已经负责 Job 分配和 worker ownership，Phase F 第一版不再复
 
 ## 15. Agent Worker 设计
 
-### 15.1 进程模型
+### 15.1 AgentServer 与 JobContext entrypoint
+
+| 概念 | 生命周期 | 责任 |
+|---|---|---|
+| `AgentServer` | 服务启动后长期运行 | 向 LiveKit 注册 `agent_name`、等待派单、上报负载、接受 Job、管理优雅摘流和 Job 进程 |
+| `JobContext entrypoint` | 每个被接受的 Job 执行一次 | 获得当前 `ctx.room` 和 job metadata，编排一通呼入从连接到 cleanup 的完整生命周期 |
+
+`AgentServer` 不是每通电话单独部署的服务。一个 AgentServer 实例可以持续接收多个 Job，但每通电话仍由独立 Job 执行 entrypoint，避免单通失败直接污染其他通话。
+
+`JobContext` 是 LiveKit 交给单通 Job 的运行上下文，主要使用：
+
+1. `ctx.room`：当前呼入已分配的 LiveKit Room。
+2. `ctx.job.metadata`：dispatch rule 传入的 schema、`entryType` 和 `routeKey`。
+3. `ctx.worker_id` / Job 标识：日志、事件和故障关联。
+4. `ctx.connect()` / participant 等待能力：连接 Room 并找到真实 SIP caller。
+
+Phase F 只使用 LiveKit Agents 的 dispatch、Job 隔离、Room 和生命周期能力，不强制创建标准 `AgentSession`，不改写现有 Qwen Realtime 端到端音频链路。
+
+### 15.2 进程模型
 
 新增独立启动入口，例如：
 
@@ -540,7 +535,7 @@ app/workers/ai_call_inbound_agent.py
 
 API 服务和 Agent worker 可以使用同一代码仓库与镜像，但必须是两个独立进程/Deployment，不能在 FastAPI startup 中顺带启动 AgentServer。
 
-### 15.2 JobContext entrypoint
+### 15.3 JobContext entrypoint
 
 entrypoint 只做单通编排：
 
@@ -550,13 +545,35 @@ entrypoint 只做单通编排：
 4. 幂等认领通话。
 5. 创建单 Job runtime 依赖。
 6. 启动录音、Qwen、transport 和 opening。
-7. 监听实时控制命令。
-8. 等待 caller 离开或本地结束。
-9. 执行幂等 cleanup。
+7. 等待 caller 离开或 AI 本地结束。
+8. 执行幂等 cleanup。
 
 不要把全局 trunk 管理、坐席队列或批处理塞入 Job entrypoint。
 
-### 15.3 Runtime factory
+结构伪代码：
+
+```python
+server = AgentServer()
+
+
+@server.rtc_session(agent_name="ai-call-inbound")
+async def inbound_call_entrypoint(ctx: JobContext):
+    register_room_listeners(ctx.room)
+    await ctx.connect()
+    sip_participant = await wait_for_verified_sip_participant(ctx)
+    call = await claim_sip_inbound_call(ctx, sip_participant)
+
+    runtime = build_inbound_runtime(
+        ctx=ctx,
+        call=call,
+        sip_participant=sip_participant,
+    )
+    await runtime.run_until_call_ends()
+```
+
+伪代码只表达 ownership 和时序；具体 API 以 F0 锁定的 `livekit-agents` 版本为准。
+
+### 15.4 Runtime factory
 
 当前 Runner 构造逻辑集中在 `AiCallOrchestrator._build_default_agent_runner()`。
 
@@ -570,7 +587,7 @@ Phase F 应抽取一个最小 runtime factory，用于统一构造：
 
 现有 Web/外呼 Orchestrator 和呼入 worker 共用该 factory。factory 不负责 Room 创建、trunk、dispatch 或数据库认领。
 
-### 15.4 单 Job 内存态
+### 15.5 单 Job 内存态
 
 Runner 现有字典以 `call_id` 为键。每个 Job 独立进程后，可以继续使用：
 
@@ -615,10 +632,10 @@ target identity = 实际 inbound SIP participant identity
 
 1. transport 注册前音轨已经存在。
 2. transport 注册后 caller 才发布音轨。
-3. Room 后续加入 human agent。
+3. Room 后续加入未知非 SIP participant。
 4. Room 出现额外 SIP participant。
 
-human agent 或其他 participant 音轨不能被错误发送给 Qwen。
+非目标 participant 音轨不能被错误发送给 Qwen。
 
 ### 16.4 Agent identity
 
@@ -680,11 +697,12 @@ Phase F 不重写 SIP P1。
 
 当前 event/dialogue listener 主要在 API 进程配置。呼入 Runner 位于独立 Job 进程后，API 进程不会自动收到 worker 的内存事件。
 
-每个 Job 必须显式创建并绑定：
+每个 Job 必须将本地 event/dialogue store 显式绑定到持久化 sink：
 
 1. event persistence listener
 2. dialogue persistence listener
-3. handoff realtime coordinator
+
+listener 按 Job 绑定，sink 可以由 worker 进程共享并批量写入数据库，不必为每通电话创建独立数据库连接池。
 
 Job 结束前应在有限超时内 drain 持久化队列；超时写 cleanup failure，但不能无限阻塞 Job 退出。
 
@@ -699,71 +717,26 @@ Job 结束前应在有限超时内 drain 持久化队列；超时写 cleanup fai
 | `agent_job_restarted` | worker | 活跃通话发生 Job 重派 |
 | `sip_media_connected` | transport | caller 音轨已可消费 |
 | `opening_started` | runner | 开场白开始发布 |
-| `runtime_command_claimed` | worker | 控制命令已认领 |
-| `runtime_command_succeeded` | worker | 控制命令成功 |
-| `runtime_command_failed` | worker | 控制命令失败 |
+| `recording_started` | recording service | 混音和两条分轨已启动 |
+| `post_call_processing_ready` | worker/reconciler | 实时通话已结束，可进入后处理 |
+| `semantic_analysis_reconciled` | semantic reconciler | 发现并补做了漏跑分析 |
 | `agent_job_ended` | worker | Job cleanup 完成 |
 | `webhook_reconciled` | webhook | webhook 执行了状态补偿 |
 
 事件 payload 不保存原始手机号、完整 SIP headers、Token、API Key 或未脱敏异常对象。
 
-## 20. 跨进程控制与转人工
+## 20. AI-only 运行控制边界
 
-### 20.1 为什么不能直接调用 Orchestrator
+呼入 Runner 在 Agent Job 进程，API 中的 `AiCallOrchestrator.registry` 无法访问该 Runner。但本阶段没有转人工、挂起或恢复命令，因此不新增通用命令表、Redis 命令通道、Data Packet ACK 或 handoff reconciler。
 
-呼入 Runner 在 Agent Job 进程，API 中的 `AiCallOrchestrator.registry` 无法访问该 Runner。
+正常结束只由当前 Job 内的实时事实触发：
 
-因此以下调用不能继续直接依赖 API 内存：
+1. caller 离开 Room。
+2. 现有 call-end policy 或 Qwen tool 决定结束。
+3. Qwen、媒体或安全校验失败后按策略结束。
+4. JobContext 进入 shutdown。
 
-1. `suspend_for_handoff`
-2. `resume_after_handoff`
-3. `end_session`
-
-### 20.2 持久化命令 + Redis 通知
-
-控制流程：
-
-```text
-API
-  -> 写 ai_call_command(status=pending)
-  -> 提交数据库事务
-  -> Redis publish ai-call:command:{call_id} command_id
-  -> worker 读取命令并原子 claimed
-  -> 执行 Runner 动作
-  -> 更新 succeeded / failed
-  -> 写 runtime command 事件
-```
-
-可靠性规则：
-
-1. 数据库命令表是事实源，Redis 只负责低延迟唤醒。
-2. Redis publish 失败不回滚已提交命令；worker 定期补查 pending 命令。
-3. worker 启动或重派后必须先扫描该 `call_id` 的 pending 命令。
-4. 命令按 `command_id` 幂等，成功命令不能重复执行副作用。
-5. `suspend/resume` 必须携带 `handoff_id`，执行前核对数据库当前 handoff，避免旧命令作用于新状态。
-6. `end_call` 对已终态通话返回幂等成功。
-
-### 20.3 AI 主动转人工
-
-当同一 Job 内的 Runner 识别到高可信转人工意图时，优先在 worker 内完成实时动作：
-
-1. 创建或取得 active handoff 记录。
-2. 立即挂起当前 Runner。
-3. 清空播放队列并停止新的模型回复。
-4. 进入 `waiting`。
-5. 持久化 handoff 和事件。
-
-不需要先绕到 API 再返回 worker，避免增加实时控制延迟。
-
-### 20.4 坐席接入
-
-坐席 API：
-
-1. 从数据库读取 `call_id`、`room_name`、通话状态和 handoff 状态。
-2. 使用实际 Room 签发 `human-agent-{handoff_id}` Token。
-3. 不通过 `InMemorySessionRegistry` 查找呼入 session。
-4. 坐席加入后，AI 保持挂起。
-5. 坐席离开或 handoff 失败时，根据现有 B3/B3.1 规则决定终态或恢复命令。
+如运维人员需要强制结束异常通话，API 直接调用 LiveKit RoomService 删除目标 Room。worker 和 webhook 按 `room_finished` / participant 离开进入幂等 cleanup，不为该单一操作建设通用跨进程命令系统。
 
 ## 21. 录音与通话后处理
 
@@ -774,9 +747,10 @@ worker 认领通话并得到实际 participant identities 后启动：
 1. Room composite egress。
 2. SIP caller participant egress。
 3. Agent participant egress。
-4. handoff 后的 human agent participant egress。
 
 录音服务必须使用实际 identity，不能依赖呼入 identity 前缀或固定 Agent identity。
+
+三份产物均属于 Phase F 必须验收范围：混音用于人工回听，客户分轨用于 offline ASR 和客户表达复核，AI 分轨用于核对当场实际播放内容。
 
 ### 21.2 录音失败策略
 
@@ -791,9 +765,10 @@ Phase F 上线前必须由业务和合规明确采用哪一种；在决定前，
 
 1. worker 完成实时终态和录音停止请求。
 2. API 侧 recording reconciler 继续核对 Egress 产物。
-3. 录音关闭后进入现有 offline ASR。
-4. 对话和录音证据准备完成后进入现有 semantic analysis。
-5. handoff 后 snapshot 契约继续沿用 Phase B5。
+3. 客户分轨关闭后进入现有 offline ASR；AI 分轨作为播放审计证据，AI 文本优先使用 realtime dialogue。
+4. 对话、录音和 offline ASR 证据准备完成后，快速路径立即将 `call_id` 提交给现有 semantic analysis worker。
+5. 新增专用 semantic analysis reconciler，分批扫描“通话已终态 + 录音/ASR 已就绪 + 分析缺失、pending、可重试 failed 或超时 running”的记录并幂等补做。
+6. 语义分析必须保存 transcript snapshot/hash，并输出来电目的、核心诉求、已解决/未解决事项、是否需回访、回访原因、时间要求和可回溯证据。
 
 ## 22. Webhook 设计
 
@@ -805,7 +780,7 @@ webhook 负责：
 2. 在 worker 尚未认领时调用同一 claim service 创建最小记录。
 3. 发现没有 Agent Job 的孤儿来电。
 4. worker 未写终态时补充 `remote_hangup`、`room_finished` 或 `runtime_failed`。
-5. 触发录音和 handoff 的最终 reconciliation。
+5. 触发录音和通话后分析的最终 reconciliation。
 
 webhook 不负责：
 
@@ -832,11 +807,11 @@ webhook 不负责：
 | 没有可用 worker | webhook/reconciler | 超过 dispatch grace period 后标记 `agent_dispatch_timeout`，告警，不由 webhook 临时启动 Agent |
 | 数据库不可用 | worker claim | 不启动 Qwen，播放本地故障提示后结束 |
 | prompt 解析失败 | worker preparing | 记录 `prompt_resolve_failed`，不使用任意默认业务提示词 |
-| Qwen 连接失败 | Runner | 本地故障提示，按策略转人工或结束 |
+| Qwen 连接失败 | Runner | 播放本地故障提示后结束 |
 | caller 无音轨 | transport timeout | `media_timeout`，结束或提示后结束 |
 | 录音失败 | recording service | 按已确认的 fail-open/fail-closed 策略 |
 | worker 中途崩溃 | LiveKit AgentServer | Job 重派，幂等认领原记录 |
-| Redis 通知失败 | API/worker | 命令保留 pending，worker 补查数据库 |
+| 语义分析入队丢失或进程重启 | semantic reconciler | 从数据库发现未完成记录并幂等补做 |
 | webhook 重复/乱序 | reconciler | event id + 状态条件更新 |
 | cleanup 超时 | worker | 写 cleanup failure，释放 Job，后续 reconciler 补偿 |
 
@@ -846,11 +821,11 @@ webhook 不负责：
 
 1. 不创建新 `call_id`。
 2. 写包含新 `job_id/worker_id` 的 `agent_job_restarted` 事件。
-3. 重新读取当前通话、handoff 和 pending command 状态。
+3. 重新读取当前通话、已持久化对话和录音状态。
 4. 重新建立 Qwen Session。
 5. 第一版不承诺恢复原 Qwen 隐状态。
 6. 有可信对话文本时，可以在后续实现中构造有限恢复摘要；本阶段不提前设计完整会话重放。
-7. 重建失败时优先转人工；无可用人工时播放本地提示并结束。
+7. 重建失败时播放本地提示并结束，不承诺无感续接。
 
 ## 24. 配置设计
 
@@ -866,7 +841,6 @@ AI_CALL_SIP_INBOUND_ROUTE_KEY
 AI_CALL_SIP_INBOUND_AGENT_DISPATCH_TIMEOUT_SECONDS
 AI_CALL_SIP_INBOUND_PARTICIPANT_TIMEOUT_SECONDS
 AI_CALL_SIP_INBOUND_MEDIA_TIMEOUT_SECONDS
-AI_CALL_RUNTIME_COMMAND_REDIS_PREFIX
 ```
 
 默认原则：
@@ -892,15 +866,12 @@ AI_CALL_RUNTIME_COMMAND_REDIS_PREFIX
 5. AI Call API。
 6. `ai-call-inbound` AgentServer worker pool。
 7. 业务数据库。
-8. AI Call runtime command Redis 或独立逻辑命名空间。
-
-LiveKit Redis 和应用命令 Redis 可以物理复用，但必须使用独立 key prefix、权限和容量监控；正式环境更推荐逻辑隔离，避免应用命令流量影响 LiveKit 控制面。
 
 ### 25.2 网络
 
 1. SIP signaling 和 RTP 端口按 `livekit-sip` 要求对运营商开放。
 2. LiveKit API/Twirp endpoint、Redis 和数据库优先走国内内网/VPC。
-3. Agent worker 只需要主动连接 LiveKit、数据库、Redis 和 DashScope，不暴露公网业务端口。
+3. Agent worker 只需要主动连接 LiveKit、数据库和 DashScope，不暴露公网业务端口。
 4. Twirp 是 HTTP 控制面，不承载 SIP/RTP 音频；国内风险主要来自跨境网络和公网媒体端口，而不是 Twirp 协议本身。
 5. 项目继续优先使用官方 SDK；只有 SDK 不可用或版本不兼容时才使用显式、可观测的 Twirp fallback。
 
@@ -910,7 +881,8 @@ LiveKit Redis 和应用命令 Redis 可以物理复用，但必须使用独立 k
 2. worker readiness 必须包含 LiveKit 注册状态和必要配置校验。
 3. 发布时使用 AgentServer graceful drain，不接受新 Job，等待存量通话结束。
 4. 单 Job 崩溃不能导致同 worker 上其他通话一起失败。
-5. 上线前必须根据实际模型内存、CPU 和目标并发完成容量测试，不使用拍脑袋并发值。
+5. F0 先完成 1～2 路真实同时呼入；Phase F 首版验收基线为 10 路稳定并发。
+6. 本阶段不验收 50 CPS；但必须记录单 Job CPU、内存、带宽和 Qwen 连接占用，为后续扩容保留实测基线。
 
 ## 26. 可观测性
 
@@ -939,10 +911,13 @@ LiveKit Redis 和应用命令 Redis 可以物理复用，但必须使用独立 k
 6. `job_started_to_media_connected_ms`
 7. `media_connected_to_opening_audio_ms`
 8. `qwen_connect_ms`
-9. `runtime_command_latency_ms`
-10. `recording_start_failed_total`
-11. `webhook_reconcile_total`
-12. `sip_inbound_terminal_reason_total`
+9. `recording_start_failed_total`
+10. `recording_tracks_completed_total`
+11. `semantic_analysis_pending_total`
+12. `semantic_analysis_reconcile_total`
+13. `semantic_analysis_failed_total`
+14. `webhook_reconcile_total`
+15. `sip_inbound_terminal_reason_total`
 
 P95/P99 阈值和目标并发必须在真实 PoC 基线后写入上线清单；本设计不虚构尚未测量的延迟目标。
 
@@ -955,8 +930,8 @@ P95/P99 阈值和目标并发必须在真实 PoC 基线后写入上线清单；�
 5. 控制面使用内网或 TLS，禁止将 Redis 和数据库暴露到公网。
 6. caller/dialed number 只保存 hash 和 masked 值。
 7. webhook 必须继续验证 LiveKit 签名。
-8. 控制命令执行前校验 call/handoff 当前状态，防止重放旧命令。
-9. 日志和事件不保存 SIP auth、JWT、DashScope key、完整 headers 和原始客户隐私数据。
+8. 日志和事件不保存 SIP auth、JWT、DashScope key、完整 headers 和原始客户隐私数据。
+9. 录音、分轨、对话 snapshot 和语义分析结果必须纳入访问控制、保留周期和删除策略。
 
 ## 28. 实施分期
 
@@ -999,17 +974,17 @@ F0 不接现有 Qwen 和业务记录。
 5. 录音和终态。
 6. webhook joined/left/room finished reconciliation。
 
-### 28.4 F3：转人工与跨进程控制
+### 28.4 F3：录音与通话后分析闭环
 
-目标：API 和坐席可以可靠控制 worker 中的实时通话。
+目标：每通呼入都能留下可回听、可复核、可用于后续回访的完整证据。
 
 必须完成：
 
-1. `ai_call_command`。
-2. Redis 低延迟通知和数据库补查。
-3. suspend/resume/end 幂等执行。
-4. 坐席 Token 从数据库 Room 信息签发。
-5. AI 主动转人工的 worker-local 闭环。
+1. 混音录音、客户分轨和 AI 分轨完整关闭。
+2. recording reconciler 可发现 Egress 延迟、失败和缺失产物。
+3. 客户分轨 offline ASR 和 realtime dialogue 合并。
+4. 语义分析快速入队与数据库 reconciliation 补偿。
+5. 回访结果字段、transcript snapshot/hash 和原始证据关联。
 
 ### 28.5 F4：生产加固
 
@@ -1020,8 +995,8 @@ F0 不接现有 Qwen 和业务记录。
 1. 双 worker 与滚动发布。
 2. Job 崩溃和重派测试。
 3. webhook 重复、乱序和丢失测试。
-4. Redis、数据库、Qwen、Egress 故障演练。
-5. 目标并发压测和容量结论。
+4. LiveKit Redis、数据库、Qwen、Egress 故障演练。
+5. 10 路稳定并发验收和容量基线记录。
 6. 告警、runbook、回滚路径和运营商联调记录。
 
 ## 29. 验收矩阵
@@ -1033,16 +1008,18 @@ F0 不接现有 Qwen 和业务记录。
 3. 开场白、客户讲话、AI 回复均可听见。
 4. AI 播放期间客户插话，SIP P1 正常。
 5. 同一通话内可以从综合接待切换到不同业务主题。
-6. 转人工后 AI 停止，坐席与客户双向通话。
-7. 客户挂机后记录、录音、对话和语义分析闭环。
+6. 客户挂机后记录、混音、客户/AI 分轨、对话和语义分析闭环。
+7. 语义分析输出来电目的、核心诉求、未解决事项、是否需回访、回访原因和证据。
+8. 10 路同时呼入不串 Room、不串音轨、不串记录和分析结果。
 
 ### 29.2 幂等验收
 
 1. 同一 `participant_joined` webhook 重放多次仍只有一条记录。
 2. worker 和 webhook 同时认领仍只有一个 `call_id`。
 3. worker 重派不创建第二条记录。
-4. `end_call` 命令重试不会重复执行破坏性动作。
-5. 已终态记录不会被晚到 webhook 改回运行态。
+4. 重复录音关闭通知不创建重复后处理任务。
+5. 语义分析快速入队和 reconciler 同时触发时只有一个执行者取得 claim。
+6. 已终态记录不会被晚到 webhook 改回运行态。
 
 ### 29.3 故障验收
 
@@ -1052,10 +1029,11 @@ F0 不接现有 Qwen 和业务记录。
 4. caller 音轨未出现。
 5. Qwen 连接失败或中途断开。
 6. Egress 启动或停止失败。
-7. Redis publish 失败。
-8. 数据库短暂不可用。
-9. worker 通话中崩溃。
-10. API 和 worker 分别滚动发布。
+7. 语义分析入队后 API/worker 进程立即重启。
+8. 语义分析长时间停留 `running` 或模型调用失败。
+9. 数据库短暂不可用。
+10. worker 通话中崩溃。
+11. API 和 worker 分别滚动发布。
 
 ### 29.4 证据要求
 
@@ -1069,7 +1047,7 @@ F0 不接现有 Qwen 和业务记录。
 6. 录音与分轨
 7. 对话文本
 8. P1 summary
-9. handoff 记录（如适用）
+9. 语义分析结果、transcript snapshot/hash 和证据关联
 10. 最终状态和结束原因
 
 ## 30. 上线和回滚
@@ -1104,10 +1082,11 @@ trunk/rule 变更必须由运维显式执行并记录，不由应用在启动或
 2. 公司公开号码和测试号码分别是什么。
 3. `company_reception` prompt profile 的正式内容、开场白和允许业务主题。
 4. 录音失败采用 fail-open 还是 fail-closed。
-5. 无人工可接时的业务处理：恢复 AI、留言还是结束通话。
-6. 目标峰值并发、可接受的开场延迟和可用性目标。
-7. worker 重派后是否需要基于已持久化对话做有限上下文恢复。
-8. 公开号码回滚时的运营商备用路由。
+5. 录音、分轨、对话和语义分析的保留周期、访问权限和删除策略。
+6. 语义分析回访字段的正式 schema 和业务解释。
+7. 首版 10 路稳定并发、可接受的开场延迟和可用性目标。
+8. worker 重派后是否需要基于已持久化对话做有限上下文恢复。
+9. 公开号码回滚时的运营商备用路由。
 
 ## 32. 最终结论
 
@@ -1120,15 +1099,16 @@ self-hosted livekit-sip
   -> roomConfig.agents explicit dispatch
   -> AgentServer / JobContext per-call worker
   -> existing Qwen Realtime Runner
-  -> existing P1 / recording / dialogue / handoff / semantic closure
+  -> existing P1 / recording / dialogue
+  -> recording reconcile / offline ASR / semantic closure
 ```
 
 这不是对现有 AI 通话业务能力的重写，而是把 SIP 呼入的实时运行 ownership 从 API 进程迁到专用 Job worker。
 
-Phase F 最大的工程风险不是 Qwen 兼容性，而是以下三个跨进程边界：
+Phase F 最大的工程风险不是 Qwen 兼容性，而是以下三个可靠性边界：
 
 1. worker 内事件和对话必须独立持久化。
-2. API 对实时通话的控制必须通过持久化命令完成。
+2. 录音、offline ASR 和语义分析必须通过数据库状态和 reconciler 最终闭环。
 3. worker/webhook/Job 重派必须通过 SIP call key 幂等认领同一 `call_id`。
 
 只有这三个边界通过故障和并发验收，才能把公开号码呼入称为正式生产能力。
