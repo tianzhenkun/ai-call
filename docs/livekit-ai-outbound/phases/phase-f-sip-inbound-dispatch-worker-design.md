@@ -33,7 +33,7 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 4. 复用现有 `RealtimeCallAgentRunner`、Qwen Realtime、SIP P1、录音、对话和通话结束能力。
 5. 支持多个 worker、并发通话、优雅发布和单通故障隔离。
 6. 保证来电认领、webhook、worker 重启、录音后处理和语义分析具有幂等性。
-7. 呼入初始定位为“公司综合接待”，同一通话内可以切换业务主题，不因主题切换重建 Room 或 Qwen Session。
+7. 呼入初始定位为“公司综合接待”；首版只识别和记录客户关注主题，不因主题变化切换 prompt、知识权限、Room 或 Qwen Session。
 
 ### 2.2 已知约束
 
@@ -53,7 +53,7 @@ Phase F 采用正式生产目标设计，不先建设一套由 webhook 在 API �
 4. 录音、分轨、对话文本、关键事件和通话后语义分析可按 `call_id` 查询。
 5. 混音录音、客户分轨和 AI 分轨均能最终关闭并可查询，语义分析产出可回溯原始对话证据的回访信息。
 6. 客户挂机、AI 主动结束、worker 失败和 Room 结束都能进入明确终态。
-7. 重复 webhook、Job 重派、录音补偿和语义分析重试不产生重复记录或重复副作用。
+7. 重复 webhook、Job 重派、录音补偿和语义分析重试不产生重复记录或重复副作用；Job 重派首版只保证故障收口，不保证继续原对话。
 8. 双 worker 部署和滚动发布不主动中断已有通话。
 
 ## 3. 当前代码事实
@@ -424,11 +424,11 @@ entry_type in {sip_inbound, sip_outbound}
 
 1. `sip.callIDFull` 存在：`full:<sip.callIDFull>`。
 2. 否则使用：`trunk:<sip.trunkID>|call:<sip.callID>`。
-3. attributes 不完整时，仅作为诊断兜底：`room:<room_name>|participant:<identity>`。
+3. attributes 不完整时，`room:<room_name>|participant:<identity>` 仅作为诊断关联键，不作为正式通话幂等键。
 
 数据库只保存 canonical key 的稳定 hash，不保存完整原文。
 
-兜底键必须写 `sip_idempotency_weak` 事件；正式验收中如果出现兜底键，应先修复 SIP attributes，再扩大流量。
+弱关联键必须写 `sip_idempotency_weak` 告警。webhook 不使用弱关联键创建正式通话记录；worker 缺少关键 SIP attributes 时按安全校验失败处理。正式验收中如果出现弱关联键，应先修复 SIP attributes，再扩大流量。
 
 ### 12.3 认领事务
 
@@ -483,6 +483,7 @@ Phase F 复用现有 `CallSessionStatus`，不为 SIP 呼入另建一套通话�
 | `caller_phone_number_masked` | `varchar(32)` | 否 | 呼入主叫号码脱敏展示 |
 | `dialed_phone_number_hash` | `varchar(80)` | 否 | 客户拨打的公司号码指纹 |
 | `dialed_phone_number_masked` | `varchar(32)` | 否 | 客户拨打的公司号码脱敏展示 |
+| `dialogue_persistence_status` | `varchar(16)` | 否 | `complete` 或 `uncertain`；呼入 Job 的对话持久化完整性 |
 
 索引：
 
@@ -673,8 +674,8 @@ routeKey=company_reception
 1. 同一个 `call_id`。
 2. 同一个 LiveKit Room。
 3. 同一个 Qwen Realtime Session。
-4. 根据客户兴趣在合同、单证、海外增长、GEO、催收等业务主题间切换。
-5. 主题切换写 `business_topic_switched` 事件，不重建 Job。
+4. 综合接待提示词只提供允许范围内的业务介绍，不在通话中动态替换完整 `intro_*` prompt、知识权限或工具集合。
+5. 实时识别结果写 `business_topic_detected` 事件，仅作为提示性证据；最终关注主题由通话后语义分析确认。
 6. `ai_call_record.scene_code` 记录入口提示词配置，不承担逐轮主题历史。
 
 正式实现前需要新增或确认 `company_reception` prompt profile；在该 profile 可查询且 preview 通过之前，不把任意 `intro_*` 场景硬编码为呼入默认值。
@@ -705,6 +706,12 @@ Phase F 不重写 SIP P1。
 listener 按 Job 绑定，sink 可以由 worker 进程共享并批量写入数据库，不必为每通电话创建独立数据库连接池。
 
 Job 结束前应在有限超时内 drain 持久化队列；超时写 cleanup failure，但不能无限阻塞 Job 退出。
+
+首版不建设通用事件溯源或消息平台，但必须保存最小完整性状态：
+
+1. 正常 drain 完成：`dialogue_persistence_status=complete`。
+2. Job 异常重派、drain 超时或无法确认写入完整：`dialogue_persistence_status=uncertain`。
+3. `uncertain` 必须进入通话后分析准入判断，不能默认对话证据完整。
 
 ### 19.2 新增事件建议
 
@@ -754,21 +761,20 @@ worker 认领通话并得到实际 participant identities 后启动：
 
 ### 21.2 录音失败策略
 
-技术设计支持两种业务策略：
+Phase F 首版采用受控 fail-open：录音启动或产物失败时记录高优先级事件和明确的完整性状态，继续公司综合接待，但通话后分析必须按证据情况降级为人工复核或证据不足，不能静默忽略失败，也不能输出不受证据支持的强业务结论。
 
-1. fail-open：记录高优先级事件并继续接待。
-2. fail-closed：播放故障提示并结束，不允许无录音通话继续。
-
-Phase F 上线前必须由业务和合规明确采用哪一种；在决定前，不能把录音失败静默忽略。
+连续或批量录音失败先通过告警和人工摘流处理，不在首版建设动态熔断平台。若后续进入依法必须全程录音的业务，再按具体场景单独设计 fail-closed。
 
 ### 21.3 通话后处理
 
 1. worker 完成实时终态和录音停止请求。
 2. API 侧 recording reconciler 继续核对 Egress 产物。
 3. 客户分轨关闭后进入现有 offline ASR；AI 分轨作为播放审计证据，AI 文本优先使用 realtime dialogue。
-4. 对话、录音和 offline ASR 证据准备完成后，快速路径立即将 `call_id` 提交给现有 semantic analysis worker。
+4. 只有通话已终态、录音已进入明确终态、offline ASR 已成功或明确失败/超时、对话持久化状态已明确时，快速路径才将 `call_id` 提交给现有 semantic analysis worker。
 5. 新增专用 semantic analysis reconciler，分批扫描“通话已终态 + 录音/ASR 已就绪 + 分析缺失、pending、可重试 failed 或超时 running”的记录并幂等补做。
-6. 语义分析必须保存 transcript snapshot/hash，并输出来电目的、核心诉求、已解决/未解决事项、是否需回访、回访原因、时间要求和可回溯证据。
+6. 语义分析继续使用 transcript snapshot/hash 做幂等判断；hash 未变化不重复分析，晚到证据导致 hash 变化时允许补做。
+7. 证据完整时输出正常结果；offline ASR 失败但 realtime dialogue 可用，或对话完整性为 `uncertain` 时进入人工复核；两类证据都不足时输出证据不足，不生成强业务结论。
+8. 正常结果必须包含来电目的、核心诉求、已解决/未解决事项、是否需回访、回访原因、时间要求和可回溯证据。具体状态值优先复用现有语义分析枚举，不为 Phase F 新建平行状态体系。
 
 ## 22. Webhook 设计
 
@@ -777,10 +783,12 @@ Phase F 上线前必须由业务和合规明确采用哪一种；在决定前，
 webhook 负责：
 
 1. 记录 LiveKit 观察到的 participant/Room 外部事实。
-2. 在 worker 尚未认领时调用同一 claim service 创建最小记录。
+2. 在具备强 SIP 幂等键时，可以调用同一 claim service 创建 `status=created` 的最小观察记录；运行态只能由 worker 推进。
 3. 发现没有 Agent Job 的孤儿来电。
 4. worker 未写终态时补充 `remote_hangup`、`room_finished` 或 `runtime_failed`。
 5. 触发录音和通话后分析的最终 reconciliation。
+
+webhook 创建的最小记录不得写 `answered_at`，也不得推进 `preparing`、`ready` 或 `connected`。超过 dispatch 宽限时间仍没有 `agent_job_started` / worker 认领证据时，由 reconciler 收口为 `agent_dispatch_timeout`。
 
 webhook 不负责：
 
@@ -803,13 +811,13 @@ webhook 不负责：
 |---|---|---|
 | trunk/rule 不匹配 | worker preflight | 拒绝、记录、结束 Room |
 | SIP participant 超时 | Job entrypoint | `participant_timeout`，结束 Job |
-| SIP attributes 缺失 | claim/preflight | 使用弱幂等键并告警；关键校验缺失则拒绝 |
+| SIP attributes 缺失 | claim/preflight | 只生成弱诊断关联和告警；关键校验缺失则拒绝，不创建正式记录 |
 | 没有可用 worker | webhook/reconciler | 超过 dispatch grace period 后标记 `agent_dispatch_timeout`，告警，不由 webhook 临时启动 Agent |
-| 数据库不可用 | worker claim | 不启动 Qwen，播放本地故障提示后结束 |
+| 数据库不可用 | worker claim | 不启动 Qwen；最小本地音频发布能力可用时播放固定故障提示，否则直接结束 |
 | prompt 解析失败 | worker preparing | 记录 `prompt_resolve_failed`，不使用任意默认业务提示词 |
 | Qwen 连接失败 | Runner | 播放本地故障提示后结束 |
 | caller 无音轨 | transport timeout | `media_timeout`，结束或提示后结束 |
-| 录音失败 | recording service | 按已确认的 fail-open/fail-closed 策略 |
+| 录音失败 | recording service | 首版受控 fail-open，记录完整性、降级后处理并告警 |
 | worker 中途崩溃 | LiveKit AgentServer | Job 重派，幂等认领原记录 |
 | 语义分析入队丢失或进程重启 | semantic reconciler | 从数据库发现未完成记录并幂等补做 |
 | webhook 重复/乱序 | reconciler | event id + 状态条件更新 |
@@ -821,11 +829,12 @@ webhook 不负责：
 
 1. 不创建新 `call_id`。
 2. 写包含新 `job_id/worker_id` 的 `agent_job_restarted` 事件。
-3. 重新读取当前通话、已持久化对话和录音状态。
-4. 重新建立 Qwen Session。
-5. 第一版不承诺恢复原 Qwen 隐状态。
-6. 有可信对话文本时，可以在后续实现中构造有限恢复摘要；本阶段不提前设计完整会话重放。
-7. 重建失败时播放本地提示并结束，不承诺无感续接。
+3. 将 `dialogue_persistence_status` 标记为 `uncertain`，停止把该记录视为正常连续对话。
+4. 首版不重新建立 Qwen Session，不恢复原话轮，也不继续业务对话。
+5. 最小本地音频发布能力可用时播放固定故障提示，然后结束 Room；播放失败时直接结束。
+6. worker/webhook/reconciler 继续补齐录音、终态和后处理状态。
+
+首版只保证幂等认领、故障终止和证据补偿。基于已持久化摘要继续对话属于后续增强，不是 Phase F 验收项。
 
 ## 24. 配置设计
 
@@ -960,6 +969,7 @@ F0 不接现有 Qwen 和业务记录。
 3. `CallSession.entry_type`。
 4. worker-local event/dialogue persistence。
 5. Qwen 双向音频和开场白。
+6. 不依赖数据库、Qwen 和 OSS 的最小固定故障音频发布能力。
 
 ### 28.3 F2：SIP 呼入记录闭环
 
@@ -984,7 +994,8 @@ F0 不接现有 Qwen 和业务记录。
 2. recording reconciler 可发现 Egress 延迟、失败和缺失产物。
 3. 客户分轨 offline ASR 和 realtime dialogue 合并。
 4. 语义分析快速入队与数据库 reconciliation 补偿。
-5. 回访结果字段、transcript snapshot/hash 和原始证据关联。
+5. 最小分析准入：通话终态、录音/ASR 明确终态、对话完整性状态和 transcript hash 幂等。
+6. 回访结果字段、transcript snapshot/hash 和原始证据关联。
 
 ### 28.5 F4：生产加固
 
@@ -1007,7 +1018,7 @@ F0 不接现有 Qwen 和业务记录。
 2. caller/dialed number 只以 hash/masked 形式出现。
 3. 开场白、客户讲话、AI 回复均可听见。
 4. AI 播放期间客户插话，SIP P1 正常。
-5. 同一通话内可以从综合接待切换到不同业务主题。
+5. 同一通话保持综合接待 prompt，能够识别和记录一个或多个客户关注主题，不动态切换 prompt、知识权限或 Qwen Session。
 6. 客户挂机后记录、混音、客户/AI 分轨、对话和语义分析闭环。
 7. 语义分析输出来电目的、核心诉求、未解决事项、是否需回访、回访原因和证据。
 8. 10 路同时呼入不串 Room、不串音轨、不串记录和分析结果。
@@ -1034,6 +1045,8 @@ F0 不接现有 Qwen 和业务记录。
 9. 数据库短暂不可用。
 10. worker 通话中崩溃。
 11. API 和 worker 分别滚动发布。
+
+worker 通话中崩溃的首版通过标准是：同一来电仍只有一个 `call_id`，新 Job 能标记证据不确定、结束 Room 并完成终态补偿；不要求继续原对话。
 
 ### 29.4 证据要求
 
@@ -1081,11 +1094,11 @@ trunk/rule 变更必须由运维显式执行并记录，不由应用在启动或
 1. 真实运营商/SBC 是否提供固定 SIP 出口 IP 或 SIP 认证。
 2. 公司公开号码和测试号码分别是什么。
 3. `company_reception` prompt profile 的正式内容、开场白和允许业务主题。
-4. 录音失败采用 fail-open 还是 fail-closed。
+4. 受控 fail-open 是否满足当前综合接待业务与合规要求；依法必须全程录音的后续场景另行确认 fail-closed。
 5. 录音、分轨、对话和语义分析的保留周期、访问权限和删除策略。
 6. 语义分析回访字段的正式 schema 和业务解释。
 7. 首版 10 路稳定并发、可接受的开场延迟和可用性目标。
-8. worker 重派后是否需要基于已持久化对话做有限上下文恢复。
+8. 后续阶段是否需要基于已持久化对话做有限上下文恢复；该能力不属于 Phase F 首版。
 9. 公开号码回滚时的运营商备用路由。
 
 ## 32. 最终结论
