@@ -10443,7 +10443,7 @@ async def test_realtime_agent_runner_defers_180ms_webrtc_shadow_without_stable_w
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_uses_continuous_webrtc_shadow_context_for_clear_local_modulation() -> None:
+async def test_realtime_agent_runner_does_not_let_continuous_webrtc_shadow_bypass_authority_guard() -> None:
     shadow = FakeSipVadShadowDetector(
         [
             SipVadShadowObservation(
@@ -10483,18 +10483,12 @@ async def test_realtime_agent_runner_uses_continuous_webrtc_shadow_context_for_c
             await runner.send_audio_frame(call_id, frame)
 
         events = store.list(call_id)
-        pre_stop = next(event for event in events if event.type == "sip_pre_stop")
-        assert pre_stop.payload["candidateDurationMs"] == 180
-        assert pre_stop.payload["sipPreStopAuthority"] == "local_speech"
-        assert pre_stop.payload["sipPreStopAuthorityEvidence"] == (
-            "continuous_webrtc_shadow_local_modulation"
-        )
-        assert pre_stop.payload["sipVadShadowEvidence"] == (
-            "realtime_webrtc_shadow_continuous_context"
-        )
-        assert pre_stop.payload["sipVadShadowDetector"] == "webrtc_shadow"
-        assert pre_stop.payload["sipVadShadowLocalEvidence"] == "local_modulated_candidate"
-        assert publisher.stopped_call_ids == [call_id]
+        event_types = [event.type for event in events]
+        deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
+        assert deferred.payload["candidateDurationMs"] == 180
+        assert deferred.payload["requiredPreStopDurationMs"] > 180
+        assert "sip_pre_stop" not in event_types
+        assert publisher.stopped_call_ids == []
         assert provider.cancelled_response_count == 0
     finally:
         await runner.stop(call_id)
@@ -10771,7 +10765,7 @@ async def test_realtime_agent_runner_shadow_authority_pre_stops_sustained_modula
         event_types = [event.type for event in events]
         pre_stop = next(event for event in events if event.type == "sip_pre_stop")
         assert "sip_interrupt_candidate" in event_types
-        assert "sip_ai_playback_echo_deferred" not in event_types
+        assert "sip_ai_playback_echo_deferred" in event_types
         assert pre_stop.payload["sipPreStopAuthority"] == "local_speech"
         assert pre_stop.payload["sipPreStopAuthorityEvidence"] == (
             "realtime_webrtc_shadow_local_modulation"
@@ -14168,7 +14162,7 @@ async def test_realtime_agent_runner_holds_single_short_sip_burst_on_high_noise_
         deferred = next(event for event in events if event.type == "sip_pre_stop_deferred")
         assert "sip_interrupt_candidate" in event_types
         assert deferred.payload["candidateDurationMs"] == 180
-        assert deferred.payload["noiseFloorDbfs"] > -38.0
+        assert deferred.payload["noiseFloorDbfs"] == -44.0
         assert deferred.payload["reason"] == "awaiting_pre_stop_authority"
         assert "sip_pre_stop" not in event_types
         assert "response_generation_invalidated" not in event_types
@@ -15354,7 +15348,7 @@ async def test_realtime_agent_runner_suppresses_cough_like_hot_burst_with_voiced
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_max_hold_does_not_confirm_on_vad_without_snr() -> None:
+async def test_realtime_agent_runner_max_hold_defers_vad_without_snr() -> None:
     runner, _registry, store, provider, _publisher, call_id = await _started_sip_runner(
         vad=FakeVad([True] * 40),
         call_id="call_sip_max_hold",
@@ -15373,7 +15367,9 @@ async def test_realtime_agent_runner_max_hold_does_not_confirm_on_vad_without_sn
         await asyncio.sleep(0.08)
 
         event_types = [event.type for event in store.list(call_id)]
-        assert "sip_interrupt_rejected" in event_types
+        assert "sip_pre_stop_deferred" in event_types
+        assert "sip_pre_stop" not in event_types
+        assert "sip_interrupt_rejected" not in event_types
         assert "sip_interrupt_confirmed" not in event_types
         assert provider.cancelled_response_count == 0
     finally:
