@@ -1,6 +1,6 @@
 # 通用浏览器坐席中心 V1 设计
 
-最后更新：2026-07-17
+最后更新：2026-07-18
 
 ## 1. 文档定位
 
@@ -55,7 +55,7 @@
 11. 强制话后处理。
 12. 四类业务共用的人工跟进任务。
 13. 再次系统外呼、联系尝试、延期、完成和关闭。
-14. 基础主管异常处理、操作审计、状态补偿和运营指标。
+14. 具备管理权限的用户可执行异常处理，并提供操作审计、状态补偿和运营指标。
 
 ### 3.2 V1 不包含
 
@@ -106,7 +106,8 @@
 
 - 身份复用现有用户登录体系，`user_id` 是稳定身份来源。
 - 浏览器是 V1 唯一人工接听终端。
-- LiveKit Token 只在认领成功后签发，并绑定 `agent_id`、`handoff_id` 和 `device_session_id`。
+- LiveKit Token 只在认领成功后签发，并绑定 `agent_identity`、`handoff_id` 和 `console_session_id`。
+- `console_session_id` 是浏览器每次打开坐席工作台生成的随机 UUID，用来区分同一账号的多个页面，不采集硬件指纹。
 
 ### 4.4 跟进边界
 
@@ -181,7 +182,7 @@
 
 ### 5.5 我的跟进
 
-统一展示：
+跟进区分为“待认领回访”和“我的跟进”两个页签。待认领回访展示当前坐席有权限处理的人工未接回访任务，提供原子认领按钮；我的跟进统一展示：
 
 - 今日待跟进；
 - 即将到期；
@@ -238,7 +239,7 @@ wrap_up
 - 坐席运行状态以服务端为准；
 - 空闲坐席心跳连续约 30 秒过期后转为 `offline`；
 - 通话中失联先进入重连窗口，不立即释放通话；
-- 同一账号允许打开多个页面，但同一时间只有一个 `device_session_id` 拥有媒体控制权。
+- 同一账号允许打开多个页面，但同一时间只有一个 `console_session_id` 拥有媒体控制权。
 
 ## 7. 转人工与认领状态机
 
@@ -272,7 +273,7 @@ connected
 2. 校验客户仍在线、Room 存在且任务未过期；
 3. 锁定并校验坐席状态为 `available`；
 4. 校验坐席具备该业务权限；
-5. 更新 handoff 为 `accepted` 并绑定坐席与设备；
+5. 更新 handoff 为 `accepted` 并绑定坐席与工作台会话；
 6. 更新坐席为 `claiming` 并绑定 handoff 与 call；
 7. 提交成功后再签发 LiveKit Token。
 
@@ -290,11 +291,18 @@ connected
 
 ### 7.3 接入和重连期限
 
-- 认领后建议在 15 秒内完成媒体接入；
+- 认领成功后必须在 15 秒内完成媒体接入，`claim_expires_at = min(认领时间 + 15 秒, expires_at)`；
 - 通话中断后建议提供 15 秒重连窗口；
-- 两个期限都不能突破客户的转人工总等待期限；
+- 客户从请求转人工开始的总等待期限固定为 30 秒；接入和重连期限都不能突破该期限；
 - 接入或重连失败后，若客户仍在线且总等待未超时，任务可以重新进入待接池；
+- 30 秒内仍无人接通时，handoff 进入 `expired`，并立即、幂等地创建“人工未接回访”任务；
+- 客户已经明确要求人工，因此是否创建回访任务不再交由语义分析判断。语义分析只异步补充摘要、要点和建议联系时间；
 - AI 在整个转人工和人工通话阶段保持挂起，避免与坐席同时发声。
+
+V1 使用全局固定配置，不按业务场景分别设置：
+
+- `AI_CALL_AGENT_CLAIM_CONNECT_TIMEOUT_SECONDS=15`；
+- `AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS=30`。
 
 ## 8. 设备检测和通知
 
@@ -346,6 +354,8 @@ V1 使用 SSE 或 WebSocket 推送任务进入、被认领、取消和过期；�
 
 若选择需要跟进，则同一事务内创建跟进任务，避免话后结果与跟进任务不一致。
 
+话后处理采用“AI 草稿 + 人工确认”：现有异步语义分析可以根据 AI、客户和人工坐席三方内容生成摘要、关键事项和建议跟进时间，但坐席必须确认处理结果与是否跟进。分析未完成时允许坐席手工填写并提交；后到的分析结果不得覆盖已提交内容，也不得阻塞坐席恢复空闲。
+
 ## 10. 统一人工跟进
 
 ### 10.1 跟进含义
@@ -354,7 +364,7 @@ V1 使用 SSE 或 WebSocket 推送任务进入、被认领、取消和过期；�
 
 跟进模块不管理四类业务自身的业务阶段。
 
-V1 采用“谁接听，谁跟进”：任务创建后负责人固定为实际接听坐席，不提供转交、更换负责人或批量重新分配能力。数据仍保留 `owner_agent_id`，用于查询本人任务和为后续明确需求保留扩展边界。
+V1 对接通后的任务采用“谁接听，谁跟进”：任务创建后负责人固定为实际接听坐席，不提供转交、更换负责人或批量重新分配能力。数据保留 `owner_agent_identity`，用于查询本人任务。人工未接回访任务先进入公共回访池，首次认领后同样固定负责人。
 
 ### 10.2 状态
 
@@ -388,15 +398,17 @@ processing
 
 接口受理只表示外呼任务创建成功，不代表客户已接通。
 
-### 10.5 重复任务提示
+### 10.5 人工未接回访池
 
-创建跟进任务时，如果同一客户和业务已有未完成任务，页面提示坐席选择：
+客户明确要求转人工、但在 30 秒总等待期限内无人接通的任务，自动进入公共回访池：
 
-- 更新已有任务；
-- 关联已有任务；
-- 明确创建新任务。
+- 初始 `owner_agent_identity` 为空；
+- 只向具备对应 `scene_code` 权限且状态可用的坐席展示；
+- 坐席通过服务端事务原子认领，认领成功后负责人固定；
+- 这属于首次分配，不属于任务转交；V1 不支持认领后更换负责人；
+- 原本由坐席接通后创建的跟进任务，仍遵循“谁接听，谁跟进”。
 
-V1 不自动合并任务。
+V1 不做客户维度的重复任务提示或自动合并，仅使用 `source_handoff_id` 唯一约束和接口幂等键防止同一来源重复创建。
 
 ## 11. 数据设计
 
@@ -405,36 +417,44 @@ V1 不自动合并任务。
 | 字段 | 说明 |
 |---|---|
 | `id` | 雪花主键 |
-| `user_id` | 现有用户 ID，唯一 |
-| `agent_code` | 坐席编号，唯一 |
-| `display_name` | 展示名称 |
+| `tenant_id` | 租户 ID，由框架统一处理租户隔离 |
+| `agent_identity` | 坐席稳定业务标识，同租户唯一 |
+| `user_id` | 关联现有 `sys_user` 的用户 ID |
 | `enabled` | 是否启用 |
-| `max_concurrent_calls` | V1 固定为 1 |
-| `created_at` / `updated_at` | 时间 |
+| `created_by` / `created_at` | 创建人和创建时间 |
+| `updated_by` / `updated_at` | 最后修改人和修改时间 |
 
-### 11.2 `ai_call_agent_business_scope`
+V1 不复制用户展示名称，也不配置最大并发数；名称实时取用户体系，并发固定为一通。
+
+### 11.2 `ai_call_agent_scene_scope`
 
 | 字段 | 说明 |
 |---|---|
 | `id` | 主键 |
-| `agent_id` | 坐席 ID |
-| `business_type` | 业务编码 |
-| `enabled` | 是否允许接听 |
+| `tenant_id` | 租户 ID |
+| `agent_identity` | 坐席稳定业务标识 |
+| `scene_code` | 可接听场景编码，V1 为四类固定场景之一 |
+| `created_by` / `created_at` | 配置人和配置时间 |
 
-对 `(agent_id, business_type)` 建唯一约束，不建物理外键。
+只保存已勾选的场景行，对 `(tenant_id, agent_identity, scene_code)` 建唯一约束，不建物理外键。该表是待接和公共回访路由的唯一业务范围依据。
 
-### 11.3 `ai_call_agent_presence`
+### 11.3 `ai_call_handoff_agent` 调整
+
+复用现有 `ai_call_handoff_agent`，不再新建语义重复的 presence 表。保留现有字段，并建议补充：
 
 | 字段 | 说明 |
 |---|---|
-| `agent_id` | 坐席 ID，唯一 |
-| `status` | 坐席运行状态 |
+| `tenant_id` | 租户 ID |
+| `agent_identity` | 坐席稳定业务标识，沿用现有字段 |
+| `status` | `offline`、`available`、`claiming`、`in_call`、`reconnecting`、`wrap_up`、`paused` |
 | `active_handoff_id` | 当前 handoff |
 | `active_call_id` | 当前 call |
-| `device_session_id` | 媒体控制设备 |
+| `console_session_id` | 当前拥有控制权的浏览器工作台会话 UUID |
 | `heartbeat_at` | 最近心跳 |
 | `status_changed_at` | 状态变化时间 |
-| `version` | 并发版本 |
+| `skill_group` | 现有兼容字段，V1 固定为 `default`，不参与路由判断 |
+
+坐席状态变更使用带前置状态条件的原子更新；V1 不增加乐观锁字段。
 
 ### 11.4 `ai_call_handoff` 调整
 
@@ -442,32 +462,58 @@ V1 不自动合并任务。
 
 | 字段 | 说明 |
 |---|---|
-| `claim_expires_at` | 本次坐席接入期限 |
-| `accepted_device_session_id` | 获得接听权的设备实例 |
+| `tenant_id` | 租户 ID |
+| `claim_expires_at` | 认领成功至真实媒体接通的截止时间，最多 15 秒且不超过 `expires_at` |
+| `accepted_console_session_id` | 获得接听权的浏览器工作台会话 UUID |
 
-`expires_at` 继续表示客户转人工总等待期限。
+`expires_at` 继续表示客户转人工总等待期限，V1 固定为请求转人工后 30 秒。
 
 ### 11.5 `ai_call_after_call_work`
 
 | 字段 | 说明 |
 |---|---|
+| `id` | 雪花主键 |
 | `work_id` | 话后处理 ID |
+| `tenant_id` | 租户 ID |
 | `call_id` | 通话 ID |
 | `handoff_id` | handoff ID，唯一 |
-| `agent_id` | 接听坐席 |
+| `agent_identity` | 实际接听坐席 |
 | `disposition_code` | 处理结果 |
-| `summary` | 人工摘要 |
+| `summary` | 坐席确认后的摘要；AI 只可提供草稿，不得自动覆盖 |
 | `needs_follow_up` | 是否需要跟进 |
 | `submitted_at` | 提交时间 |
-| `version` | 并发版本 |
+| `created_at` / `updated_at` | 创建和修改时间 |
+
+对 `(tenant_id, handoff_id)` 建唯一约束。该表不保存录音 ID 或录音地址；页面通过 `call_id -> ai_call_recording` 查询录音处理状态和播放入口。录音尚未生成不阻塞话后提交。
 
 ### 11.6 `ai_call_follow_up_task`
 
-保存客户引用、业务引用、来源 call/handoff、负责人、状态、联系方式、原因、优先级、计划时间、摘要、关闭原因、版本和终态时间。
+| 字段 | 说明 |
+|---|---|
+| `id` / `tenant_id` | 雪花主键和租户 ID |
+| `source_type` | `after_call_work`（接通后跟进）或 `handoff_unanswered`（人工未接回访） |
+| `source_call_id` | 来源通话 ID |
+| `source_handoff_id` | 来源 handoff ID，用于幂等去重 |
+| `scene_code` | 场景编码，用于权限过滤和公共回访池路由 |
+| `business_type` / `business_id` | 上游业务对象类型和 ID |
+| `contact_ref` / `masked_contact` | 服务端联系方式引用和页面脱敏展示值 |
+| `owner_agent_identity` | 负责人；人工未接回访初始为空，原子认领后写入且不再转交 |
+| `status` | `pending`、`processing`、`completed`、`closed` |
+| `follow_up_reason` | 跟进原因 |
+| `scheduled_at` | 下次计划联系时间 |
+| `summary` | 已确认的任务摘要，可由异步语义分析提供草稿 |
+| `closed_reason` | 未完成目标而关闭时的结构化原因 |
+| `closed_remark` | 对关闭原因的人工补充说明 |
+| `completed_at` / `closed_at` | 完成或关闭时间 |
+| `created_at` / `updated_at` | 创建和修改时间 |
+
+`closed_reason` 仅在 `status=closed` 时填写，取值为 `customer_refused`、`invalid_contact`、`created_by_error`、`no_longer_needed`、`other`。其中 `created_by_error`、`no_longer_needed`、`other` 必须填写 `closed_remark`；其他原因可选填但建议说明。
+
+对 `(tenant_id, source_handoff_id)` 建唯一约束，防止同一 handoff 重复创建任务。无需增加并发版本字段，状态修改使用“当前状态 + 负责人”条件更新并配合接口幂等键。
 
 ### 11.7 `ai_call_follow_up_attempt`
 
-每次联系新增一条，保存操作坐席、联系方式、结果、关联新 call、备注、实际联系时间和下次计划时间。历史尝试只新增，不覆盖。
+每次联系新增一条，保存租户、任务、操作坐席、联系渠道、联系结果、`related_call_id`、备注、实际联系时间和下次计划时间。历史尝试只新增、不覆盖，因此无需并发版本字段。
 
 ### 11.8 数据约束
 
@@ -504,12 +550,15 @@ PUT  /ai-call/agent-console/calls/{callId}/after-call-work
 GET  /ai-call/agent-console/follow-ups
 GET  /ai-call/agent-console/follow-ups/{followUpId}
 POST /ai-call/agent-console/follow-ups/{followUpId}/attempts
+POST /ai-call/agent-console/follow-ups/{followUpId}/claim
 POST /ai-call/agent-console/follow-ups/{followUpId}/call
 POST /ai-call/agent-console/follow-ups/{followUpId}/complete
 POST /ai-call/agent-console/follow-ups/{followUpId}/close
 ```
 
-再次外呼接口只表示任务已创建，最终通话状态通过 `call_id` 查询。
+`claim` 仅用于初始负责人为空的人工未接回访任务，必须按任务状态、负责人为空和坐席场景权限做事务式原子认领。
+
+再次外呼接口只表示任务已创建，最终通话状态通过 `call_id` 查询。浏览器回拨走 SIP/LiveKit 人工通话链路，不启动 AI Runner；服务端通过 `business_type + business_id + contact_ref` 解析受控号码，普通坐席不读取或提交明文号码。
 
 ### 12.3 管理端
 
@@ -517,7 +566,7 @@ POST /ai-call/agent-console/follow-ups/{followUpId}/close
 GET  /ai-call/admin/agents
 POST /ai-call/admin/agents
 PUT  /ai-call/admin/agents/{agentId}
-PUT  /ai-call/admin/agents/{agentId}/business-scopes
+PUT  /ai-call/admin/agents/{agentId}/scene-scopes
 GET  /ai-call/admin/agents/{agentId}/status
 POST /ai-call/admin/agents/{agentId}/force-offline
 GET  /ai-call/admin/handoffs
@@ -536,23 +585,28 @@ GET  /ai-call/admin/follow-ups
 - `AGENT_NOT_AVAILABLE`
 - `AGENT_SCOPE_MISMATCH`
 - `AGENT_ALREADY_IN_CALL`
-- `DEVICE_SESSION_CONFLICT`
+- `CONSOLE_SESSION_CONFLICT`
 - `CLAIM_CONNECT_TIMEOUT`
 - `MEDIA_NOT_READY`
-- `FOLLOW_UP_VERSION_CONFLICT`
+- `FOLLOW_UP_ALREADY_CLAIMED`
+- `FOLLOW_UP_STATE_CONFLICT`
 
 错误信息面向坐席说明下一步操作，不直接暴露内部异常。
 
 ## 13. 权限与数据安全
 
-1. 普通坐席默认只查看有权限业务的待接任务、自己的通话和自己的跟进任务。
-2. 主管按授权范围查看坐席和业务数据。
-3. 普通页面只展示脱敏号码，完整号码仅供服务端发起通话。
-4. 录音、对话、客户资料和导出分别授权。
-5. LiveKit Token 短期有效、按参与者签发，不进入 URL、普通日志或持久化响应缓存。
-6. 服务端不能接受前端传入的任意 `agent_id` 作为身份，以当前登录用户为准。
-7. 所有启停、权限修改、强制释放和话后结果修订均写审计。
-8. 录音告知、保留期限和下载权限由实际业务合规要求确定，实施前作为上线门槛确认。
+1. 宿主系统新增菜单 `AI Call > 坐席工作台`，菜单权限标识为 `ai_call:agent:console`；通过现有角色与菜单授权控制页面入口。
+2. 宿主系统新增菜单 `AI Call > 坐席管理`，菜单权限标识为 `ai_call:agent:manage`；V1 不新建固定“坐席主管”角色，由超级管理员或已获该菜单权限的用户负责配置。
+3. 坐席管理页单独勾选四类 `scene_code`，保存到 `ai_call_agent_scene_scope`。菜单权限决定能否进入页面，场景范围决定能看到和认领哪些任务，两者不能互相替代。
+4. 普通坐席默认只查看有权限场景的待接任务、公共未接回访任务、自己的通话和认领后的本人跟进任务。
+5. 服务端每次认领、查看和回拨都校验登录身份、坐席档案启用状态、`scene_code` 范围、任务状态及负责人，不能只依赖前端菜单隐藏。
+6. 当前 Python AI Call 的 `AuthPermission` 仅作为接口权限标识外壳；实施时必须接通宿主真实登录与菜单权限校验，不能把枚举本身视为已经完成授权。
+7. 普通页面只展示脱敏号码，完整号码仅供服务端发起通话。
+8. V1 不额外拆分 `ai_call:agent:recording` 等细粒度权限；录音入口跟随工作台或管理页的记录查看能力，后续出现独立下载、导出、监听需求时再单独增加权限标识。
+9. LiveKit Token 短期有效、按参与者签发，不进入 URL、普通日志或持久化响应缓存。
+10. 服务端不能接受前端传入的任意 `agent_identity` 作为身份，以当前登录用户映射为准。
+11. 所有启停、场景范围修改、强制释放和话后结果修订均写审计。
+12. 录音告知、保留期限和下载权限由实际业务合规要求确定，实施前作为上线门槛确认。
 
 ## 14. 异常场景与恢复
 
@@ -563,6 +617,8 @@ GET  /ai-call/admin/follow-ups
 ### 14.2 认领后未接入
 
 到 `claim_expires_at` 后释放坐席。如果客户仍在线且总等待未超时，handoff 回到 `requested`；否则按超时或失败闭环。
+
+到转人工请求后的 30 秒仍无人真实接通时，handoff 进入 `expired`，并以 `source_handoff_id` 幂等创建人工未接回访任务。该动作不等待语义分析；分析完成后仅补充草稿信息。
 
 ### 14.3 坐席通话中断线
 
@@ -603,7 +659,7 @@ GET  /ai-call/admin/follow-ups
 
 ## 16. 幂等与并发
 
-以下操作必须支持幂等键或版本控制：
+以下操作必须支持幂等键、唯一约束或带前置状态条件的原子更新：
 
 - 原子认领；
 - 媒体就绪确认；
@@ -613,7 +669,7 @@ GET  /ai-call/admin/follow-ups
 - 再次外呼；
 - 完成和关闭跟进任务。
 
-坐席状态和 handoff 的关键变更在同一事务完成。跟进任务修改使用 `version`，冲突时要求刷新后重试，不能静默覆盖。
+坐席状态和 handoff 的关键变更在同一事务完成。V1 不增加通用乐观锁字段；冲突时返回稳定业务错误，前端刷新服务端状态后提示用户，不能静默覆盖。
 
 ## 17. 基础指标与告警
 
@@ -666,7 +722,8 @@ V1 至少统计：
 3. 再次电话联系产生新的 call 并关联原任务。
 4. 未接通后可记录尝试并安排下次时间。
 5. 跟进可以完成和关闭，历史尝试不被覆盖。
-6. 同客户已有未完成任务时出现重复提示。
+6. 同一 handoff 的重复超时事件或重复提交不会创建两条跟进任务。
+7. 人工未接回访任务只允许一名有对应场景权限的坐席认领，认领后不能转交。
 
 ## 19. 分阶段交付建议
 
@@ -684,7 +741,7 @@ V1 至少统计：
 
 ### V1.1：运营增强
 
-- 更完整的主管异常处理；
+- 更完整的管理端异常处理；
 - 更细的提醒规则；
 - 录音和对话查询体验；
 - SLA 报表与告警完善。
