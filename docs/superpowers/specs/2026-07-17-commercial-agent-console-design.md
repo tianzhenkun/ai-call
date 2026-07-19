@@ -1,6 +1,6 @@
 # 通用浏览器坐席中心 V1 设计
 
-最后更新：2026-07-18
+最后更新：2026-07-19
 
 ## 1. 文档定位
 
@@ -185,23 +185,49 @@
 
 跟进区分为“待认领回访”和“我的跟进”两个页签。待认领回访展示当前坐席有权限处理的人工未接回访任务，提供原子认领按钮；我的跟进统一展示：
 
-- 今日待跟进；
-- 即将到期；
-- 已逾期；
+- 普通待处理；
+- 客户预约待回访；
+- 客户预约已逾期；
 - 我负责的全部任务；
 - 已完成与已关闭任务。
 
-支持按业务类型、计划时间、优先级和状态筛选。
+支持按业务场景、来源类型、客户预约时间和状态筛选。未认领任务只展示“认领”；本人 `pending` 任务展示“开始处理”和“呼叫客户”；`processing` 展示联系记录、完成和关闭；终态任务只读。关闭必须选择 `closed_reason`，并按字段规则填写说明。
 
 ### 5.6 管理页面
 
-V1 包含：
+V1 使用三个独立页面，不把所有管理功能堆入一个多标签页面。
 
-1. 坐席管理：启停、业务权限和当前状态；
-2. 通话与转人工记录：坐席、等待时间、结果、录音和对话；
-3. 跟进任务管理：查询和异常处理；
+#### 5.6.1 坐席管理
 
-V1 不建设独立配置页面和运营大屏。首次接入、断线重连和总等待期限使用服务端部署配置；在线状态、等待量、接通率和异常率等基础指标分别放在上述相关列表顶部。
+顶部指标显示已启用、当前在线、当前空闲、通话中和异常占用坐席数。查询条件包括用户姓名或账号、启用状态、运行状态和 `scene_code`；工具区提供刷新和添加坐席。
+
+列表字段包括坐席、可接场景、启用状态、运行状态、当前通话、最近心跳和操作。支持：
+
+- 从现有 `sys_user` 中添加尚未成为坐席的用户；
+- 编辑启用状态和四类场景范围，不重复维护姓名、手机号或并发数；
+- 启用和停用：空闲坐席停用后立即离线，正在通话的坐席完成当前通话后离线且不再接收新任务；
+- 查看当前状态和关联通话；
+- 仅对已确认没有活动 Room 或通话已经结束的异常占用执行“强制释放”，二次确认并写审计。V1 不通过管理页强制掐断仍在进行的客户通话。
+
+添加和编辑使用抽屉。用户为必选且创建后不可更换；至少勾选一个 `scene_code` 才能启用坐席。运行状态只读，不能由管理员任意改成 `available` 或 `in_call`。
+
+#### 5.6.2 转人工记录
+
+顶部指标显示请求数、60 秒内接通率、平均等待时间、等待超时数和媒体接入失败数。查询条件包括时间范围、场景、handoff 状态、接听坐席、客户关键字、`call_id` 和是否生成未接回访。
+
+列表字段包括请求时间、脱敏客户、业务场景、转人工原因、等待时长、接听坐席、最终结果和操作。详情抽屉按以下顺序展示：基本信息、状态时间线、AI 交接摘要与待处理事项、三方对话、录音状态、快速话后结果、关联跟进任务以及默认折叠的模型与话术配置。
+
+该页面以查询和排障为主，不允许修改正常通话结果。只有状态补偿确认产生的异常记录才展示“重新补偿”或“释放异常占用”，操作必须幂等并写审计。
+
+#### 5.6.3 跟进任务管理
+
+顶部指标显示待处理、客户预约待回访、预约已逾期、人工未接回访、已完成和已关闭任务数。查询条件包括来源类型、场景、负责人、状态、客户预约时间、客户关键字、来源 `call_id` 和 `handoff_id`。
+
+列表字段包括脱敏客户、业务场景、来源、跟进原因、负责人、客户预约时间、状态、最近联系结果和操作。详情抽屉展示客户与业务引用、来源通话、任务摘要、预约时间、历次联系尝试、关联回拨通话、完成或关闭信息和操作审计。
+
+V1 不提供转交、批量重新分配或替坐席修改正常处理结果。管理端只允许查询和处理系统异常；普通完成、关闭和回拨仍由任务负责人在坐席工作台完成。
+
+V1 不建设独立配置页面和运营大屏。首次接入、断线重连和总等待期限使用服务端部署配置；基础指标分别放在上述相关列表顶部。
 
 ## 6. 坐席状态机
 
@@ -295,7 +321,7 @@ connected
 - 人工已经接通后，60 秒总等待期限不再生效。通话中断时单独提供 15 秒重连宽限期，并写入 `reconnect_expires_at`；
 - 重连窗口内只有原坐席保有媒体控制权。重连失败后结束本次人工通话并进入快速话后确认，不重新放入公共待接池；
 - 60 秒内仍无人接通时，handoff 进入 `expired`，并立即、幂等地创建“人工未接回访”任务；
-- 客户已经明确要求人工，因此是否创建回访任务不再交由语义分析判断。语义分析只异步补充摘要、要点和建议联系时间；
+- 客户已经明确要求人工，因此是否创建回访任务不再交由语义分析判断。语义分析只异步补充摘要、要点，以及客户在对话中明确提出的预约时间；
 - AI 在整个转人工和人工通话阶段保持挂起，避免与坐席同时发声。
 
 V1 使用全局固定配置，不按业务场景分别设置：
@@ -363,7 +389,7 @@ V1 使用 SSE 或 WebSocket 推送任务进入、被认领、取消和过期；�
 
 若选择需要跟进，则同一事务内创建跟进任务，避免话后结果与跟进任务不一致。
 
-人工摘要和补充备注均为可选。现有异步语义分析可以根据 AI、客户和人工坐席三方内容生成摘要、关键事项和建议跟进时间，但不能阻塞坐席恢复空闲，也不得覆盖坐席已经修改或确认的内容。
+人工摘要和补充备注均为可选。现有异步语义分析可以根据 AI、客户和人工坐席三方内容生成摘要、关键事项，并提取客户明确提出的预约时间，但不能自行建议重试时间、阻塞坐席恢复空闲或覆盖坐席已经修改、确认的内容。
 
 若通话过程中坐席已经选择处理结果，通话结束后只需确认即可提交。选择“需要跟进”时立即创建 `pending` 任务，不要求坐席临时选择预设的再次联系时间。只有客户在已接通的通话中明确约定回访时间时，坐席才记录准确的客户预约时间。
 
@@ -446,6 +472,8 @@ V1 不做客户维度的重复任务提示或自动合并，仅使用 `source_ha
 
 V1 不复制用户展示名称，也不配置最大并发数；名称实时取用户体系，并发固定为一通。
 
+对 `(tenant_id, agent_identity)` 和 `(tenant_id, user_id)` 分别建唯一约束，保证同一租户内一个系统用户只对应一个坐席档案。
+
 ### 11.2 `ai_call_agent_scene_scope`
 
 | 字段 | 说明 |
@@ -460,34 +488,52 @@ V1 不复制用户展示名称，也不配置最大并发数；名称实时取�
 
 ### 11.3 `ai_call_handoff_agent` 调整
 
-复用现有 `ai_call_handoff_agent`，不再新建语义重复的 presence 表。保留现有字段，并建议补充：
+复用现有 `ai_call_handoff_agent`，不再新建语义重复的 presence 表。V1 确定字段为：
 
 | 字段 | 说明 |
 |---|---|
+| `id` | 雪花主键 |
 | `tenant_id` | 租户 ID |
-| `agent_identity` | 坐席稳定业务标识，沿用现有字段 |
+| `agent_identity` | 坐席稳定业务标识，同租户唯一 |
+| `skill_group` | 现有兼容字段，固定为 `default`，不参与路由判断 |
 | `status` | `offline`、`available`、`claiming`、`in_call`、`reconnecting`、`wrap_up_quick`、`paused` |
 | `active_handoff_id` | 当前 handoff |
 | `active_call_id` | 当前 call |
 | `console_session_id` | 当前拥有控制权的浏览器工作台会话 UUID |
-| `heartbeat_at` | 最近心跳 |
-| `status_changed_at` | 状态变化时间 |
-| `skill_group` | 现有兼容字段，V1 固定为 `default`，不参与路由判断 |
+| `last_seen_at` | 最近心跳时间，复用现有字段 |
+| `status_updated_at` | 状态更新时间，复用现有字段 |
 
-坐席状态变更使用带前置状态条件的原子更新；V1 不增加乐观锁字段。
+对 `(tenant_id, agent_identity)` 建唯一约束，并为 `(tenant_id, status)`、`active_handoff_id` 建索引。坐席状态变更使用带前置状态条件的原子更新；V1 不增加乐观锁字段。
 
 ### 11.4 `ai_call_handoff` 调整
 
-复用现有表，建议增加：
+复用现有表，V1 确定字段为：
 
 | 字段 | 说明 |
 |---|---|
+| `id` | 雪花主键 |
 | `tenant_id` | 租户 ID |
+| `handoff_id` | 转人工业务 ID，同租户唯一 |
+| `call_id` | 来源通话 ID |
+| `room_name` | 客户所在 LiveKit Room |
+| `scene_code` | 触发转人工时冻结的业务场景，用于待接权限过滤 |
+| `status` | `requested`、`accepted`、`connected`、`completed`、`expired`、`canceled`、`failed` |
+| `request_source` | 转人工请求来源 |
+| `request_reason` | 结构化转人工原因 |
+| `request_message` | 客户原话或简短请求摘要 |
+| `human_agent_identity` | 成功认领的坐席身份 |
+| `accepted_console_session_id` | 获得接听权的浏览器工作台会话 UUID |
+| `requested_at` / `accepted_at` / `connected_at` | 请求、认领和真实媒体接通时间 |
+| `ended_at` | handoff 终态时间 |
+| `expires_at` | 首次接通人工前的 60 秒总等待截止时间 |
 | `claim_expires_at` | 认领成功至真实媒体接通的截止时间，最多 15 秒且不超过 `expires_at` |
 | `reconnect_expires_at` | 已接通后媒体中断时，原坐席重连宽限期的截止时间；未处于重连状态时为空 |
-| `accepted_console_session_id` | 获得接听权的浏览器工作台会话 UUID |
+| `end_reason` | 正常完成、客户挂机或超时等终态原因 |
+| `failure_stage` / `failure_message` | 失败阶段和可展示的失败摘要 |
 
 `expires_at` 继续表示客户首次接通人工前的总等待期限，V1 固定为请求转人工后 60 秒；handoff 进入 `connected` 后该字段不再约束通话和重连。
+
+对 `(tenant_id, handoff_id)` 建唯一约束，并为 `(tenant_id, status, requested_at)`、`(tenant_id, call_id, requested_at)` 建索引。
 
 ### 11.5 `ai_call_after_call_work`
 
@@ -505,13 +551,14 @@ V1 不复制用户展示名称，也不配置最大并发数；名称实时取�
 | `submitted_at` | 提交时间 |
 | `created_at` / `updated_at` | 创建和修改时间 |
 
-对 `(tenant_id, handoff_id)` 建唯一约束。该表不保存录音 ID 或录音地址；页面通过 `call_id -> ai_call_recording` 查询录音处理状态和播放入口。录音尚未生成不阻塞话后提交。
+对 `(tenant_id, work_id)` 和 `(tenant_id, handoff_id)` 分别建唯一约束。该表不保存录音 ID 或录音地址；页面通过 `call_id -> ai_call_recording` 查询录音处理状态和播放入口。录音尚未生成不阻塞话后提交。
 
 ### 11.6 `ai_call_follow_up_task`
 
 | 字段 | 说明 |
 |---|---|
-| `id` / `tenant_id` | 雪花主键和租户 ID |
+| `id` | 雪花主键 |
+| `tenant_id` | 租户 ID |
 | `source_type` | `after_call_work`（接通后跟进）或 `handoff_unanswered`（人工未接回访） |
 | `source_call_id` | 来源通话 ID |
 | `source_handoff_id` | 来源 handoff ID，用于幂等去重 |
@@ -534,7 +581,25 @@ V1 不复制用户展示名称，也不配置最大并发数；名称实时取�
 
 ### 11.7 `ai_call_follow_up_attempt`
 
-每次联系新增一条，保存租户、任务、操作坐席、联系渠道、联系结果、`related_call_id`、响铃时长、线路错误、备注、实际联系时间和客户明确预约时间（如有）。历史尝试只新增、不覆盖，因此无需并发版本字段。
+每次联系只新增、不覆盖。V1 确定字段为：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 雪花主键 |
+| `tenant_id` | 租户 ID |
+| `follow_up_id` | 所属跟进任务 ID |
+| `agent_identity` | 本次操作坐席 |
+| `contact_channel` | `system_callback`、`manual_phone`、`wechat`、`email`、`other` |
+| `attempt_result` | `connected`、`no_answer`、`busy`、`rejected`、`invalid_contact`、`technical_failure` 等结果 |
+| `related_call_id` | 系统回拨产生的新通话 ID；非系统电话可为空 |
+| `ring_duration_seconds` | 系统电话响铃时长；其他渠道可为空 |
+| `error_message` | 线路或服务商失败摘要，仅技术失败时填写 |
+| `remark` | 可选人工备注 |
+| `contacted_at` | 实际联系或尝试时间 |
+| `customer_callback_at` | 本次沟通中客户明确预约的回访时间；未接通时为空 |
+| `created_at` | 创建时间 |
+
+为 `(tenant_id, follow_up_id, contacted_at)` 和 `(tenant_id, related_call_id)` 建索引。历史尝试为追加式记录，因此无需并发版本字段。
 
 ### 11.8 数据约束
 
@@ -589,12 +654,15 @@ POST /ai-call/admin/agents
 PUT  /ai-call/admin/agents/{agentId}
 PUT  /ai-call/admin/agents/{agentId}/scene-scopes
 GET  /ai-call/admin/agents/{agentId}/status
-POST /ai-call/admin/agents/{agentId}/force-offline
+POST /ai-call/admin/agents/{agentId}/release-stale
 GET  /ai-call/admin/handoffs
+GET  /ai-call/admin/handoffs/{handoffId}
+POST /ai-call/admin/handoffs/{handoffId}/reconcile
 GET  /ai-call/admin/follow-ups
+GET  /ai-call/admin/follow-ups/{followUpId}
 ```
 
-强制操作必须区分禁止接新任务、当前通话结束后下线和强制结束当前通话。强制结束必须二次确认并写审计。
+启用状态和场景范围通过更新坐席档案维护。`release-stale` 只处理已确认没有活动 Room 或通话已经结束的异常占用；`reconcile` 只重新执行幂等状态补偿。两个接口都必须二次确认并写审计，V1 不提供强制结束仍在进行中的客户通话接口。
 
 ### 12.4 错误码
 
@@ -606,6 +674,8 @@ GET  /ai-call/admin/follow-ups
 - `AGENT_NOT_AVAILABLE`
 - `AGENT_SCOPE_MISMATCH`
 - `AGENT_ALREADY_IN_CALL`
+- `AGENT_ACTIVE_CALL_EXISTS`
+- `STALE_RELEASE_NOT_ALLOWED`
 - `CONSOLE_SESSION_CONFLICT`
 - `CLAIM_CONNECT_TIMEOUT`
 - `AGENT_RECONNECT_TIMEOUT`
@@ -618,7 +688,7 @@ GET  /ai-call/admin/follow-ups
 ## 13. 权限与数据安全
 
 1. 宿主系统新增菜单 `AI Call > 坐席工作台`，菜单权限标识为 `ai_call:agent:console`；通过现有角色与菜单授权控制页面入口。
-2. 宿主系统新增菜单 `AI Call > 坐席管理`，菜单权限标识为 `ai_call:agent:manage`；V1 不新建固定“坐席主管”角色，由超级管理员或已获该菜单权限的用户负责配置。
+2. 宿主系统在 `AI Call` 下增加“坐席管理”“转人工记录”“跟进任务管理”三个管理菜单，V1 共用权限标识 `ai_call:agent:manage`，不再拆分细粒度管理权限；V1 不新建固定“坐席主管”角色，由超级管理员或已获该权限的用户负责配置和排障。
 3. 坐席管理页单独勾选四类 `scene_code`，保存到 `ai_call_agent_scene_scope`。菜单权限决定能否进入页面，场景范围决定能看到和认领哪些任务，两者不能互相替代。
 4. 普通坐席默认只查看有权限场景的待接任务、公共未接回访任务、自己的通话和认领后的本人跟进任务。
 5. 服务端每次认领、查看和回拨都校验登录身份、坐席档案启用状态、`scene_code` 范围、任务状态及负责人，不能只依赖前端菜单隐藏。
