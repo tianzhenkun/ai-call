@@ -1,4 +1,5 @@
 import os
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -214,6 +215,9 @@ class Settings(BaseSettings):
         "当前暂时没有人工接入，我先帮您记录需求，稍后安排顾问联系您。"
     )
     AI_CALL_HANDOFF_TIMEOUT_SECONDS: int = 30
+    AI_CALL_AGENT_CLAIM_CONNECT_TIMEOUT_SECONDS: int = 15
+    AI_CALL_AGENT_RECONNECT_GRACE_SECONDS: int = 15
+    AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
     AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED: bool = True
     AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED: bool = True
     AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED: bool = True
@@ -419,3 +423,11 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+if "AI_CALL_HANDOFF_TIMEOUT_SECONDS" in os.environ:
+    warnings.warn(
+        "AI_CALL_HANDOFF_TIMEOUT_SECONDS is deprecated; use "
+        "AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )

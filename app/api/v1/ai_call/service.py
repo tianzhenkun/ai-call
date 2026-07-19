@@ -1651,7 +1651,7 @@ def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService
         dialogue_service=dialogue_service,
         handoff_service=AiCallHandoffService(
             repository,
-            request_timeout_seconds=settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS,
+            request_timeout_seconds=settings.AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS,
         ),
         handoff_exception_manager=handoff_exception_manager,
         prompt_repository=repository,
@@ -1805,7 +1805,7 @@ def _ensure_default_handoff_exception_manager(
             session_factory=async_db_session,
             recording_service_factory=_build_recording_service,
             system_prompt_player=prompt_player,
-            timeout_seconds=settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS,
+            timeout_seconds=settings.AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS,
             exception_close_enabled=settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED,
             waiting_prompt_audio_path=_strip_or_none(
                 settings.AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH

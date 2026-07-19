@@ -638,9 +638,9 @@ class AiCallHandoffModel(MappedBase):
 
     __tablename__ = "ai_call_handoff"
     __table_args__ = (
-        UniqueConstraint("handoff_id", name="uk_ai_call_handoff_handoff_id"),
-        Index("idx_ai_call_handoff_call_requested", "call_id", "requested_at"),
-        Index("idx_ai_call_handoff_status_requested", "status", "requested_at"),
+        UniqueConstraint("tenant_id", "handoff_id", name="uk_ai_call_handoff_tenant_handoff"),
+        Index("idx_ai_call_handoff_tenant_call", "tenant_id", "call_id", "requested_at"),
+        Index("idx_ai_call_handoff_tenant_status", "tenant_id", "status", "requested_at"),
         {"comment": "AI Call 转人工记录表"},
     )
     __permission_strategy__ = None
@@ -651,6 +651,9 @@ class AiCallHandoffModel(MappedBase):
         autoincrement=False,
         comment="雪花主键",
     )
+    tenant_id: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="000000", server_default="000000", comment="租户编号"
+    )
     handoff_id: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
@@ -658,6 +661,9 @@ class AiCallHandoffModel(MappedBase):
     )
     call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
     room_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="LiveKit Room")
+    scene_code: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default", server_default="default", comment="业务场景编码"
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, comment="转人工状态")
     request_source: Mapped[str] = mapped_column(String(32), nullable=False, comment="请求来源")
     request_reason: Mapped[str | None] = mapped_column(
@@ -674,6 +680,9 @@ class AiCallHandoffModel(MappedBase):
         String(128),
         nullable=True,
         comment="接管人工身份",
+    )
+    accepted_console_session_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, comment="认领浏览器会话UUID"
     )
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -700,6 +709,12 @@ class AiCallHandoffModel(MappedBase):
         nullable=True,
         comment="等待或连接超时时间",
     )
+    claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="首次媒体接入截止时间"
+    )
+    reconnect_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="媒体重连截止时间"
+    )
     end_reason: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
@@ -722,8 +737,10 @@ class AiCallHandoffAgentModel(MappedBase):
 
     __tablename__ = "ai_call_handoff_agent"
     __table_args__ = (
-        UniqueConstraint("agent_identity", name="uk_ai_call_handoff_agent_identity"),
-        Index("idx_ai_call_handoff_agent_status", "status", "skill_group"),
+        UniqueConstraint(
+            "tenant_id", "agent_identity", name="uk_ai_call_handoff_agent_tenant_identity"
+        ),
+        Index("idx_ai_call_handoff_agent_tenant_status", "tenant_id", "status"),
         Index("idx_ai_call_handoff_agent_active", "active_handoff_id"),
         {"comment": "AI Call 人工坐席状态表"},
     )
@@ -734,6 +751,9 @@ class AiCallHandoffAgentModel(MappedBase):
         primary_key=True,
         autoincrement=False,
         comment="雪花主键",
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="000000", server_default="000000", comment="租户编号"
     )
     agent_identity: Mapped[str] = mapped_column(
         String(128),
@@ -756,6 +776,12 @@ class AiCallHandoffAgentModel(MappedBase):
         nullable=True,
         comment="当前接管转人工ID",
     )
+    active_call_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="当前人工通话ID"
+    )
+    console_session_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, comment="媒体控制浏览器会话UUID"
+    )
     last_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -766,6 +792,151 @@ class AiCallHandoffAgentModel(MappedBase):
         nullable=False,
         comment="状态更新时间",
     )
+
+
+class AiCallAgentProfileModel(MappedBase):
+    """AI Call 坐席档案表。"""
+
+    __tablename__ = "ai_call_agent_profile"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "agent_identity", name="uk_ai_call_agent_profile_identity"),
+        UniqueConstraint("tenant_id", "user_id", name="uk_ai_call_agent_profile_user"),
+        {"comment": "AI Call 坐席档案表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallAgentSceneScopeModel(MappedBase):
+    """AI Call 坐席场景授权表。"""
+
+    __tablename__ = "ai_call_agent_scene_scope"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_identity",
+            "scene_code",
+            name="uk_ai_call_agent_scene_scope",
+        ),
+        Index("idx_ai_call_agent_scene_scope_scene", "tenant_id", "scene_code"),
+        {"comment": "AI Call 坐席场景授权表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    scene_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallAfterCallWorkModel(MappedBase):
+    """AI Call 快速话后处理表。"""
+
+    __tablename__ = "ai_call_after_call_work"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "work_id", name="uk_ai_call_acw_work"),
+        UniqueConstraint("tenant_id", "handoff_id", name="uk_ai_call_acw_handoff"),
+        Index("idx_ai_call_acw_tenant_call", "tenant_id", "call_id"),
+        {"comment": "AI Call 快速话后处理表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    work_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    handoff_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    disposition_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    needs_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallFollowUpTaskModel(MappedBase):
+    """AI Call 人工跟进任务表。"""
+
+    __tablename__ = "ai_call_follow_up_task"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "source_handoff_id", name="uk_ai_call_follow_up_source_handoff"
+        ),
+        Index(
+            "idx_ai_call_follow_up_owner_status",
+            "tenant_id",
+            "owner_agent_identity",
+            "status",
+        ),
+        Index("idx_ai_call_follow_up_scene_status", "tenant_id", "scene_code", "status"),
+        {"comment": "AI Call 人工跟进任务表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_handoff_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scene_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    business_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    business_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    contact_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    masked_contact: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_agent_identity: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    follow_up_reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    customer_callback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closed_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    closed_remark: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallFollowUpAttemptModel(MappedBase):
+    """AI Call 跟进联系尝试表。"""
+
+    __tablename__ = "ai_call_follow_up_attempt"
+    __table_args__ = (
+        Index(
+            "idx_ai_call_follow_up_attempt_time",
+            "tenant_id",
+            "follow_up_id",
+            "contacted_at",
+        ),
+        Index("idx_ai_call_follow_up_attempt_call", "tenant_id", "related_call_id"),
+        {"comment": "AI Call 跟进联系尝试表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    follow_up_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    contact_channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_result: Mapped[str] = mapped_column(String(32), nullable=False)
+    related_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ring_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    remark: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    contacted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    customer_callback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AiCallPromptProfileModel(MappedBase):
