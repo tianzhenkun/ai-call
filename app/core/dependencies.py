@@ -115,7 +115,11 @@ async def get_current_user(
     request.scope["dept_id"] = dept_id
 
     # 创建认证对象
-    auth = AuthSchema(db=db, check_data_scope=False)
+    auth = AuthSchema(
+        db=db,
+        check_data_scope=False,
+        permissions={str(item) for item in user_info.get("permissions", []) if item},
+    )
     auth.user = user
     return auth
 
@@ -197,7 +201,11 @@ async def _verify_token(
     user.tenant_id = tenant_id
     user.dept_id = dept_id
 
-    auth = AuthSchema(db=db, check_data_scope=False)
+    auth = AuthSchema(
+        db=db,
+        check_data_scope=False,
+        permissions={str(item) for item in user_info.get("permissions", []) if item},
+    )
     auth.user = user
     return auth
 
@@ -236,12 +244,10 @@ class AuthPermission:
         if auth.user and auth.user.is_superuser:
             return auth
 
-        # 如果未启用JWT认证，默认放行
-        if not settings.JWT_ENABLE:
-            return auth
-
-        # 只要用户存在即可
         if not auth.user:
+            raise CustomException(msg="无权限操作", code=10403, status_code=403)
+
+        if not set(self.permissions).issubset(auth.permissions):
             raise CustomException(msg="无权限操作", code=10403, status_code=403)
 
         return auth
