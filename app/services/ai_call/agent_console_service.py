@@ -130,6 +130,17 @@ class AiCallAgentConsoleService:
             limit=limit,
         )
 
+    async def require_available_presence(
+        self,
+        auth: AuthSchema,
+        *,
+        console_session_id: str,
+    ) -> tuple[AiCallAgentProfileModel, AiCallHandoffAgentModel]:
+        profile = await self.require_current_agent(auth)
+        presence = await self._require_console_presence(profile, console_session_id)
+        await self._ensure_available(presence)
+        return profile, presence
+
     async def claim_handoff(
         self,
         auth: AuthSchema,

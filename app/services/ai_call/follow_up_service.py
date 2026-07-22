@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from fastapi import status
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.v1.ai_call.agent_console_schema import (
     AfterCallWorkIn,
     FollowUpAttemptIn,
+    FollowUpCallIn,
     FollowUpCloseIn,
 )
 from app.api.v1.ai_call.model import (
@@ -24,15 +28,33 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.livekit_sip import HumanOnlySipSessionFactory
 from app.utils.id_util import generate_snowflake_id
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpCallbackAccepted:
+    status: str
+    call_id: str
+    livekit_url: str
+    participant_token: str
+    participant_identity: str
+    expires_in_seconds: int
 
 
 class AiCallFollowUpService:
     """快速话后确认和负责人固定的人工跟进。"""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        callback_factory: HumanOnlySipSessionFactory | None = None,
+    ) -> None:
         self.db = db
         self.agent_service = AiCallAgentConsoleService(db)
+        self.callback_factory = callback_factory
 
     async def submit_after_call_work(
         self,
@@ -227,6 +249,250 @@ class AiCallFollowUpService:
         await self.db.flush()
         return attempt
 
+    async def start_callback(
+        self,
+        auth: AuthSchema,
+        *,
+        follow_up_id: int,
+        payload: FollowUpCallIn,
+    ) -> FollowUpCallbackAccepted:
+        profile, task = await self._required_owned_task(auth, follow_up_id)
+        if task.status not in {"pending", "processing"}:
+            self._raise_conflict("当前跟进状态不允许回拨", "FOLLOW_UP_STATE_CONFLICT")
+        await self.agent_service.require_scene_access(auth, task.scene_code)
+        _, presence = await self.agent_service.require_available_presence(
+            auth,
+            console_session_id=str(payload.console_session_id),
+        )
+        if self.callback_factory is None:
+            raise CustomException(msg="人工回拨服务未配置", status_code=503)
+
+        call_id = f"call_{generate_snowflake_id()}"
+        now = datetime.now(timezone.utc)
+        agent_claimed = await self.db.execute(
+            update(AiCallHandoffAgentModel)
+            .where(
+                AiCallHandoffAgentModel.tenant_id == profile.tenant_id,
+                AiCallHandoffAgentModel.agent_identity == profile.agent_identity,
+                AiCallHandoffAgentModel.status == "available",
+                AiCallHandoffAgentModel.active_handoff_id.is_(None),
+                AiCallHandoffAgentModel.active_call_id.is_(None),
+                AiCallHandoffAgentModel.console_session_id
+                == str(payload.console_session_id),
+            )
+            .values(
+                status="claiming",
+                active_call_id=call_id,
+                last_seen_at=now,
+                status_updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if agent_claimed.rowcount != 1:
+            await self.db.rollback()
+            self._raise_conflict("坐席当前正在处理其他通话", "AGENT_ALREADY_IN_CALL")
+        set_committed_value(presence, "status", "claiming")
+        set_committed_value(presence, "active_call_id", call_id)
+        set_committed_value(presence, "last_seen_at", now)
+        set_committed_value(presence, "status_updated_at", now)
+
+        self.db.add(
+            AiCallRecordModel(
+                id=generate_snowflake_id(),
+                call_id=call_id,
+                follow_up_id=task.id,
+                business_type=task.business_type,
+                business_id=task.business_id,
+                scene_code=task.scene_code,
+                entry_type="sip_callback",
+                room_name=f"ai-call-{call_id}",
+                participant_identity=f"sip-{call_id}",
+                callee_phone_number_hash=self._phone_hash(payload.callee_phone_number),
+                callee_phone_number_masked=self._mask_phone(payload.callee_phone_number),
+                status="ringing",
+                started_at=now,
+            )
+        )
+        task.status = "processing"
+        task.updated_at = now
+        await self.db.flush()
+        # 先提交可关联的回拨事实，避免 SIP webhook 先于本事务提交而丢失。
+        await self.db.commit()
+
+        try:
+            session = await self.callback_factory.create(
+                call_id=call_id,
+                callee_phone_number=payload.callee_phone_number,
+            )
+        except AiCallError as exc:
+            await self.record_callback_outcome(
+                call_id=call_id,
+                attempt_result="technical_failure",
+                error_message=exc.msg,
+            )
+            await self.db.commit()
+            raise CustomException(
+                msg=exc.msg,
+                status_code=exc.status_code,
+                data={"errorCode": exc.error_id},
+            ) from exc
+        except Exception as exc:
+            error_message = "人工回拨服务调用失败"
+            await self.record_callback_outcome(
+                call_id=call_id,
+                attempt_result="technical_failure",
+                error_message=error_message,
+            )
+            await self.db.commit()
+            raise CustomException(
+                msg=error_message,
+                status_code=502,
+                data={"errorCode": "sip_callback_failed"},
+            ) from exc
+
+        return FollowUpCallbackAccepted(
+            status="accepted",
+            call_id=call_id,
+            livekit_url=session.livekit_url,
+            participant_token=session.participant_token,
+            participant_identity=session.agent_participant_identity,
+            expires_in_seconds=session.expires_in_seconds,
+        )
+
+    async def record_callback_outcome(
+        self,
+        *,
+        call_id: str,
+        attempt_result: str,
+        ring_duration_seconds: int | None = None,
+        error_message: str | None = None,
+    ) -> AiCallFollowUpAttemptModel:
+        existing = await self._attempt_by_call_id(call_id)
+        if existing is not None:
+            return existing
+        record = await self._record(call_id)
+        if record is None or record.follow_up_id is None:
+            raise CustomException(msg="人工回拨记录不存在", status_code=404)
+        task = await self._required_task_by_id(record.follow_up_id)
+        allowed_results = {
+            "connected",
+            "no_answer",
+            "busy",
+            "rejected",
+            "invalid_contact",
+            "technical_failure",
+        }
+        if attempt_result not in allowed_results:
+            raise CustomException(msg="不支持的人工回拨结果", status_code=422)
+        if attempt_result == "technical_failure" and not (error_message or "").strip():
+            raise CustomException(msg="技术失败必须提供错误摘要", status_code=422)
+
+        now = datetime.now(timezone.utc)
+        attempt = AiCallFollowUpAttemptModel(
+            id=generate_snowflake_id(),
+            tenant_id=task.tenant_id,
+            follow_up_id=task.id,
+            agent_identity=task.owner_agent_identity or "system",
+            contact_channel="system_callback",
+            attempt_result=attempt_result,
+            related_call_id=call_id,
+            ring_duration_seconds=ring_duration_seconds,
+            error_message=(error_message or "").strip() or None,
+            remark=None,
+            contacted_at=now,
+            customer_callback_at=None,
+            created_at=now,
+        )
+        self.db.add(attempt)
+        if attempt_result == "connected":
+            record.status = "running"
+            record.answered_at = record.answered_at or now
+            task.status = "processing"
+        else:
+            record.status = "failed" if attempt_result == "technical_failure" else "completed"
+            record.ended_at = record.ended_at or now
+            record.end_reason = f"callback_{attempt_result}"
+            if attempt_result == "technical_failure":
+                record.failure_stage = "sip_callback"
+                record.failure_message = attempt.error_message
+            task.status = "pending"
+        task.updated_at = now
+        await self._settle_callback_presence(
+            tenant_id=task.tenant_id,
+            agent_identity=task.owner_agent_identity,
+            call_id=call_id,
+            connected=attempt_result == "connected",
+            now=now,
+        )
+        await self.db.flush()
+        return attempt
+
+    async def handle_livekit_webhook_event(
+        self,
+        *,
+        event_type: str,
+        room_name: str | None,
+        participant_identity: str | None,
+        payload: dict | None = None,
+    ) -> dict:
+        if not participant_identity or not participant_identity.startswith("sip-"):
+            return {"handled": False, "reason": "non_sip_participant"}
+        call_id = participant_identity.removeprefix("sip-")
+        if not call_id or (room_name and room_name != f"ai-call-{call_id}"):
+            return {"handled": False, "reason": "room_mismatch"}
+        record = await self._record(call_id)
+        if record is None or record.entry_type != "sip_callback":
+            return {"handled": False, "reason": "not_human_callback"}
+
+        if event_type == "participant_joined":
+            attempt_result = "connected"
+        elif event_type == "participant_left":
+            existing_attempt = await self._attempt_by_call_id(call_id)
+            if existing_attempt is not None and existing_attempt.attempt_result == "connected":
+                task = await self._required_task_by_id(record.follow_up_id)
+                now = datetime.now(timezone.utc)
+                record.status = "completed"
+                record.ended_at = record.ended_at or now
+                record.end_reason = record.end_reason or "callback_completed"
+                task.updated_at = now
+                await self._settle_callback_presence(
+                    tenant_id=task.tenant_id,
+                    agent_identity=task.owner_agent_identity,
+                    call_id=call_id,
+                    connected=False,
+                    now=now,
+                )
+                await self.db.flush()
+                return {
+                    "handled": True,
+                    "action": "complete_connected_callback",
+                    "callId": call_id,
+                    "attemptResult": existing_attempt.attempt_result,
+                }
+            attempt_result = self._callback_attempt_result(payload or {})
+            if attempt_result is None:
+                return {"handled": False, "reason": "callback_status_unknown"}
+        else:
+            return {"handled": False, "reason": "unsupported_event"}
+
+        error_message = (
+            "SIP/LiveKit 人工回拨技术失败"
+            if attempt_result == "technical_failure"
+            else None
+        )
+        attempt = await self.record_callback_outcome(
+            call_id=call_id,
+            attempt_result=attempt_result,
+            ring_duration_seconds=self._callback_ring_duration(payload or {}),
+            error_message=error_message,
+        )
+        return {
+            "handled": True,
+            "action": "record_callback_outcome",
+            "callId": call_id,
+            "attemptResult": attempt.attempt_result,
+        }
+
     async def complete_follow_up(
         self,
         auth: AuthSchema,
@@ -345,6 +611,17 @@ class AiCallFollowUpService:
             "customer_callback_at": cls._api_datetime(attempt.customer_callback_at),
         }
 
+    @staticmethod
+    def callback_payload(callback: FollowUpCallbackAccepted) -> dict:
+        return {
+            "status": callback.status,
+            "call_id": callback.call_id,
+            "livekit_url": callback.livekit_url,
+            "participant_token": callback.participant_token,
+            "participant_identity": callback.participant_identity,
+            "expires_in_seconds": callback.expires_in_seconds,
+        }
+
     async def _owned_handoff_for_call(
         self,
         *,
@@ -397,6 +674,23 @@ class AiCallFollowUpService:
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
         )
         return result.scalar_one_or_none()
+
+    async def _attempt_by_call_id(self, call_id: str) -> AiCallFollowUpAttemptModel | None:
+        result = await self.db.execute(
+            select(AiCallFollowUpAttemptModel).where(
+                AiCallFollowUpAttemptModel.related_call_id == call_id
+            )
+        )
+        return result.scalars().first()
+
+    async def _required_task_by_id(self, follow_up_id: int) -> AiCallFollowUpTaskModel:
+        result = await self.db.execute(
+            select(AiCallFollowUpTaskModel).where(AiCallFollowUpTaskModel.id == follow_up_id)
+        )
+        task = result.scalar_one_or_none()
+        if task is None:
+            raise CustomException(msg="跟进任务不存在", status_code=404)
+        return task
 
     async def _required_task(
         self,
@@ -451,6 +745,97 @@ class AiCallFollowUpService:
         presence.active_handoff_id = None
         presence.active_call_id = None
         presence.status_updated_at = now
+
+    async def _settle_callback_presence(
+        self,
+        *,
+        tenant_id: str,
+        agent_identity: str | None,
+        call_id: str,
+        connected: bool,
+        now: datetime,
+    ) -> None:
+        if not agent_identity:
+            return
+        result = await self.db.execute(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.tenant_id == tenant_id,
+                AiCallHandoffAgentModel.agent_identity == agent_identity,
+            )
+        )
+        presence = result.scalar_one_or_none()
+        if presence is None or presence.active_call_id != call_id:
+            return
+        presence.status = "in_call" if connected else "available"
+        if not connected:
+            presence.active_call_id = None
+        presence.status_updated_at = now
+
+    @staticmethod
+    def _mask_phone(phone_number: str) -> str:
+        normalized = "".join(ch for ch in phone_number if ch.isdigit())
+        if len(normalized) <= 7:
+            return "***"
+        return f"{normalized[:3]}****{normalized[-4:]}"
+
+    @staticmethod
+    def _phone_hash(phone_number: str) -> str:
+        normalized = "".join(ch for ch in phone_number if ch.isdigit())
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
+
+    @staticmethod
+    def _callback_attempt_result(payload: dict) -> str | None:
+        participant = payload.get("participant")
+        participant = participant if isinstance(participant, dict) else {}
+        attributes = participant.get("attributes") or payload.get("attributes") or {}
+        attributes = attributes if isinstance(attributes, dict) else {}
+        raw_status = (
+            attributes.get("sip.callStatus")
+            or payload.get("sipCallStatus")
+            or payload.get("sip_call_status")
+        )
+        normalized = str(raw_status or "").strip().lower().replace("-", "_")
+        mapping = {
+            "no_answer": "no_answer",
+            "timeout": "no_answer",
+            "ringing_timeout": "no_answer",
+            "busy": "busy",
+            "rejected": "rejected",
+            "declined": "rejected",
+            "invalid_contact": "invalid_contact",
+            "invalid_number": "invalid_contact",
+            "failed": "technical_failure",
+            "error": "technical_failure",
+            "technical_failure": "technical_failure",
+        }
+        mapped = mapping.get(normalized)
+        if mapped is not None:
+            return mapped
+        disconnect_reason = (
+            payload.get("disconnectReason")
+            or payload.get("disconnect_reason")
+            or participant.get("disconnectReason")
+            or participant.get("disconnect_reason")
+        )
+        reason_mapping = {
+            "user_unavailable": "no_answer",
+            "connection_timeout": "no_answer",
+            "user_rejected": "rejected",
+            "sip_trunk_failure": "technical_failure",
+            "join_failure": "technical_failure",
+            "media_failure": "technical_failure",
+            "agent_error": "technical_failure",
+        }
+        return reason_mapping.get(str(disconnect_reason or "").strip().lower())
+
+    @staticmethod
+    def _callback_ring_duration(payload: dict) -> int | None:
+        for key in ("ringDurationSeconds", "ring_duration_seconds"):
+            value = payload.get(key)
+            if isinstance(value, int) and value >= 0:
+                return value
+        return None
 
     @staticmethod
     def _api_datetime(value: datetime | None) -> datetime | None:

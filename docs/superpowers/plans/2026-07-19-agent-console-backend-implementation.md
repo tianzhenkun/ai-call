@@ -123,12 +123,14 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 **文件：**
 - 修改：`app/services/ai_call/follow_up_service.py`
 - 修改：`app/services/ai_call/livekit_sip.py`
+- 修改：`app/api/v1/ai_call/model.py`
+- 修改：`docs/livekit-ai-outbound/sql/phase-g-agent-console-migration.sql`
 - 修改：`app/api/v1/ai_call/agent_console_controller.py`
 - 测试：`tests/test_ai_call_follow_up.py`
 
-- [ ] 编写失败测试：只允许负责人回拨；服务端由 `business_type + business_id + contact_ref` 解析号码；创建新 `call_id`；不启动 AI Runner；无人接听自动写 attempt 并回 pending；技术失败不算有效客户联系。
+- [ ] 编写失败测试：只允许负责人回拨；手机号只从 HTTPS 请求体临时输入且不持久化或回显；创建新 `call_id`；不启动 AI Runner；无人接听自动写 attempt 并回 pending；技术失败不算有效客户联系。
 - [ ] 运行定向测试确认 FAIL。
-- [ ] 实现 human-only SIP/LiveKit 会话工厂；接口响应只返回“已受理 + call_id”，最终 connected/no_answer/busy/rejected/invalid/technical_failure 由查询或推送更新。
+- [ ] 实现 human-only SIP/LiveKit 会话工厂；接口响应返回“已受理 + call_id + 短期 LiveKit 坐席凭证”，凭证不持久化，最终 connected/no_answer/busy/rejected/invalid/technical_failure 由查询或推送更新。
 - [ ] 对人工回拨增加坐席 availability 条件，避免 Twilio 文档所示的并发回拨与在途通话重叠问题。
 - [ ] 运行定向测试，预期 PASS。
 - [ ] 提交：`git commit -m "feat(ai-call): add human only callback flow"`。

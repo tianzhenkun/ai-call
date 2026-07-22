@@ -87,6 +87,56 @@ class CreateSipParticipantResult:
     raw_status: str
 
 
+@dataclass(frozen=True, slots=True)
+class HumanCallbackSessionResult:
+    call_id: str
+    room_name: str
+    customer_participant_identity: str
+    agent_participant_identity: str
+    livekit_url: str
+    participant_token: str
+    expires_in_seconds: int
+
+
+class HumanOnlySipSessionFactory:
+    """创建不启动 AI Runner 的浏览器人工回拨 Room。"""
+
+    def __init__(self, *, room_manager: Any, sip_client: LiveKitSipClient) -> None:
+        self.room_manager = room_manager
+        self.sip_client = sip_client
+
+    async def create(
+        self,
+        *,
+        call_id: str,
+        callee_phone_number: str,
+    ) -> HumanCallbackSessionResult:
+        room_name = f"ai-call-{call_id}"
+        customer_identity = f"sip-{call_id}"
+        agent_identity = f"human-callback-{call_id}"
+        await self.room_manager.create_room(room_name)
+        try:
+            token = self.room_manager.issue_browser_token(room_name, agent_identity)
+            await self.sip_client.create_participant(
+                room_name=room_name,
+                participant_identity=customer_identity,
+                callee_phone_number=callee_phone_number,
+                wait_until_answered=False,
+            )
+        except Exception:
+            await self.room_manager.delete_room(room_name)
+            raise
+        return HumanCallbackSessionResult(
+            call_id=call_id,
+            room_name=room_name,
+            customer_participant_identity=customer_identity,
+            agent_participant_identity=agent_identity,
+            livekit_url=token.livekit_url,
+            participant_token=token.participant_token,
+            expires_in_seconds=token.expires_in_seconds,
+        )
+
+
 class LiveKitSipClient:
     def __init__(
         self,

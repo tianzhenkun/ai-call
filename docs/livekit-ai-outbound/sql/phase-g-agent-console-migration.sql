@@ -98,6 +98,10 @@ create index if not exists idx_ai_call_follow_up_attempt_time
 create index if not exists idx_ai_call_follow_up_attempt_call
     on ai_call_follow_up_attempt (tenant_id, related_call_id);
 
+alter table ai_call_record add column if not exists follow_up_id bigint;
+create index if not exists idx_ai_call_record_follow_up
+    on ai_call_record (follow_up_id);
+
 alter table ai_call_handoff add column if not exists tenant_id varchar(20);
 alter table ai_call_handoff add column if not exists scene_code varchar(64);
 alter table ai_call_handoff add column if not exists accepted_console_session_id varchar(36);

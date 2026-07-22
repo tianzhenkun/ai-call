@@ -13,6 +13,7 @@ from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.agent_console_schema import (
     AfterCallWorkIn,
     FollowUpAttemptIn,
+    FollowUpCallIn,
     FollowUpCloseIn,
 )
 from app.api.v1.ai_call.model import (
@@ -30,7 +31,12 @@ from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
+from app.services.ai_call.livekit_sip import (
+    HumanCallbackSessionResult,
+    HumanOnlySipSessionFactory,
+)
 
 
 def _auth(db, *, user_id: int, tenant_id: str = "tenant-a") -> AuthSchema:
@@ -206,6 +212,7 @@ def test_task5_routes_are_registered() -> None:
         "/ai-call/agent-console/follow-ups/{follow_up_id}",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/attempts",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/claim",
+        "/ai-call/agent-console/follow-ups/{follow_up_id}/call",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/complete",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/close",
     } <= paths
@@ -467,3 +474,455 @@ async def test_ai_summary_draft_never_overwrites_human_summary(session_factory) 
         await db.refresh(follow_up)
         assert acw.summary == "人工确认摘要"
         assert follow_up.summary == "人工确认摘要"
+
+
+class _FakeRoomManager:
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+
+    async def create_room(self, room_name: str) -> None:
+        self.created.append(room_name)
+
+    async def delete_room(self, room_name: str) -> None:
+        self.deleted.append(room_name)
+
+    def issue_browser_token(self, room_name: str, participant_identity: str):
+        return type(
+            "Token",
+            (),
+            {
+                "livekit_url": "wss://livekit.example.com",
+                "participant_token": "agent-token",
+                "participant_identity": participant_identity,
+                "expires_in_seconds": 60,
+            },
+        )()
+
+
+class _FakeSipClient:
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+
+    async def create_participant(self, **kwargs):
+        self.created.append(kwargs)
+        return type(
+            "SipResult",
+            (),
+            {
+                "participant_identity": kwargs["participant_identity"],
+                "sip_call_id": "sip-call-1",
+                "sip_call_status": "dialing",
+            },
+        )()
+
+
+class _FakeCallbackFactory:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs) -> HumanCallbackSessionResult:
+        self.calls.append(kwargs)
+        call_id = kwargs["call_id"]
+        return HumanCallbackSessionResult(
+            call_id=call_id,
+            room_name=f"ai-call-{call_id}",
+            customer_participant_identity=f"sip-{call_id}",
+            agent_participant_identity=f"human-callback-{call_id}",
+            livekit_url="wss://livekit.example.com",
+            participant_token="agent-token",
+            expires_in_seconds=60,
+        )
+
+
+class _FailingCallbackFactory:
+    async def create(self, **_kwargs):
+        raise AiCallError(
+            error_id="sip_create_participant_failed",
+            msg="SIP Participant 创建失败",
+            status_code=502,
+        )
+
+
+@pytest.mark.parametrize(
+    ("disconnect_reason", "expected"),
+    [
+        ("USER_UNAVAILABLE", "no_answer"),
+        ("CONNECTION_TIMEOUT", "no_answer"),
+        ("USER_REJECTED", "rejected"),
+        ("SIP_TRUNK_FAILURE", "technical_failure"),
+        ("MEDIA_FAILURE", "technical_failure"),
+    ],
+)
+def test_callback_result_maps_livekit_disconnect_reason(
+    disconnect_reason: str,
+    expected: str,
+) -> None:
+    assert (
+        AiCallFollowUpService._callback_attempt_result(
+            {"disconnectReason": disconnect_reason}
+        )
+        == expected
+    )
+
+
+@pytest.mark.anyio
+async def test_human_only_factory_creates_room_and_sip_without_agent_runner() -> None:
+    room_manager = _FakeRoomManager()
+    sip_client = _FakeSipClient()
+    factory = HumanOnlySipSessionFactory(
+        room_manager=room_manager,
+        sip_client=sip_client,
+    )
+
+    result = await factory.create(
+        call_id="call-callback",
+        callee_phone_number="13800000000",
+    )
+
+    assert room_manager.created == ["ai-call-call-callback"]
+    assert sip_client.created == [
+        {
+            "room_name": "ai-call-call-callback",
+            "participant_identity": "sip-call-callback",
+            "callee_phone_number": "13800000000",
+            "wait_until_answered": False,
+        }
+    ]
+    assert result.agent_participant_identity == "human-callback-call-callback"
+    assert result.participant_token == "agent-token"
+
+
+@pytest.mark.anyio
+async def test_callback_requires_owner_and_available_presence_without_persisting_phone(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_agent(session_factory, user_id=21, agent_identity="agent-21")
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        owner_service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        owner_auth = _auth(db, user_id=20)
+        await owner_service.claim_follow_up(owner_auth, follow_up_id=100)
+
+        with pytest.raises(CustomException):
+            await owner_service.start_callback(
+                _auth(db, user_id=21),
+                follow_up_id=100,
+                payload=FollowUpCallIn(
+                    console_session_id=console_session_id,
+                    callee_phone_number="13800000000",
+                ),
+            )
+
+        result = await owner_service.start_callback(
+            owner_auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(
+                console_session_id=console_session_id,
+                callee_phone_number="13800000000",
+            ),
+        )
+        assert result.status == "accepted"
+        assert result.call_id.startswith("call_")
+        assert "13800000000" not in repr(result)
+
+        record = (
+            await db.execute(
+                select(AiCallRecordModel).where(AiCallRecordModel.call_id == result.call_id)
+            )
+        ).scalar_one()
+        assert record.follow_up_id == 100
+        assert record.callee_phone_number_hash != "13800000000"
+        assert record.callee_phone_number_masked == "138****0000"
+        assert "13800000000" not in repr(record.__dict__)
+
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        assert presence.status == "claiming"
+        assert presence.active_call_id == result.call_id
+
+        with pytest.raises(CustomException) as busy:
+            await owner_service.start_callback(
+                owner_auth,
+                follow_up_id=100,
+                payload=FollowUpCallIn(
+                    console_session_id=console_session_id,
+                    callee_phone_number="13900000000",
+                ),
+            )
+        assert _error_code(busy.value) == "AGENT_ALREADY_IN_CALL"
+
+
+@pytest.mark.anyio
+async def test_no_answer_callback_appends_once_returns_pending_and_releases_agent(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(
+                console_session_id=console_session_id,
+                callee_phone_number="13800000000",
+            ),
+        )
+
+        first = await service.record_callback_outcome(
+            call_id=callback.call_id,
+            attempt_result="no_answer",
+            ring_duration_seconds=12,
+        )
+        second = await service.record_callback_outcome(
+            call_id=callback.call_id,
+            attempt_result="no_answer",
+            ring_duration_seconds=12,
+        )
+        assert first.id == second.id
+        assert first.related_call_id == callback.call_id
+
+        task = (
+            await db.execute(
+                select(AiCallFollowUpTaskModel).where(AiCallFollowUpTaskModel.id == 100)
+            )
+        ).scalar_one()
+        assert task.status == "pending"
+        attempts = list((await db.execute(select(AiCallFollowUpAttemptModel))).scalars().all())
+        assert len(attempts) == 1
+        assert attempts[0].attempt_result == "no_answer"
+        assert attempts[0].ring_duration_seconds == 12
+
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        assert presence.status == "available"
+        assert presence.active_call_id is None
+
+
+@pytest.mark.anyio
+async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(
+                console_session_id=console_session_id,
+                callee_phone_number="13800000000",
+            ),
+        )
+
+        result = await service.handle_livekit_webhook_event(
+            event_type="participant_left",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+            payload={
+                "participant": {
+                    "attributes": {"sip.callStatus": "no_answer"},
+                }
+            },
+        )
+
+        assert result == {
+            "handled": True,
+            "action": "record_callback_outcome",
+            "callId": callback.call_id,
+            "attemptResult": "no_answer",
+        }
+        attempt = (
+            await db.execute(
+                select(AiCallFollowUpAttemptModel).where(
+                    AiCallFollowUpAttemptModel.related_call_id == callback.call_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.attempt_result == "no_answer"
+
+
+@pytest.mark.anyio
+async def test_immediate_sip_failure_records_technical_failure_and_releases_agent(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FailingCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+
+        with pytest.raises(CustomException) as failed:
+            await service.start_callback(
+                auth,
+                follow_up_id=100,
+                payload=FollowUpCallIn(
+                    console_session_id=console_session_id,
+                    callee_phone_number="13800000000",
+                ),
+            )
+        assert failed.value.data == {"errorCode": "sip_create_participant_failed"}
+
+        record = (
+            await db.execute(
+                select(AiCallRecordModel).where(AiCallRecordModel.follow_up_id == 100)
+            )
+        ).scalar_one()
+        assert record.status == "failed"
+        assert record.failure_stage == "sip_callback"
+        attempt = (
+            await db.execute(
+                select(AiCallFollowUpAttemptModel).where(
+                    AiCallFollowUpAttemptModel.related_call_id == record.call_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.attempt_result == "technical_failure"
+        task = await db.get(AiCallFollowUpTaskModel, 100)
+        assert task.status == "pending"
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.status == "available"
+        assert presence.active_call_id is None
+
+
+@pytest.mark.anyio
+async def test_concurrent_callbacks_allow_only_one_active_call(session_factory) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        await service.claim_follow_up(_auth(db, user_id=20), follow_up_id=100)
+
+    callback_factory = _FakeCallbackFactory()
+
+    async def start_callback():
+        async with session_factory() as db:
+            service = AiCallFollowUpService(db, callback_factory=callback_factory)
+            try:
+                return await service.start_callback(
+                    _auth(db, user_id=20),
+                    follow_up_id=100,
+                    payload=FollowUpCallIn(
+                        console_session_id=console_session_id,
+                        callee_phone_number="13800000000",
+                    ),
+                )
+            except CustomException as exc:
+                return exc
+
+    results = await asyncio.gather(start_callback(), start_callback())
+
+    accepted = [item for item in results if not isinstance(item, CustomException)]
+    conflicts = [item for item in results if isinstance(item, CustomException)]
+    assert len(accepted) == 1
+    assert len(conflicts) == 1
+    assert _error_code(conflicts[0]) == "AGENT_ALREADY_IN_CALL"
+    assert len(callback_factory.calls) == 1
+    async with session_factory() as db:
+        record_count = await db.scalar(
+            select(func.count(AiCallRecordModel.id)).where(
+                AiCallRecordModel.follow_up_id == 100
+            )
+        )
+        assert record_count == 1
+
+
+@pytest.mark.anyio
+async def test_connected_callback_hangup_finishes_call_and_releases_agent(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(
+                console_session_id=console_session_id,
+                callee_phone_number="13800000000",
+            ),
+        )
+
+        await service.handle_livekit_webhook_event(
+            event_type="participant_joined",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+        )
+        await db.commit()
+        result = await service.handle_livekit_webhook_event(
+            event_type="participant_left",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+        )
+
+        assert result == {
+            "handled": True,
+            "action": "complete_connected_callback",
+            "callId": callback.call_id,
+            "attemptResult": "connected",
+        }
+        record = (
+            await db.execute(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == callback.call_id
+                )
+            )
+        ).scalar_one()
+        assert record.status == "completed"
+        assert record.ended_at is not None
+        assert record.end_reason == "callback_completed"
+        task = await db.get(AiCallFollowUpTaskModel, 100)
+        assert task.status == "processing"
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.status == "available"
+        assert presence.active_call_id is None

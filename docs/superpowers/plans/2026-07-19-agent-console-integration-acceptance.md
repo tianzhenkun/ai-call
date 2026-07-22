@@ -53,7 +53,7 @@
 ### 场景 6：人工未接回访与人工回拨
 
 - [ ] 未接回访初始无负责人，两坐席同时认领仅一人成功，认领后不能转交。
-- [ ] 回拨由服务端解析 contact_ref，前端网络请求和日志不出现明文号码；新 call_id 关联原任务且不启动 AI Runner。
+- [ ] 回拨手机号只通过 HTTPS 请求体临时提交，URL、普通日志、事件、数据库和响应均不出现明文；新 call_id 关联原任务且不启动 AI Runner。
 - [ ] no_answer/busy/rejected 自动追加 attempt 并回 pending，不显示固定重试时间、不自动重拨。
 - [ ] technical_failure 记录 error_message 且不计有效客户联系；客户明确预约才写 customer_callback_at。
 

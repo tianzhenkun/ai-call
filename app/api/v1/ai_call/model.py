@@ -19,6 +19,7 @@ class AiCallRecordModel(MappedBase):
         Index("idx_ai_call_record_status_started", "status", "started_at"),
         Index("idx_ai_call_record_entry_started", "entry_type", "started_at"),
         Index("idx_ai_call_record_business", "business_type", "business_id"),
+        Index("idx_ai_call_record_follow_up", "follow_up_id"),
         Index("idx_ai_call_record_room_name", "room_name"),
         Index(
             "idx_ai_call_record_sip_callee_active",
@@ -38,6 +39,11 @@ class AiCallRecordModel(MappedBase):
         comment="雪花主键",
     )
     call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
+    follow_up_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="人工回拨来源跟进任务ID",
+    )
     business_type: Mapped[str | None] = mapped_column(
         String(32),
         nullable=True,

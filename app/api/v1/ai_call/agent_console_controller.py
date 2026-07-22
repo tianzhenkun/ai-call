@@ -13,6 +13,7 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
+from app.services.ai_call.livekit_sip import HumanOnlySipSessionFactory
 
 from .agent_console_schema import (
     AfterCallWorkIn,
@@ -24,6 +25,7 @@ from .agent_console_schema import (
     AgentProfileUpdateIn,
     AgentSceneScopesIn,
     FollowUpAttemptIn,
+    FollowUpCallIn,
     FollowUpCloseIn,
 )
 from .service import get_default_ai_call_service
@@ -47,7 +49,14 @@ async def get_agent_console_service(
 async def get_follow_up_service(
     db: Annotated[AsyncSession, Depends(db_getter)],
 ) -> AiCallFollowUpService:
-    return AiCallFollowUpService(db)
+    ai_call_service = get_default_ai_call_service(db)
+    callback_factory = None
+    if ai_call_service.sip_client is not None:
+        callback_factory = HumanOnlySipSessionFactory(
+            room_manager=ai_call_service.orchestrator.livekit_room_manager,
+            sip_client=ai_call_service.sip_client,
+        )
+    return AiCallFollowUpService(db, callback_factory=callback_factory)
 
 
 def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
@@ -304,6 +313,21 @@ async def claim_follow_up_controller(
 ):
     task = await service.claim_follow_up(auth, follow_up_id=follow_up_id)
     return SuccessResponse(data=service.follow_up_payload(task))
+
+
+@AgentConsoleRouter.post("/follow-ups/{follow_up_id}/call", summary="发起浏览器人工回拨")
+async def start_follow_up_call_controller(
+    follow_up_id: int,
+    payload: FollowUpCallIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    callback = await service.start_callback(
+        auth,
+        follow_up_id=follow_up_id,
+        payload=payload,
+    )
+    return SuccessResponse(data=service.callback_payload(callback), msg="回拨任务已受理")
 
 
 @AgentConsoleRouter.post("/follow-ups/{follow_up_id}/complete", summary="完成跟进任务")

@@ -1696,7 +1696,17 @@ async def _handle_livekit_webhook_event_background(
     async with async_db_session() as db:
         async with db.begin():
             service = get_default_ai_call_service(db)
-            return await service.handle_livekit_webhook_event(
+            result = await service.handle_livekit_webhook_event(
+                event_type=event_type,
+                room_name=room_name,
+                participant_identity=participant_identity,
+                payload=payload,
+            )
+            if result.get("handled"):
+                return result
+            from app.services.ai_call.follow_up_service import AiCallFollowUpService
+
+            return await AiCallFollowUpService(db).handle_livekit_webhook_event(
                 event_type=event_type,
                 room_name=room_name,
                 participant_identity=participant_identity,

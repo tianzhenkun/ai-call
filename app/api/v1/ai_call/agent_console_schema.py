@@ -138,6 +138,11 @@ class FollowUpAttemptIn(BaseModel):
         return self
 
 
+class FollowUpCallIn(BaseModel):
+    console_session_id: UUID
+    callee_phone_number: str = Field(pattern=r"^\+?\d{5,20}$")
+
+
 class FollowUpCloseIn(BaseModel):
     closed_reason: FollowUpClosedReason
     closed_remark: str | None = Field(default=None, max_length=500)
