@@ -69,17 +69,19 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 
 **文件：**
 - 修改：`app/api/v1/ai_call/crud.py`
-- 创建：`app/api/v1/ai_call/agent_console_controller.py`
-- 修改：`app/api/v1/ai_call/__init__.py`
+- 修改：`app/api/v1/ai_call/agent_console_controller.py`（任务 2 已创建并注册路由）
+- 修改：`app/api/v1/ai_call/agent_console_schema.py`
 - 修改：`app/services/ai_call/agent_console_service.py`
+- 修改：`app/services/ai_call/handoff_service.py`（创建 handoff 时冻结来源通话 `scene_code`）
 - 测试：`tests/test_ai_call_agent_console_claim.py`
 
-- [ ] 编写失败测试覆盖：上线预检标记、心跳、暂停/下线、按 `scene_code` 过滤、两坐席抢同一 handoff 仅一个成功、同一坐席抢两单仅一个成功、重复幂等键返回同一结果。
+- [ ] 编写失败测试覆盖：上线预检标记、心跳、暂停/下线、来源通话 `scene_code` 冻结、按 `scene_code` 过滤、两坐席抢同一 handoff 仅一个成功、同一坐席抢两单仅一个成功、同一 handoff + 登录坐席 + `console_session_id` 的安全重试返回同一结果。
 - [ ] 运行 `uv run pytest tests/test_ai_call_agent_console_claim.py -q`，预期 FAIL。
 - [ ] 在 repository 增加带条件的原子更新；PostgreSQL 使用 `SELECT ... FOR UPDATE`，SQLite 测试用条件 `UPDATE ... WHERE status='requested'` 验证影响行数。事务同时更新 handoff 与 agent。
 - [ ] 认领成功写入 `accepted_at`、`claim_expires_at=min(now+15s, expires_at)`、`human_agent_identity`、`accepted_console_session_id`，坐席进入 `claiming`；事务提交后才签发 Token。
 - [ ] 实现 bootstrap、presence、pending、claim 接口；冲突映射为规格中的稳定错误码，不返回 SQL 异常。
 - [ ] 运行定向测试；增加 `pytest -n` 并发不可用时使用 `asyncio.gather` + 两个独立 session 验证竞争。
+- [ ] 当前 `ai_call_record` 不保存 `tenant_id`，handoff 继续沿用既有 `000000` 单租户边界；不得跨租户兜底查询。若接入非 `000000` 宿主租户，必须先补充上游权威租户来源并统一迁移通话与 handoff 链路。
 - [ ] 提交：`git commit -m "feat(ai-call): add atomic handoff claim pool"`。
 
 ### 任务 4：实现媒体确认、重连和 15/60 秒状态收敛

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -41,3 +43,16 @@ class AgentProfileOut(BaseModel):
 
 class AgentBootstrapOut(BaseModel):
     profile: AgentProfileOut
+
+
+class AgentPresenceOnlineIn(BaseModel):
+    console_session_id: UUID
+    device_preflight_passed: bool
+
+
+class AgentPresenceSessionIn(BaseModel):
+    console_session_id: UUID
+
+
+class AgentHandoffClaimIn(BaseModel):
+    console_session_id: UUID

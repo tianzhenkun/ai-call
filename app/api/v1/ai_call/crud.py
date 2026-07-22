@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Select, asc, desc, func, or_, select
+from sqlalchemy import Select, asc, desc, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -969,12 +969,14 @@ class AiCallRecordRepository:
         request_message: str | None,
         requested_at: datetime,
         expires_at: datetime | None,
+        scene_code: str = "default",
     ) -> AiCallHandoffModel:
         handoff = AiCallHandoffModel(
             id=generate_snowflake_id(),
             handoff_id=handoff_id,
             call_id=call_id,
             room_name=room_name,
+            scene_code=scene_code,
             status=status,
             request_source=request_source,
             request_reason=request_reason,
@@ -1035,6 +1037,121 @@ class AiCallRecordRepository:
             .limit(max(1, min(limit, 100)))
         )
         return list(result.scalars().all())
+
+    async def list_console_pending_handoffs(
+        self,
+        *,
+        tenant_id: str,
+        scene_codes: list[str],
+        now: datetime,
+        limit: int,
+    ) -> list[AiCallHandoffModel]:
+        if not scene_codes:
+            return []
+        result = await self.db.execute(
+            select(AiCallHandoffModel)
+            .where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.status == "requested",
+                AiCallHandoffModel.scene_code.in_(scene_codes),
+                or_(AiCallHandoffModel.expires_at.is_(None), AiCallHandoffModel.expires_at > now),
+            )
+            .order_by(asc(AiCallHandoffModel.requested_at), asc(AiCallHandoffModel.id))
+            .limit(max(1, min(limit, 100)))
+        )
+        return list(result.scalars().all())
+
+    async def get_console_handoff_for_claim(
+        self,
+        *,
+        tenant_id: str,
+        handoff_id: str,
+    ) -> AiCallHandoffModel | None:
+        stmt = select(AiCallHandoffModel).where(
+            AiCallHandoffModel.tenant_id == tenant_id,
+            AiCallHandoffModel.handoff_id == handoff_id,
+        )
+        if self._dialect_name() == "postgresql":
+            stmt = stmt.with_for_update()
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_console_agent_for_claim(
+        self,
+        *,
+        tenant_id: str,
+        agent_identity: str,
+    ) -> AiCallHandoffAgentModel | None:
+        stmt = select(AiCallHandoffAgentModel).where(
+            AiCallHandoffAgentModel.tenant_id == tenant_id,
+            AiCallHandoffAgentModel.agent_identity == agent_identity,
+        )
+        if self._dialect_name() == "postgresql":
+            stmt = stmt.with_for_update()
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def claim_console_handoff_if_requested(
+        self,
+        *,
+        tenant_id: str,
+        handoff_id: str,
+        agent_identity: str,
+        console_session_id: str,
+        accepted_at: datetime,
+        claim_expires_at: datetime,
+    ) -> bool:
+        result = await self.db.execute(
+            update(AiCallHandoffModel)
+            .where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.handoff_id == handoff_id,
+                AiCallHandoffModel.status == "requested",
+                or_(
+                    AiCallHandoffModel.expires_at.is_(None),
+                    AiCallHandoffModel.expires_at > accepted_at,
+                ),
+            )
+            .values(
+                status="accepted",
+                human_agent_identity=agent_identity,
+                accepted_console_session_id=console_session_id,
+                accepted_at=accepted_at,
+                claim_expires_at=claim_expires_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    async def claim_console_agent_if_available(
+        self,
+        *,
+        tenant_id: str,
+        agent_identity: str,
+        console_session_id: str,
+        handoff_id: str,
+        call_id: str,
+        now: datetime,
+    ) -> bool:
+        result = await self.db.execute(
+            update(AiCallHandoffAgentModel)
+            .where(
+                AiCallHandoffAgentModel.tenant_id == tenant_id,
+                AiCallHandoffAgentModel.agent_identity == agent_identity,
+                AiCallHandoffAgentModel.status == "available",
+                AiCallHandoffAgentModel.active_handoff_id.is_(None),
+                AiCallHandoffAgentModel.console_session_id == console_session_id,
+            )
+            .values(
+                status="claiming",
+                active_handoff_id=handoff_id,
+                active_call_id=call_id,
+                last_seen_at=now,
+                status_updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
 
     async def update_handoff(
         self,

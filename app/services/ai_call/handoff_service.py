@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import status
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallHandoffModel
+from app.api.v1.ai_call.model import AiCallHandoffModel, AiCallRecordModel
 from app.common.constant import RET
 from app.core.exceptions import CustomException
 from app.services.ai_call.session_registry import CallSessionStatus, utc_now
@@ -77,7 +77,7 @@ class AiCallHandoffService:
         reason: str | None,
         request_message: str | None,
     ) -> tuple[AiCallHandoffModel, bool]:
-        await self._ensure_call_can_handoff(call_id)
+        record = await self._ensure_call_can_handoff(call_id)
         request_source = self._validate_source(source)
         active = await self.get_current(call_id)
         if active is not None:
@@ -95,6 +95,7 @@ class AiCallHandoffService:
             request_message=request_message,
             requested_at=requested_at,
             expires_at=expires_at,
+            scene_code=(record.scene_code or "default").strip() or "default",
         )
         return handoff, True
 
@@ -375,7 +376,7 @@ class AiCallHandoffService:
                 status_code=status.HTTP_404_NOT_FOUND,
             )
 
-    async def _ensure_call_can_handoff(self, call_id: str) -> None:
+    async def _ensure_call_can_handoff(self, call_id: str) -> AiCallRecordModel:
         record = await self.repository.get_record(call_id)
         if record is None:
             raise CustomException(
@@ -389,6 +390,7 @@ class AiCallHandoffService:
                 code=RET.ERROR.code,
                 status_code=status.HTTP_409_CONFLICT,
             )
+        return record
 
     async def _get_required(self, handoff_id: str) -> AiCallHandoffModel:
         handoff = await self.repository.get_handoff_by_id(handoff_id)
