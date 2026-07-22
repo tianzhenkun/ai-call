@@ -280,6 +280,32 @@ class AiCallAgentConsoleService:
         await self.db.commit()
         return handoff
 
+    async def complete_handoff(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+    ) -> AiCallHandoffModel:
+        profile = await self.require_current_agent(auth)
+        handoff, presence = await self._require_owned_handoff(
+            profile,
+            handoff_id=handoff_id,
+            console_session_id=console_session_id,
+            statuses={"connected", "reconnecting"},
+        )
+        now = datetime.now(timezone.utc)
+        handoff.status = "completed"
+        handoff.ended_at = now
+        handoff.end_reason = "agent_completed"
+        handoff.claim_expires_at = None
+        handoff.reconnect_expires_at = None
+        presence.status = "wrap_up_quick"
+        presence.last_seen_at = now
+        presence.status_updated_at = now
+        await self.db.flush()
+        return handoff
+
     async def reconcile_handoff_timeout(
         self,
         tenant_id: str,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AgentProfileCreateIn(BaseModel):
@@ -61,3 +63,93 @@ class AgentHandoffClaimIn(BaseModel):
 class AgentMediaReadyIn(BaseModel):
     console_session_id: UUID
     participant_identity: str = Field(min_length=1, max_length=255)
+
+
+DispositionCode = Literal[
+    "resolved",
+    "follow_up_required",
+    "customer_refused",
+    "invalid_contact",
+    "other",
+]
+FollowUpContactChannel = Literal[
+    "system_callback",
+    "manual_phone",
+    "wechat",
+    "email",
+    "other",
+]
+FollowUpAttemptResult = Literal[
+    "connected",
+    "no_answer",
+    "busy",
+    "rejected",
+    "invalid_contact",
+    "technical_failure",
+]
+FollowUpClosedReason = Literal[
+    "customer_refused",
+    "invalid_contact",
+    "no_longer_needed",
+    "other",
+]
+
+
+class AfterCallWorkIn(BaseModel):
+    disposition_code: DispositionCode
+    needs_follow_up: bool
+    summary: str | None = Field(default=None, max_length=4000)
+    customer_callback_at: datetime | None = None
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_optional_summary(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_callback_time(self):
+        if self.customer_callback_at is not None and not self.needs_follow_up:
+            raise ValueError("只有需要跟进时才能记录客户预约时间")
+        return self
+
+
+class FollowUpAttemptIn(BaseModel):
+    contact_channel: FollowUpContactChannel
+    attempt_result: FollowUpAttemptResult
+    related_call_id: str | None = Field(default=None, min_length=1, max_length=64)
+    ring_duration_seconds: int | None = Field(default=None, ge=0)
+    error_message: str | None = Field(default=None, max_length=500)
+    remark: str | None = Field(default=None, max_length=500)
+    customer_callback_at: datetime | None = None
+
+    @field_validator("error_message", "remark")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_result_details(self):
+        if self.attempt_result == "technical_failure" and not self.error_message:
+            raise ValueError("技术失败必须填写错误摘要")
+        if self.customer_callback_at is not None and self.attempt_result != "connected":
+            raise ValueError("只有客户已接通并明确预约时才能记录回访时间")
+        return self
+
+
+class FollowUpCloseIn(BaseModel):
+    closed_reason: FollowUpClosedReason
+    closed_remark: str | None = Field(default=None, max_length=500)
+
+    @field_validator("closed_remark")
+    @classmethod
+    def normalize_closed_remark(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_other_reason(self):
+        if self.closed_reason == "other" and not self.closed_remark:
+            raise ValueError("选择其他关闭原因时必须填写说明")
+        return self

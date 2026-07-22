@@ -12,8 +12,10 @@ from app.core.dependencies import db_getter, get_current_user
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.follow_up_service import AiCallFollowUpService
 
 from .agent_console_schema import (
+    AfterCallWorkIn,
     AgentHandoffClaimIn,
     AgentMediaReadyIn,
     AgentPresenceOnlineIn,
@@ -21,6 +23,8 @@ from .agent_console_schema import (
     AgentProfileCreateIn,
     AgentProfileUpdateIn,
     AgentSceneScopesIn,
+    FollowUpAttemptIn,
+    FollowUpCloseIn,
 )
 from .service import get_default_ai_call_service
 
@@ -38,6 +42,12 @@ async def get_agent_console_service(
         db,
         participant_verifier=room_manager.has_published_microphone,
     )
+
+
+async def get_follow_up_service(
+    db: Annotated[AsyncSession, Depends(db_getter)],
+) -> AiCallFollowUpService:
+    return AiCallFollowUpService(db)
 
 
 def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
@@ -212,6 +222,113 @@ async def reconnect_token_controller(
             "seat_token": _issue_handoff_token(auth, handoff),
         }
     )
+
+
+@AgentConsoleRouter.post("/handoffs/{handoff_id}/complete", summary="结束人工通话并进入快速话后确认")
+async def complete_agent_handoff_controller(
+    handoff_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+):
+    handoff = await service.complete_handoff(
+        auth,
+        handoff_id=handoff_id,
+        console_session_id=str(payload.console_session_id),
+    )
+    return SuccessResponse(data=service.handoff_payload(handoff))
+
+
+@AgentConsoleRouter.put("/calls/{call_id}/after-call-work", summary="提交快速话后确认")
+async def submit_after_call_work_controller(
+    call_id: str,
+    payload: AfterCallWorkIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    work, follow_up = await service.submit_after_call_work(
+        auth,
+        call_id=call_id,
+        payload=payload,
+    )
+    return SuccessResponse(
+        data={
+            "after_call_work": service.after_call_work_payload(work),
+            "follow_up": service.follow_up_payload(follow_up) if follow_up else None,
+        }
+    )
+
+
+@AgentConsoleRouter.get("/follow-ups", summary="查询本人跟进和公共人工未接回访")
+async def list_follow_ups_controller(
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    rows = await service.list_follow_ups(auth)
+    return TableResponse(
+        rows=[service.follow_up_payload(task) for task in rows],
+        total=len(rows),
+    )
+
+
+@AgentConsoleRouter.get("/follow-ups/{follow_up_id}", summary="查询跟进任务详情")
+async def get_follow_up_controller(
+    follow_up_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    task = await service.get_follow_up(auth, follow_up_id=follow_up_id)
+    return SuccessResponse(data=service.follow_up_payload(task))
+
+
+@AgentConsoleRouter.post("/follow-ups/{follow_up_id}/attempts", summary="追加联系尝试")
+async def append_follow_up_attempt_controller(
+    follow_up_id: int,
+    payload: FollowUpAttemptIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    attempt = await service.append_attempt(
+        auth,
+        follow_up_id=follow_up_id,
+        payload=payload,
+    )
+    return SuccessResponse(data=service.attempt_payload(attempt))
+
+
+@AgentConsoleRouter.post("/follow-ups/{follow_up_id}/claim", summary="原子认领人工未接回访")
+async def claim_follow_up_controller(
+    follow_up_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    task = await service.claim_follow_up(auth, follow_up_id=follow_up_id)
+    return SuccessResponse(data=service.follow_up_payload(task))
+
+
+@AgentConsoleRouter.post("/follow-ups/{follow_up_id}/complete", summary="完成跟进任务")
+async def complete_follow_up_controller(
+    follow_up_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    task = await service.complete_follow_up(auth, follow_up_id=follow_up_id)
+    return SuccessResponse(data=service.follow_up_payload(task))
+
+
+@AgentConsoleRouter.post("/follow-ups/{follow_up_id}/close", summary="关闭跟进任务")
+async def close_follow_up_controller(
+    follow_up_id: int,
+    payload: FollowUpCloseIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    task = await service.close_follow_up(
+        auth,
+        follow_up_id=follow_up_id,
+        payload=payload,
+    )
+    return SuccessResponse(data=service.follow_up_payload(task))
 
 
 @AgentAdminRouter.get("/agents", summary="查询坐席档案")
