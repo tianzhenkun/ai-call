@@ -8,7 +8,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
-from app.api.v1.ai_call.agent_console_controller import get_agent_console_service
+from app.api.v1.ai_call.agent_console_controller import (
+    get_agent_console_reconciler,
+    get_agent_console_service,
+)
 from app.api.v1.ai_call.agent_console_schema import AgentProfileCreateIn, AgentSceneScopesIn
 from app.api.v1.ai_call.model import AiCallAgentProfileModel, AiCallAgentSceneScopeModel
 from app.api.v1.system.auth.schema import AuthSchema
@@ -16,6 +19,7 @@ from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException, handle_exception
+from app.services.ai_call.agent_console_reconciler import AiCallAgentConsoleReconciler
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 
 
@@ -47,7 +51,24 @@ def _client(auth_factory, service: AiCallAgentConsoleService) -> TestClient:
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_current_user] = auth_factory
     app.dependency_overrides[get_agent_console_service] = lambda: service
+    app.dependency_overrides[get_agent_console_reconciler] = lambda: (
+        AiCallAgentConsoleReconciler(service.db, room_exists=lambda _room: False)
+    )
     return TestClient(app)
+
+
+def test_task7_management_and_sse_routes_are_registered() -> None:
+    paths = {route.path for route in AiCallRouter.routes}
+    assert {
+        "/ai-call/agent-console/events",
+        "/ai-call/admin/agents/{agent_id}/status",
+        "/ai-call/admin/agents/{agent_id}/release-stale",
+        "/ai-call/admin/handoffs",
+        "/ai-call/admin/handoffs/{handoff_id}",
+        "/ai-call/admin/handoffs/{handoff_id}/reconcile",
+        "/ai-call/admin/follow-ups",
+        "/ai-call/admin/follow-ups/{follow_up_id}",
+    } <= paths
 
 
 @pytest.mark.anyio
@@ -99,6 +120,7 @@ async def test_admin_endpoints_only_require_login(db_session) -> None:
 
     with _client(authenticated, service) as client:
         assert client.get("/ai-call/admin/agents").status_code == 200
+        assert client.get("/ai-call/agent-console/events").status_code == 403
 
 
 @pytest.mark.anyio

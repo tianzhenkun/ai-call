@@ -343,6 +343,7 @@ class AiCallAgentConsoleService:
             handoff.end_reason = "reconnect_timeout"
             await self._set_claimed_presence(handoff, status_value="wrap_up_quick", release=False)
             await self.db.flush()
+            await self._publish_handoff_state(handoff)
             return handoff
         if (
             handoff.status in {"requested", "accepted"}
@@ -384,6 +385,7 @@ class AiCallAgentConsoleService:
                 }
             )
             await self.db.flush()
+            await self._publish_handoff_state(handoff)
             return handoff
         if (
             handoff.status == "accepted"
@@ -397,6 +399,7 @@ class AiCallAgentConsoleService:
                 handoff.ended_at = current
                 handoff.end_reason = "customer_disconnected"
                 await self.db.flush()
+                await self._publish_handoff_state(handoff)
                 return handoff
             handoff.status = "requested"
             handoff.human_agent_identity = None
@@ -404,6 +407,7 @@ class AiCallAgentConsoleService:
             handoff.accepted_at = None
             handoff.claim_expires_at = None
             await self.db.flush()
+            await self._publish_handoff_state(handoff)
         return handoff
 
     async def require_current_agent(self, auth: AuthSchema) -> AiCallAgentProfileModel:
@@ -646,6 +650,22 @@ class AiCallAgentConsoleService:
         if release:
             presence.active_handoff_id = None
             presence.active_call_id = None
+
+    @staticmethod
+    async def _publish_handoff_state(handoff: AiCallHandoffModel) -> None:
+        from app.services.ai_call.agent_console_reconciler import (
+            publish_agent_console_event,
+        )
+
+        await publish_agent_console_event(
+            handoff.tenant_id,
+            "handoff.changed",
+            {
+                "handoff_id": handoff.handoff_id,
+                "call_id": handoff.call_id,
+                "status": handoff.status,
+            },
+        )
 
     async def _set_idle_presence_status(
         self,

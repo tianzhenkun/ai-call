@@ -140,14 +140,16 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 **文件：**
 - 创建：`app/services/ai_call/agent_console_reconciler.py`
 - 修改：`app/api/v1/ai_call/agent_console_controller.py`
-- 修改：`app/api/v1/ai_call/crud.py`
+- 修改：`app/api/v1/ai_call/agent_console_schema.py`
+- 修改：`app/api/v1/ai_call/service.py`
+- 修改：`app/services/ai_call/livekit_room.py`
 - 测试：`tests/test_ai_call_agent_console_reconcile.py`
 - 测试：`tests/test_ai_call_agent_console_api.py`
 
 - [ ] 编写失败测试覆盖三个管理列表指标、详情、异常释放限制、幂等 reconcile、SSE 事件序号与断线后 bootstrap 恢复。
 - [ ] 运行两个测试文件确认 FAIL。
-- [ ] 实现管理查询、`release-stale`、`reconcile` 和结构化审计；活动 Room 存在时返回 `STALE_RELEASE_NOT_ALLOWED`。
-- [ ] 推送 handoff/task/presence 状态变化；推送失败不回滚数据库事实，客户端以 bootstrap/轮询补偿。
+- [ ] 基于现有 `AiCallRecordRepository` 的记录与幂等事件能力实现管理查询、`release-stale`、`reconcile` 和结构化审计；无需为管理端重复增加 CRUD 仓储层。活动 Room 存在时返回 `STALE_RELEASE_NOT_ALLOWED`。
+- [ ] 使用进程内 SSE 推送 handoff/task/presence 状态变化并带递增序号；推送失败不回滚数据库事实，客户端以 bootstrap/轮询补偿。V1 不把进程内事件历史当持久事实，多实例广播后续再接共享消息基础设施。
 - [ ] 运行：
 
 ```bash

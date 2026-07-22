@@ -425,6 +425,20 @@ class AiCallFollowUpService:
             now=now,
         )
         await self.db.flush()
+        from app.services.ai_call.agent_console_reconciler import (
+            publish_agent_console_event,
+        )
+
+        await publish_agent_console_event(
+            task.tenant_id,
+            "follow_up.callback_outcome",
+            {
+                "follow_up_id": str(task.id),
+                "call_id": call_id,
+                "attempt_result": attempt_result,
+                "task_status": task.status,
+            },
+        )
         return attempt
 
     async def handle_livekit_webhook_event(

@@ -119,6 +119,18 @@ class LiveKitRoomManager:
             for track in tracks
         )
 
+    async def room_exists(self, room_name: str) -> bool:
+        result = await self._post_room_service(
+            method="ListRooms",
+            payload={"names": [room_name]},
+            error_id="room_lookup_failed",
+            msg="LiveKit Room 核验失败",
+        )
+        rooms = result.get("rooms")
+        if not isinstance(rooms, list):
+            return False
+        return any(isinstance(room, dict) and room.get("name") == room_name for room in rooms)
+
     async def _post_room_service(
         self,
         method: str,

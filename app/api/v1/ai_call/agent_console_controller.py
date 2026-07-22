@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
 from app.core.dependencies import db_getter, get_current_user
 from app.core.exceptions import CustomException
+from app.services.ai_call.agent_console_reconciler import (
+    AiCallAgentConsoleReconciler,
+    agent_console_event_broker,
+    publish_agent_console_event,
+)
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
@@ -17,6 +24,7 @@ from app.services.ai_call.livekit_sip import HumanOnlySipSessionFactory
 
 from .agent_console_schema import (
     AfterCallWorkIn,
+    AgentAdminActionIn,
     AgentHandoffClaimIn,
     AgentMediaReadyIn,
     AgentPresenceOnlineIn,
@@ -59,6 +67,35 @@ async def get_follow_up_service(
     return AiCallFollowUpService(db, callback_factory=callback_factory)
 
 
+async def get_agent_console_reconciler(
+    db: Annotated[AsyncSession, Depends(db_getter)],
+) -> AiCallAgentConsoleReconciler:
+    room_manager = get_default_ai_call_service(db).orchestrator.livekit_room_manager
+    return AiCallAgentConsoleReconciler(db, room_exists=room_manager.room_exists)
+
+
+def _tenant_id(auth: AuthSchema) -> str:
+    return str(getattr(auth.user, "tenant_id", None) or "000000")
+
+
+def _sse_event(event) -> str:
+    data = {
+        "sequence": event.sequence,
+        "type": event.event_type,
+        "payload": event.payload,
+        "occurred_at": event.occurred_at.isoformat(),
+    }
+    return (
+        f"id: {event.sequence}\n"
+        f"event: {event.event_type}\n"
+        f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    )
+
+
+async def _publish(auth: AuthSchema, event_type: str, payload: dict) -> None:
+    await publish_agent_console_event(_tenant_id(auth), event_type, payload)
+
+
 def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
     if not handoff.human_agent_identity:
         raise CustomException(msg="认领结果缺少坐席身份", status_code=500)
@@ -98,7 +135,37 @@ async def bootstrap_controller(
     auth: AuthenticatedUser,
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
 ):
-    return SuccessResponse(data=await service.bootstrap_payload(auth))
+    data = await service.bootstrap_payload(auth)
+    data["event_sequence"] = agent_console_event_broker.latest_sequence(_tenant_id(auth))
+    return SuccessResponse(data=data)
+
+
+@AgentConsoleRouter.get("/events", summary="订阅坐席中心状态变化")
+async def agent_console_events_controller(
+    auth: AuthenticatedUser,
+    after_sequence: Annotated[int, Query(ge=0)] = 0,
+):
+    tenant_id = _tenant_id(auth)
+    await AiCallAgentConsoleService(auth.db).require_current_agent(auth)
+    # SSE 不再读取数据库，提前释放认证查询占用的连接，避免长连接耗尽连接池。
+    await auth.db.close()
+
+    async def stream():
+        sequence = after_sequence
+        while True:
+            events = await agent_console_event_broker.wait_for_events(tenant_id, sequence)
+            if not events:
+                yield ": heartbeat\n\n"
+                continue
+            for event in events:
+                sequence = event.sequence
+                yield _sse_event(event)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @AgentConsoleRouter.post("/presence/online", summary="坐席设备预检通过后上线")
@@ -111,6 +178,11 @@ async def online_controller(
         auth,
         console_session_id=str(payload.console_session_id),
         device_preflight_passed=payload.device_preflight_passed,
+    )
+    await _publish(
+        auth,
+        "presence.changed",
+        {"agent_identity": presence.agent_identity, "status": presence.status},
     )
     return SuccessResponse(data=service.presence_payload(presence, presence.agent_identity))
 
@@ -135,6 +207,11 @@ async def pause_controller(
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
 ):
     presence = await service.pause(auth, console_session_id=str(payload.console_session_id))
+    await _publish(
+        auth,
+        "presence.changed",
+        {"agent_identity": presence.agent_identity, "status": presence.status},
+    )
     return SuccessResponse(data=service.presence_payload(presence, presence.agent_identity))
 
 
@@ -145,6 +222,11 @@ async def offline_controller(
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
 ):
     presence = await service.offline(auth, console_session_id=str(payload.console_session_id))
+    await _publish(
+        auth,
+        "presence.changed",
+        {"agent_identity": presence.agent_identity, "status": presence.status},
+    )
     return SuccessResponse(data=service.presence_payload(presence, presence.agent_identity))
 
 
@@ -178,6 +260,11 @@ async def claim_handoff_controller(
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
+    await _publish(
+        auth,
+        "handoff.changed",
+        {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
+    )
     return SuccessResponse(
         data={
             "handoff": service.handoff_payload(handoff),
@@ -207,6 +294,11 @@ async def media_ready_controller(
             handoff_status=handoff.status,
             reason="media_ready",
         )
+    await _publish(
+        auth,
+        "handoff.changed",
+        {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
+    )
     return SuccessResponse(data=service.handoff_payload(handoff))
 
 
@@ -224,6 +316,11 @@ async def reconnect_token_controller(
         auth,
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
+    )
+    await _publish(
+        auth,
+        "handoff.changed",
+        {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
     )
     return SuccessResponse(
         data={
@@ -245,6 +342,11 @@ async def complete_agent_handoff_controller(
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
+    await _publish(
+        auth,
+        "handoff.changed",
+        {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
+    )
     return SuccessResponse(data=service.handoff_payload(handoff))
 
 
@@ -259,6 +361,15 @@ async def submit_after_call_work_controller(
         auth,
         call_id=call_id,
         payload=payload,
+    )
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {
+            "call_id": call_id,
+            "follow_up_id": str(follow_up.id) if follow_up else None,
+            "status": follow_up.status if follow_up else None,
+        },
     )
     return SuccessResponse(
         data={
@@ -302,6 +413,11 @@ async def append_follow_up_attempt_controller(
         follow_up_id=follow_up_id,
         payload=payload,
     )
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {"follow_up_id": str(attempt.follow_up_id), "attempt_result": attempt.attempt_result},
+    )
     return SuccessResponse(data=service.attempt_payload(attempt))
 
 
@@ -312,6 +428,11 @@ async def claim_follow_up_controller(
     service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
 ):
     task = await service.claim_follow_up(auth, follow_up_id=follow_up_id)
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {"follow_up_id": str(task.id), "status": task.status},
+    )
     return SuccessResponse(data=service.follow_up_payload(task))
 
 
@@ -327,6 +448,11 @@ async def start_follow_up_call_controller(
         follow_up_id=follow_up_id,
         payload=payload,
     )
+    await _publish(
+        auth,
+        "follow_up.callback_started",
+        {"follow_up_id": str(follow_up_id), "call_id": callback.call_id},
+    )
     return SuccessResponse(data=service.callback_payload(callback), msg="回拨任务已受理")
 
 
@@ -337,6 +463,11 @@ async def complete_follow_up_controller(
     service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
 ):
     task = await service.complete_follow_up(auth, follow_up_id=follow_up_id)
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {"follow_up_id": str(task.id), "status": task.status},
+    )
     return SuccessResponse(data=service.follow_up_payload(task))
 
 
@@ -352,17 +483,23 @@ async def close_follow_up_controller(
         follow_up_id=follow_up_id,
         payload=payload,
     )
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {"follow_up_id": str(task.id), "status": task.status},
+    )
     return SuccessResponse(data=service.follow_up_payload(task))
 
 
 @AgentAdminRouter.get("/agents", summary="查询坐席档案")
 async def list_agents_controller(
     auth: AuthenticatedUser,
-    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
 ):
-    profiles = await service.list_profiles(auth)
-    rows = [await service.profile_payload(profile) for profile in profiles]
-    return TableResponse(rows=rows, total=len(rows))
+    return SuccessResponse(data=await service.list_agents(auth))
 
 
 @AgentAdminRouter.post("/agents", summary="创建坐席档案")
@@ -395,3 +532,104 @@ async def replace_agent_scene_scopes_controller(
 ):
     scene_codes = await service.replace_scene_scopes(auth, agent_id, payload)
     return SuccessResponse(data={"sceneCodes": scene_codes})
+
+
+@AgentAdminRouter.get("/agents/{agent_id}/status", summary="查询坐席运行状态")
+async def get_agent_status_controller(
+    agent_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    return SuccessResponse(data=await service.get_agent_status(auth, agent_id))
+
+
+@AgentAdminRouter.post("/agents/{agent_id}/release-stale", summary="释放坐席异常占用")
+async def release_stale_agent_controller(
+    agent_id: int,
+    payload: AgentAdminActionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    result = await service.release_stale_agent(
+        auth,
+        agent_id=agent_id,
+        confirmed=payload.confirmed,
+        reason=payload.reason,
+    )
+    await _publish(
+        auth,
+        "presence.changed",
+        {"agent_identity": result["agent_identity"], "status": result["status"]},
+    )
+    return SuccessResponse(data=result)
+
+
+@AgentAdminRouter.get("/handoffs", summary="查询转人工记录与指标")
+async def list_admin_handoffs_controller(
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    return SuccessResponse(data=await service.list_handoffs(auth))
+
+
+@AgentAdminRouter.get("/handoffs/{handoff_id}", summary="查询转人工记录详情")
+async def get_admin_handoff_controller(
+    handoff_id: str,
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    return SuccessResponse(data=await service.get_handoff_detail(auth, handoff_id))
+
+
+@AgentAdminRouter.post("/handoffs/{handoff_id}/reconcile", summary="重新执行转人工状态补偿")
+async def reconcile_admin_handoff_controller(
+    handoff_id: str,
+    payload: AgentAdminActionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    result = await service.reconcile_handoff(
+        auth,
+        handoff_id=handoff_id,
+        confirmed=payload.confirmed,
+        reason=payload.reason,
+    )
+    return SuccessResponse(data=result)
+
+
+@AgentAdminRouter.get("/follow-ups", summary="查询跟进任务与指标")
+async def list_admin_follow_ups_controller(
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    return SuccessResponse(data=await service.list_follow_ups(auth))
+
+
+@AgentAdminRouter.get("/follow-ups/{follow_up_id}", summary="查询跟进任务详情")
+async def get_admin_follow_up_controller(
+    follow_up_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[
+        AiCallAgentConsoleReconciler,
+        Depends(get_agent_console_reconciler),
+    ],
+):
+    return SuccessResponse(data=await service.get_follow_up_detail(auth, follow_up_id))

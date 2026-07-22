@@ -158,3 +158,8 @@ class FollowUpCloseIn(BaseModel):
         if self.closed_reason == "other" and not self.closed_remark:
             raise ValueError("选择其他关闭原因时必须填写说明")
         return self
+
+
+class AgentAdminActionIn(BaseModel):
+    confirmed: bool
+    reason: str | None = Field(default=None, max_length=500)

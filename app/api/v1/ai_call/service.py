@@ -827,6 +827,21 @@ class AiCallService:
             if refreshed is not None:
                 handoff = refreshed
         self._schedule_handoff_timeout(handoff)
+        if created:
+            from app.services.ai_call.agent_console_reconciler import (
+                publish_agent_console_event,
+            )
+
+            await publish_agent_console_event(
+                handoff.tenant_id,
+                "handoff.requested",
+                {
+                    "handoff_id": handoff.handoff_id,
+                    "call_id": handoff.call_id,
+                    "scene_code": handoff.scene_code,
+                    "status": handoff.status,
+                },
+            )
         return self.handoff_service.handoff_to_dict(handoff)
 
     async def get_current_handoff(self, call_id: str) -> dict | None:

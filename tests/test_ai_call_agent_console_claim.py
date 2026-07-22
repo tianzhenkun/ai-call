@@ -175,6 +175,18 @@ async def test_livekit_media_ready_requires_unmuted_microphone_track() -> None:
 
 
 @pytest.mark.anyio
+async def test_livekit_room_lookup_uses_exact_room_name() -> None:
+    manager = LiveKitRoomManager("ws://livekit.test", "key", "secret", 60)
+
+    async def list_rooms(**_kwargs):
+        return {"rooms": [{"name": "room-1"}, {"name": "room-2"}]}
+
+    manager._post_room_service = list_rooms
+    assert await manager.room_exists("room-1") is True
+    assert await manager.room_exists("room-missing") is False
+
+
+@pytest.mark.anyio
 async def test_handoff_creation_freezes_source_call_scene_code(session_factory) -> None:
     now = datetime.now(timezone.utc)
     async with session_factory() as db:
