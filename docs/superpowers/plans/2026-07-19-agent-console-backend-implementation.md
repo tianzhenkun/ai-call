@@ -87,8 +87,12 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 ### 任务 4：实现媒体确认、重连和 15/60 秒状态收敛
 
 **文件：**
+- 修改：`app/api/v1/ai_call/crud.py`（幂等创建人工未接回访）
+- 修改：`app/api/v1/ai_call/agent_console_schema.py`
 - 修改：`app/services/ai_call/handoff_service.py`
 - 修改：`app/services/ai_call/agent_console_service.py`
+- 修改：`app/services/ai_call/handoff_exception_manager.py`（按 claim/reconnect/total deadline 调度）
+- 修改：`app/services/ai_call/livekit_room.py`（核验 Participant 麦克风轨）
 - 修改：`app/api/v1/ai_call/agent_console_controller.py`
 - 测试：`tests/test_ai_call_agent_console_claim.py`
 

@@ -11,11 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallHandoffModel
 from app.core.logger import log
+from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.handoff_service import (
     HANDOFF_STATUS_ACCEPTED,
     HANDOFF_STATUS_REQUESTED,
-    AiCallHandoffService,
 )
 from app.services.ai_call.orchestrator import AiCallOrchestrator
 from app.services.ai_call.record_service import AiCallRecordService
@@ -84,11 +84,26 @@ class AiCallHandoffExceptionManager:
     def schedule_timeout(self, handoff: AiCallHandoffModel) -> None:
         if not self.exception_close_enabled or handoff.expires_at is None:
             return
-        if handoff.status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
+        if handoff.status not in {
+            HANDOFF_STATUS_REQUESTED,
+            HANDOFF_STATUS_ACCEPTED,
+            "reconnecting",
+        }:
+            return
+        deadlines = [handoff.expires_at]
+        if handoff.status == HANDOFF_STATUS_ACCEPTED:
+            deadlines.append(handoff.claim_expires_at)
+        elif handoff.status == "reconnecting":
+            deadlines = [handoff.reconnect_expires_at]
+        deadline = min(
+            (self._ensure_utc(value) for value in deadlines if value is not None),
+            default=None,
+        )
+        if deadline is None:
             return
         handoff_id = handoff.handoff_id
         self.cancel_timeout(handoff_id)
-        delay_seconds = max(0.0, (self._ensure_utc(handoff.expires_at) - utc_now()).total_seconds())
+        delay_seconds = max(0.0, (deadline - utc_now()).total_seconds())
         try:
             task = asyncio.create_task(
                 self._timeout_worker(
@@ -112,7 +127,7 @@ class AiCallHandoffExceptionManager:
             event_type="handoff_timeout_task_started",
             handoff_id=handoff_id,
             handoff_status=handoff.status,
-            payload={"expiresAt": self._ensure_utc(handoff.expires_at).isoformat()},
+            payload={"deadlineAt": deadline.isoformat()},
         )
 
     def start_waiting_tone(self, handoff: AiCallHandoffModel) -> None:
@@ -275,18 +290,33 @@ class AiCallHandoffExceptionManager:
         try:
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
-            expired = await self._expire_handoff_if_due(handoff_id)
-            if expired is None:
+            reconciled = await self._expire_handoff_if_due(handoff_id)
+            if reconciled is None:
+                return
+            if reconciled.status in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
+                self._timeout_tasks.pop(handoff_id, None)
+                self.schedule_timeout(reconciled)
+                return
+            if reconciled.status == "failed":
+                self._record_handoff_event(
+                    call_id=reconciled.call_id,
+                    event_type="handoff_reconnect_timeout",
+                    handoff_id=reconciled.handoff_id,
+                    handoff_status=reconciled.status,
+                    payload={"reason": reconciled.end_reason},
+                )
+                return
+            if reconciled.status != "expired":
                 return
             self._record_handoff_event(
-                call_id=expired.call_id,
+                call_id=reconciled.call_id,
                 event_type="handoff_expired",
-                handoff_id=expired.handoff_id,
-                handoff_status=expired.status,
-                payload={"reason": expired.end_reason},
+                handoff_id=reconciled.handoff_id,
+                handoff_status=reconciled.status,
+                payload={"reason": reconciled.end_reason},
             )
             self._timeout_tasks.pop(handoff_id, None)
-            self.trigger_exception_close(expired, call_end_reason="handoff_timeout")
+            self.trigger_exception_close(reconciled, call_end_reason="handoff_timeout")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -361,15 +391,11 @@ class AiCallHandoffExceptionManager:
                 handoff = await repository.get_handoff_by_id(handoff_id)
                 if handoff is None:
                     return None
-                if handoff.status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
-                    return None
-                if handoff.expires_at is None or self._ensure_utc(handoff.expires_at) > utc_now():
-                    return None
-                handoff_service = AiCallHandoffService(
-                    repository,
-                    request_timeout_seconds=self.timeout_seconds,
+                return await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+                    handoff.tenant_id,
+                    handoff.handoff_id,
+                    now=utc_now(),
                 )
-                return await handoff_service.expire_request(handoff_id)
 
     async def _close_after_exception(
         self,

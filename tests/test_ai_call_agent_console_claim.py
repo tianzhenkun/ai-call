@@ -13,6 +13,7 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
+    AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
@@ -23,6 +24,7 @@ from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.handoff_service import AiCallHandoffService
+from app.services.ai_call.livekit_room import LiveKitRoomManager
 
 
 def _auth(db, *, user_id: int, tenant_id: str = "tenant-a") -> AuthSchema:
@@ -150,7 +152,26 @@ def test_agent_console_task3_routes_are_registered() -> None:
         "/ai-call/agent-console/presence/heartbeat",
         "/ai-call/agent-console/handoffs/pending",
         "/ai-call/agent-console/handoffs/{handoff_id}/claim",
+        "/ai-call/agent-console/handoffs/{handoff_id}/media-ready",
+        "/ai-call/agent-console/handoffs/{handoff_id}/reconnect-token",
     } <= paths
+
+
+@pytest.mark.anyio
+async def test_livekit_media_ready_requires_unmuted_microphone_track() -> None:
+    manager = LiveKitRoomManager("ws://livekit.test", "key", "secret", 60)
+
+    async def microphone_participant(**_kwargs):
+        return {"tracks": [{"type": 0, "source": 2, "muted": False}]}
+
+    manager._post_room_service = microphone_participant
+    assert await manager.has_published_microphone("room-1", "human-agent-1") is True
+
+    async def muted_participant(**_kwargs):
+        return {"tracks": [{"type": 0, "source": 2, "muted": True}]}
+
+    manager._post_room_service = muted_participant
+    assert await manager.has_published_microphone("room-1", "human-agent-1") is False
 
 
 @pytest.mark.anyio
@@ -475,3 +496,177 @@ async def test_same_agent_session_claim_retry_returns_same_result(session_factor
     assert second.id == first.id
     assert second.accepted_at.replace(tzinfo=timezone.utc) == first.accepted_at
     assert second.claim_expires_at.replace(tzinfo=timezone.utc) == first.claim_expires_at
+
+
+@pytest.mark.anyio
+async def test_media_ready_requires_livekit_microphone_before_connected(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    claimed = await _claim(
+        session_factory,
+        user_id=20,
+        handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(claimed, AiCallHandoffModel)
+    assert claimed.status == "accepted"
+
+    async def microphone_missing(_room_name: str, _participant_identity: str) -> bool:
+        return False
+
+    async with session_factory() as db:
+        service = AiCallAgentConsoleService(db, participant_verifier=microphone_missing)
+        with pytest.raises(CustomException) as not_ready:
+            await service.media_ready(
+                _auth(db, user_id=20),
+                handoff_id="handoff-1",
+                console_session_id=console_session_id,
+                participant_identity="human-agent-handoff-1",
+            )
+    assert _error_code(not_ready.value) == "MEDIA_NOT_READY"
+
+    async def microphone_ready(_room_name: str, _participant_identity: str) -> bool:
+        return True
+
+    async with session_factory() as db, db.begin():
+        connected = await AiCallAgentConsoleService(
+            db,
+            participant_verifier=microphone_ready,
+        ).media_ready(
+            _auth(db, user_id=20),
+            handoff_id="handoff-1",
+            console_session_id=console_session_id,
+            participant_identity="human-agent-handoff-1",
+        )
+    assert connected.status == "connected"
+
+
+@pytest.mark.anyio
+async def test_claim_timeout_requeues_before_total_wait_deadline(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    await _claim(
+        session_factory,
+        user_id=20,
+        handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        handoff = (
+            await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        ).scalar_one()
+        handoff.claim_expires_at = now - timedelta(seconds=1)
+        handoff.expires_at = now + timedelta(seconds=30)
+
+    async with session_factory() as db, db.begin():
+        reconciled = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+            "tenant-a",
+            "handoff-1",
+            now=now,
+        )
+    assert reconciled.status == "requested"
+    assert reconciled.human_agent_identity is None
+
+    async with session_factory() as db:
+        presence = (
+            await db.execute(select(AiCallHandoffAgentModel).where(AiCallHandoffAgentModel.id == 20))
+        ).scalar_one()
+    assert presence.status == "available"
+    assert presence.active_handoff_id is None
+
+
+@pytest.mark.anyio
+async def test_total_wait_timeout_creates_one_unanswered_follow_up(session_factory) -> None:
+    await _seed_handoff(
+        session_factory,
+        row_id=1,
+        handoff_id="handoff-1",
+        expires_delta=timedelta(seconds=-1),
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db:
+        service = AiCallAgentConsoleService(db)
+        await service.reconcile_handoff_timeout("tenant-a", "handoff-1", now=now)
+        await service.reconcile_handoff_timeout("tenant-a", "handoff-1", now=now)
+        await db.commit()
+
+    async with session_factory() as db:
+        handoff = (
+            await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        ).scalar_one()
+        follow_ups = list((await db.execute(select(AiCallFollowUpTaskModel))).scalars().all())
+    assert handoff.status == "expired"
+    assert len(follow_ups) == 1
+    assert follow_ups[0].source_type == "handoff_unanswered"
+    assert follow_ups[0].status == "pending"
+    assert follow_ups[0].customer_callback_at is None
+
+
+@pytest.mark.anyio
+async def test_reconnect_timeout_fails_without_returning_to_public_pool(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    await _claim(
+        session_factory,
+        user_id=20,
+        handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    async with session_factory() as db, db.begin():
+        handoff = (
+            await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        ).scalar_one()
+        handoff.status = "connected"
+        presence = (
+            await db.execute(select(AiCallHandoffAgentModel).where(AiCallHandoffAgentModel.id == 20))
+        ).scalar_one()
+        presence.status = "in_call"
+
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        reconnecting = await AiCallAgentConsoleService(db).begin_reconnect(
+            _auth(db, user_id=20),
+            handoff_id="handoff-1",
+            console_session_id=console_session_id,
+            now=now,
+        )
+    async with session_factory() as db, db.begin():
+        reconnecting = (
+            await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        ).scalar_one()
+        reconnecting.reconnect_expires_at = now - timedelta(seconds=1)
+
+    async with session_factory() as db, db.begin():
+        failed = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+            "tenant-a",
+            "handoff-1",
+            now=now,
+        )
+    assert failed.status == "failed"
+    assert failed.end_reason == "reconnect_timeout"
+
+    async with session_factory() as db:
+        presence = (
+            await db.execute(select(AiCallHandoffAgentModel).where(AiCallHandoffAgentModel.id == 20))
+        ).scalar_one()
+    assert presence.status == "wrap_up_quick"
+    assert presence.active_handoff_id == "handoff-1"

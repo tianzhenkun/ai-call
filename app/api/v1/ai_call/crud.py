@@ -13,6 +13,7 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallPromptProfileModel,
@@ -1152,6 +1153,43 @@ class AiCallRecordRepository:
             .execution_options(synchronize_session=False)
         )
         return result.rowcount == 1
+
+    async def create_unanswered_follow_up_if_missing(self, values: dict) -> None:
+        table = AiCallFollowUpTaskModel.__table__
+        dialect_name = self._dialect_name()
+        if dialect_name == "postgresql":
+            stmt = (
+                postgresql_insert(table)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[table.c.tenant_id, table.c.source_handoff_id]
+                )
+            )
+        elif dialect_name == "sqlite":
+            stmt = (
+                sqlite_insert(table)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[table.c.tenant_id, table.c.source_handoff_id]
+                )
+            )
+        elif dialect_name == "mysql":
+            insert_stmt = mysql_insert(table).values(**values)
+            stmt = insert_stmt.on_duplicate_key_update(
+                source_handoff_id=insert_stmt.inserted.source_handoff_id
+            )
+        else:
+            existing = await self.db.execute(
+                select(AiCallFollowUpTaskModel.id).where(
+                    AiCallFollowUpTaskModel.tenant_id == values["tenant_id"],
+                    AiCallFollowUpTaskModel.source_handoff_id
+                    == values["source_handoff_id"],
+                )
+            )
+            if existing.scalar_one_or_none() is None:
+                self.db.add(AiCallFollowUpTaskModel(**values))
+            return
+        await self.db.execute(stmt)
 
     async def update_handoff(
         self,

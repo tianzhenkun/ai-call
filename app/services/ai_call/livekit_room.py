@@ -97,13 +97,35 @@ class LiveKitRoomManager:
             expires_in_seconds=expires_in_seconds,
         )
 
+    async def has_published_microphone(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> bool:
+        participant = await self._post_room_service(
+            method="GetParticipant",
+            payload={"room": room_name, "identity": participant_identity},
+            error_id="participant_lookup_failed",
+            msg="LiveKit 坐席参与方核验失败",
+        )
+        tracks = participant.get("tracks")
+        if not isinstance(tracks, list):
+            return False
+        return any(
+            isinstance(track, dict)
+            and track.get("type") in {0, "AUDIO"}
+            and track.get("source") in {2, "MICROPHONE"}
+            and not bool(track.get("muted"))
+            for track in tracks
+        )
+
     async def _post_room_service(
         self,
         method: str,
         payload: dict,
         error_id: str,
         msg: str,
-    ) -> None:
+    ) -> dict:
         service_url = f"{self._http_base_url()}/twirp/livekit.RoomService/{method}"
         token = self._issue_room_admin_token()
         try:
@@ -120,6 +142,8 @@ class LiveKitRoomManager:
                 msg=msg,
                 status_code=status.HTTP_502_BAD_GATEWAY,
             ) from exc
+        data = response.json()
+        return data if isinstance(data, dict) else {}
 
     def _issue_room_admin_token(self) -> str:
         now = datetime.now(timezone.utc)

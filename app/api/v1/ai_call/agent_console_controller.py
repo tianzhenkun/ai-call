@@ -15,6 +15,7 @@ from app.services.ai_call.exceptions import AiCallError
 
 from .agent_console_schema import (
     AgentHandoffClaimIn,
+    AgentMediaReadyIn,
     AgentPresenceOnlineIn,
     AgentPresenceSessionIn,
     AgentProfileCreateIn,
@@ -32,7 +33,45 @@ AuthenticatedUser = Annotated[AuthSchema, Depends(get_current_user)]
 async def get_agent_console_service(
     db: Annotated[AsyncSession, Depends(db_getter)],
 ) -> AiCallAgentConsoleService:
-    return AiCallAgentConsoleService(db)
+    room_manager = get_default_ai_call_service(db).orchestrator.livekit_room_manager
+    return AiCallAgentConsoleService(
+        db,
+        participant_verifier=room_manager.has_published_microphone,
+    )
+
+
+def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
+    if not handoff.human_agent_identity:
+        raise CustomException(msg="认领结果缺少坐席身份", status_code=500)
+    ai_call_service = get_default_ai_call_service(auth.db)
+    if ai_call_service.handoff_exception_manager is not None:
+        ai_call_service.handoff_exception_manager.schedule_timeout(handoff)
+    try:
+        token = ai_call_service.orchestrator.issue_handoff_token(
+            call_id=handoff.call_id,
+            handoff_id=handoff.handoff_id,
+            human_agent_identity=handoff.human_agent_identity,
+        )
+    except AiCallError as exc:
+        error_code = (
+            "CUSTOMER_NOT_CONNECTED"
+            if exc.error_id in {"session_not_found", "invalid_session_state"}
+            else exc.error_id
+        )
+        raise CustomException(
+            msg=exc.msg,
+            status_code=exc.status_code,
+            data={"errorCode": error_code},
+        ) from exc
+    return {
+        "call_id": token.call_id,
+        "handoff_id": token.handoff_id,
+        "room_name": token.room_name,
+        "livekit_url": token.livekit_url,
+        "participant_token": token.participant_token,
+        "participant_identity": token.participant_identity,
+        "expires_in_seconds": token.expires_in_seconds,
+    }
 
 
 @AgentConsoleRouter.get("/bootstrap", summary="获取坐席工作台启动状态")
@@ -120,37 +159,57 @@ async def claim_handoff_controller(
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
-    if not handoff.human_agent_identity:
-        raise CustomException(msg="认领结果缺少坐席身份", status_code=500)
-    try:
-        token = get_default_ai_call_service(auth.db).orchestrator.issue_handoff_token(
-            call_id=handoff.call_id,
-            handoff_id=handoff.handoff_id,
-            human_agent_identity=handoff.human_agent_identity,
-        )
-    except AiCallError as exc:
-        error_code = (
-            "CUSTOMER_NOT_CONNECTED"
-            if exc.error_id in {"session_not_found", "invalid_session_state"}
-            else exc.error_id
-        )
-        raise CustomException(
-            msg=exc.msg,
-            status_code=exc.status_code,
-            data={"errorCode": error_code},
-        ) from exc
     return SuccessResponse(
         data={
             "handoff": service.handoff_payload(handoff),
-            "seat_token": {
-                "call_id": token.call_id,
-                "handoff_id": token.handoff_id,
-                "room_name": token.room_name,
-                "livekit_url": token.livekit_url,
-                "participant_token": token.participant_token,
-                "participant_identity": token.participant_identity,
-                "expires_in_seconds": token.expires_in_seconds,
-            },
+            "seat_token": _issue_handoff_token(auth, handoff),
+        }
+    )
+
+
+@AgentConsoleRouter.post("/handoffs/{handoff_id}/media-ready", summary="确认坐席媒体已就绪")
+async def media_ready_controller(
+    handoff_id: str,
+    payload: AgentMediaReadyIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+):
+    handoff = await service.media_ready(
+        auth,
+        handoff_id=handoff_id,
+        console_session_id=str(payload.console_session_id),
+        participant_identity=payload.participant_identity,
+    )
+    ai_call_service = get_default_ai_call_service(auth.db)
+    if ai_call_service.handoff_exception_manager is not None:
+        ai_call_service.handoff_exception_manager.cancel_timeout(
+            handoff.handoff_id,
+            call_id=handoff.call_id,
+            handoff_status=handoff.status,
+            reason="media_ready",
+        )
+    return SuccessResponse(data=service.handoff_payload(handoff))
+
+
+@AgentConsoleRouter.post(
+    "/handoffs/{handoff_id}/reconnect-token",
+    summary="进入重连窗口并重新签发坐席 Token",
+)
+async def reconnect_token_controller(
+    handoff_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+):
+    handoff = await service.begin_reconnect(
+        auth,
+        handoff_id=handoff_id,
+        console_session_id=str(payload.console_session_id),
+    )
+    return SuccessResponse(
+        data={
+            "handoff": service.handoff_payload(handoff),
+            "seat_token": _issue_handoff_token(auth, handoff),
         }
     )
 

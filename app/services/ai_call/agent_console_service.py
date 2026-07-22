@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -26,9 +27,15 @@ from app.utils.id_util import generate_snowflake_id
 class AiCallAgentConsoleService:
     """坐席身份、在线状态、场景路由和原子认领。"""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        participant_verifier: Callable[[str, str], Awaitable[bool]] | None = None,
+    ) -> None:
         self.db = db
         self.repository = AiCallRecordRepository(db)
+        self.participant_verifier = participant_verifier
 
     async def online(
         self,
@@ -210,6 +217,156 @@ class AiCallAgentConsoleService:
         set_committed_value(handoff, "claim_expires_at", claim_expires_at)
         # 认领事务先落库，控制器随后才能签发 LiveKit Token。
         await self.db.commit()
+        return handoff
+
+    async def media_ready(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+        participant_identity: str,
+    ) -> AiCallHandoffModel:
+        profile = await self.require_current_agent(auth)
+        handoff, presence = await self._require_owned_handoff(
+            profile,
+            handoff_id=handoff_id,
+            console_session_id=console_session_id,
+            statuses={"accepted", "reconnecting"},
+        )
+        if participant_identity != f"human-agent-{handoff.handoff_id}":
+            self._raise_conflict("坐席 Participant 身份不匹配", "CONSOLE_SESSION_CONFLICT")
+        record = await self.repository.get_record(handoff.call_id)
+        if record is not None and record.status in {"completed", "failed"}:
+            self._raise_conflict("客户通话已经结束", "CUSTOMER_NOT_CONNECTED")
+        if self.participant_verifier is None:
+            raise CustomException(msg="LiveKit Participant 核验器未配置", status_code=503)
+        if not await self.participant_verifier(handoff.room_name, participant_identity):
+            self._raise_conflict("坐席麦克风尚未就绪", "MEDIA_NOT_READY")
+        now = datetime.now(timezone.utc)
+        handoff.status = "connected"
+        handoff.connected_at = handoff.connected_at or now
+        handoff.reconnect_expires_at = None
+        presence.status = "in_call"
+        presence.last_seen_at = now
+        presence.status_updated_at = now
+        await self.db.flush()
+        return handoff
+
+    async def begin_reconnect(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+        now: datetime | None = None,
+    ) -> AiCallHandoffModel:
+        profile = await self.require_current_agent(auth)
+        handoff, presence = await self._require_owned_handoff(
+            profile,
+            handoff_id=handoff_id,
+            console_session_id=console_session_id,
+            statuses={"connected", "reconnecting"},
+        )
+        current = now or datetime.now(timezone.utc)
+        if handoff.status == "connected":
+            handoff.status = "reconnecting"
+            handoff.reconnect_expires_at = current + timedelta(
+                seconds=settings.AI_CALL_AGENT_RECONNECT_GRACE_SECONDS
+            )
+        presence.status = "reconnecting"
+        presence.last_seen_at = current
+        presence.status_updated_at = current
+        await self.db.commit()
+        return handoff
+
+    async def reconcile_handoff_timeout(
+        self,
+        tenant_id: str,
+        handoff_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> AiCallHandoffModel | None:
+        current = now or datetime.now(timezone.utc)
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=tenant_id,
+            handoff_id=handoff_id,
+        )
+        if handoff is None:
+            return None
+        if handoff.status in {"completed", "expired", "canceled", "failed"}:
+            return handoff
+        if (
+            handoff.status == "reconnecting"
+            and handoff.reconnect_expires_at is not None
+            and self._ensure_utc(handoff.reconnect_expires_at) <= current
+        ):
+            handoff.status = "failed"
+            handoff.ended_at = current
+            handoff.end_reason = "reconnect_timeout"
+            await self._set_claimed_presence(handoff, status_value="wrap_up_quick", release=False)
+            await self.db.flush()
+            return handoff
+        if (
+            handoff.status in {"requested", "accepted"}
+            and handoff.expires_at is not None
+            and self._ensure_utc(handoff.expires_at) <= current
+        ):
+            handoff.status = "expired"
+            handoff.ended_at = current
+            handoff.end_reason = "handoff_unanswered"
+            await self._set_claimed_presence(handoff, status_value="available", release=True)
+            record = await self.repository.get_record(handoff.call_id)
+            await self.repository.create_unanswered_follow_up_if_missing(
+                {
+                    "id": generate_snowflake_id(),
+                    "tenant_id": handoff.tenant_id,
+                    "source_type": "handoff_unanswered",
+                    "source_call_id": handoff.call_id,
+                    "source_handoff_id": handoff.handoff_id,
+                    "scene_code": handoff.scene_code,
+                    "business_type": record.business_type if record is not None else None,
+                    "business_id": record.business_id if record is not None else None,
+                    "contact_ref": f"call:{handoff.call_id}",
+                    "masked_contact": (
+                        record.callee_phone_number_masked
+                        if record is not None and record.callee_phone_number_masked
+                        else "未提供"
+                    ),
+                    "owner_agent_identity": None,
+                    "status": "pending",
+                    "follow_up_reason": "首次人工接通等待超时",
+                    "customer_callback_at": None,
+                    "summary": None,
+                    "closed_reason": None,
+                    "closed_remark": None,
+                    "completed_at": None,
+                    "closed_at": None,
+                    "created_at": current,
+                    "updated_at": current,
+                }
+            )
+            await self.db.flush()
+            return handoff
+        if (
+            handoff.status == "accepted"
+            and handoff.claim_expires_at is not None
+            and self._ensure_utc(handoff.claim_expires_at) <= current
+        ):
+            record = await self.repository.get_record(handoff.call_id)
+            await self._set_claimed_presence(handoff, status_value="available", release=True)
+            if record is not None and record.status in {"completed", "failed"}:
+                handoff.status = "canceled"
+                handoff.ended_at = current
+                handoff.end_reason = "customer_disconnected"
+                await self.db.flush()
+                return handoff
+            handoff.status = "requested"
+            handoff.human_agent_identity = None
+            handoff.accepted_console_session_id = None
+            handoff.accepted_at = None
+            handoff.claim_expires_at = None
+            await self.db.flush()
         return handoff
 
     async def require_current_agent(self, auth: AuthSchema) -> AiCallAgentProfileModel:
@@ -401,6 +558,57 @@ class AiCallAgentConsoleService:
             "expires_at": cls._api_datetime(handoff.expires_at),
             "claim_expires_at": cls._api_datetime(handoff.claim_expires_at),
         }
+
+    async def _require_owned_handoff(
+        self,
+        profile: AiCallAgentProfileModel,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+        statuses: set[str],
+    ) -> tuple[AiCallHandoffModel, AiCallHandoffAgentModel]:
+        session_id = self._console_session_id(console_session_id)
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=profile.tenant_id,
+            handoff_id=handoff_id,
+        )
+        if handoff is None:
+            raise CustomException(msg="转人工任务不存在", status_code=404)
+        if handoff.status not in statuses:
+            self._raise_conflict("当前转人工状态不允许该操作", "HANDOFF_STATE_CONFLICT")
+        if handoff.human_agent_identity != profile.agent_identity:
+            self._raise_conflict("当前坐席不是任务负责人", "HANDOFF_ALREADY_CLAIMED")
+        if handoff.accepted_console_session_id != session_id:
+            self._raise_conflict("当前标签页不拥有媒体控制权", "CONSOLE_SESSION_CONFLICT")
+        presence = await self.repository.get_console_agent_for_claim(
+            tenant_id=profile.tenant_id,
+            agent_identity=profile.agent_identity,
+        )
+        if presence is None or presence.active_handoff_id != handoff.handoff_id:
+            self._raise_conflict("坐席活动通话状态不一致", "AGENT_ACTIVE_CALL_EXISTS")
+        self._ensure_console_owner(presence, session_id)
+        return handoff, presence
+
+    async def _set_claimed_presence(
+        self,
+        handoff: AiCallHandoffModel,
+        *,
+        status_value: str,
+        release: bool,
+    ) -> None:
+        if not handoff.human_agent_identity:
+            return
+        presence = await self.repository.get_console_agent_for_claim(
+            tenant_id=handoff.tenant_id,
+            agent_identity=handoff.human_agent_identity,
+        )
+        if presence is None or presence.active_handoff_id != handoff.handoff_id:
+            return
+        presence.status = status_value
+        presence.status_updated_at = datetime.now(timezone.utc)
+        if release:
+            presence.active_handoff_id = None
+            presence.active_call_id = None
 
     async def _set_idle_presence_status(
         self,

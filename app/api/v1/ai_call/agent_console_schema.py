@@ -56,3 +56,8 @@ class AgentPresenceSessionIn(BaseModel):
 
 class AgentHandoffClaimIn(BaseModel):
     console_session_id: UUID
+
+
+class AgentMediaReadyIn(BaseModel):
+    console_session_id: UUID
+    participant_identity: str = Field(min_length=1, max_length=255)
