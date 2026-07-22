@@ -49,7 +49,7 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 - [ ] 运行 `uv run pytest tests/test_ai_call_agent_console_models.py -q` 和 `uv run ruff check app/api/v1/ai_call/model.py app/config/setting.py`，预期 PASS。
 - [ ] 提交：`git commit -m "feat(ai-call): add agent console data contract"`。
 
-### 任务 2：接通真实登录权限与坐席场景授权
+### 任务 2：接通真实登录身份与坐席场景授权
 
 **文件：**
 - 创建：`app/api/v1/ai_call/agent_console_schema.py`
@@ -57,10 +57,10 @@ AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS: int = 60
 - 修改：`app/core/dependencies.py:205-230`
 - 测试：`tests/test_ai_call_agent_console_api.py`
 
-- [ ] 编写失败测试：未登录返回 401；缺少 `ai_call:agent:console` 返回 403；档案停用或场景不匹配不能查看、认领；管理接口要求 `ai_call:agent:manage`。
-- [ ] 运行 `uv run pytest tests/test_ai_call_agent_console_api.py -q`，预期权限断言 FAIL。
+- [ ] 编写失败测试：未登录返回 401；已登录且档案启用的用户可进入工作台；档案停用或场景不匹配不能查看、认领；V1 管理接口只要求登录。
+- [ ] 运行 `uv run pytest tests/test_ai_call_agent_console_api.py -q`，预期登录身份或坐席档案断言 FAIL。
 - [ ] 让 agent-console 路由显式依赖 `get_current_user`，从登录用户映射 `user_id -> agent_profile -> agent_identity`，禁止请求体传任意坐席身份。
-- [ ] 将 `AuthPermission` 接到宿主返回的 permission code 集合；若当前 `AuthSchema` 不包含权限集合，先增加一个专用依赖并为缺失权限 fail-closed，不能只比较枚举常量。
+- [ ] V1 按 `LingChenAdmin` 现有方式仅校验登录，不消费宿主 permission code；`ai_call:agent:console` 和 `ai_call:agent:manage` 只用于前端菜单展示。管理接口同样显式依赖 `get_current_user`。坐席档案、场景范围、状态和负责人仍由业务服务端校验。
 - [ ] 实现坐席档案 CRUD、场景范围整组替换和启停规则；启用时校验至少一个 `scene_code`，通话中停用只禁止新认领并在结束后转 `offline`。
 - [ ] 运行定向测试和 `uv run ruff check app/core/dependencies.py app/services/ai_call/agent_console_service.py`，预期 PASS。
 - [ ] 提交：`git commit -m "feat(ai-call): enforce agent identity and scene scope"`。

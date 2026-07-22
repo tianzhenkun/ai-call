@@ -19,7 +19,7 @@ from app.core.exceptions import CustomException, handle_exception
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 
 
-def _auth(db, *, permissions: set[str], user_id: int = 20, tenant_id: str = "tenant-a"):
+def _auth(db, *, user_id: int = 20, tenant_id: str = "tenant-a"):
     user = UserModel(
         user_id=user_id,
         tenant_id=tenant_id,
@@ -27,7 +27,7 @@ def _auth(db, *, permissions: set[str], user_id: int = 20, tenant_id: str = "ten
         nick_name=f"坐席{user_id}",
         user_type="sys_user",
     )
-    return AuthSchema(db=db, user=user, permissions=permissions, check_data_scope=False)
+    return AuthSchema(db=db, user=user, check_data_scope=False)
 
 
 @pytest.fixture
@@ -51,7 +51,7 @@ def _client(auth_factory, service: AiCallAgentConsoleService) -> TestClient:
 
 
 @pytest.mark.anyio
-async def test_agent_console_requires_login_and_permission(db_session) -> None:
+async def test_agent_console_requires_login_and_enabled_profile(db_session) -> None:
     service = AiCallAgentConsoleService(db_session)
 
     async def unauthenticated():
@@ -60,23 +60,45 @@ async def test_agent_console_requires_login_and_permission(db_session) -> None:
     with _client(unauthenticated, service) as client:
         assert client.get("/ai-call/agent-console/bootstrap").status_code == 401
 
-    async def without_permission():
-        return _auth(db_session, permissions=set())
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        AiCallAgentProfileModel(
+            id=1,
+            tenant_id="tenant-a",
+            agent_identity="agent-20",
+            user_id=20,
+            enabled=True,
+            created_by=1,
+            created_at=now,
+            updated_by=1,
+            updated_at=now,
+        )
+    )
+    await db_session.commit()
 
-    with _client(without_permission, service) as client:
+    async def authenticated():
+        return _auth(db_session)
+
+    with _client(authenticated, service) as client:
         response = client.get("/ai-call/agent-console/bootstrap")
-        assert response.status_code == 403
+        assert response.status_code == 200
 
 
 @pytest.mark.anyio
-async def test_admin_endpoints_require_manage_permission(db_session) -> None:
+async def test_admin_endpoints_only_require_login(db_session) -> None:
     service = AiCallAgentConsoleService(db_session)
 
-    async def console_only():
-        return _auth(db_session, permissions={"ai_call:agent:console"})
+    async def unauthenticated():
+        raise CustomException(msg="认证已失效", code=10401, status_code=401)
 
-    with _client(console_only, service) as client:
-        assert client.get("/ai-call/admin/agents").status_code == 403
+    with _client(unauthenticated, service) as client:
+        assert client.get("/ai-call/admin/agents").status_code == 401
+
+    async def authenticated():
+        return _auth(db_session)
+
+    with _client(authenticated, service) as client:
+        assert client.get("/ai-call/admin/agents").status_code == 200
 
 
 @pytest.mark.anyio
@@ -106,7 +128,7 @@ async def test_disabled_or_scope_mismatched_agent_is_rejected(db_session) -> Non
     )
     await db_session.commit()
 
-    auth = _auth(db_session, permissions={"ai_call:agent:console"})
+    auth = _auth(db_session)
     with pytest.raises(CustomException) as disabled:
         await service.require_current_agent(auth)
     assert disabled.value.status_code == 403
@@ -122,7 +144,7 @@ async def test_disabled_or_scope_mismatched_agent_is_rejected(db_session) -> Non
 @pytest.mark.anyio
 async def test_admin_crud_replaces_scopes_and_requires_scope_before_enable(db_session) -> None:
     service = AiCallAgentConsoleService(db_session)
-    auth = _auth(db_session, permissions={"ai_call:agent:manage"}, user_id=1)
+    auth = _auth(db_session, user_id=1)
 
     profile = await service.create_profile(
         auth,
