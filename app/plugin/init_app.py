@@ -270,13 +270,14 @@ async def _start_ai_call_offline_asr_worker():
     from app.core.database import async_db_session
     from app.services.ai_call.offline_asr_service import (
         AiCallOfflineAsrWorker,
-        DashScopeParaformerAsrProvider,
+        build_dashscope_offline_asr_provider,
         parse_language_hints,
     )
 
-    provider = DashScopeParaformerAsrProvider(
+    provider = build_dashscope_offline_asr_provider(
+        provider_name=settings.AI_CALL_OFFLINE_ASR_PROVIDER,
         api_key=settings.EFFECTIVE_ASR_API_KEY,
-        model=settings.AI_CALL_OFFLINE_ASR_MODEL or settings.ASR_MODEL or "paraformer-v2",
+        model=settings.AI_CALL_OFFLINE_ASR_MODEL,
         language_hints=parse_language_hints(settings.AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS),
         timeout_seconds=settings.AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS,
         poll_interval_seconds=settings.AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS,

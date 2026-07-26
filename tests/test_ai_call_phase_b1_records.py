@@ -740,9 +740,11 @@ def test_handoff_timeout_default_is_commercial_wait_window() -> None:
     assert settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS == 30
 
 
-def test_offline_asr_defaults_to_chinese_language_hint() -> None:
+def test_offline_asr_defaults_to_qwen_filetrans_with_chinese_language() -> None:
     settings = Settings(_env_file=None)
 
+    assert settings.AI_CALL_OFFLINE_ASR_PROVIDER == "dashscope_qwen_filetrans"
+    assert settings.AI_CALL_OFFLINE_ASR_MODEL == "qwen3-asr-flash-filetrans"
     assert settings.AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS == "zh"
 
 

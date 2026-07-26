@@ -189,8 +189,11 @@ class Settings(BaseSettings):
     AI_CALL_RECORDING_RECONCILE_INTERVAL_SECONDS: float = 5.0
     AI_CALL_RECORDING_RECONCILE_BATCH_SIZE: int = 50
     AI_CALL_OFFLINE_ASR_ENABLED: bool = True
-    AI_CALL_OFFLINE_ASR_PROVIDER: Literal["dashscope_paraformer"] = "dashscope_paraformer"
-    AI_CALL_OFFLINE_ASR_MODEL: str = "paraformer-v2"
+    AI_CALL_OFFLINE_ASR_PROVIDER: Literal[
+        "dashscope_paraformer",
+        "dashscope_qwen_filetrans",
+    ] = "dashscope_qwen_filetrans"
+    AI_CALL_OFFLINE_ASR_MODEL: str = "qwen3-asr-flash-filetrans"
     AI_CALL_OFFLINE_ASR_LANGUAGE_HINTS: str = "zh"
     AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS: float = 300.0
     AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS: float = 2.0

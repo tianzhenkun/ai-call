@@ -89,12 +89,6 @@ class DashScopeParaformerAsrProvider:
         )
 
     async def _submit(self, audio_url: str) -> str:
-        payload: dict[str, Any] = {
-            "model": self.model_name,
-            "input": {"file_urls": [audio_url]},
-        }
-        if self.language_hints:
-            payload["parameters"] = {"language_hints": self.language_hints}
         async with httpx.AsyncClient(timeout=min(30.0, self.timeout_seconds)) as client:
             response = await client.post(
                 self.submit_url,
@@ -103,7 +97,7 @@ class DashScopeParaformerAsrProvider:
                     "Content-Type": "application/json",
                     "X-DashScope-Async": "enable",
                 },
-                json=payload,
+                json=self._submit_payload(audio_url),
             )
         response.raise_for_status()
         data = response.json()
@@ -111,6 +105,15 @@ class DashScopeParaformerAsrProvider:
         if not task_id:
             raise ValueError("ASR 提交响应缺少 task_id")
         return task_id
+
+    def _submit_payload(self, audio_url: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "input": {"file_urls": [audio_url]},
+        }
+        if self.language_hints:
+            payload["parameters"] = {"language_hints": self.language_hints}
+        return payload
 
     async def _wait_for_task(self, task_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout_seconds
@@ -155,6 +158,11 @@ class DashScopeParaformerAsrProvider:
     @classmethod
     def _transcription_url(cls, data: dict[str, Any]) -> str | None:
         output = cls._output(data)
+        result = output.get("result")
+        if isinstance(result, dict):
+            value = result.get("transcription_url")
+            if value:
+                return str(value)
         results = output.get("results")
         if isinstance(results, list):
             for item in results:
@@ -239,6 +247,71 @@ class DashScopeParaformerAsrProvider:
             return max(0, int(float(value)))
         except (TypeError, ValueError):
             return None
+
+
+class DashScopeQwenFileTranscriptionAsrProvider(DashScopeParaformerAsrProvider):
+    """DashScope Qwen3 录音文件识别适配器。"""
+
+    provider_name = "dashscope_qwen_filetrans"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        language_hints: Sequence[str] | None = None,
+        timeout_seconds: float = 300.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            model=model.strip() or "qwen3-asr-flash-filetrans",
+            language_hints=language_hints,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    def _submit_payload(self, audio_url: str) -> dict[str, Any]:
+        parameters: dict[str, Any] = {
+            "channel_id": [0],
+            "enable_itn": True,
+            "enable_words": True,
+        }
+        if self.language_hints:
+            parameters["language"] = self.language_hints[0]
+        return {
+            "model": self.model_name,
+            "input": {"file_url": audio_url},
+            "parameters": parameters,
+        }
+
+
+def build_dashscope_offline_asr_provider(
+    *,
+    provider_name: str,
+    api_key: str,
+    model: str,
+    language_hints: Sequence[str] | None = None,
+    timeout_seconds: float = 300.0,
+    poll_interval_seconds: float = 2.0,
+) -> OfflineAsrProviderProtocol:
+    provider_types = {
+        DashScopeParaformerAsrProvider.provider_name: DashScopeParaformerAsrProvider,
+        DashScopeQwenFileTranscriptionAsrProvider.provider_name: (
+            DashScopeQwenFileTranscriptionAsrProvider
+        ),
+    }
+    try:
+        provider_type = provider_types[provider_name]
+    except KeyError as exc:
+        raise ValueError(f"不支持的离线 ASR provider: {provider_name}") from exc
+    return provider_type(
+        api_key=api_key,
+        model=model,
+        language_hints=language_hints,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
 
 
 @dataclass(slots=True)
