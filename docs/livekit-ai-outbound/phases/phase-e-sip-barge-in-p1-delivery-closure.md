@@ -14,6 +14,13 @@ Chinese interruption is detected within the target latency.
 
 The delivery branch must not change runtime files relative to `8ffa0b9`.
 
+## Superseding runtime policy
+
+As of 2026-07-24, the product policy enables interruption for the entire call
+across all outbound scenes. The scene-level `ai_call_prompt_profile.barge_in_enabled`
+field described below is retained only as historical evidence for this frozen
+snapshot; current runtime authority uses the global interruption switch.
+
 ## Included
 
 Keep the complete 13-commit P1 sequence from `a7a1dbc` through `8ffa0b9` as one

@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 import pytest
@@ -1732,6 +1733,75 @@ async def test_handoff_trigger_worker_auto_creates_customer_handoff(b1_service) 
 
 
 @pytest.mark.anyio
+async def test_handoff_trigger_worker_uses_explicit_transfer_delta_when_done_is_missing(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.2,
+            reason="not_handoff",
+            summary="不应调用通用分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_delta",
+            source="provider",
+            payload={
+                "item_id": "item_explicit_transfer",
+                "text": "转人工",
+                "stash": "",
+            },
+        )
+
+        await worker.flush_pending()
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["requestReason"] == "customer_request"
+        assert classifier.transcripts == []
+
+        await b1_service.flush_events()
+        events = await record_service.list_events(result.call_id)
+        detected = next(
+            event for event in events if event.event_type == "handoff_intent_detected"
+        )
+        assert json.loads(detected.payload_json)["classifierSource"] == (
+            "realtime_delta_guard"
+        )
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
 async def test_handoff_trigger_worker_ignores_low_confidence_text(b1_service) -> None:
     service, record_service = b1_service
     classifier = FakeHandoffIntentClassifier(
@@ -2478,6 +2548,21 @@ async def test_end_session_finalizes_active_handoff(b1_service) -> None:
         reason="customer_request",
         request_message=None,
     )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    await service.accept_handoff(
+        handoff_id=handoff["handoffId"],
+        human_agent_identity="agent-debug-001",
+    )
+    await service.mark_handoff_connected(handoff["handoffId"])
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    presence.active_call_id = result.call_id
+    presence.console_session_id = "8ed3e232-907f-49cc-b365-6a9cc5c9aa0a"
+    await service.handoff_service.repository.db.flush()
 
     await service.end_session(result.call_id)
 
@@ -2485,8 +2570,14 @@ async def test_end_session_finalizes_active_handoff(b1_service) -> None:
     history = await service.list_handoffs(result.call_id)
     assert history["total"] == 1
     assert history["rows"][0]["handoffId"] == handoff["handoffId"]
-    assert history["rows"][0]["status"] == "canceled"
+    assert history["rows"][0]["status"] == "completed"
     assert history["rows"][0]["endReason"] == "web_user_end"
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    assert presence.status == "wrap_up_quick"
+    assert presence.active_handoff_id == handoff["handoffId"]
+    assert presence.active_call_id == result.call_id
 
 
 @pytest.mark.anyio
@@ -3795,10 +3886,9 @@ async def test_recording_closure_starts_stops_and_registers_oss(monkeypatch) -> 
         assert completed is not None
         assert completed["status"] == "completed"
         assert completed["ossId"].isdigit()
-        assert (
-            completed["playUrl"]
-            == f"https://files.test/recordings/ai-call/recordings/{result.call_id}.mp3"
-        )
+        play_url = urlparse(completed["playUrl"])
+        assert play_url.path == f"/recordings/ai-call/recordings/{result.call_id}.mp3"
+        assert parse_qs(play_url.query)["X-Amz-SignedHeaders"] == ["host"]
         assert completed["durationMs"] == 1200
         assert fake_egress.started == [(result.room_name, result.call_id)]
         assert fake_egress.stopped == [f"EG_{result.call_id}"]
@@ -4741,9 +4831,11 @@ async def test_recording_stop_timeout_enters_verifying_then_reconciles(
         assert completed["failureStage"] is None
         assert completed["failureMessage"] is None
         assert completed["ossId"] is not None
-        assert completed["playUrl"] == (
-            f"https://files.test/recordings/ai-call/recordings/{result.call_id}.mp3"
+        play_url = urlparse(completed["playUrl"])
+        assert play_url.path == (
+            f"/recordings/ai-call/recordings/{result.call_id}.mp3"
         )
+        assert parse_qs(play_url.query)["X-Amz-SignedHeaders"] == ["host"]
         assert completed["verifyAttempts"] == 1
         assert completed["nextVerifyAt"] is None
 
@@ -5058,10 +5150,12 @@ async def test_participant_stop_timeout_enters_verifying_then_reconciles(
         assert tracks["ai"]["failureStage"] is None
         assert tracks["ai"]["failureMessage"] is None
         assert tracks["ai"]["ossId"] is not None
-        assert tracks["ai"]["playUrl"] == (
-            f"https://files.test/recordings/ai-call/recordings/tracks/"
+        play_url = urlparse(tracks["ai"]["playUrl"])
+        assert play_url.path == (
+            f"/recordings/ai-call/recordings/tracks/"
             f"{result.call_id}/ai-agent-{result.call_id}.mp3"
         )
+        assert parse_qs(play_url.query)["X-Amz-SignedHeaders"] == ["host"]
 
         oss_row = await db.execute(
             text("select ext1 from sys_oss where oss_id = :oss_id"),

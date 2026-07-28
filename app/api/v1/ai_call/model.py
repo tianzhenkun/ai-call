@@ -978,13 +978,6 @@ class AiCallPromptProfileModel(MappedBase):
         nullable=True,
         comment="固定开场白",
     )
-    barge_in_enabled: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-        server_default="false",
-        comment="是否允许当前场景启用通话打断",
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

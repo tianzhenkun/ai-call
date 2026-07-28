@@ -434,7 +434,6 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
     )
     prompt_text: str | None = Field(default=None, description="固定提示词")
     opening_message: str | None = Field(default=None, max_length=1000, description="固定开场白")
-    barge_in_enabled: bool = Field(default=False, description="是否允许当前场景启用通话打断")
 
     @model_validator(mode="after")
     def validate_static_content(self) -> "PromptProfileBaseRequest":
@@ -466,7 +465,6 @@ class PromptProfileOut(AiCallBaseSchema):
     provider_key: str
     prompt_text: str | None = None
     opening_message: str | None = None
-    barge_in_enabled: bool = False
     created_at: datetime
     updated_at: datetime
 

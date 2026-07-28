@@ -41,12 +41,21 @@ class LiveKitRoomManager:
         )
 
     async def delete_room(self, room_name: str) -> None:
-        await self._post_room_service(
-            method="DeleteRoom",
-            payload={"room": room_name},
-            error_id="room_delete_failed",
-            msg="LiveKit Room 删除失败",
-        )
+        try:
+            await self._post_room_service(
+                method="DeleteRoom",
+                payload={"room": room_name},
+                error_id="room_delete_failed",
+                msg="LiveKit Room 删除失败",
+            )
+        except AiCallError as exc:
+            cause = exc.__cause__
+            if (
+                isinstance(cause, httpx.HTTPStatusError)
+                and cause.response.status_code == status.HTTP_404_NOT_FOUND
+            ):
+                return
+            raise
 
     def issue_browser_token(self, room_name: str, participant_identity: str) -> BrowserRoomToken:
         return self.issue_participant_token(
@@ -139,7 +148,10 @@ class LiveKitRoomManager:
         msg: str,
     ) -> dict:
         service_url = f"{self._http_base_url()}/twirp/livekit.RoomService/{method}"
-        token = self._issue_room_admin_token()
+        room_name = payload.get("room")
+        token = self._issue_room_admin_token(
+            room_name=str(room_name).strip() if room_name else None,
+        )
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.post(
@@ -157,17 +169,20 @@ class LiveKitRoomManager:
         data = response.json()
         return data if isinstance(data, dict) else {}
 
-    def _issue_room_admin_token(self) -> str:
+    def _issue_room_admin_token(self, *, room_name: str | None = None) -> str:
         now = datetime.now(timezone.utc)
+        video_grant = {
+            "roomCreate": True,
+            "roomList": True,
+            "roomAdmin": True,
+        }
+        if room_name:
+            video_grant["room"] = room_name
         payload = {
             "iss": self.api_key,
             "nbf": int(now.timestamp()),
             "exp": int((now + timedelta(minutes=5)).timestamp()),
-            "video": {
-                "roomCreate": True,
-                "roomList": True,
-                "roomAdmin": True,
-            },
+            "video": video_grant,
         }
         return jwt.encode(payload, self.api_secret, algorithm="HS256")
 

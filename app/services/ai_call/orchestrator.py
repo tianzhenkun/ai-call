@@ -42,6 +42,7 @@ from app.services.ai_call.sip_vad_shadow import (
 from app.utils.id_util import generate_snowflake_id
 
 END_CLEANUP_TIMEOUT_SECONDS = 1.0
+BROWSER_READY_TIMEOUT_SECONDS = 90.0
 TERMINAL_BROWSER_EVENT_TYPES = frozenset(
     {
         "browser_disconnect",
@@ -322,12 +323,17 @@ class AiCallOrchestrator:
         event_store: InMemoryEventStore | None = None,
         metrics_by_call_id: dict[str, CallMetrics] | None = None,
         end_cleanup_timeout_seconds: float = END_CLEANUP_TIMEOUT_SECONDS,
+        browser_ready_timeout_seconds: float = BROWSER_READY_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.registry = registry or InMemorySessionRegistry()
         self.event_store = event_store or InMemoryEventStore()
         self.metrics_by_call_id = metrics_by_call_id if metrics_by_call_id is not None else {}
         self.end_cleanup_timeout_seconds = max(0.001, end_cleanup_timeout_seconds)
+        self.browser_ready_timeout_seconds = max(
+            0.001,
+            browser_ready_timeout_seconds,
+        )
         self.livekit_room_manager = livekit_room_manager or LiveKitRoomManager(
             livekit_url=config.livekit_url,
             api_key=config.livekit_api_key,
@@ -335,6 +341,8 @@ class AiCallOrchestrator:
             browser_token_ttl_seconds=config.browser_token_ttl_seconds,
         )
         self._auto_end_tasks: set[asyncio.Task[None]] = set()
+        self._browser_ready_timeout_handles: dict[str, asyncio.TimerHandle] = {}
+        self._browser_ready_timeout_tasks: set[asyncio.Task[None]] = set()
         self.agent_runner = agent_runner or self._build_default_agent_runner()
 
     @classmethod
@@ -506,6 +514,7 @@ class AiCallOrchestrator:
 
         self.registry.transition(call_id, CallSessionStatus.READY)
         self._append_event(call_id, "session_ready", "orchestrator")
+        self._schedule_browser_ready_watchdog(call_id)
 
         return CreateSessionResult(
             call_id=call_id,
@@ -817,6 +826,7 @@ class AiCallOrchestrator:
         *,
         end_reason: str = "web_user_end",
     ) -> EndSessionResult:
+        self._cancel_browser_ready_watchdog(call_id)
         session = self.registry.get(call_id)
         if session.status == CallSessionStatus.COMPLETED:
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
@@ -877,6 +887,74 @@ class AiCallOrchestrator:
                     "timeoutSeconds": self.end_cleanup_timeout_seconds,
                 },
             )
+        except Exception as exc:
+            self._append_event(
+                call_id,
+                "session_cleanup_failed",
+                "orchestrator",
+                {
+                    "step": step,
+                    "errorType": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+
+    def _schedule_browser_ready_watchdog(self, call_id: str) -> None:
+        self._cancel_browser_ready_watchdog(call_id)
+        loop = asyncio.get_running_loop()
+        self._browser_ready_timeout_handles[call_id] = loop.call_later(
+            self.browser_ready_timeout_seconds,
+            self._start_browser_ready_timeout,
+            call_id,
+        )
+
+    def _cancel_browser_ready_watchdog(self, call_id: str) -> None:
+        handle = self._browser_ready_timeout_handles.pop(call_id, None)
+        handle and handle.cancel()
+
+    def _start_browser_ready_timeout(self, call_id: str) -> None:
+        self._browser_ready_timeout_handles.pop(call_id, None)
+        task = asyncio.create_task(
+            self._expire_browser_ready_session(call_id),
+            name=f"ai-call-browser-ready-timeout-{call_id}",
+        )
+        self._browser_ready_timeout_tasks.add(task)
+        task.add_done_callback(self._consume_browser_ready_timeout_task)
+
+    def _consume_browser_ready_timeout_task(
+        self,
+        task: asyncio.Task[None],
+    ) -> None:
+        self._browser_ready_timeout_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            prefix = "ai-call-browser-ready-timeout-"
+            call_id = task.get_name()[len(prefix) :]
+            with suppress(Exception):
+                self._append_event(
+                    call_id,
+                    "browser_ready_timeout_failed",
+                    "orchestrator",
+                    {
+                        "errorType": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+
+    async def _expire_browser_ready_session(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if session.status != CallSessionStatus.READY:
+            return
+        self._append_event(
+            call_id,
+            "browser_ready_timeout",
+            "orchestrator",
+            {"timeoutSeconds": self.browser_ready_timeout_seconds},
+        )
+        await self.end_session(call_id, end_reason="browser_ready_timeout")
 
     def _schedule_auto_end_session(self, call_id: str, end_reason: str) -> None:
         task = asyncio.create_task(
@@ -993,6 +1071,7 @@ class AiCallOrchestrator:
             metrics.mark_browser_first_audio(reported_at)
             session.metrics = metrics.snapshot()
         elif event_type == "browser_ready":
+            self._cancel_browser_ready_watchdog(call_id)
             if session.status == CallSessionStatus.READY:
                 self.registry.transition(call_id, CallSessionStatus.CONNECTED)
                 should_start_opening = bool(
@@ -1163,9 +1242,7 @@ class AiCallOrchestrator:
                 vad_type=self.config.vad_type,
                 vad_threshold=self.config.vad_threshold,
                 vad_silence_duration_ms=self.config.vad_silence_duration_ms,
-                barge_in_enabled=(
-                    self.config.barge_in_enabled and prompt_effective_config.barge_in_enabled
-                ),
+                barge_in_enabled=self.config.barge_in_enabled,
                 instructions=prompt_effective_config.instructions,
             )
 
@@ -1194,7 +1271,7 @@ class AiCallOrchestrator:
             vad_type=self.config.vad_type,
             vad_threshold=self.config.vad_threshold,
             vad_silence_duration_ms=self.config.vad_silence_duration_ms,
-            barge_in_enabled=False,
+            barge_in_enabled=self.config.barge_in_enabled,
         )
 
     def _web_audio_constraints(self) -> WebAudioConstraints:

@@ -189,15 +189,15 @@ status=0
 
 这条配置在本地 SQLite 里，录音上传会使用它。它会连接远端 OSS，但不会写线上业务数据库。注意不要泄露 `access_key` / `secret_key`。
 
-当前业务场景的打断开关在本地 SQLite 的 `ai_call_prompt_profile.barge_in_enabled`：
+当前外呼统一使用运行时全局打断开关，不再按业务场景单独授权：
 
 ```text
-intro_collection = 1
-intro_geo        = 1
-其他 intro_*     = 0
+AI_CALL_BARGE_IN_ENABLED=true
+AI_CALL_SIP_BARGE_IN_ENABLED=true
+AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED=true
 ```
 
-如果测试的场景没有开启 `barge_in_enabled`，理论上不应该启用 P1 打断；如果仍然打断，需要优先查 effective config 和事件日志，而不是继续调 VAD 阈值。
+新建通话后应确认 `effectiveConfig.bargeInEnabled=true`。如果全局开关关闭后仍发生打断，需要优先查 effective config 和事件日志，而不是继续调 VAD 阈值。
 
 ## 启动前检查
 
@@ -207,7 +207,6 @@ intro_geo        = 1
 docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' | grep -E '19011|freeswitch'
 lsof -nP -iTCP:19011 -sTCP:LISTEN
 sqlite3 /tmp/ai_call_ed81_local.db "select count(*) from sys_oss_config where status='0';"
-sqlite3 /tmp/ai_call_ed81_local.db "select scene_code,barge_in_enabled from ai_call_prompt_profile order by scene_code;"
 docker exec sip_realtime_freeswitch fs_cli -x 'sofia status profile internal reg'
 ```
 
@@ -217,7 +216,7 @@ docker exec sip_realtime_freeswitch fs_cli -x 'sofia status profile internal reg
 - `sip_realtime_freeswitch` 在
 - 19011 API 在监听
 - 本地 SQLite 有 active OSS 配置
-- 当前测试场景 `barge_in_enabled=1`
+- 新建通话的 `effectiveConfig.bargeInEnabled=true`
 - Linphone 注册 `1000@当前本机 IP` 且 Reachable
 
 只有这条基线通过后，再分析 P1 打断慢、误打断、漏打断。

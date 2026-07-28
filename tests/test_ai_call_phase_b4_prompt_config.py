@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,7 @@ def build_runtime_config() -> AiCallRuntimeConfig:
     )
 
 
-def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None:
+def test_global_barge_in_enabled_applies_to_all_prompt_sources() -> None:
     orchestrator = AiCallOrchestrator(
         config=build_runtime_config(),
         livekit_room_manager=FakeLiveKitRoomManager(),
@@ -178,7 +179,6 @@ def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None
             prompt="业务话术",
             opening_message="您好，这是开场白。",
             source_key="test.scene",
-            barge_in_enabled=True,
         )
     )
     b4_config = orchestrator._build_effective_config(
@@ -191,31 +191,46 @@ def test_legacy_effective_config_keeps_agent_runner_prompt_composition() -> None
     assert legacy_config.prompt == "你是一个电话外呼助手，回答要简短自然。"
     assert b4_config.instructions == composed_prompt.instructions
     assert b4_config.prompt == composed_prompt.instructions
-    assert legacy_config.barge_in_enabled is False
+    assert legacy_config.barge_in_enabled is True
     assert b4_config.barge_in_enabled is True
 
 
-def test_prompt_profile_schema_defaults_barge_in_disabled() -> None:
-    request = PromptProfileCreateRequest.model_validate({
-        "sceneCode": "intro_geo",
-        "name": "GEO 产品介绍",
-        "providerKey": "static_profile",
-        "promptText": "介绍 GEO 产品。",
-        "openingMessage": "您好，请问现在方便吗？",
-    })
+def test_global_barge_in_disabled_applies_to_all_prompt_sources() -> None:
+    runtime_config = replace(build_runtime_config(), barge_in_enabled=False)
+    orchestrator = AiCallOrchestrator(
+        config=runtime_config,
+        livekit_room_manager=FakeLiveKitRoomManager(),
+        agent_runner=CapturingAgentRunner(),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    composed_prompt = PromptComposer(handoff_component_enabled=True).compose(
+        BusinessPromptResult(
+            prompt="业务话术",
+            opening_message="您好，这是开场白。",
+            source_key="test.scene",
+        )
+    )
 
-    assert request.barge_in_enabled is False
+    legacy_config = orchestrator._build_effective_config(voice=None, prompt=None)
+    b4_config = orchestrator._build_effective_config(
+        voice=None,
+        prompt=None,
+        prompt_effective_config=composed_prompt,
+    )
+
+    assert legacy_config.barge_in_enabled is False
+    assert b4_config.barge_in_enabled is False
 
 
-def test_prompt_profile_schema_accepts_barge_in_enabled() -> None:
-    request = PromptProfileCreateRequest.model_validate({
-        "sceneCode": "intro_collection",
-        "name": "物业催收",
-        "providerKey": "business_query",
-        "bargeInEnabled": True,
-    })
-
-    assert request.barge_in_enabled is True
+def test_prompt_profile_schema_rejects_removed_barge_in_field() -> None:
+    with pytest.raises(ValidationError):
+        PromptProfileCreateRequest.model_validate({
+            "sceneCode": "intro_collection",
+            "name": "物业催收",
+            "providerKey": "business_query",
+            "bargeInEnabled": True,
+        })
 
 
 def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries() -> None:
@@ -226,6 +241,7 @@ def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries()
     seed_sql = seed_path.read_text(encoding="utf-8")
 
     assert "'intro_geo'" in seed_sql
+    assert "barge_in_enabled" not in seed_sql
     assert "不要一上来对客户讲" in seed_sql
     assert "专业但易懂的表达" in seed_sql
     assert "统一问题集观察主流 AI 平台" in seed_sql
@@ -276,6 +292,17 @@ def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries()
     assert "想简单介绍一下 GEO 生成式引擎优化服务" in seed_sql
 
 
+def test_prompt_profile_barge_in_removal_migration_drops_scene_field() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-remove-profile-barge-in-postgres.sql"
+    )
+
+    assert "drop column if exists barge_in_enabled" in migration_path.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_intro_overseas_seed_uses_overseas_growth_agent_boundaries() -> None:
     seed_path = (
         Path(__file__).resolve().parents[1]
@@ -306,7 +333,6 @@ def test_intro_overseas_seed_uses_overseas_growth_agent_boundaries() -> None:
     assert "没空、在开会、只有半分钟" in overseas_block
     assert "回复最多 60 个汉字" in overseas_block
     assert "如果当前没有人工接入，稍后会安排顾问联系" in overseas_block
-    assert "false" in overseas_block
 
 
 def test_intro_contract_seed_uses_contract_intelligent_review_boundaries() -> None:
@@ -336,7 +362,6 @@ def test_intro_contract_seed_uses_contract_intelligent_review_boundaries() -> No
     assert "天气、日期、股市" in contract_block
     assert "不回答具体内容" in contract_block
     assert "如果当前没有人工接入，稍后会安排顾问联系" in contract_block
-    assert "false" in contract_block
 
 
 def test_intro_document_seed_uses_cross_border_document_review_boundaries() -> None:
@@ -366,7 +391,6 @@ def test_intro_document_seed_uses_cross_border_document_review_boundaries() -> N
     assert "属于可评估方向" in document_block
     assert "天气、日期、股市" in document_block
     assert "不回答具体内容" in document_block
-    assert "false" in document_block
 
 
 def test_intro_geo_batch_cases_cover_guardrails() -> None:
@@ -651,9 +675,9 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     )
 
     assert profile["sceneCode"] == "debt_promise_repay_reminder"
-    assert profile["bargeInEnabled"] is False
+    assert "bargeInEnabled" not in profile
     assert preview["promptSourceKey"] == "debt_promise_repay_reminder"
-    assert preview["bargeInEnabled"] is False
+    assert preview["bargeInEnabled"] is True
     assert "平台关键约束" in preview["instructions"]
     assert "当前日期：" in preview["instructions"]
     assert "不得代替客户使用第一人称表达客户需求" in preview["instructions"]
@@ -664,10 +688,10 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     assert "{{customerName}}" not in preview["instructions"]
     assert preview["openingMessage"] == "您好张总，我是灵宸智能助手，想和您确认一下还款安排。"
     assert result.effective_config.prompt_source_key == "debt_promise_repay_reminder"
-    assert result.effective_config.barge_in_enabled is False
+    assert result.effective_config.barge_in_enabled is True
     assert result.effective_config.prompt_hash == preview["promptHash"]
     assert agent_runner.started_sessions[0].effective_config.instructions == preview["instructions"]
-    assert agent_runner.started_sessions[0].effective_config.barge_in_enabled is False
+    assert agent_runner.started_sessions[0].effective_config.barge_in_enabled is True
     events = await service.orchestrator.list_events(result.call_id)
     assert events.rows[0].payload == {
         "promptHash": preview["promptHash"],
@@ -895,7 +919,6 @@ async def test_business_query_scene_uses_recov_collection_store(
         "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
         "prompt_text": None,
         "opening_message": None,
-        "barge_in_enabled": True,
     })
 
     preview = await service.preview_prompt_profile(

@@ -5,7 +5,6 @@ insert into ai_call_prompt_profile (
     provider_key,
     prompt_text,
     opening_message,
-    barge_in_enabled,
     created_at,
     updated_at
 ) values
@@ -16,7 +15,6 @@ insert into ai_call_prompt_profile (
     'business_query',
     null,
     null,
-    true,
     now(),
     now()
 ),
@@ -80,7 +78,6 @@ insert into ai_call_prompt_profile (
 不能承诺：不承诺替代律师或法务最终判断；不承诺百分百准确；不承诺零风险、零漏审、零纠纷、一定胜诉或一定避免损失；不编造客户案例或具体效果数据；不直接承诺一定支持某个系统接入、数据不出域、特定安全方案、固定上线周期或固定提效比例。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的合同智能审查产品，请问现在方便吗？',
-    false,
     now(),
     now()
 ),
@@ -143,7 +140,6 @@ insert into ai_call_prompt_profile (
 不能承诺：不承诺完全替代人工审核；不承诺百分百识别准确；不承诺零风险、零漏审、零拒付；不编造客户案例或具体效果数据；不直接承诺一定支持某个系统接入、私有化部署、数据不出域、特定安全方案或固定上线周期。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的跨境单证智能审核产品，请问现在方便吗？',
-    false,
     now(),
     now()
 ),
@@ -196,7 +192,6 @@ insert into ai_call_prompt_profile (
 不能承诺：不承诺固定线索数量、固定回复率、固定成交率或固定周期见效；不编造客户案例或效果数据；不承诺自动群发、绕过平台规则或规避当地合规要求；不直接承诺一定能接入客户 CRM、邮箱、LinkedIn 或内部系统。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下我们的海外获客智能体，请问现在方便吗？',
-    false,
     now(),
     now()
 ),
@@ -244,7 +239,6 @@ insert into ai_call_prompt_profile (
 17. 普通产品问题先直接回答，不要每个回答都用预约顾问收尾；只有客户询问合作、试用、报价、合同/SLA、私有化、数据安全、系统接入、内部实现、客户案例、明确要求人工，或多轮追问进入具体推进时，才引导预约演示、产品顾问沟通或转人工。
     $prompt$,
     '您好{{customerName}}，我是灵宸智能助手，想简单介绍一下 GEO 生成式引擎优化服务，请问现在方便吗？',
-    false,
     now(),
     now()
 )
@@ -253,5 +247,4 @@ on conflict (scene_code) do update set
     provider_key = excluded.provider_key,
     prompt_text = excluded.prompt_text,
     opening_message = excluded.opening_message,
-    barge_in_enabled = excluded.barge_in_enabled,
     updated_at = now();

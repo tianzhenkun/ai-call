@@ -472,7 +472,7 @@ class AiCallService:
             "promptHash": effective_config.prompt_hash,
             "openingMessageHash": effective_config.opening_message_hash,
             "promptSourceKey": effective_config.prompt_source_key,
-            "bargeInEnabled": effective_config.barge_in_enabled,
+            "bargeInEnabled": self.orchestrator.config.barge_in_enabled,
         }
 
     async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
@@ -1360,7 +1360,6 @@ class AiCallService:
             ).strip(),
             "prompt_text": _strip_or_none(values.get("prompt_text")),
             "opening_message": _strip_or_none(values.get("opening_message")),
-            "barge_in_enabled": _bool_or_false(values.get("barge_in_enabled")),
         }
         if not normalized["scene_code"]:
             raise CustomException(msg="sceneCode 不能为空", code=RET.ERROR.code, status_code=400)
@@ -1400,7 +1399,6 @@ class AiCallService:
             "providerKey": profile.provider_key,
             "promptText": profile.prompt_text,
             "openingMessage": profile.opening_message,
-            "bargeInEnabled": bool(getattr(profile, "barge_in_enabled", False)),
             "createdAt": profile.created_at,
             "updatedAt": profile.updated_at,
         }
@@ -1477,6 +1475,13 @@ class AiCallService:
         if session.status not in RUNNING_STATUSES:
             return
         await self.end_session(call_id, end_reason=end_reason or "agent_completed")
+
+    async def end_running_session_after_handoff(
+        self,
+        call_id: str,
+        end_reason: str | None,
+    ) -> None:
+        await self._end_running_session_after_handoff(call_id, end_reason)
 
     async def _finalize_handoffs_for_call(self, call_id: str, *, end_reason: str) -> None:
         if self.handoff_service is None:
@@ -1869,14 +1874,3 @@ def _strip_or_none(value) -> str | None:
 
 def _is_sqlite_database_locked(exc: OperationalError) -> bool:
     return "database is locked" in str(exc).lower()
-
-
-def _bool_or_false(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, (int, float)):
-        return bool(value)
-    normalized = str(value).strip().lower()
-    return normalized in {"1", "true", "yes", "y", "on"}

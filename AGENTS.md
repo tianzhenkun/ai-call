@@ -41,7 +41,7 @@ DATABASE_NAME=/tmp/ai_call_ed81_local
 
 - 分析 P1 通话时，优先结合事件日志、分轨录音、LiveKit SIP 日志、FreeSWITCH/Linphone 注册状态。
 - 不要只凭主观体验直接调 VAD 阈值。
-- 如果测试场景没有开启 `barge_in_enabled` 但仍发生打断，先查 effective config 和事件链路。
+- 打断不再按业务场景单独授权；如果全局开关关闭但仍发生打断，先查 effective config 和事件链路。
 - 如果出现打断慢、误打断、漏打断，要先区分环境链路、媒体上行、客户轨隔离、generation gate、confirmed/rejected 逻辑，再决定是否改代码。
 
 ## 修改策略

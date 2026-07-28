@@ -429,6 +429,22 @@ class RecentHandoffConfirmationCandidate:
 
 class AiCallHandoffTriggerService:
     RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
+    EXPLICIT_TRANSFER_DELTA_COMMANDS = frozenset(
+        {
+            "转人工",
+            "转人工吧",
+            "请转人工",
+            "帮我转人工",
+            "请帮我转人工",
+            "给我转人工",
+            "我要转人工",
+            "我想转人工",
+            "找人工客服",
+            "我要找人工客服",
+            "找真人客服",
+            "我要找真人客服",
+        }
+    )
     CONFIRMATION_ACCEPT_PATTERNS = (
         "可以",
         "行",
@@ -510,7 +526,8 @@ class AiCallHandoffTriggerService:
         if event.type == "handoff_tool_requested":
             await self._handle_tool_request(event=event, event_store=event_store)
             return
-        if event.type != "user_transcript_done":
+        is_explicit_delta = self._is_explicit_transfer_delta(event)
+        if event.type != "user_transcript_done" and not is_explicit_delta:
             return
         if not self.enabled or not self.customer_intent_enabled:
             self._append_ignored(
@@ -553,29 +570,38 @@ class AiCallHandoffTriggerService:
             )
             return
         self._remember_confirmation_candidate(event, transcript)
-        try:
-            result = await asyncio.wait_for(
-                self.classifier.classify(transcript=transcript),
-                timeout=self.timeout_seconds,
+        if is_explicit_delta:
+            result = HandoffIntentResult(
+                matched=True,
+                confidence=0.95,
+                reason="customer_request",
+                summary="用户明确要求转人工",
+                source="realtime_delta_guard",
             )
-        except TimeoutError:
-            self._append_ignored(
-                event_store,
-                event.call_id,
-                reason="classifier_timeout",
-                transcript=transcript,
-            )
-            return
-        except Exception as exc:
-            self._append_failed(
-                event_store,
-                event.call_id,
-                stage="classify",
-                message=str(exc),
-                error_type=type(exc).__name__,
-                transcript=transcript,
-            )
-            return
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    self.classifier.classify(transcript=transcript),
+                    timeout=self.timeout_seconds,
+                )
+            except TimeoutError:
+                self._append_ignored(
+                    event_store,
+                    event.call_id,
+                    reason="classifier_timeout",
+                    transcript=transcript,
+                )
+                return
+            except Exception as exc:
+                self._append_failed(
+                    event_store,
+                    event.call_id,
+                    stage="classify",
+                    message=str(exc),
+                    error_type=type(exc).__name__,
+                    transcript=transcript,
+                )
+                return
 
         if not result.matched or result.confidence < self.threshold:
             self._append_ignored(
@@ -921,12 +947,20 @@ class AiCallHandoffTriggerService:
 
     @staticmethod
     def _transcript_text(event: AiCallEvent) -> str:
-        value = (
-            event.payload.get("transcript")
-            or event.payload.get("text")
-            or event.payload.get("delta")
-        )
+        text = event.payload.get("text")
+        stash = event.payload.get("stash")
+        if isinstance(text, str) or isinstance(stash, str):
+            return f"{text or ''}{stash or ''}".strip()
+        value = event.payload.get("transcript") or event.payload.get("delta")
         return value.strip() if isinstance(value, str) else ""
+
+    @classmethod
+    def _is_explicit_transfer_delta(cls, event: AiCallEvent) -> bool:
+        if event.type != "user_transcript_delta":
+            return False
+        transcript = cls._transcript_text(event)
+        normalized = cls._normalize(transcript)
+        return normalized in cls.EXPLICIT_TRANSFER_DELTA_COMMANDS
 
     def _remember_confirmation_candidate(
         self,
@@ -1071,7 +1105,11 @@ class AiCallHandoffTriggerWorker:
 
     def enqueue(self, event: AiCallEvent, event_store: InMemoryEventStore) -> None:
         should_enqueue = event.type == "handoff_tool_requested" or (
-            self.transcript_trigger_enabled and event.type == "user_transcript_done"
+            self.transcript_trigger_enabled
+            and (
+                event.type == "user_transcript_done"
+                or self.trigger_service._is_explicit_transfer_delta(event)
+            )
         )
         if not should_enqueue:
             return

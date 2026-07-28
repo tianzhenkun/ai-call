@@ -18,6 +18,9 @@ from app.services.ai_call.call_end_decision_service import (
 )
 from app.services.ai_call.dialogue_merge import normalize_dialogue_text
 from app.services.ai_call.event_store import InMemoryEventStore
+from app.services.ai_call.handoff_trigger_service import (
+    RuleBasedHandoffIntentClassifier,
+)
 from app.services.ai_call.metrics import CallMetrics
 from app.services.ai_call.prompt_config import (
     CALL_END_TOOL_INSTRUCTIONS,
@@ -88,6 +91,9 @@ class RoomAudioTransportProtocol(AudioPublisherProtocol, Protocol):
 ProviderFactory = Callable[[CallSession], RealtimeProviderProtocol]
 CallEndScheduler = Callable[[str, str], None]
 
+AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS = 60_000
+AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT = 80
+
 
 CALL_END_REASON_MAPPING = {
     "customer_end": "customer_end",
@@ -97,6 +103,9 @@ CALL_END_REASON_MAPPING = {
 HANDOFF_REASON_VALUES = {"customer_request", "business_escalation"}
 BUSINESS_HANDOFF_CONFIRMATION_TOOL_RESULT = (
     "系统尚未开始转人工。请先询问用户是否确认需要转人工，不得说正在转接、马上接入或已经接通。"
+)
+CUSTOMER_HANDOFF_REJECTED_TOOL_RESULT = (
+    "未确认用户明确要求转人工。请继续回应用户刚才的话，不要转人工。"
 )
 CALL_END_FINAL_RESPONSE_TOOL_RESULT = "已记录。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
 CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "已记录。系统将结束通话，不要再生成额外回复。"
@@ -773,11 +782,30 @@ class PlaybackGuard:
     current_response_generation: int = 0
     current_response_audio_published: bool = False
     cancelled_response_ids: set[str] = field(default_factory=set)
+    overflowed_responses: set[tuple[str | None, int]] = field(default_factory=set)
     cancel_requested: bool = False
     audio_stop_requested: bool = False
     user_speech_active: bool = False
     awaiting_response_start_after_interrupt: bool = False
     suppress_audio_until: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioPlayoutDelta:
+    delta: str
+    pcm_bytes: int
+    frame_count: int
+    response_id: str | None
+    response_generation: int
+
+
+@dataclass(slots=True)
+class AudioPlayoutQueueStats:
+    queued_frames: int = 0
+    queued_bytes: int = 0
+    high_watermark_response_keys: set[tuple[str | None, int]] = field(
+        default_factory=set
+    )
 
 
 @dataclass(slots=True)
@@ -887,6 +915,10 @@ class RealtimeCallAgentRunner:
         self._providers: dict[str, RealtimeProviderProtocol] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._audio_tasks: dict[str, asyncio.Task[None]] = {}
+        self._audio_playout_queues: dict[str, asyncio.Queue[AudioPlayoutDelta]] = {}
+        self._audio_playout_queue_stats: dict[str, AudioPlayoutQueueStats] = {}
+        self._audio_playout_tasks: dict[str, asyncio.Task[None]] = {}
+        self._audio_playout_overflow_tasks: dict[str, asyncio.Task[None]] = {}
         self._playout_tasks: dict[str, asyncio.Task[None]] = {}
         self._turn_response_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_ai_audio_published_at: dict[str, datetime] = {}
@@ -947,6 +979,36 @@ class RealtimeCallAgentRunner:
         await self._cancel_sip_barge_in_task(call_id)
         await self._cancel_sip_clean_window_task(call_id)
         await self._cancel_sip_recovery_task(call_id)
+        await self._cancel_audio_playout_overflow_task(call_id)
+        guard = self._playback_guards.get(call_id)
+        playout_queue = self._audio_playout_queues.get(call_id)
+        playout_task = self._audio_playout_tasks.get(call_id)
+        has_audio_playout = (
+            (
+                guard is not None
+                and guard.current_response_audio_published
+                and not guard.audio_stop_requested
+            )
+            or (playout_queue is not None and not playout_queue.empty())
+            or (playout_task is not None and not playout_task.done())
+        )
+        if has_audio_playout:
+            cleanup_errors = await self._stop_audio_playout_queue(
+                call_id,
+                source="agent",
+                reason="session_stop",
+                force=True,
+            )
+            for cleanup_error in cleanup_errors:
+                self._append_event(
+                    call_id,
+                    "agent_cleanup_failed",
+                    "agent",
+                    cleanup_error,
+                )
+        else:
+            self._clear_audio_playout_queue(call_id)
+            await self._cancel_audio_playout_worker(call_id)
 
         audio_task = self._audio_tasks.pop(call_id, None)
         if audio_task is not None and not audio_task.done():
@@ -981,6 +1043,8 @@ class RealtimeCallAgentRunner:
         self._pending_call_end_intents.pop(call_id, None)
         self._provider_transport_diagnostics.pop(call_id, None)
         self._last_ai_question_completed_at.pop(call_id, None)
+        self._audio_playout_queues.pop(call_id, None)
+        self._audio_playout_queue_stats.pop(call_id, None)
         if self._sip_barge_in_detector is not None:
             self._sip_barge_in_detector.reset(call_id)
         if self._sip_vad_shadow_detector is not None:
@@ -988,20 +1052,19 @@ class RealtimeCallAgentRunner:
 
     async def suspend_for_handoff(self, call_id: str) -> None:
         await self._cancel_playout_task(call_id)
-        if self.audio_publisher is not None:
-            try:
-                await self.audio_publisher.stop_audio(call_id)
-            except Exception as exc:
-                self._append_event(
-                    call_id,
-                    "handoff_prompt_cleanup_failed",
-                    "agent",
-                    {
-                        "step": "stop_audio",
-                        "errorType": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
+        cleanup_errors = await self._stop_audio_playout_queue(
+            call_id,
+            source="handoff",
+            reason="suspend_for_handoff",
+            force=True,
+        )
+        for cleanup_error in cleanup_errors:
+            self._append_event(
+                call_id,
+                "handoff_prompt_cleanup_failed",
+                "agent",
+                cleanup_error,
+            )
 
         provider = self._providers.get(call_id)
         if provider is not None:
@@ -1020,6 +1083,15 @@ class RealtimeCallAgentRunner:
         turn_response_task = self._turn_response_tasks.get(call_id)
         if turn_response_task is not None:
             await turn_response_task
+        audio_playout_task = self._audio_playout_tasks.get(call_id)
+        if audio_playout_task is not None:
+            await audio_playout_task
+        overflow_task = self._audio_playout_overflow_tasks.get(call_id)
+        if overflow_task is not None:
+            await overflow_task
+        playout_task = self._playout_tasks.get(call_id)
+        if playout_task is not None:
+            await playout_task
 
     async def send_audio_frame(self, call_id: str, frame: PcmAudioFrame) -> None:
         provider = self._providers[call_id]
@@ -1281,6 +1353,7 @@ class RealtimeCallAgentRunner:
                 if delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
                 if self.registry.get(call_id).status in {
+                    CallSessionStatus.ENDING,
                     CallSessionStatus.COMPLETED,
                     CallSessionStatus.FAILED,
                 }:
@@ -5289,6 +5362,7 @@ class RealtimeCallAgentRunner:
             return False
         session = self.registry.get(call_id)
         if session.status in {
+            CallSessionStatus.ENDING,
             CallSessionStatus.COMPLETED,
             CallSessionStatus.FAILED,
         }:
@@ -5359,6 +5433,7 @@ class RealtimeCallAgentRunner:
             return False
         session = self.registry.get(call_id)
         if session.status in {
+            CallSessionStatus.ENDING,
             CallSessionStatus.COMPLETED,
             CallSessionStatus.FAILED,
         }:
@@ -6198,6 +6273,42 @@ class RealtimeCallAgentRunner:
             )
             return
 
+        if reason == "customer_request":
+            transcript = self._pending_turn(call_id).transcript
+            decision = await RuleBasedHandoffIntentClassifier().classify(
+                transcript=transcript
+            )
+            if not decision.matched or decision.reason != "customer_request":
+                self._append_event(
+                    call_id,
+                    "handoff_tool_ignored",
+                    "agent",
+                    {
+                        "reason": "customer_request_without_explicit_intent",
+                        "toolCallId": tool_call_id,
+                        "localDecisionReason": decision.reason,
+                        "localDecisionConfidence": decision.confidence,
+                        "transcriptPreview": self._text_preview(transcript),
+                    },
+                )
+                try:
+                    await provider.submit_tool_result(
+                        tool_call_id,
+                        CUSTOMER_HANDOFF_REJECTED_TOOL_RESULT,
+                    )
+                    self._queue_response_create(call_id)
+                except Exception as exc:
+                    self._append_event(
+                        call_id,
+                        "agent_error",
+                        "agent",
+                        {
+                            "message": f"提交转人工工具拒绝结果失败: {exc}",
+                            "toolCallId": tool_call_id,
+                        },
+                    )
+                return
+
         self._append_event(
             call_id,
             "handoff_tool_requested",
@@ -6485,19 +6596,12 @@ class RealtimeCallAgentRunner:
         self._append_event(call_id, "browser_pre_stop_requested", "agent", event_payload)
 
         await self._cancel_playout_task(call_id)
-        stop_audio_succeeded = self.audio_publisher is None
-        cleanup_errors: list[dict[str, str]] = []
-        if self.audio_publisher is not None:
-            try:
-                await self.audio_publisher.stop_audio(call_id)
-                stop_audio_succeeded = True
-                guard.audio_stop_requested = True
-            except Exception as exc:
-                cleanup_errors.append({
-                    "step": "stop_audio",
-                    "errorType": type(exc).__name__,
-                    "message": str(exc),
-                })
+        cleanup_errors = await self._stop_audio_playout_queue(
+            call_id,
+            source="browser",
+            reason=decision.reason,
+        )
+        stop_audio_succeeded = not cleanup_errors
 
         completed_payload = dict(event_payload)
         completed_payload["stopAudioSucceeded"] = stop_audio_succeeded
@@ -6550,19 +6654,12 @@ class RealtimeCallAgentRunner:
         self._append_event(call_id, "browser_audio_hold_requested", "agent", event_payload)
 
         await self._cancel_playout_task(call_id)
-        stop_audio_succeeded = self.audio_publisher is None
-        cleanup_errors: list[dict[str, str]] = []
-        if self.audio_publisher is not None:
-            try:
-                await self.audio_publisher.stop_audio(call_id)
-                stop_audio_succeeded = True
-                guard.audio_stop_requested = True
-            except Exception as exc:
-                cleanup_errors.append({
-                    "step": "stop_audio",
-                    "errorType": type(exc).__name__,
-                    "message": str(exc),
-                })
+        cleanup_errors = await self._stop_audio_playout_queue(
+            call_id,
+            source="browser",
+            reason=decision.reason,
+        )
+        stop_audio_succeeded = not cleanup_errors
 
         completed_payload = dict(event_payload)
         completed_payload["stopAudioSucceeded"] = stop_audio_succeeded
@@ -7306,6 +7403,7 @@ class RealtimeCallAgentRunner:
             ):
                 return
             if self.registry.get(call_id).status in {
+                CallSessionStatus.ENDING,
                 CallSessionStatus.COMPLETED,
                 CallSessionStatus.FAILED,
             }:
@@ -7591,58 +7689,493 @@ class RealtimeCallAgentRunner:
         if not isinstance(delta, str) or not delta:
             return
 
-        frame = self.audio_bridge.decode_qwen_output_delta(delta)
-        for playout_frame in self.audio_bridge.iter_output_playout_frames(frame):
-            drop_reason = self._audio_drop_reason(call_id, provider_event)
-            if drop_reason is not None:
-                self._append_stale_audio_dropped(call_id, provider_event, drop_reason)
-                return
-            await self.audio_publisher.publish_audio(call_id, playout_frame)
-            drop_reason = self._audio_drop_reason(call_id, provider_event)
-            if drop_reason is not None:
-                self._append_stale_audio_dropped(call_id, provider_event, drop_reason)
-                cleanup_errors = await self._stop_audio_playout_queue(
-                    call_id,
-                    source="agent",
-                    reason=f"stale_audio_after_publish:{drop_reason}",
-                    force=True,
-                )
-                for cleanup_error in cleanup_errors:
-                    self._append_event(
-                        call_id,
-                        "interrupt_cleanup_failed",
-                        "agent",
-                        cleanup_error,
-                    )
-                return
-            event_timestamp = self._append_event(
+        guard = self._playback_guard(call_id)
+        response_id = self._response_id_from_payload(provider_event.payload)
+        response_generation = guard.current_response_generation
+        pcm_bytes, frame_count = self._audio_playout_delta_shape(delta)
+        if pcm_bytes <= 0 or frame_count <= 0:
+            return
+        queued_delta = AudioPlayoutDelta(
+            delta=delta,
+            pcm_bytes=pcm_bytes,
+            frame_count=frame_count,
+            response_id=response_id,
+            response_generation=response_generation,
+        )
+        queue = self._audio_playout_queue(call_id)
+        stats = self._audio_playout_queue_stats_for_call(call_id)
+        if stats.queued_bytes + pcm_bytes > self._audio_playout_max_pcm_bytes():
+            self._fail_audio_playout_response_nowait(call_id, queued_delta)
+            return
+        try:
+            queue.put_nowait(queued_delta)
+        except asyncio.QueueFull:
+            self._fail_audio_playout_response_nowait(call_id, queued_delta)
+            return
+        self._record_audio_playout_enqueued(call_id, queued_delta)
+        self._ensure_audio_playout_worker(call_id)
+        # 只让出事件循环调度 worker，不等待 capture_frame 或实际播放进度。
+        await asyncio.sleep(0)
+
+    def _audio_playout_delta_shape(self, delta: str) -> tuple[int, int]:
+        padding = 2 if delta.endswith("==") else 1 if delta.endswith("=") else 0
+        pcm_bytes = max(0, len(delta) * 3 // 4 - padding)
+        frame_bytes = self._audio_playout_frame_bytes()
+        frame_count = (pcm_bytes + frame_bytes - 1) // frame_bytes
+        return pcm_bytes, frame_count
+
+    def _audio_playout_frame_bytes(self) -> int:
+        samples = (
+            self.audio_bridge.qwen_output_sample_rate_hz
+            * self.audio_bridge.output_frame_duration_ms
+            // 1000
+        )
+        return max(1, samples * self.audio_bridge.sample_width_bytes)
+
+    def _audio_playout_queue_capacity(self) -> int:
+        frame_duration_ms = max(1, self.audio_bridge.output_frame_duration_ms)
+        return max(
+            1,
+            (
+                AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS
+                + frame_duration_ms
+                - 1
+            )
+            // frame_duration_ms,
+        )
+
+    def _audio_playout_max_pcm_bytes(self) -> int:
+        return (
+            self.audio_bridge.qwen_output_sample_rate_hz
+            * self.audio_bridge.sample_width_bytes
+            * AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS
+            // 1000
+        )
+
+    def _audio_playout_queue_item_capacity(self) -> int:
+        # 单个合法 mono PCM delta 至少包含一个 sample；实际容量由 PCM 字节预算约束。
+        return max(
+            1,
+            self._audio_playout_max_pcm_bytes()
+            // self.audio_bridge.sample_width_bytes,
+        )
+
+    def _audio_playout_frame_count_for_bytes(self, pcm_bytes: int) -> int:
+        frame_bytes = self._audio_playout_frame_bytes()
+        return max(0, (pcm_bytes + frame_bytes - 1) // frame_bytes)
+
+    def _audio_playout_high_watermark(self) -> int:
+        capacity = self._audio_playout_queue_capacity()
+        return max(
+            1,
+            (
+                capacity * AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT
+                + 99
+            )
+            // 100,
+        )
+
+    def _audio_playout_queue(self, call_id: str) -> asyncio.Queue[AudioPlayoutDelta]:
+        queue = self._audio_playout_queues.get(call_id)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self._audio_playout_queue_item_capacity())
+            self._audio_playout_queues[call_id] = queue
+        return queue
+
+    def _audio_playout_queue_stats_for_call(
+        self,
+        call_id: str,
+    ) -> AudioPlayoutQueueStats:
+        return self._audio_playout_queue_stats.setdefault(
+            call_id,
+            AudioPlayoutQueueStats(),
+        )
+
+    def _record_audio_playout_enqueued(
+        self,
+        call_id: str,
+        queued_delta: AudioPlayoutDelta,
+    ) -> None:
+        queue = self._audio_playout_queue(call_id)
+        stats = self._audio_playout_queue_stats_for_call(call_id)
+        stats.queued_bytes += queued_delta.pcm_bytes
+        stats.queued_frames = self._audio_playout_frame_count_for_bytes(
+            stats.queued_bytes
+        )
+        self._set_audio_playout_queue_depth(call_id, stats.queued_frames)
+
+        response_key = (
+            queued_delta.response_id,
+            queued_delta.response_generation,
+        )
+        high_watermark = self._audio_playout_high_watermark()
+        if (
+            stats.queued_frames >= high_watermark
+            and response_key not in stats.high_watermark_response_keys
+        ):
+            stats.high_watermark_response_keys.add(response_key)
+            self._append_event(
                 call_id,
-                "ai_audio_published",
+                "audio_playout_queue_watermark",
+                "agent",
+                self._audio_playout_queue_payload(
+                    call_id,
+                    response_id=queued_delta.response_id,
+                    response_generation=queued_delta.response_generation,
+                    queue_depth_deltas=queue.qsize(),
+                    queued_frames=stats.queued_frames,
+                    queued_bytes=stats.queued_bytes,
+                ),
+            )
+
+    def _record_audio_playout_dequeued(
+        self,
+        call_id: str,
+        queued_delta: AudioPlayoutDelta,
+    ) -> None:
+        stats = self._audio_playout_queue_stats_for_call(call_id)
+        stats.queued_bytes = max(0, stats.queued_bytes - queued_delta.pcm_bytes)
+        stats.queued_frames = self._audio_playout_frame_count_for_bytes(
+            stats.queued_bytes
+        )
+        self._set_audio_playout_queue_depth(call_id, stats.queued_frames)
+
+    def _set_audio_playout_queue_depth(self, call_id: str, depth: int) -> None:
+        metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
+        metrics.audio_queue_depth = max(0, depth)
+        self.registry.get(call_id).metrics = metrics.snapshot()
+
+    def _audio_playout_queue_payload(
+        self,
+        call_id: str,
+        *,
+        response_id: str | None,
+        response_generation: int,
+        queue_depth_deltas: int,
+        queued_frames: int,
+        queued_bytes: int,
+    ) -> dict[str, Any]:
+        frame_duration_ms = max(1, self.audio_bridge.output_frame_duration_ms)
+        return {
+            "responseId": response_id,
+            "generation": self._playback_guard(call_id).generation,
+            "responseGeneration": response_generation,
+            "queueUnit": "model_audio_delta",
+            "queueDepthDeltas": queue_depth_deltas,
+            "queuedFrames": queued_frames,
+            "queuedBytes": queued_bytes,
+            "queuedDurationMs": queued_frames * frame_duration_ms,
+            "capacityFrames": self._audio_playout_queue_capacity(),
+            "capacityBytes": self._audio_playout_max_pcm_bytes(),
+            "capacityDurationMs": AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS,
+            "highWatermarkFrames": self._audio_playout_high_watermark(),
+            "highWatermarkPercent": AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT,
+        }
+
+    def _ensure_audio_playout_worker(self, call_id: str) -> None:
+        task = self._audio_playout_tasks.get(call_id)
+        if task is not None and not task.done():
+            return
+        self._audio_playout_tasks[call_id] = asyncio.create_task(
+            self._run_audio_playout_worker(call_id),
+            name=f"ai-call-audio-playout-{call_id}",
+        )
+
+    async def _run_audio_playout_worker(self, call_id: str) -> None:
+        queue = self._audio_playout_queue(call_id)
+        try:
+            while True:
+                try:
+                    queued_delta = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                self._record_audio_playout_dequeued(call_id, queued_delta)
+                try:
+                    drop_reason = self._queued_audio_drop_reason(call_id, queued_delta)
+                    if drop_reason is not None:
+                        self._append_queued_audio_dropped(
+                            call_id,
+                            queued_delta,
+                            drop_reason,
+                        )
+                        continue
+                    try:
+                        decoded = self.audio_bridge.decode_qwen_output_delta(
+                            queued_delta.delta
+                        )
+                        playout_frames = list(
+                            self.audio_bridge.iter_output_playout_frames(decoded)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self._fail_running_session(
+                            call_id,
+                            end_reason="audio_transport_error",
+                            failure_stage="audio_playout",
+                            failure_message=f"AI 音频解码异常: {exc}",
+                        )
+                        return
+                    for frame_index, playout_frame in enumerate(playout_frames):
+                        drop_reason = self._queued_audio_drop_reason(
+                            call_id,
+                            queued_delta,
+                        )
+                        if drop_reason is not None:
+                            self._append_queued_audio_dropped(
+                                call_id,
+                                queued_delta,
+                                drop_reason,
+                                frames=playout_frames[frame_index:],
+                            )
+                            return
+                        try:
+                            await self.audio_publisher.publish_audio(
+                                call_id,
+                                playout_frame,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            drop_reason = self._queued_audio_drop_reason(
+                                call_id,
+                                queued_delta,
+                            )
+                            if drop_reason is not None:
+                                self._append_queued_audio_dropped(
+                                    call_id,
+                                    queued_delta,
+                                    drop_reason,
+                                    frames=playout_frames[frame_index:],
+                                )
+                                return
+                            self._fail_running_session(
+                                call_id,
+                                end_reason="audio_transport_error",
+                                failure_stage="audio_playout",
+                                failure_message=f"AI 音频播放异常: {exc}",
+                            )
+                            return
+                        drop_reason = self._queued_audio_drop_reason(
+                            call_id,
+                            queued_delta,
+                        )
+                        if drop_reason is not None:
+                            self._append_queued_audio_dropped(
+                                call_id,
+                                queued_delta,
+                                drop_reason,
+                                frames=playout_frames[frame_index:],
+                            )
+                            cleanup_errors = await self._stop_audio_playout_queue(
+                                call_id,
+                                source="agent",
+                                reason=f"stale_audio_after_publish:{drop_reason}",
+                                force=True,
+                            )
+                            for cleanup_error in cleanup_errors:
+                                self._append_event(
+                                    call_id,
+                                    "interrupt_cleanup_failed",
+                                    "agent",
+                                    cleanup_error,
+                                )
+                            return
+                        self._record_audio_playout_published(call_id, playout_frame)
+                finally:
+                    queue.task_done()
+        finally:
+            if self._audio_playout_tasks.get(call_id) is asyncio.current_task():
+                self._audio_playout_tasks.pop(call_id, None)
+
+    def _fail_audio_playout_response_nowait(
+        self,
+        call_id: str,
+        overflow_delta: AudioPlayoutDelta,
+    ) -> None:
+        guard = self._playback_guard(call_id)
+        response_key = (
+            overflow_delta.response_id,
+            overflow_delta.response_generation,
+        )
+        if response_key in guard.overflowed_responses:
+            return
+        guard.overflowed_responses.add(response_key)
+        if overflow_delta.response_id:
+            guard.cancelled_response_ids.add(overflow_delta.response_id)
+
+        queue = self._audio_playout_queue(call_id)
+        queue_depth_deltas = queue.qsize()
+        queued_frames = self._audio_playout_queue_stats_for_call(call_id).queued_frames
+        queued_bytes = self._audio_playout_queue_stats_for_call(call_id).queued_bytes
+        cleared_frames, cleared_bytes = self._clear_audio_playout_queue(call_id)
+        worker = self._audio_playout_tasks.get(call_id)
+        if worker is not None and not worker.done():
+            worker.cancel()
+
+        dropped_bytes = cleared_bytes + overflow_delta.pcm_bytes
+        dropped_frames = self._audio_playout_frame_count_for_bytes(dropped_bytes)
+        payload = self._audio_playout_queue_payload(
+            call_id,
+            response_id=overflow_delta.response_id,
+            response_generation=overflow_delta.response_generation,
+            queue_depth_deltas=queue_depth_deltas,
+            queued_frames=queued_frames,
+            queued_bytes=queued_bytes,
+        )
+        payload.update({
+            "overflowResponseId": overflow_delta.response_id,
+            "overflowDeltaFrames": overflow_delta.frame_count,
+            "overflowDeltaBytes": overflow_delta.pcm_bytes,
+            "droppedFrames": dropped_frames,
+            "droppedBytes": dropped_bytes,
+            "strategy": "cancel_response_and_clear_playout",
+        })
+        self._append_event(
+            call_id,
+            "audio_playout_queue_full",
+            "agent",
+            payload,
+        )
+        self._audio_playout_overflow_tasks[call_id] = asyncio.create_task(
+            self._handle_audio_playout_overflow(
+                call_id=call_id,
+                overflow_delta=overflow_delta,
+                cleared_frames=cleared_frames,
+                cleared_bytes=cleared_bytes,
+                dropped_frames=dropped_frames,
+                dropped_bytes=dropped_bytes,
+            ),
+            name=f"ai-call-audio-overflow-{call_id}",
+        )
+
+    async def _handle_audio_playout_overflow(
+        self,
+        *,
+        call_id: str,
+        overflow_delta: AudioPlayoutDelta,
+        cleared_frames: int,
+        cleared_bytes: int,
+        dropped_frames: int,
+        dropped_bytes: int,
+    ) -> None:
+        cleanup_errors: list[dict[str, str]] = []
+        try:
+            await self._cancel_audio_playout_worker(call_id)
+            if self.audio_publisher is not None:
+                try:
+                    await self.audio_publisher.stop_audio(call_id)
+                except Exception as exc:
+                    cleanup_errors.append({
+                        "step": "stop_audio",
+                        "errorType": type(exc).__name__,
+                        "message": str(exc),
+                    })
+            guard = self._playback_guard(call_id)
+            guard.audio_stop_requested = True
+            self._append_event(
+                call_id,
+                "playout_queue_flushed",
                 "agent",
                 {
-                    "sampleRateHz": playout_frame.sample_rate_hz,
-                    "bytes": len(playout_frame.data),
+                    "source": "agent",
+                    "reason": "audio_playout_queue_overflow",
+                    "generation": guard.generation,
+                    "responseId": overflow_delta.response_id,
+                    "forced": True,
+                    "clearedFrames": cleared_frames,
+                    "clearedBytes": cleared_bytes,
                 },
             )
-            metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
-            metrics.mark_audio_published(event_timestamp)
-            self._last_ai_audio_published_at[call_id] = event_timestamp
-            ai_rms_dbfs = SipBargeInDetector._pcm16_rms_dbfs(playout_frame)
-            if ai_rms_dbfs is not None:
-                self._last_ai_audio_rms_dbfs[call_id] = ai_rms_dbfs
-            self._playback_guard(call_id).current_response_audio_published = True
-            self.registry.get(call_id).metrics = metrics.snapshot()
+
+            provider = self._providers.get(call_id)
+            if provider is not None:
+                try:
+                    await provider.cancel_response()
+                    guard.cancel_requested = True
+                except Exception as exc:
+                    cleanup_errors.append({
+                        "step": "cancel_response",
+                        "errorType": type(exc).__name__,
+                        "message": str(exc),
+                    })
+            self._append_event(
+                call_id,
+                "audio_playout_response_failed",
+                "agent",
+                {
+                    "reason": "audio_playout_queue_overflow",
+                    "responseId": overflow_delta.response_id,
+                    "generation": guard.generation,
+                    "responseGeneration": overflow_delta.response_generation,
+                    "droppedFrames": dropped_frames,
+                    "droppedBytes": dropped_bytes,
+                    "cleanupErrors": cleanup_errors,
+                },
+            )
+        finally:
+            if self._audio_playout_overflow_tasks.get(call_id) is asyncio.current_task():
+                self._audio_playout_overflow_tasks.pop(call_id, None)
+
+    def _record_audio_playout_published(
+        self,
+        call_id: str,
+        frame: PcmAudioFrame,
+    ) -> None:
+        event_timestamp = self._append_event(
+            call_id,
+            "ai_audio_published",
+            "agent",
+            {
+                "sampleRateHz": frame.sample_rate_hz,
+                "bytes": len(frame.data),
+            },
+        )
+        metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
+        metrics.mark_audio_published(event_timestamp)
+        self._last_ai_audio_published_at[call_id] = event_timestamp
+        ai_rms_dbfs = SipBargeInDetector._pcm16_rms_dbfs(frame)
+        if ai_rms_dbfs is not None:
+            self._last_ai_audio_rms_dbfs[call_id] = ai_rms_dbfs
+        self._playback_guard(call_id).current_response_audio_published = True
+        self.registry.get(call_id).metrics = metrics.snapshot()
 
     def _audio_drop_reason(self, call_id: str, provider_event: ProviderEvent) -> str | None:
         guard = self._playback_guard(call_id)
-        response_id = self._response_id_from_payload(provider_event.payload)
+        return self._audio_identity_drop_reason(
+            call_id,
+            response_id=self._response_id_from_payload(provider_event.payload),
+            response_generation=guard.current_response_generation,
+        )
+
+    def _queued_audio_drop_reason(
+        self,
+        call_id: str,
+        queued_delta: AudioPlayoutDelta,
+    ) -> str | None:
+        return self._audio_identity_drop_reason(
+            call_id,
+            response_id=queued_delta.response_id,
+            response_generation=queued_delta.response_generation,
+        )
+
+    def _audio_identity_drop_reason(
+        self,
+        call_id: str,
+        *,
+        response_id: str | None,
+        response_generation: int,
+    ) -> str | None:
+        guard = self._playback_guard(call_id)
+        if (response_id, response_generation) in guard.overflowed_responses:
+            return "audio_playout_queue_overflow"
         if response_id and response_id in guard.cancelled_response_ids:
             return "cancelled_response"
         if guard.awaiting_response_start_after_interrupt and (
             not guard.current_response_id or response_id != guard.current_response_id
         ):
             return "awaiting_response_start_after_interrupt"
-        if guard.current_response_generation != guard.generation:
+        if response_generation != guard.generation:
             return "stale_generation"
         if response_id and guard.current_response_id and response_id != guard.current_response_id:
             return "non_current_response"
@@ -7656,6 +8189,40 @@ class RealtimeCallAgentRunner:
             return "session_not_ai_speaking"
         return None
 
+    def _append_queued_audio_dropped(
+        self,
+        call_id: str,
+        queued_delta: AudioPlayoutDelta,
+        reason: str,
+        *,
+        frames: list[PcmAudioFrame] | None = None,
+    ) -> None:
+        guard = self._playback_guard(call_id)
+        dropped_frames = (
+            len(frames)
+            if frames is not None
+            else queued_delta.frame_count
+        )
+        dropped_bytes = (
+            sum(len(frame.data) for frame in frames)
+            if frames is not None
+            else queued_delta.pcm_bytes
+        )
+        self._append_event(
+            call_id,
+            "stale_audio_dropped",
+            "agent",
+            {
+                "reason": reason,
+                "responseId": queued_delta.response_id,
+                "currentResponseId": guard.current_response_id,
+                "generation": guard.generation,
+                "currentResponseGeneration": guard.current_response_generation,
+                "deltaFrames": dropped_frames,
+                "deltaBytes": dropped_bytes,
+            },
+        )
+
     def _append_stale_audio_dropped(
         self,
         call_id: str,
@@ -7664,6 +8231,10 @@ class RealtimeCallAgentRunner:
     ) -> None:
         guard = self._playback_guard(call_id)
         delta = provider_event.payload.get("delta")
+        delta_bytes = self._base64_decoded_size(delta) if isinstance(delta, str) else None
+        delta_frames = None
+        if isinstance(delta, str):
+            _, delta_frames = self._audio_playout_delta_shape(delta)
         self._append_event(
             call_id,
             "stale_audio_dropped",
@@ -7674,7 +8245,8 @@ class RealtimeCallAgentRunner:
                 "currentResponseId": guard.current_response_id,
                 "generation": guard.generation,
                 "currentResponseGeneration": guard.current_response_generation,
-                "deltaBytes": self._base64_decoded_size(delta) if isinstance(delta, str) else None,
+                "deltaFrames": delta_frames,
+                "deltaBytes": delta_bytes,
             },
         )
 
@@ -7687,6 +8259,8 @@ class RealtimeCallAgentRunner:
         force: bool = False,
     ) -> list[dict[str, str]]:
         guard = self._playback_guard(call_id)
+        cleared_frames, cleared_bytes = self._clear_audio_playout_queue(call_id)
+        await self._cancel_audio_playout_worker(call_id)
         if self.audio_publisher is None:
             return []
         if guard.audio_stop_requested and not force:
@@ -7713,9 +8287,51 @@ class RealtimeCallAgentRunner:
                 "generation": guard.generation,
                 "responseId": guard.current_response_id,
                 "forced": force,
+                "clearedFrames": cleared_frames,
+                "clearedBytes": cleared_bytes,
             },
         )
         return []
+
+    def _clear_audio_playout_queue(self, call_id: str) -> tuple[int, int]:
+        queue = self._audio_playout_queues.get(call_id)
+        if queue is None:
+            return 0, 0
+        cleared_bytes = 0
+        while True:
+            try:
+                queued_delta = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            cleared_bytes += queued_delta.pcm_bytes
+            queue.task_done()
+        cleared_frames = self._audio_playout_frame_count_for_bytes(cleared_bytes)
+        stats = self._audio_playout_queue_stats_for_call(call_id)
+        stats.queued_frames = 0
+        stats.queued_bytes = 0
+        self._set_audio_playout_queue_depth(call_id, 0)
+        return cleared_frames, cleared_bytes
+
+    async def _cancel_audio_playout_worker(self, call_id: str) -> None:
+        task = self._audio_playout_tasks.get(call_id)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        self._audio_playout_tasks.pop(call_id, None)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_audio_playout_overflow_task(self, call_id: str) -> None:
+        task = self._audio_playout_overflow_tasks.pop(call_id, None)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def _has_recent_ai_audio(self, call_id: str, trigger_timestamp: datetime) -> bool:
         last_published_at = self._last_ai_audio_published_at.get(call_id)
@@ -8058,6 +8674,15 @@ class RealtimeCallAgentRunner:
         opening_response: bool = False,
     ) -> bool:
         lifecycle = self._response_lifecycle(call_id)
+        if self.registry.get(call_id).status in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
+            lifecycle.pending_create = False
+            lifecycle.pending_input_text = None
+            lifecycle.pending_response_is_opening = False
+            return False
         if lifecycle.active or lifecycle.cancel_pending:
             lifecycle.pending_create = True
             if input_text:
@@ -8074,6 +8699,13 @@ class RealtimeCallAgentRunner:
                 failure_stage="model_response_create",
                 failure_message=f"创建模型响应失败: {exc}",
             )
+            return False
+        if self.registry.get(call_id).status in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
+            self._clear_response_lifecycle(call_id)
             return False
         lifecycle.active = True
         lifecycle.active_started_at = datetime.now(timezone.utc)
@@ -8205,6 +8837,15 @@ class RealtimeCallAgentRunner:
         guard.cancel_requested = False
         if cancel_was_pending:
             self._mark_provider_cancel_race_window(lifecycle)
+        if self.registry.get(call_id).status in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
+            lifecycle.pending_create = False
+            lifecycle.pending_input_text = None
+            lifecycle.pending_response_is_opening = False
+            return
         if not lifecycle.pending_create:
             if await self._maybe_recover_sip_confirmed_without_transcript(call_id, provider):
                 return
@@ -8212,14 +8853,6 @@ class RealtimeCallAgentRunner:
             self._schedule_pending_call_end_nowait(call_id)
             return
         if self._drop_unmaterialized_no_barge_pending_response_if_needed(call_id):
-            return
-        if self.registry.get(call_id).status in {
-            CallSessionStatus.COMPLETED,
-            CallSessionStatus.FAILED,
-        }:
-            lifecycle.pending_create = False
-            lifecycle.pending_input_text = None
-            lifecycle.pending_response_is_opening = False
             return
         if self._defer_sip_response_release_if_needed(
             call_id,
@@ -8368,6 +9001,12 @@ class RealtimeCallAgentRunner:
         if pending_call_end is None or pending_call_end.scheduled:
             return
         if not pending_call_end.final_response_started:
+            return
+        if self.registry.get(call_id).status in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
             return
         if pending_call_end.local_explicit_intent and self.registry.get(call_id).status not in {
             CallSessionStatus.COMPLETED,
@@ -8599,7 +9238,11 @@ class RealtimeCallAgentRunner:
     ) -> None:
         self._clear_response_lifecycle(call_id)
         session = self.registry.get(call_id)
-        if session.status in {CallSessionStatus.COMPLETED, CallSessionStatus.FAILED}:
+        if session.status in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }:
             return
         self.registry.transition(call_id, CallSessionStatus.FAILED)
         payload: dict[str, Any] = {
@@ -8661,11 +9304,13 @@ class RealtimeCallAgentRunner:
 
     def _complete_ai_speaking_after_playout(self, call_id: str) -> None:
         wait_for_playout = getattr(self.audio_publisher, "wait_for_playout", None)
-        if wait_for_playout is None:
+        audio_playout_task = self._audio_playout_tasks.get(call_id)
+        if wait_for_playout is None and (
+            audio_playout_task is None or audio_playout_task.done()
+        ):
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
             self._schedule_pending_call_end_nowait(call_id)
             return
-
         self._cancel_playout_task_nowait(call_id)
         self._playout_tasks[call_id] = asyncio.create_task(
             self._wait_for_playout_and_mark_connected(call_id, wait_for_playout)
@@ -8677,7 +9322,11 @@ class RealtimeCallAgentRunner:
         wait_for_playout: Any,
     ) -> None:
         try:
-            await wait_for_playout(call_id)
+            audio_playout_task = self._audio_playout_tasks.get(call_id)
+            if audio_playout_task is not None and audio_playout_task is not asyncio.current_task():
+                await audio_playout_task
+            if wait_for_playout is not None:
+                await wait_for_playout(call_id)
             if self.ai_speaking_tail_grace_seconds > 0:
                 await asyncio.sleep(self.ai_speaking_tail_grace_seconds)
             session = self.registry.get(call_id)
