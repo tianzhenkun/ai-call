@@ -35,3 +35,5 @@ CREATE INDEX IF NOT EXISTS idx_outbound_attempt_task
     ON ai_call_outbound_attempt (tenant_id, task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_outbound_attempt_target
     ON ai_call_outbound_attempt (tenant_id, target_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_outbound_attempt_stale
+    ON ai_call_outbound_attempt (status, started_at);

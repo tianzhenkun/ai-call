@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_task (
     failed_targets integer NOT NULL DEFAULT 0,
     execution_mode varchar(16) NOT NULL,
     scheduled_at timestamptz,
+    next_dispatch_at timestamptz,
+    last_dispatched_at timestamptz,
     started_at timestamptz,
     ended_at timestamptz,
     prompt_profile_id varchar(64),
@@ -81,6 +83,8 @@ CREATE INDEX IF NOT EXISTS idx_outbound_task_tenant_id
     ON ai_call_outbound_task (tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_outbound_task_validation
     ON ai_call_outbound_task (tenant_id, validation_id);
+CREATE INDEX IF NOT EXISTS idx_outbound_task_dispatch
+    ON ai_call_outbound_task (status, next_dispatch_at, last_dispatched_at, id);
 
 CREATE TABLE IF NOT EXISTS ai_call_outbound_target (
     id bigint PRIMARY KEY,

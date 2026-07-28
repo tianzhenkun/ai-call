@@ -514,6 +514,7 @@ class OutboundRuleTaskService:
         task.task_name = request.task_name
         task.execution_mode = "scheduled"
         task.scheduled_at = self._parse_datetime(request.scheduled_at)
+        task.next_dispatch_at = None
         task.updated_at = _now()
         await db.flush()
         return AcceptedCommandOut()
@@ -525,7 +526,19 @@ class OutboundRuleTaskService:
         task_id: int,
         action: str,
     ) -> AcceptedCommandOut:
-        task = await self._get_task(db, tenant_id, task_id)
+        task = await db.scalar(
+            select(AiCallOutboundTaskModel)
+            .where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.id == task_id,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            raise CustomException(
+                msg="外呼任务不存在",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
         allowed = {
             "pause": {"RUNNING"},
             "resume": {"PAUSED"},
@@ -554,6 +567,7 @@ class OutboundRuleTaskService:
             )
         elif action == "resume":
             task.status = "RUNNING"
+            task.next_dispatch_at = None
         else:
             await db.execute(
                 update(AiCallOutboundTargetModel)

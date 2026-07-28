@@ -29,6 +29,8 @@ from app.utils.id_util import generate_snowflake_id
 
 def test_outbound_target_persists_next_attempt_at_and_migration() -> None:
     assert "next_attempt_at" in AiCallOutboundTargetModel.__table__.columns
+    assert "next_dispatch_at" in AiCallOutboundTaskModel.__table__.columns
+    assert "last_dispatched_at" in AiCallOutboundTaskModel.__table__.columns
 
     migration_path = (
         Path(__file__).parents[1]
@@ -39,6 +41,12 @@ def test_outbound_target_persists_next_attempt_at_and_migration() -> None:
     )
     migration = migration_path.read_text(encoding="utf-8").lower()
     assert "add column if not exists next_attempt_at" in migration
+    assert "add column if not exists next_dispatch_at" in migration
+    assert "add column if not exists last_dispatched_at" in migration
+    assert "idx_outbound_task_dispatch" in migration
+    assert "idx_outbound_task_scheduled_dispatch" in migration
+    assert "idx_outbound_task_running_dispatch" in migration
+    assert "idx_outbound_attempt_stale" in migration
 
 
 @pytest.fixture
@@ -430,7 +438,106 @@ async def test_closed_window_task_does_not_starve_later_due_task(database) -> No
         closed_task = await session.get(AiCallOutboundTaskModel, closed_task_id)
         due_task = await session.get(AiCallOutboundTaskModel, due_task_id)
     assert closed_task is not None and closed_task.status == "SCHEDULED"
+    assert closed_task.next_dispatch_at == datetime(2026, 7, 28, 10, 0)
     assert due_task is not None and due_task.status == "COMPLETED"
+
+
+@pytest.mark.anyio
+async def test_running_tasks_rotate_fairly_across_polls(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    first_task_id, _ = await _seed_task(database, now=now, target_count=2)
+    second_task_id, _ = await _seed_task(database, now=now, target_count=2)
+    async with database() as session:
+        await session.execute(
+            AiCallOutboundTaskModel.__table__.update()
+            .where(AiCallOutboundTaskModel.id.in_([first_task_id, second_task_id]))
+            .values(status="RUNNING", started_at=now)
+        )
+        await session.commit()
+
+    dialer = SequenceDialer([
+        DialResult(call_result="connected"),
+        DialResult(call_result="connected"),
+    ])
+    executor = OutboundTaskExecutor(
+        database,
+        dialer,
+        task_batch_size=1,
+        target_batch_size=1,
+        now_provider=lambda: now,
+        business_timezone="UTC",
+    )
+
+    assert await executor.run_once() == 1
+    assert await executor.run_once() == 1
+    assert {request.task_id for request in dialer.requests} == {
+        first_task_id,
+        second_task_id,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("transitional_status", "expected_status", "expected_target_status"),
+    [
+        ("PAUSING", "PAUSED", "PENDING"),
+        ("STOPPING", "STOPPED", "CANCELLED"),
+    ],
+)
+async def test_poll_reconciles_transitional_task_without_active_attempt(
+    database,
+    transitional_status,
+    expected_status,
+    expected_target_status,
+) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        assert task is not None
+        task.status = transitional_status
+        task.started_at = now
+        await session.commit()
+
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([]),
+        now_provider=lambda: now,
+    )
+    assert await executor.run_once() == 0
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+    assert task is not None and task.status == expected_status
+    assert target is not None and target.status == expected_target_status
+
+
+@pytest.mark.anyio
+async def test_executor_does_not_claim_cross_tenant_target_with_corrupt_link(
+    database,
+) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None
+        target.tenant_id = "tenant-b"
+        await session.commit()
+
+    dialer = SequenceDialer([])
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    assert await executor.run_once() == 0
+
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt_count = int(
+            await session.scalar(select(func.count(AiCallOutboundAttemptModel.id)))
+            or 0
+        )
+    assert target is not None and target.status == "PENDING"
+    assert attempt_count == 0
+    assert dialer.requests == []
 
 
 @pytest.mark.anyio

@@ -62,6 +62,13 @@ class AiCallOutboundTaskModel(MappedBase):
             "status",
             "created_at",
         ),
+        Index(
+            "idx_outbound_task_dispatch",
+            "status",
+            "next_dispatch_at",
+            "last_dispatched_at",
+            "id",
+        ),
         Index("idx_outbound_task_tenant_id", "tenant_id", "id"),
         Index("idx_outbound_task_validation", "tenant_id", "validation_id"),
         {"comment": "通用外呼正式任务"},
@@ -82,6 +89,8 @@ class AiCallOutboundTaskModel(MappedBase):
     failed_targets: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     execution_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     prompt_profile_id: Mapped[str | None] = mapped_column(String(64))
@@ -172,6 +181,7 @@ class AiCallOutboundAttemptModel(MappedBase):
             "target_id",
             "attempt_no",
         ),
+        Index("idx_outbound_attempt_stale", "status", "started_at"),
         {"comment": "通用外呼拨打尝试与通话记录关联"},
     )
     __permission_strategy__ = None

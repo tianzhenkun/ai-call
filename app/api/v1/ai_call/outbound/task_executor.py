@@ -9,7 +9,7 @@ from typing import Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
@@ -31,6 +31,7 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class OutboundDialRequest:
+    tenant_id: str
     task_id: int
     target_id: int
     attempt_no: int
@@ -52,6 +53,12 @@ class DialResult:
 class ClaimedAttempt:
     request: OutboundDialRequest
     call_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskKey:
+    tenant_id: str
+    task_id: int
 
 
 class OutboundDialer(Protocol):
@@ -99,14 +106,15 @@ class OutboundTaskExecutor:
     async def run_once(self) -> int:
         now = self.now_provider()
         await self._recover_stale_attempts(now)
+        await self._reconcile_transitional_tasks(now)
         await self._claim_due_tasks(now)
-        task_ids = await self._list_running_task_ids(now)
+        task_keys = await self._list_running_task_keys(now)
         processed = 0
-        for task_id in task_ids:
+        for task_key in task_keys:
             for _ in range(self.target_batch_size):
-                claimed = await self._claim_target(task_id, self.now_provider())
+                claimed = await self._claim_target(task_key, self.now_provider())
                 if claimed is None:
-                    await self._refresh_task_counters(task_id, self.now_provider())
+                    await self._refresh_task_counters(task_key, self.now_provider())
                     break
                 try:
                     result = await self.dialer.dial(claimed.request)
@@ -140,12 +148,24 @@ class OutboundTaskExecutor:
             ).all()
             recovery_items: list[tuple[OutboundDialRequest, str]] = []
             for attempt in attempts:
-                task = await db.get(AiCallOutboundTaskModel, attempt.task_id)
-                target = await db.get(AiCallOutboundTargetModel, attempt.target_id)
+                task = await db.scalar(
+                    select(AiCallOutboundTaskModel).where(
+                        AiCallOutboundTaskModel.tenant_id == attempt.tenant_id,
+                        AiCallOutboundTaskModel.id == attempt.task_id,
+                    )
+                )
+                target = await db.scalar(
+                    select(AiCallOutboundTargetModel).where(
+                        AiCallOutboundTargetModel.tenant_id == attempt.tenant_id,
+                        AiCallOutboundTargetModel.task_id == attempt.task_id,
+                        AiCallOutboundTargetModel.id == attempt.target_id,
+                    )
+                )
                 if task is None or target is None or target.status != "DIALING":
                     continue
                 recovery_items.append((
                     OutboundDialRequest(
+                        tenant_id=attempt.tenant_id,
                         task_id=task.id,
                         target_id=target.id,
                         attempt_no=attempt.attempt_no,
@@ -168,48 +188,81 @@ class OutboundTaskExecutor:
                 now,
             )
 
-    async def _claim_due_tasks(self, now: datetime) -> None:
-        schedule_now = self._schedule_comparison_now(now)
+    async def _reconcile_transitional_tasks(self, now: datetime) -> None:
         async with self.session_factory() as db:
-            claimed_count = 0
-            last_id = 0
-            while claimed_count < self.task_batch_size:
-                candidates = (
-                    await db.scalars(
-                        select(AiCallOutboundTaskModel)
+            tasks = (
+                await db.scalars(
+                    select(AiCallOutboundTaskModel)
+                    .where(
+                        AiCallOutboundTaskModel.status.in_(["PAUSING", "STOPPING"])
+                    )
+                    .order_by(
+                        AiCallOutboundTaskModel.updated_at,
+                        AiCallOutboundTaskModel.id,
+                    )
+                    .limit(self.task_batch_size * 4)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            for task in tasks:
+                if task.status == "STOPPING":
+                    await db.execute(
+                        update(AiCallOutboundTargetModel)
                         .where(
-                            AiCallOutboundTaskModel.status == "SCHEDULED",
-                            AiCallOutboundTaskModel.id > last_id,
-                            or_(
-                                AiCallOutboundTaskModel.execution_mode == "immediate",
-                                AiCallOutboundTaskModel.scheduled_at <= schedule_now,
+                            AiCallOutboundTargetModel.tenant_id == task.tenant_id,
+                            AiCallOutboundTargetModel.task_id == task.id,
+                            AiCallOutboundTargetModel.status.in_(
+                                ["PENDING", "RETRY_WAIT"]
                             ),
                         )
-                        .order_by(AiCallOutboundTaskModel.id)
-                        .limit(self.task_batch_size)
-                    )
-                ).all()
-                if not candidates:
-                    break
-                last_id = candidates[-1].id
-                for task in candidates:
-                    if not self._within_call_window(task, now):
-                        continue
-                    result = await db.execute(
-                        update(AiCallOutboundTaskModel)
-                        .where(
-                            AiCallOutboundTaskModel.id == task.id,
-                            AiCallOutboundTaskModel.status == "SCHEDULED",
-                        )
                         .values(
-                            status="RUNNING",
-                            started_at=func.coalesce(AiCallOutboundTaskModel.started_at, now),
+                            status="CANCELLED",
+                            next_attempt_at=None,
                             updated_at=now,
                         )
                     )
-                    claimed_count += max(0, result.rowcount)
-                    if claimed_count >= self.task_batch_size:
-                        break
+                    await db.flush()
+                await self._refresh_task_counters_in_session(db, task, now)
+            await db.commit()
+
+    async def _claim_due_tasks(self, now: datetime) -> None:
+        schedule_now = self._schedule_comparison_now(now)
+        async with self.session_factory() as db:
+            candidates = (
+                await db.scalars(
+                    select(AiCallOutboundTaskModel)
+                    .where(
+                        AiCallOutboundTaskModel.status == "SCHEDULED",
+                        or_(
+                            AiCallOutboundTaskModel.next_dispatch_at.is_(None),
+                            AiCallOutboundTaskModel.next_dispatch_at <= now,
+                        ),
+                        or_(
+                            AiCallOutboundTaskModel.execution_mode == "immediate",
+                            AiCallOutboundTaskModel.scheduled_at <= schedule_now,
+                        ),
+                    )
+                    .order_by(
+                        AiCallOutboundTaskModel.next_dispatch_at,
+                        AiCallOutboundTaskModel.id,
+                    )
+                    .limit(self.task_batch_size * 4)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            claimed_count = 0
+            for task in candidates:
+                if not self._within_call_window(task, now):
+                    task.next_dispatch_at = self._next_call_window_at(task, now)
+                    task.updated_at = now
+                    continue
+                task.status = "RUNNING"
+                task.started_at = task.started_at or now
+                task.next_dispatch_at = None
+                task.updated_at = now
+                claimed_count += 1
+                if claimed_count >= self.task_batch_size:
+                    break
             await db.commit()
 
     def _schedule_comparison_now(self, now: datetime) -> datetime:
@@ -218,48 +271,64 @@ class OutboundTaskExecutor:
         business_now = aware_now.astimezone(self.business_timezone)
         return business_now.replace(tzinfo=timezone.utc)
 
-    async def _list_running_task_ids(self, now: datetime) -> list[int]:
+    async def _list_running_task_keys(self, now: datetime) -> list[TaskKey]:
         async with self.session_factory() as db:
-            task_ids: list[int] = []
-            last_id = 0
-            while len(task_ids) < self.task_batch_size:
-                tasks = (
-                    await db.scalars(
-                        select(AiCallOutboundTaskModel)
-                        .where(
-                            AiCallOutboundTaskModel.status == "RUNNING",
-                            AiCallOutboundTaskModel.id > last_id,
-                        )
-                        .order_by(AiCallOutboundTaskModel.id)
-                        .limit(self.task_batch_size)
+            tasks = (
+                await db.scalars(
+                    select(AiCallOutboundTaskModel)
+                    .where(
+                        AiCallOutboundTaskModel.status == "RUNNING",
+                        or_(
+                            AiCallOutboundTaskModel.next_dispatch_at.is_(None),
+                            AiCallOutboundTaskModel.next_dispatch_at <= now,
+                        ),
                     )
-                ).all()
-                if not tasks:
-                    break
-                last_id = tasks[-1].id
-                for task in tasks:
-                    active_count, claimable_count = await self._target_work_counts(
+                    .order_by(
+                        AiCallOutboundTaskModel.last_dispatched_at.asc().nulls_first(),
+                        AiCallOutboundTaskModel.id,
+                    )
+                    .limit(self.task_batch_size * 4)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            task_keys: list[TaskKey] = []
+            for task in tasks:
+                active_count, claimable_count = await self._target_work_counts(
+                    db,
+                    task.tenant_id,
+                    task.id,
+                    now,
+                )
+                if active_count == 0:
+                    task_keys.append(TaskKey(task.tenant_id, task.id))
+                elif claimable_count > 0 and self._within_call_window(task, now):
+                    task_keys.append(TaskKey(task.tenant_id, task.id))
+                elif not self._within_call_window(task, now):
+                    task.next_dispatch_at = self._next_call_window_at(task, now)
+                else:
+                    task.next_dispatch_at = await self._next_target_attempt_at(
                         db,
+                        task.tenant_id,
                         task.id,
-                        now,
                     )
-                    if active_count == 0 or (
-                        claimable_count > 0 and self._within_call_window(task, now)
-                    ):
-                        task_ids.append(task.id)
-                        if len(task_ids) >= self.task_batch_size:
-                            break
-            return task_ids
+                task.last_dispatched_at = now
+                task.updated_at = now
+                if len(task_keys) >= self.task_batch_size:
+                    break
+            await db.commit()
+            return task_keys
 
     @staticmethod
     async def _target_work_counts(
         db: AsyncSession,
+        tenant_id: str,
         task_id: int,
         now: datetime,
     ) -> tuple[int, int]:
         active_count = int(
             await db.scalar(
                 select(func.count(AiCallOutboundTargetModel.id)).where(
+                    AiCallOutboundTargetModel.tenant_id == tenant_id,
                     AiCallOutboundTargetModel.task_id == task_id,
                     AiCallOutboundTargetModel.status.in_(
                         ["PENDING", "DIALING", "RETRY_WAIT"]
@@ -271,6 +340,7 @@ class OutboundTaskExecutor:
         claimable_count = int(
             await db.scalar(
                 select(func.count(AiCallOutboundTargetModel.id)).where(
+                    AiCallOutboundTargetModel.tenant_id == tenant_id,
                     AiCallOutboundTargetModel.task_id == task_id,
                     or_(
                         AiCallOutboundTargetModel.status == "PENDING",
@@ -285,13 +355,34 @@ class OutboundTaskExecutor:
         )
         return active_count, claimable_count
 
+    @staticmethod
+    async def _next_target_attempt_at(
+        db: AsyncSession,
+        tenant_id: str,
+        task_id: int,
+    ) -> datetime | None:
+        return await db.scalar(
+            select(func.min(AiCallOutboundTargetModel.next_attempt_at)).where(
+                AiCallOutboundTargetModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.task_id == task_id,
+                AiCallOutboundTargetModel.status == "RETRY_WAIT",
+            )
+        )
+
     async def _claim_target(
         self,
-        task_id: int,
+        task_key: TaskKey,
         now: datetime,
     ) -> ClaimedAttempt | None:
         async with self.session_factory() as db:
-            task = await db.get(AiCallOutboundTaskModel, task_id)
+            task = await db.scalar(
+                select(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == task_key.tenant_id,
+                    AiCallOutboundTaskModel.id == task_key.task_id,
+                )
+                .with_for_update()
+            )
             if (
                 task is None
                 or task.status != "RUNNING"
@@ -302,7 +393,8 @@ class OutboundTaskExecutor:
                 await db.scalars(
                     select(AiCallOutboundTargetModel.id)
                     .where(
-                        AiCallOutboundTargetModel.task_id == task_id,
+                        AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_key.task_id,
                         or_(
                             AiCallOutboundTargetModel.status == "PENDING",
                             (
@@ -323,7 +415,16 @@ class OutboundTaskExecutor:
                     update(AiCallOutboundTargetModel)
                     .where(
                         AiCallOutboundTargetModel.id == target_id,
-                        AiCallOutboundTargetModel.task_id == task_id,
+                        AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_key.task_id,
+                        exists(
+                            select(AiCallOutboundTaskModel.id).where(
+                                AiCallOutboundTaskModel.tenant_id
+                                == task_key.tenant_id,
+                                AiCallOutboundTaskModel.id == task_key.task_id,
+                                AiCallOutboundTaskModel.status == "RUNNING",
+                            )
+                        ),
                         or_(
                             AiCallOutboundTargetModel.status == "PENDING",
                             (
@@ -341,10 +442,17 @@ class OutboundTaskExecutor:
                 )
                 if result.rowcount != 1:
                     continue
-                target = await db.get(AiCallOutboundTargetModel, target_id)
+                target = await db.scalar(
+                    select(AiCallOutboundTargetModel).where(
+                        AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_key.task_id,
+                        AiCallOutboundTargetModel.id == target_id,
+                    )
+                )
                 if target is None:
                     return None
                 request = OutboundDialRequest(
+                    tenant_id=task.tenant_id,
                     task_id=task.id,
                     target_id=target.id,
                     attempt_no=target.attempt_count,
@@ -358,7 +466,7 @@ class OutboundTaskExecutor:
                 db.add(
                     AiCallOutboundAttemptModel(
                         id=generate_snowflake_id(),
-                        tenant_id=task.tenant_id,
+                        tenant_id=request.tenant_id,
                         task_id=request.task_id,
                         target_id=request.target_id,
                         attempt_no=request.attempt_no,
@@ -415,12 +523,32 @@ class OutboundTaskExecutor:
         now: datetime,
     ) -> None:
         async with self.session_factory() as db:
-            task = await db.get(AiCallOutboundTaskModel, request.task_id)
-            target = await db.get(AiCallOutboundTargetModel, request.target_id)
-            attempt = await db.scalar(
-                select(AiCallOutboundAttemptModel).where(
-                    AiCallOutboundAttemptModel.call_id == call_id
+            task = await db.scalar(
+                select(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == request.tenant_id,
+                    AiCallOutboundTaskModel.id == request.task_id,
                 )
+                .with_for_update()
+            )
+            target = await db.scalar(
+                select(AiCallOutboundTargetModel)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == request.tenant_id,
+                    AiCallOutboundTargetModel.task_id == request.task_id,
+                    AiCallOutboundTargetModel.id == request.target_id,
+                )
+                .with_for_update()
+            )
+            attempt = await db.scalar(
+                select(AiCallOutboundAttemptModel)
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == request.tenant_id,
+                    AiCallOutboundAttemptModel.task_id == request.task_id,
+                    AiCallOutboundAttemptModel.target_id == request.target_id,
+                    AiCallOutboundAttemptModel.call_id == call_id,
+                )
+                .with_for_update()
             )
             record = await db.scalar(
                 select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
@@ -449,6 +577,7 @@ class OutboundTaskExecutor:
 
             target.latest_result = result.call_result
             target.updated_at = now
+            task.next_dispatch_at = None
             if connected:
                 target.status = "COMPLETED"
                 target.next_attempt_at = None
@@ -468,9 +597,20 @@ class OutboundTaskExecutor:
             await self._refresh_task_counters_in_session(db, task, now)
             await db.commit()
 
-    async def _refresh_task_counters(self, task_id: int, now: datetime) -> None:
+    async def _refresh_task_counters(
+        self,
+        task_key: TaskKey,
+        now: datetime,
+    ) -> None:
         async with self.session_factory() as db:
-            task = await db.get(AiCallOutboundTaskModel, task_id)
+            task = await db.scalar(
+                select(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == task_key.tenant_id,
+                    AiCallOutboundTaskModel.id == task_key.task_id,
+                )
+                .with_for_update()
+            )
             if task is None:
                 return
             await self._refresh_task_counters_in_session(db, task, now)
@@ -489,7 +629,10 @@ class OutboundTaskExecutor:
                     AiCallOutboundTargetModel.latest_result,
                     func.count(AiCallOutboundTargetModel.id),
                 )
-                .where(AiCallOutboundTargetModel.task_id == task.id)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == task.tenant_id,
+                    AiCallOutboundTargetModel.task_id == task.id,
+                )
                 .group_by(
                     AiCallOutboundTargetModel.status,
                     AiCallOutboundTargetModel.latest_result,
@@ -586,6 +729,42 @@ class OutboundTaskExecutor:
             and window["startTime"] <= current_time < window["endTime"]
             for window in windows
         )
+
+    def _next_call_window_at(
+        self,
+        task: AiCallOutboundTaskModel,
+        now: datetime,
+    ) -> datetime:
+        try:
+            snapshot = json.loads(task.config_snapshot_json)
+            windows = snapshot["rule"].get("callWindows")
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return now + timedelta(minutes=5)
+        if not isinstance(windows, list) or not windows:
+            return now + timedelta(minutes=5)
+        aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        business_now = aware_now.astimezone(self.business_timezone)
+        candidates: list[datetime] = []
+        for window in windows:
+            if not isinstance(window, dict):
+                continue
+            start_time = window.get("startTime")
+            if not isinstance(start_time, str):
+                continue
+            try:
+                hour, minute = (int(part) for part in start_time.split(":", 1))
+                candidate = business_now.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=0,
+                    microsecond=0,
+                )
+            except (TypeError, ValueError):
+                continue
+            if candidate <= business_now:
+                candidate += timedelta(days=1)
+            candidates.append(candidate.astimezone(timezone.utc))
+        return min(candidates) if candidates else now + timedelta(minutes=5)
 
 
 class OutboundTaskWorker:
