@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     ai_call_recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
     ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
     await _recover_ai_call_outbound_validations()
+    ai_call_outbound_task_worker = await _start_ai_call_outbound_task_worker()
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             await _init_ai_call_standalone_oss_config()
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
             yield
             log.info("✅ AI Call standalone 模式关闭")
         finally:
+            await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
             await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
             await _stop_ai_call_event_worker(ai_call_event_worker)
             await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
@@ -76,6 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         )
 
     except Exception as e:
+        await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
         await _stop_ai_call_event_worker(ai_call_event_worker)
         await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
@@ -88,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     try:
         yield
     finally:
+        await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
         await _stop_ai_call_event_worker(ai_call_event_worker)
         await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
@@ -114,6 +118,40 @@ async def _init_ai_call_standalone_oss_config() -> None:
     from app.api.v1.system.oss.service import OssService
 
     await OssService.init_active_config()
+
+
+async def _start_ai_call_outbound_task_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_OUTBOUND_EXECUTOR_ENABLED:
+        return None
+    from app.api.v1.ai_call.outbound.task_executor import (
+        MockOutboundDialer,
+        OutboundTaskExecutor,
+        OutboundTaskWorker,
+    )
+    from app.core.database import async_db_session
+
+    executor = OutboundTaskExecutor(
+        async_db_session,
+        MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT),
+        task_batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TASK_BATCH_SIZE,
+        target_batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
+        business_timezone=settings.AI_CALL_OUTBOUND_TIMEZONE,
+        dialing_timeout_seconds=settings.AI_CALL_OUTBOUND_DIALING_TIMEOUT_SECONDS,
+    )
+    worker = OutboundTaskWorker(
+        executor,
+        poll_interval_seconds=settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS,
+    )
+    await worker.start()
+    log.warning("AI Call 通用外呼模拟执行器已启动，不会发起真实 SIP 呼叫")
+    return worker
+
+
+async def _stop_ai_call_outbound_task_worker(worker) -> None:
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 通用外呼模拟执行器已关闭")
 
 
 async def _start_ai_call_event_worker():

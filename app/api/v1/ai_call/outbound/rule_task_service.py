@@ -532,33 +532,111 @@ class OutboundRuleTaskService:
             "stop": {"RUNNING", "PAUSED"},
             "cancel": {"SCHEDULED"},
         }
-        if action == "cancel" and task.status == "CANCELLED":
+        idempotent_statuses = {
+            "pause": {"PAUSING", "PAUSED"},
+            "resume": {"RUNNING"},
+            "stop": {"STOPPING", "STOPPED"},
+            "cancel": {"CANCELLED"},
+        }.get(action, set())
+        if task.status in idempotent_statuses:
             return AcceptedCommandOut()
         if action not in allowed or task.status not in allowed[action]:
             raise CustomException(
                 msg=f"任务当前状态不允许{self._action_name(action)}",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        if action != "cancel":
-            raise CustomException(
-                msg="任务执行器尚未接入，暂不接受该操作",
-                status_code=status.HTTP_409_CONFLICT,
-            )
         now = _now()
-        task.status = "CANCELLED"
-        task.ended_at = now
-        task.updated_at = now
-        await db.execute(
-            update(AiCallOutboundTargetModel)
-            .where(
-                AiCallOutboundTargetModel.tenant_id == tenant_id,
-                AiCallOutboundTargetModel.task_id == task_id,
-                AiCallOutboundTargetModel.status == "PENDING",
+        if action == "pause":
+            task.status = (
+                "PAUSING"
+                if await self._active_target_count(db, tenant_id, task_id)
+                else "PAUSED"
             )
-            .values(status="CANCELLED", updated_at=now)
-        )
+        elif action == "resume":
+            task.status = "RUNNING"
+        else:
+            await db.execute(
+                update(AiCallOutboundTargetModel)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == tenant_id,
+                    AiCallOutboundTargetModel.task_id == task_id,
+                    AiCallOutboundTargetModel.status.in_(["PENDING", "RETRY_WAIT"]),
+                )
+                .values(
+                    status="CANCELLED",
+                    next_attempt_at=None,
+                    updated_at=now,
+                )
+            )
+            await db.flush()
+            if action == "stop":
+                has_active_target = bool(
+                    await self._active_target_count(db, tenant_id, task_id)
+                )
+                task.status = "STOPPING" if has_active_target else "STOPPED"
+                task.ended_at = None if has_active_target else now
+            else:
+                task.status = "CANCELLED"
+                task.ended_at = now
+            await self._sync_task_counts(db, task)
+        task.updated_at = now
         await db.flush()
         return AcceptedCommandOut()
+
+    @staticmethod
+    async def _active_target_count(
+        db: AsyncSession,
+        tenant_id: str,
+        task_id: int,
+    ) -> int:
+        return int(
+            await db.scalar(
+                select(func.count(AiCallOutboundTargetModel.id)).where(
+                    AiCallOutboundTargetModel.tenant_id == tenant_id,
+                    AiCallOutboundTargetModel.task_id == task_id,
+                    AiCallOutboundTargetModel.status.in_(["DIALING", "IN_CALL"]),
+                )
+            )
+            or 0
+        )
+
+    @staticmethod
+    async def _sync_task_counts(
+        db: AsyncSession,
+        task: AiCallOutboundTaskModel,
+    ) -> None:
+        status_rows = (
+            await db.execute(
+                select(
+                    AiCallOutboundTargetModel.status,
+                    AiCallOutboundTargetModel.latest_result,
+                    func.count(AiCallOutboundTargetModel.id),
+                )
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == task.tenant_id,
+                    AiCallOutboundTargetModel.task_id == task.id,
+                )
+                .group_by(
+                    AiCallOutboundTargetModel.status,
+                    AiCallOutboundTargetModel.latest_result,
+                )
+            )
+        ).all()
+        task.completed_targets = sum(
+            int(count)
+            for target_status, _, count in status_rows
+            if target_status in {"COMPLETED", "CANCELLED"}
+        )
+        task.connected_targets = sum(
+            int(count)
+            for target_status, latest_result, count in status_rows
+            if target_status == "COMPLETED" and latest_result == "connected"
+        )
+        task.failed_targets = sum(
+            int(count)
+            for target_status, latest_result, count in status_rows
+            if target_status == "COMPLETED" and latest_result != "connected"
+        )
 
     async def list_targets(
         self,

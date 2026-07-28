@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_target (
     status varchar(32) NOT NULL,
     attempt_count integer NOT NULL DEFAULT 0,
     latest_result varchar(128),
+    next_attempt_at timestamptz,
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
     CONSTRAINT uk_outbound_target_source_row
@@ -109,4 +110,4 @@ COMMENT ON COLUMN ai_call_outbound_target.source_validation_row_id
 CREATE INDEX IF NOT EXISTS idx_outbound_target_task_page
     ON ai_call_outbound_target (tenant_id, task_id, source_row_number, id);
 CREATE INDEX IF NOT EXISTS idx_outbound_target_task_status
-    ON ai_call_outbound_target (tenant_id, task_id, status);
+    ON ai_call_outbound_target (tenant_id, task_id, status, next_attempt_at);

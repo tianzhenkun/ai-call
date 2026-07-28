@@ -47,7 +47,7 @@ class AiCallOutboundRuleModel(MappedBase):
 
 
 class AiCallOutboundTaskModel(MappedBase):
-    """正式通用外呼任务；本阶段只落计划态，不负责调度执行。"""
+    """正式通用外呼任务。"""
 
     __tablename__ = "ai_call_outbound_task"
     __table_args__ = (
@@ -123,6 +123,7 @@ class AiCallOutboundTargetModel(MappedBase):
             "tenant_id",
             "task_id",
             "status",
+            "next_attempt_at",
         ),
         {"comment": "通用外呼正式任务对象"},
     )
@@ -139,12 +140,13 @@ class AiCallOutboundTargetModel(MappedBase):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latest_result: Mapped[str | None] = mapped_column(String(128))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AiCallOutboundAttemptModel(MappedBase):
-    """一次正式拨打尝试；由后续任务执行器在真实拨打链路中写入。"""
+    """一次拨打尝试；通过 call_id 与通话记录逻辑关联。"""
 
     __tablename__ = "ai_call_outbound_attempt"
     __table_args__ = (

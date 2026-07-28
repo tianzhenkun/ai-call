@@ -188,6 +188,18 @@ class Settings(BaseSettings):
     AI_CALL_RECORDING_RECONCILE_ENABLED: bool = True
     AI_CALL_RECORDING_RECONCILE_INTERVAL_SECONDS: float = 5.0
     AI_CALL_RECORDING_RECONCILE_BATCH_SIZE: int = 50
+    AI_CALL_OUTBOUND_EXECUTOR_ENABLED: bool = False
+    AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS: float = 2.0
+    AI_CALL_OUTBOUND_EXECUTOR_TASK_BATCH_SIZE: int = 10
+    AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE: int = 20
+    AI_CALL_OUTBOUND_DIALING_TIMEOUT_SECONDS: int = 300
+    AI_CALL_OUTBOUND_TIMEZONE: str = "Asia/Shanghai"
+    AI_CALL_OUTBOUND_MOCK_RESULT: Literal[
+        "connected",
+        "no_answer",
+        "busy",
+        "call_failed",
+    ] = "connected"
     AI_CALL_OFFLINE_ASR_ENABLED: bool = True
     AI_CALL_OFFLINE_ASR_PROVIDER: Literal[
         "dashscope_paraformer",
