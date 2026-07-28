@@ -1,5 +1,8 @@
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from sqlalchemy import String, UniqueConstraint
@@ -7,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel
+from app.api.v1.ai_call.outbound.task_executor import OutboundDialRequest
 from app.core.base_model import MappedBase
 
 
@@ -162,3 +166,355 @@ def test_linphone_test_postgres_migration_adds_columns_and_unique_indexes() -> N
     )
     assert "foreign key" not in migration
     assert "jsonb" not in migration
+
+
+class _FakeSession:
+    def __init__(self, owner: "_FakeSessionFactory", index: int) -> None:
+        self.owner = owner
+        self.index = index
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.scalar_calls: list[Any] = []
+        self.added: list[Any] = []
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        del exc_type, exc, traceback
+
+    async def commit(self) -> None:
+        if self.index in self.owner.commit_failure_indexes:
+            raise RuntimeError("commit failed")
+        self.commit_count += 1
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+    async def scalar(self, statement):
+        self.scalar_calls.append(statement)
+        if not self.owner.records:
+            return None
+        return self.owner.records.pop(0)
+
+    def add(self, value: Any) -> None:
+        self.added.append(value)
+
+
+class _FakeSessionFactory:
+    def __init__(
+        self,
+        records: list[Any],
+        *,
+        commit_failure_indexes: set[int] | None = None,
+    ) -> None:
+        self.records = list(records)
+        self.commit_failure_indexes = commit_failure_indexes or set()
+        self.sessions: list[_FakeSession] = []
+
+    def __call__(self) -> _FakeSession:
+        session = _FakeSession(self, len(self.sessions))
+        self.sessions.append(session)
+        return session
+
+
+class _FakeAiCallService:
+    def __init__(self, exception: Exception | None = None) -> None:
+        self.exception = exception
+        self.create_calls: list[dict[str, Any]] = []
+
+    async def create_sip_session(self, **kwargs):
+        self.create_calls.append(kwargs)
+        if self.exception is not None:
+            raise self.exception
+        return SimpleNamespace(call_id=kwargs["call_id"])
+
+
+class _ControlledSleep:
+    def __init__(self) -> None:
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self.waiting.set()
+        await self.release.wait()
+
+
+def _dialer_class():
+    from app.api.v1.ai_call.outbound.linphone_test_dialer import LinphoneTestDialer
+
+    return LinphoneTestDialer
+
+
+def _request() -> OutboundDialRequest:
+    return OutboundDialRequest(
+        tenant_id="tenant-a",
+        task_id=1001,
+        target_id=2001,
+        attempt_no=1,
+        phone_number="13800000000",
+        customer_name="张三",
+        scene_code="intro_geo",
+        voice="Cherry",
+        prompt_profile_id=None,
+    )
+
+
+def _record(
+    *,
+    status: str,
+    end_reason: str | None = None,
+    failure_message: str | None = None,
+    answered_at: datetime | None = None,
+    ended_at: datetime | None = None,
+):
+    return SimpleNamespace(
+        status=status,
+        end_reason=end_reason,
+        failure_message=failure_message,
+        answered_at=answered_at,
+        ended_at=ended_at,
+    )
+
+
+async def _no_sleep(seconds: float) -> None:
+    del seconds
+
+
+def test_linphone_test_dialer_declares_real_record_ownership() -> None:
+    dialer_class = _dialer_class()
+
+    assert dialer_class.dialer_type == "linphone_test"
+    assert dialer_class.manages_call_record is True
+
+
+@pytest.mark.anyio
+async def test_dial_starts_stable_sip_session_then_waits_for_terminal_record() -> None:
+    answered_at = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    ended_at = datetime(2026, 7, 28, 8, 0, 4, tzinfo=timezone.utc)
+    session_factory = _FakeSessionFactory(
+        [
+            _record(status="connected", answered_at=answered_at),
+            _record(
+                status="completed",
+                end_reason="customer_end",
+                answered_at=answered_at,
+                ended_at=ended_at,
+            ),
+        ]
+    )
+    service = _FakeAiCallService()
+    service_sessions: list[_FakeSession] = []
+    controlled_sleep = _ControlledSleep()
+    connected_count = 0
+
+    def service_factory(session: _FakeSession) -> _FakeAiCallService:
+        service_sessions.append(session)
+        return service
+
+    async def on_connected() -> None:
+        nonlocal connected_count
+        connected_count += 1
+
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=service_factory,
+        poll_seconds=0.25,
+        sleep=controlled_sleep,
+        now=lambda: ended_at,
+    )
+
+    task = asyncio.create_task(
+        dialer.dial(
+            _request(),
+            call_id="stable-call-id",
+            on_connected=on_connected,
+        )
+    )
+    await controlled_sleep.waiting.wait()
+
+    assert connected_count == 1
+    assert not task.done()
+    assert len(session_factory.sessions) == 2
+
+    controlled_sleep.release.set()
+    result = await task
+
+    assert result.call_result == "connected"
+    assert result.duration_ms == 4000
+    assert result.error_message is None
+    assert service_sessions == [session_factory.sessions[0]]
+    assert session_factory.sessions[0].commit_count == 1
+    assert service.create_calls == [
+        {
+            "callee_phone_number": "13800000000",
+            "voice": "Cherry",
+            "call_id": "stable-call-id",
+            "business_type": "outbound_task",
+            "business_id": "1001",
+            "scene_code": "intro_geo",
+            "business_params": {
+                "customer_name": "张三",
+                "target_id": "2001",
+            },
+        }
+    ]
+    assert len(session_factory.sessions) == 3
+    assert [len(session.scalar_calls) for session in session_factory.sessions] == [0, 1, 1]
+    assert all(session.added == [] for session in session_factory.sessions)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("end_reason", "failure_message", "expected_result", "expected_message"),
+    [
+        ("busy", "被叫正忙", "busy", "被叫正忙"),
+        ("user_busy", None, "busy", "user_busy"),
+        ("ringing_timeout", None, "no_answer", "ringing_timeout"),
+        ("user_unavailable", None, "no_answer", "user_unavailable"),
+        ("sip_connect_timeout", None, "no_answer", "sip_connect_timeout"),
+        ("no_answer", None, "no_answer", "no_answer"),
+        ("connect_timeout", None, "no_answer", "connect_timeout"),
+        ("room_create_failed", "LiveKit Room 创建失败", "call_failed", "LiveKit Room 创建失败"),
+        ("unknown_runtime_error", None, "call_failed", "unknown_runtime_error"),
+    ],
+)
+async def test_unanswered_terminal_record_maps_call_result(
+    end_reason: str,
+    failure_message: str | None,
+    expected_result: str,
+    expected_message: str,
+) -> None:
+    session_factory = _FakeSessionFactory(
+        [
+            _record(
+                status="failed",
+                end_reason=end_reason,
+                failure_message=failure_message,
+            )
+        ]
+    )
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=lambda session: _FakeAiCallService(),
+        poll_seconds=0,
+        sleep=_no_sleep,
+    )
+
+    result = await dialer.dial(
+        _request(),
+        call_id="mapping-call-id",
+        on_connected=lambda: _no_sleep(0),
+    )
+
+    assert result.call_result == expected_result
+    assert result.error_message == expected_message
+    assert result.duration_ms == 0
+
+
+@pytest.mark.anyio
+async def test_answered_failed_record_stays_connected_and_clamps_duration() -> None:
+    answered_at = datetime(2026, 7, 28, 8, 0, 5)
+    now = datetime(2026, 7, 28, 8, 0, 4, tzinfo=timezone.utc)
+    session_factory = _FakeSessionFactory(
+        [
+            _record(
+                status="failed",
+                end_reason="handoff_failed",
+                failure_message="转人工失败",
+                answered_at=answered_at,
+            )
+        ]
+    )
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=lambda session: _FakeAiCallService(),
+        poll_seconds=0,
+        sleep=_no_sleep,
+        now=lambda: now,
+    )
+
+    result = await dialer.dial(
+        _request(),
+        call_id="answered-failed-call-id",
+        on_connected=lambda: _no_sleep(0),
+    )
+
+    assert result.call_result == "connected"
+    assert result.error_message is None
+    assert result.duration_ms == 0
+
+
+@pytest.mark.anyio
+async def test_create_failure_uses_persisted_terminal_record_without_callback() -> None:
+    session_factory = _FakeSessionFactory(
+        [
+            _record(
+                status="failed",
+                end_reason="sip_connect_timeout",
+                failure_message="SIP 连接超时",
+            )
+        ]
+    )
+    service = _FakeAiCallService(RuntimeError("provider exploded"))
+    connected_count = 0
+
+    async def on_connected() -> None:
+        nonlocal connected_count
+        connected_count += 1
+
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=lambda session: service,
+        poll_seconds=0,
+        sleep=_no_sleep,
+    )
+
+    result = await dialer.dial(
+        _request(),
+        call_id="failed-record-call-id",
+        on_connected=on_connected,
+    )
+
+    assert result.call_result == "no_answer"
+    assert result.error_message == "SIP 连接超时"
+    assert connected_count == 0
+    assert session_factory.sessions[0].commit_count == 1
+    assert session_factory.sessions[0].rollback_count == 0
+    assert len(session_factory.sessions) == 2
+
+
+@pytest.mark.anyio
+async def test_create_failure_without_record_rolls_back_failed_commit() -> None:
+    session_factory = _FakeSessionFactory(
+        [],
+        commit_failure_indexes={0},
+    )
+    service = _FakeAiCallService(RuntimeError("provider exploded"))
+    connected_count = 0
+
+    async def on_connected() -> None:
+        nonlocal connected_count
+        connected_count += 1
+
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=lambda session: service,
+        poll_seconds=0,
+        sleep=_no_sleep,
+    )
+
+    result = await dialer.dial(
+        _request(),
+        call_id="missing-record-call-id",
+        on_connected=on_connected,
+    )
+
+    assert result.call_result == "call_failed"
+    assert "provider exploded" in (result.error_message or "")
+    assert connected_count == 0
+    assert session_factory.sessions[0].commit_count == 0
+    assert session_factory.sessions[0].rollback_count == 1
+    assert len(session_factory.sessions) == 2
