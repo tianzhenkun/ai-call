@@ -36,6 +36,7 @@ SEMANTIC_ANALYSIS_STATUS_RUNNING = "1"
 SEMANTIC_ANALYSIS_STATUS_SUCCEEDED = "2"
 SEMANTIC_ANALYSIS_STATUS_FAILED = "3"
 SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT = "4"
+DEFAULT_TENANT_ID = "000000"
 
 
 class AiCallRecordRepository:
@@ -1396,16 +1397,17 @@ class AiCallRecordRepository:
                 )
             )
         if tenant_id:
-            stmt = stmt.where(
-                or_(
-                    AiCallOutboundAttemptModel.id.is_(None),
-                    and_(
-                        AiCallOutboundAttemptModel.tenant_id == tenant_id,
-                        AiCallOutboundTargetModel.id.is_not(None),
-                        AiCallOutboundTaskModel.id.is_not(None),
-                    ),
+            tenant_conditions = [
+                and_(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundTargetModel.id.is_not(None),
+                    AiCallOutboundTaskModel.id.is_not(None),
                 )
-            )
+            ]
+            if tenant_id == DEFAULT_TENANT_ID:
+                # 历史/Web 记录没有租户字段，只归属框架默认租户，禁止向其他租户开放。
+                tenant_conditions.append(AiCallOutboundAttemptModel.id.is_(None))
+            stmt = stmt.where(or_(*tenant_conditions))
         elif has_outbound_filters:
             stmt = stmt.where(
                 and_(

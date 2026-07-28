@@ -320,6 +320,7 @@ async def test_record_list_is_tenant_scoped_and_rejects_inconsistent_target_task
                 record(301, "call-tenant-a"),
                 record(302, "call-tenant-b"),
                 record(303, "call-inconsistent"),
+                record(304, "call-legacy-default-tenant"),
             ]
         )
         session.add_all(
@@ -387,5 +388,11 @@ async def test_record_list_is_tenant_scoped_and_rejects_inconsistent_target_task
         )
         assert blank_total == 1
         assert [row.call_id for row in blank_rows] == ["call-tenant-a"]
+
+        legacy_rows, legacy_total = await service.list_records(
+            tenant_id="000000",
+        )
+        assert legacy_total == 1
+        assert [row.call_id for row in legacy_rows] == ["call-legacy-default-tenant"]
 
     await engine.dispose()
