@@ -230,6 +230,17 @@ class _FakeAiCallService:
         return SimpleNamespace(call_id=kwargs["call_id"])
 
 
+class _AnsweredThenFailingAiCallService:
+    def __init__(self, session: _FakeSession, answered_record: Any) -> None:
+        self.session = session
+        self.answered_record = answered_record
+
+    async def create_sip_session(self, **kwargs):
+        del kwargs
+        self.session.owner.records.append(self.answered_record)
+        raise RuntimeError("opening failed after answer")
+
+
 class _ControlledSleep:
     def __init__(self) -> None:
         self.waiting = asyncio.Event()
@@ -484,6 +495,69 @@ async def test_create_failure_uses_persisted_terminal_record_without_callback() 
     assert session_factory.sessions[0].commit_count == 1
     assert session_factory.sessions[0].rollback_count == 0
     assert len(session_factory.sessions) == 2
+
+
+@pytest.mark.anyio
+async def test_create_failure_after_answer_retains_ownership_until_terminal() -> None:
+    answered_at = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    ended_at = datetime(2026, 7, 28, 8, 0, 3, tzinfo=timezone.utc)
+    answered_record = _record(status="connected", answered_at=answered_at)
+    terminal_record = _record(
+        status="failed",
+        end_reason="opening_failed",
+        failure_message="开场白播放失败",
+        answered_at=answered_at,
+        ended_at=ended_at,
+    )
+    session_factory = _FakeSessionFactory([])
+    controlled_sleep = _ControlledSleep()
+    connected_count = 0
+
+    async def on_connected() -> None:
+        nonlocal connected_count
+        connected_count += 1
+
+    dialer = _dialer_class()(
+        session_factory,
+        ai_call_service_factory=lambda session: _AnsweredThenFailingAiCallService(
+            session,
+            answered_record,
+        ),
+        poll_seconds=0.25,
+        sleep=controlled_sleep,
+        now=lambda: ended_at,
+    )
+    task = asyncio.create_task(
+        dialer.dial(
+            _request(),
+            call_id="answered-then-failed-call-id",
+            on_connected=on_connected,
+        )
+    )
+
+    try:
+        for _ in range(20):
+            if controlled_sleep.waiting.is_set() or task.done():
+                break
+            await asyncio.sleep(0)
+
+        assert connected_count == 1
+        assert controlled_sleep.waiting.is_set()
+        assert not task.done()
+
+        session_factory.records.append(terminal_record)
+        controlled_sleep.release.set()
+        result = await task
+
+        assert result.call_result == "connected"
+        assert result.error_message is None
+        assert result.duration_ms == 3000
+        assert connected_count == 1
+    finally:
+        if not task.done():
+            session_factory.records.append(terminal_record)
+            controlled_sleep.release.set()
+            await task
 
 
 @pytest.mark.anyio

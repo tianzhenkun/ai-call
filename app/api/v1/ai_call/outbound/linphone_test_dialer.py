@@ -96,6 +96,9 @@ class LinphoneTestDialer:
             record = await self._read_record(call_id)
             if self._is_terminal(record):
                 return self._map_record(record)
+            if record is not None and record.answered_at is not None:
+                await on_connected()
+                return await self._wait_terminal(call_id)
             message = str(create_error).strip() or create_error.__class__.__name__
             return DialResult(
                 call_result="call_failed",
@@ -103,6 +106,9 @@ class LinphoneTestDialer:
             )
 
         await on_connected()
+        return await self._wait_terminal(call_id)
+
+    async def _wait_terminal(self, call_id: str) -> DialResult:
         while True:
             record = await self._read_record(call_id)
             if self._is_terminal(record):
