@@ -25,7 +25,7 @@ async def db_getter() -> AsyncGenerator[AsyncSession, None]:
             yield session
 
 
-async def redis_getter(request: Request) -> Redis:
+async def redis_getter(request: Request) -> Redis | None:
     """获取Redis连接
 
     参数:
@@ -34,13 +34,15 @@ async def redis_getter(request: Request) -> Redis:
     返回:
     - Redis: Redis连接
     """
+    if settings.AI_CALL_STANDALONE_ENABLE:
+        return getattr(request.app.state, "redis", None)
     return request.app.state.redis
 
 
 async def get_current_user(
     request: Request,
     db: AsyncSession = Depends(db_getter),
-    redis: Redis = Depends(redis_getter),
+    redis: Redis | None = Depends(redis_getter),
     token: str | None = Depends(OAuth2Schema),
 ) -> AuthSchema:
     """获取当前用户
@@ -123,7 +125,7 @@ async def get_current_user(
 async def get_current_user_ws(
     token: str = Query(..., description="认证token"),
     db: AsyncSession = Depends(db_getter),
-    redis: Redis = Depends(redis_getter),
+    redis: Redis | None = Depends(redis_getter),
 ) -> AuthSchema:
     """获取当前用户（WebSocket专用，从查询参数获取token）
 
@@ -141,7 +143,7 @@ async def get_current_user_ws(
 async def _verify_token(
     token: str,
     db: AsyncSession,
-    redis: Redis,
+    redis: Redis | None,
 ) -> AuthSchema:
     """验证token并返回用户信息
 

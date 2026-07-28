@@ -18,8 +18,9 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.config.setting import settings
 from app.core.base_model import MappedBase
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, redis_getter
 from app.services.ai_call.record_service import AiCallRecordService
 
 
@@ -30,6 +31,14 @@ class _ListRecordsService:
     async def list_records(self, **query) -> dict:
         self.query = query
         return {"rows": [], "total": 0}
+
+
+@pytest.mark.anyio
+async def test_standalone_auth_dependency_does_not_require_redis(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "AI_CALL_STANDALONE_ENABLE", True)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    assert await redis_getter(request) is None
 
 
 def test_record_list_controller_forwards_outbound_filters() -> None:
