@@ -6,10 +6,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import String, UniqueConstraint
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import String, UniqueConstraint, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
@@ -21,8 +24,12 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTaskModel,
 )
 from app.api.v1.ai_call.outbound.task_executor import OutboundDialRequest
+from app.api.v1.system.auth.schema import AuthSchema
+from app.api.v1.system.user.model import UserModel
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
+from app.core.dependencies import get_current_user
+from app.core.exceptions import CustomException, handle_exception
 
 
 @pytest.fixture
@@ -513,6 +520,240 @@ async def test_capability_counts_only_distinct_available_agents_in_scene(databas
     result, _ = await _get_capability(database)
 
     assert result.available_agent_count == 1
+
+
+class _NeverDialer:
+    dialer_type = "linphone_test"
+    manages_call_record = True
+
+    async def dial(self, request, *, call_id, on_connected):
+        del request, call_id, on_connected
+        raise AssertionError("单元测试不得发起真实拨号")
+
+
+def _command_service(database, dispatched):
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+    from app.api.v1.ai_call.outbound.task_executor import OutboundTaskExecutor
+
+    executor = OutboundTaskExecutor(
+        database,
+        _NeverDialer(),
+        now_provider=lambda: CAPABILITY_NOW,
+    )
+    return LinphoneTestService(
+        session_factory=database,
+        settings_obj=_linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+        executor=executor,
+        dispatch=dispatched.append,
+    )
+
+
+@pytest.mark.anyio
+async def test_duplicate_command_creates_one_attempt_and_dispatches_once(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(),
+        targets=[_outbound_target()],
+    )
+    dispatched = []
+    service = _command_service(database, dispatched)
+
+    first = await service.start_test(
+        tenant_id="000000",
+        task_id=1001,
+        idempotency_key="cmd-1",
+        scenario="ai_only",
+    )
+    second = await service.start_test(
+        tenant_id="000000",
+        task_id=1001,
+        idempotency_key="cmd-1",
+        scenario="ai_only",
+    )
+
+    async with database() as session:
+        attempt_count = await session.scalar(
+            select(func.count(AiCallOutboundAttemptModel.id)).where(
+                AiCallOutboundAttemptModel.command_idempotency_key == "cmd-1"
+            )
+        )
+    assert first == second
+    assert first.task_id == "1001"
+    assert attempt_count == 1
+    assert len(dispatched) == 1
+
+
+@pytest.mark.anyio
+async def test_active_slot_rejects_second_linphone_command(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(task_id=1001),
+        targets=[_outbound_target(task_id=1001)],
+    )
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(task_id=1002),
+        targets=[_outbound_target(4002, task_id=1002)],
+    )
+    first_service = _command_service(database, [])
+    second_service = _command_service(database, [])
+
+    results = await asyncio.gather(
+        first_service.start_test(
+            tenant_id="000000",
+            task_id=1001,
+            idempotency_key="cmd-1",
+            scenario="ai_only",
+        ),
+        second_service.start_test(
+            tenant_id="000000",
+            task_id=1002,
+            idempotency_key="cmd-2",
+            scenario="ai_only",
+        ),
+        return_exceptions=True,
+    )
+
+    accepted = [result for result in results if not isinstance(result, Exception)]
+    rejected = [result for result in results if isinstance(result, CustomException)]
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    assert rejected[0].status_code == 409
+    assert rejected[0].msg == "已有 Linphone 测试通话进行中"
+
+
+@pytest.mark.anyio
+async def test_handoff_command_requires_available_agent(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(),
+        targets=[_outbound_target()],
+    )
+    service = _command_service(database, [])
+
+    with pytest.raises(CustomException) as caught:
+        await service.start_test(
+            tenant_id="000000",
+            task_id=1001,
+            idempotency_key="cmd-handoff",
+            scenario="handoff",
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.msg == "转人工测试至少需要一名可用坐席"
+
+
+class _LinphoneRouteServiceFake:
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, Any]] = []
+
+    async def get_capability(self, db, tenant_id: str, task_id: int):
+        from app.api.v1.ai_call.outbound.linphone_test_schema import (
+            LinphoneTestCapabilityOut,
+        )
+
+        del db
+        assert tenant_id == "000000"
+        assert task_id == 1001
+        return LinphoneTestCapabilityOut(enabled=True, eligible=True)
+
+    async def start_test(self, **kwargs):
+        from app.api.v1.ai_call.outbound.linphone_test_schema import (
+            LinphoneTestAcceptedOut,
+        )
+
+        self.start_calls.append(kwargs)
+        return LinphoneTestAcceptedOut(
+            task_id=kwargs["task_id"],
+            attempt_id=2001,
+            call_id="call-1",
+        )
+
+
+def _linphone_route_client(database, service) -> TestClient:
+    from app.api.v1.ai_call.outbound.rule_task_controller import (
+        get_linphone_test_service,
+    )
+
+    app = FastAPI()
+    handle_exception(app)
+    app.include_router(AiCallRouter)
+
+    async def auth_override():
+        async with database() as session:
+            yield AuthSchema(
+                db=session,
+                user=UserModel(
+                    user_id=20,
+                    tenant_id="000000",
+                    user_name="operator",
+                    nick_name="运营",
+                    user_type="sys_user",
+                ),
+                check_data_scope=False,
+            )
+
+    app.dependency_overrides[get_current_user] = auth_override
+    app.dependency_overrides[get_linphone_test_service] = lambda: service
+    return TestClient(app)
+
+
+@pytest.mark.anyio
+async def test_linphone_routes_are_registered_and_use_unified_envelope(database) -> None:
+    service = _LinphoneRouteServiceFake()
+    with _linphone_route_client(database, service) as client:
+        capability = client.get("/ai-call/outbound-tasks/1001/test-capability")
+        accepted = client.post(
+            "/ai-call/outbound-tasks/1001/test-run",
+            headers={"Idempotency-Key": "cmd-route-1"},
+            json={"scenario": "ai_only"},
+        )
+
+    assert capability.status_code == 200
+    assert capability.json() == {
+        "code": 200,
+        "msg": "查询成功",
+        "data": {
+            "enabled": True,
+            "eligible": True,
+            "reasons": [],
+            "availableAgentCount": 0,
+            "activeCallId": None,
+            "canEndActiveCall": False,
+        },
+    }
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "code": 200,
+        "msg": "测试拨打已受理",
+        "data": {
+            "accepted": True,
+            "taskId": "1001",
+            "attemptId": "2001",
+            "callId": "call-1",
+        },
+    }
+    assert service.start_calls == [{
+        "tenant_id": "000000",
+        "task_id": 1001,
+        "idempotency_key": "cmd-route-1",
+        "scenario": "ai_only",
+    }]
+
+
+@pytest.mark.anyio
+async def test_linphone_test_run_requires_idempotency_header(database) -> None:
+    service = _LinphoneRouteServiceFake()
+    with _linphone_route_client(database, service) as client:
+        response = client.post(
+            "/ai-call/outbound-tasks/1001/test-run",
+            json={"scenario": "ai_only"},
+        )
+
+    assert response.status_code == 422
+    assert service.start_calls == []
 
 
 def _attempt(

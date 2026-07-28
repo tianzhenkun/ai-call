@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from fastapi import status
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import (
@@ -13,17 +16,26 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffAgentModel,
 )
 from app.config.setting import settings
+from app.core.exceptions import CustomException
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     SipOutboundPreflightResult,
     validate_sip_outbound_preflight,
 )
 
-from .linphone_test_schema import LinphoneTestCapabilityOut
+from .linphone_test_schema import (
+    LinphoneTestAcceptedOut,
+    LinphoneTestCapabilityOut,
+)
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
+)
+from .task_executor import (
+    ClaimedAttempt,
+    OutboundTaskExecutor,
+    TaskKey,
 )
 
 DEFAULT_TENANT_ID = "000000"
@@ -46,11 +58,76 @@ class LinphoneTestService:
         settings_obj: Any = settings,
         now: Callable[[], datetime] = _utc_now,
         sip_preflight: Callable[[str], SipOutboundPreflightResult] | None = None,
+        executor: OutboundTaskExecutor | None = None,
+        dispatch: Callable[[ClaimedAttempt], None] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.settings = settings_obj
         self.now = now
         self.sip_preflight = sip_preflight or self._default_sip_preflight
+        self.executor = executor or self._default_executor()
+        self.dispatch = dispatch or self._dispatch_background
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    async def start_test(
+        self,
+        *,
+        tenant_id: str,
+        task_id: int,
+        idempotency_key: str,
+        scenario: str,
+    ) -> LinphoneTestAcceptedOut:
+        command_key = idempotency_key.strip()
+        if not command_key or len(command_key) > 128:
+            raise CustomException(
+                msg="Idempotency-Key 不合法",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing = await self._read_attempt_by_command(tenant_id, command_key)
+        if existing is not None:
+            return self.accepted_out(existing)
+
+        async with self.session_factory() as db:
+            capability = await self.get_capability(db, tenant_id, task_id)
+        if not capability.eligible:
+            reason = capability.reasons[0]
+            if "Linphone 测试通话" in reason:
+                reason = "已有 Linphone 测试通话进行中"
+            raise CustomException(
+                msg=reason,
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        if scenario == "handoff" and capability.available_agent_count < 1:
+            raise CustomException(
+                msg="转人工测试至少需要一名可用坐席",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        try:
+            claimed = await self.executor.claim_manual_test(
+                TaskKey(tenant_id, task_id),
+                command_idempotency_key=command_key,
+                test_scenario=scenario,
+                active_slot=LINPHONE_ACTIVE_SLOT,
+            )
+        except (IntegrityError, ValueError):
+            existing = await self._read_attempt_by_command(tenant_id, command_key)
+            if existing is not None:
+                return self.accepted_out(existing)
+            raise CustomException(
+                msg="已有 Linphone 测试通话进行中",
+                status_code=status.HTTP_409_CONFLICT,
+            ) from None
+
+        attempt = await self._read_attempt_by_command(tenant_id, command_key)
+        if attempt is None:
+            raise CustomException(
+                msg="Linphone 测试认领结果不存在",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        self.dispatch(claimed)
+        return self.accepted_out(attempt)
 
     async def get_capability(
         self,
@@ -244,6 +321,54 @@ class LinphoneTestService:
         return validate_sip_outbound_preflight(
             config,
             callee_phone_number=callee_phone_number,
+        )
+
+    def _default_executor(self) -> OutboundTaskExecutor:
+        from .linphone_test_dialer import LinphoneTestDialer
+
+        dialer = LinphoneTestDialer(
+            self.session_factory,
+            poll_seconds=getattr(
+                self.settings,
+                "AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS",
+                1.0,
+            ),
+            now=self.now,
+        )
+        return OutboundTaskExecutor(
+            self.session_factory,
+            dialer,
+            now_provider=self.now,
+        )
+
+    async def _read_attempt_by_command(
+        self,
+        tenant_id: str,
+        command_key: str,
+    ) -> AiCallOutboundAttemptModel | None:
+        async with self.session_factory() as db:
+            return await db.scalar(
+                select(AiCallOutboundAttemptModel)
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.command_idempotency_key == command_key,
+                )
+                .limit(1)
+            )
+
+    def _dispatch_background(self, claimed: ClaimedAttempt) -> None:
+        task = asyncio.create_task(self.executor.execute_claimed(claimed))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
+    def accepted_out(
+        attempt: AiCallOutboundAttemptModel,
+    ) -> LinphoneTestAcceptedOut:
+        return LinphoneTestAcceptedOut(
+            task_id=attempt.task_id,
+            attempt_id=attempt.id,
+            call_id=attempt.call_id,
         )
 
     @staticmethod
