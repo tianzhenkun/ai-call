@@ -221,6 +221,7 @@ GET /ai-call/outbound-tasks/{taskId}/test-status
 | `callStatus` | 通话记录状态 |
 | `handoffStatus` | 当前或最近一次 Handoff 状态 |
 | `phase` | 页面派生阶段 |
+| `elapsedSeconds` | 从接通到当前或结束时刻的秒数；未接通时为 0 |
 | `endReason` | 通话结束原因 |
 | `errorMessage` | 失败原因 |
 | `canEndActiveCall` | 是否允许结束当前通话 |
