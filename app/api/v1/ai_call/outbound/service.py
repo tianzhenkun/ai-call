@@ -693,6 +693,13 @@ class OutboundValidationService:
             error_message=validation.error_message,
             accepted=validation.status == "VALIDATING",
             retryable=validation.retryable,
+            retry_action=(
+                "RETRY_VALIDATION"
+                if validation.status == "SYSTEM_ERROR" and validation.retryable
+                else "REUPLOAD"
+                if validation.status == "SYSTEM_ERROR"
+                else None
+            ),
         )
 
     @staticmethod

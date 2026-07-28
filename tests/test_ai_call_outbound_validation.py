@@ -20,6 +20,7 @@ from app.api.v1.ai_call.outbound.model import (
     AiCallOutboundValidationModel,
     AiCallOutboundValidationRowModel,
 )
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTargetModel
 from app.api.v1.ai_call.outbound.schema import BatchValidationRequest
 from app.api.v1.ai_call.outbound.service import OutboundValidationService
 from app.api.v1.system.auth.schema import AuthSchema
@@ -616,6 +617,10 @@ async def test_validation_does_not_create_formal_outbound_targets(database) -> N
         table_names = await session.run_sync(
             lambda sync_session: sa_inspect(sync_session.bind).get_table_names()
         )
+        target_count = int(
+            await session.scalar(select(AiCallOutboundTargetModel.id).limit(1)) is not None
+        )
     assert "ai_call_outbound_validation" in table_names
     assert "ai_call_outbound_validation_row" in table_names
-    assert "ai_call_outbound_target" not in table_names
+    assert "ai_call_outbound_target" in table_names
+    assert target_count == 0

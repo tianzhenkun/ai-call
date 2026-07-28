@@ -45,6 +45,27 @@
 
 校验通过前不创建 `ai_call_outbound_task` 或正式外呼对象。后续“确认任务”能力必须重新校验同租户、`PASSED` 状态和配置一致性，再按主键游标分批复制有效行；本阶段不实现任务调度或 SIP 拨号。
 
+## Phase H2：呼叫规则与正式任务
+
+本阶段以当前前端 `aiCallRules/service.ts`、`aiCallTasks/service.ts` 和
+`domain.ts` 为接口真源，仍使用直接上传方案，不恢复旧 OSS 两段式。
+
+- `ai_call_outbound_rule`：租户级规则，呼叫时段、重试间隔和可重试结果以
+  `text` JSON 保存，删除使用软删除。
+- `ai_call_outbound_task`：由同租户 `PASSED` 校验结果创建，保存规则、提示词、
+  音色和请求参数快照；`Idempotency-Key` 在租户内唯一。
+- `ai_call_outbound_target`：从有效校验明细按主键游标分批复制，不一次性读取
+  全量名单；单号校验复制一条对象。
+
+创建任务前必须重新核对：校验结果与当前租户一致、状态为 `PASSED`、请求参数与
+校验固化配置完全一致、规则未删除且启用、提示词与场景匹配、音色存在。三张表均
+显式保存 `tenant_id`，只使用逻辑 ID 关联，无物理外键、无 `jsonb`。
+
+当前没有任务调度器和 SIP 执行器，因此无论立即执行还是定时执行，创建后都只落
+`SCHEDULED`。立即执行的 `scheduledAt` 为 `null`；定时执行保存计划时间。
+`cancel` 仅支持 `SCHEDULED`，不会伪造 `RUNNING`、`PAUSED` 或停止过程状态。
+本阶段不触发 LiveKit、FreeSWITCH、Linphone 或真实号码外呼。
+
 ## 处理流程
 
 1. 请求线程校验文件名和任务 JSON。

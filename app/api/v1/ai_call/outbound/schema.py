@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 
@@ -50,6 +57,14 @@ class ValidationResultOut(OutboundSchema):
     error_message: str | None = None
     accepted: bool = False
     retryable: bool = False
+    retry_action: Literal["REUPLOAD", "RETRY_VALIDATION"] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_result(self, serializer):
+        result = serializer(self)
+        if self.retry_action is None:
+            result.pop("retryAction", None)
+        return result
 
 
 class ValidationIssueOut(OutboundSchema):
