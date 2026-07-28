@@ -15,6 +15,7 @@ from .linphone_test_schema import (
     LinphoneTestAcceptedOut,
     LinphoneTestCapabilityOut,
     LinphoneTestRunIn,
+    LinphoneTestStatusOut,
 )
 from .linphone_test_service import LinphoneTestService
 from .rule_task_schema import (
@@ -295,6 +296,47 @@ async def run_linphone_test_controller(
         scenario=request.scenario.value,
     )
     return SuccessResponse(data=result, msg="测试拨打已受理")
+
+
+@OutboundRuleTaskRouter.get(
+    "/outbound-tasks/{task_id}/test-status",
+    summary="查询本机 Linphone 测试状态",
+    response_model=ResponseSchema[LinphoneTestStatusOut],
+)
+async def get_test_status_controller(
+    task_id: Annotated[int, Path(gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[
+        LinphoneTestService,
+        Depends(get_linphone_test_service),
+    ],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_status(auth.db, tenant_id, task_id)
+    return SuccessResponse(data=result, msg="查询成功")
+
+
+@OutboundRuleTaskRouter.post(
+    "/outbound-tasks/{task_id}/active-call/end",
+    summary="结束本机 Linphone 测试当前通话",
+    response_model=ResponseSchema[AcceptedCommandOut],
+)
+async def end_active_test_call_controller(
+    task_id: Annotated[int, Path(gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    service: Annotated[
+        LinphoneTestService,
+        Depends(get_linphone_test_service),
+    ],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.end_active_call(
+        tenant_id=tenant_id,
+        task_id=task_id,
+        idempotency_key=idempotency_key,
+    )
+    return SuccessResponse(data=result, msg="结束通话命令已受理")
 
 
 @OutboundRuleTaskRouter.put(

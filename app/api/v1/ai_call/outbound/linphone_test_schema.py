@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import Field, field_validator
 
@@ -32,6 +33,34 @@ class LinphoneTestAcceptedOut(AcceptedCommandOut):
     call_id: str
 
     @field_validator("task_id", "attempt_id", mode="before")
+    @classmethod
+    def stringify_bigint(cls, value: object) -> str:
+        return str(value)
+
+
+class LinphoneTestStatusOut(OutboundSchema):
+    task_id: str
+    target_id: str
+    attempt_id: str
+    call_id: str
+    target_status: str
+    attempt_status: str
+    call_status: str | None = None
+    handoff_status: str | None = None
+    phase: Literal[
+        "dialing",
+        "ai_call",
+        "waiting_handoff",
+        "human_call",
+        "completed",
+        "failed",
+    ]
+    elapsed_seconds: int
+    end_reason: str | None = None
+    error_message: str | None = None
+    can_end_active_call: bool
+
+    @field_validator("task_id", "target_id", "attempt_id", mode="before")
     @classmethod
     def stringify_bigint(cls, value: object) -> str:
         return str(value)

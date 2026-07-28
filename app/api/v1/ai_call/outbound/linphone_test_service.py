@@ -14,6 +14,8 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallHandoffAgentModel,
+    AiCallHandoffModel,
+    AiCallRecordModel,
 )
 from app.config.setting import settings
 from app.core.exceptions import CustomException
@@ -26,12 +28,14 @@ from app.services.ai_call.livekit_sip import (
 from .linphone_test_schema import (
     LinphoneTestAcceptedOut,
     LinphoneTestCapabilityOut,
+    LinphoneTestStatusOut,
 )
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from .rule_task_schema import AcceptedCommandOut
 from .task_executor import (
     ClaimedAttempt,
     OutboundTaskExecutor,
@@ -48,6 +52,38 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def derive_test_phase(
+    attempt_status: str,
+    handoff_status: str | None,
+) -> str:
+    if attempt_status == "FAILED":
+        return "failed"
+    if attempt_status == "COMPLETED":
+        return "completed"
+    if handoff_status == "connected":
+        return "human_call"
+    if handoff_status in {"requested", "accepted"}:
+        return "waiting_handoff"
+    if attempt_status == "IN_CALL":
+        return "ai_call"
+    return "dialing"
+
+
+def calculate_elapsed_seconds(
+    answered_at: datetime | None,
+    ended_at: datetime | None,
+    now: datetime,
+) -> int:
+    if answered_at is None:
+        return 0
+    end = ended_at or now
+    if answered_at.tzinfo is None and end.tzinfo is not None:
+        answered_at = answered_at.replace(tzinfo=end.tzinfo)
+    elif answered_at.tzinfo is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=answered_at.tzinfo)
+    return max(0, int((end - answered_at).total_seconds()))
+
+
 class LinphoneTestService:
     """评估正式外呼任务能否进入本机 Linphone 测试。"""
 
@@ -60,6 +96,7 @@ class LinphoneTestService:
         sip_preflight: Callable[[str], SipOutboundPreflightResult] | None = None,
         executor: OutboundTaskExecutor | None = None,
         dispatch: Callable[[ClaimedAttempt], None] | None = None,
+        ai_call_service_factory: Callable[[AsyncSession], Any] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.settings = settings_obj
@@ -67,7 +104,15 @@ class LinphoneTestService:
         self.sip_preflight = sip_preflight or self._default_sip_preflight
         self.executor = executor or self._default_executor()
         self.dispatch = dispatch or self._dispatch_background
+        self.ai_call_service_factory = (
+            ai_call_service_factory or self._default_ai_call_service_factory
+        )
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._end_command_results: dict[
+            tuple[str, int, str],
+            AcceptedCommandOut,
+        ] = {}
+        self._end_command_lock = asyncio.Lock()
 
     async def start_test(
         self,
@@ -255,6 +300,129 @@ class LinphoneTestService:
             available_agent_count=available_agent_count,
         )
 
+    async def get_status(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        task_id: int,
+    ) -> LinphoneTestStatusOut:
+        attempt = await db.scalar(
+            select(AiCallOutboundAttemptModel)
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.task_id == task_id,
+            )
+            .order_by(
+                AiCallOutboundAttemptModel.started_at.desc(),
+                AiCallOutboundAttemptModel.id.desc(),
+            )
+            .limit(1)
+        )
+        if attempt is None:
+            raise CustomException(
+                msg="任务暂无测试拨打记录",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        target = await db.scalar(
+            select(AiCallOutboundTargetModel)
+            .where(
+                AiCallOutboundTargetModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.id == attempt.target_id,
+            )
+            .limit(1)
+        )
+        if target is None:
+            raise CustomException(
+                msg="测试拨打对象不存在",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        record = await db.scalar(
+            select(AiCallRecordModel)
+            .where(AiCallRecordModel.call_id == attempt.call_id)
+            .limit(1)
+        )
+        handoff = await db.scalar(
+            select(AiCallHandoffModel)
+            .where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.call_id == attempt.call_id,
+            )
+            .order_by(
+                AiCallHandoffModel.requested_at.desc(),
+                AiCallHandoffModel.id.desc(),
+            )
+            .limit(1)
+        )
+        handoff_status = handoff.status if handoff is not None else None
+        return LinphoneTestStatusOut(
+            task_id=attempt.task_id,
+            target_id=attempt.target_id,
+            attempt_id=attempt.id,
+            call_id=attempt.call_id,
+            target_status=target.status,
+            attempt_status=attempt.status,
+            call_status=record.status if record is not None else None,
+            handoff_status=handoff_status,
+            phase=derive_test_phase(attempt.status, handoff_status),
+            elapsed_seconds=calculate_elapsed_seconds(
+                record.answered_at if record is not None else None,
+                record.ended_at if record is not None else None,
+                self.now(),
+            ),
+            end_reason=record.end_reason if record is not None else None,
+            error_message=(
+                attempt.error_message
+                or (record.failure_message if record is not None else None)
+            ),
+            can_end_active_call=(
+                attempt.active_slot == LINPHONE_ACTIVE_SLOT
+                and attempt.status in ACTIVE_ATTEMPT_STATUSES
+            ),
+        )
+
+    async def end_active_call(
+        self,
+        *,
+        tenant_id: str,
+        task_id: int,
+        idempotency_key: str,
+    ) -> AcceptedCommandOut:
+        command_key = idempotency_key.strip()
+        if not command_key or len(command_key) > 128:
+            raise CustomException(
+                msg="Idempotency-Key 不合法",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        result_key = (tenant_id, task_id, command_key)
+        async with self._end_command_lock:
+            existing = self._end_command_results.get(result_key)
+            if existing is not None:
+                return existing
+
+            async with self.session_factory() as db:
+                attempt = await self._active_attempt(
+                    db,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                )
+                if attempt is None:
+                    raise CustomException(
+                        msg="当前任务没有可结束的活动通话",
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                service = self.ai_call_service_factory(db)
+                await service.end_session(
+                    attempt.call_id,
+                    end_reason="outbound_task_manual_end",
+                )
+                await db.commit()
+
+            result = AcceptedCommandOut()
+            self._end_command_results[result_key] = result
+            return result
+
     async def _active_attempt(
         self,
         db: AsyncSession,
@@ -322,6 +490,12 @@ class LinphoneTestService:
             config,
             callee_phone_number=callee_phone_number,
         )
+
+    @staticmethod
+    def _default_ai_call_service_factory(db: AsyncSession) -> Any:
+        from app.api.v1.ai_call.service import get_default_ai_call_service
+
+        return get_default_ai_call_service(db)
 
     def _default_executor(self) -> OutboundTaskExecutor:
         from .linphone_test_dialer import LinphoneTestDialer

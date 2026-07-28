@@ -17,6 +17,8 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallHandoffAgentModel,
+    AiCallHandoffModel,
+    AiCallRecordModel,
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
@@ -648,6 +650,7 @@ async def test_handoff_command_requires_available_agent(database) -> None:
 class _LinphoneRouteServiceFake:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, Any]] = []
+        self.end_calls: list[dict[str, Any]] = []
 
     async def get_capability(self, db, tenant_id: str, task_id: int):
         from app.api.v1.ai_call.outbound.linphone_test_schema import (
@@ -670,6 +673,34 @@ class _LinphoneRouteServiceFake:
             attempt_id=2001,
             call_id="call-1",
         )
+
+    async def get_status(self, db, tenant_id: str, task_id: int):
+        from app.api.v1.ai_call.outbound.linphone_test_schema import (
+            LinphoneTestStatusOut,
+        )
+
+        del db
+        assert tenant_id == "000000"
+        assert task_id == 1001
+        return LinphoneTestStatusOut(
+            task_id=task_id,
+            target_id=4001,
+            attempt_id=2001,
+            call_id="call-1",
+            target_status="IN_CALL",
+            attempt_status="IN_CALL",
+            call_status="connected",
+            handoff_status=None,
+            phase="ai_call",
+            elapsed_seconds=5,
+            can_end_active_call=True,
+        )
+
+    async def end_active_call(self, **kwargs):
+        from app.api.v1.ai_call.outbound.rule_task_schema import AcceptedCommandOut
+
+        self.end_calls.append(kwargs)
+        return AcceptedCommandOut()
 
 
 def _linphone_route_client(database, service) -> TestClient:
@@ -710,6 +741,11 @@ async def test_linphone_routes_are_registered_and_use_unified_envelope(database)
             headers={"Idempotency-Key": "cmd-route-1"},
             json={"scenario": "ai_only"},
         )
+        test_status = client.get("/ai-call/outbound-tasks/1001/test-status")
+        ended = client.post(
+            "/ai-call/outbound-tasks/1001/active-call/end",
+            headers={"Idempotency-Key": "end-route-1"},
+        )
 
     assert capability.status_code == 200
     assert capability.json() == {
@@ -741,6 +777,33 @@ async def test_linphone_routes_are_registered_and_use_unified_envelope(database)
         "idempotency_key": "cmd-route-1",
         "scenario": "ai_only",
     }]
+    assert test_status.status_code == 200
+    assert test_status.json()["data"] == {
+        "taskId": "1001",
+        "targetId": "4001",
+        "attemptId": "2001",
+        "callId": "call-1",
+        "targetStatus": "IN_CALL",
+        "attemptStatus": "IN_CALL",
+        "callStatus": "connected",
+        "handoffStatus": None,
+        "phase": "ai_call",
+        "elapsedSeconds": 5,
+        "endReason": None,
+        "errorMessage": None,
+        "canEndActiveCall": True,
+    }
+    assert ended.status_code == 200
+    assert ended.json() == {
+        "code": 200,
+        "msg": "结束通话命令已受理",
+        "data": {"accepted": True},
+    }
+    assert service.end_calls == [{
+        "tenant_id": "000000",
+        "task_id": 1001,
+        "idempotency_key": "end-route-1",
+    }]
 
 
 @pytest.mark.anyio
@@ -754,6 +817,237 @@ async def test_linphone_test_run_requires_idempotency_header(database) -> None:
 
     assert response.status_code == 422
     assert service.start_calls == []
+
+
+@pytest.mark.parametrize(
+    ("attempt_status", "handoff_status", "expected"),
+    [
+        ("DIALING", None, "dialing"),
+        ("IN_CALL", None, "ai_call"),
+        ("IN_CALL", "requested", "waiting_handoff"),
+        ("IN_CALL", "accepted", "waiting_handoff"),
+        ("IN_CALL", "connected", "human_call"),
+        ("COMPLETED", "completed", "completed"),
+        ("FAILED", None, "failed"),
+    ],
+)
+def test_phase_is_derived_not_persisted(
+    attempt_status: str,
+    handoff_status: str | None,
+    expected: str,
+) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import derive_test_phase
+
+    assert derive_test_phase(attempt_status, handoff_status) == expected
+    assert "phase" not in AiCallOutboundAttemptModel.__table__.c
+
+
+@pytest.mark.parametrize(
+    ("answered_at", "ended_at", "now", "expected"),
+    [
+        (None, None, CAPABILITY_NOW, 0),
+        (
+            CAPABILITY_NOW - timedelta(seconds=7),
+            None,
+            CAPABILITY_NOW,
+            7,
+        ),
+        (
+            CAPABILITY_NOW - timedelta(seconds=7),
+            CAPABILITY_NOW - timedelta(seconds=2),
+            CAPABILITY_NOW,
+            5,
+        ),
+        (
+            CAPABILITY_NOW,
+            CAPABILITY_NOW - timedelta(seconds=1),
+            CAPABILITY_NOW,
+            0,
+        ),
+    ],
+)
+def test_elapsed_seconds_uses_answered_and_ended_timestamps(
+    answered_at: datetime | None,
+    ended_at: datetime | None,
+    now: datetime,
+    expected: int,
+) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import (
+        calculate_elapsed_seconds,
+    )
+
+    assert calculate_elapsed_seconds(answered_at, ended_at, now) == expected
+
+
+async def _seed_test_status(
+    database,
+    *,
+    attempt_status: str = "IN_CALL",
+    target_status: str = "IN_CALL",
+    include_record: bool = True,
+    handoff_status: str | None = None,
+) -> None:
+    attempt = _active_linphone_attempt(
+        5001,
+        task_id=1001,
+        status=attempt_status,
+    )
+    attempt.target_id = 4001
+    attempt.call_id = "call-1"
+    if attempt_status not in {"DIALING", "IN_CALL"}:
+        attempt.active_slot = None
+        attempt.ended_at = CAPABILITY_NOW
+    async with database() as session, session.begin():
+        session.add(_outbound_task(status="RUNNING"))
+        session.add(_outbound_target(status=target_status))
+        session.add(attempt)
+        if include_record:
+            session.add(
+                AiCallRecordModel(
+                    id=6001,
+                    call_id="call-1",
+                    business_type="outbound_task",
+                    business_id="1001",
+                    scene_code="intro_contract",
+                    entry_type="sip_outbound",
+                    room_name="room-call-1",
+                    participant_identity="sip-call-1",
+                    status="connected",
+                    end_reason=None,
+                    failure_message=None,
+                    started_at=CAPABILITY_NOW - timedelta(seconds=15),
+                    answered_at=CAPABILITY_NOW - timedelta(seconds=5),
+                    ended_at=None,
+                )
+            )
+        if handoff_status is not None:
+            session.add(
+                AiCallHandoffModel(
+                    id=7001,
+                    tenant_id="000000",
+                    handoff_id="handoff-1",
+                    call_id="call-1",
+                    room_name="room-call-1",
+                    scene_code="intro_contract",
+                    status=handoff_status,
+                    request_source="ai",
+                    requested_at=CAPABILITY_NOW - timedelta(seconds=3),
+                )
+            )
+
+
+@pytest.mark.anyio
+async def test_status_aggregates_attempt_target_record_and_latest_handoff(database) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    await _seed_test_status(database, handoff_status="connected")
+    service = LinphoneTestService(
+        database,
+        settings_obj=_linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+    )
+
+    async with database() as session:
+        result = await service.get_status(session, "000000", 1001)
+
+    assert result.model_dump(by_alias=True) == {
+        "taskId": "1001",
+        "targetId": "4001",
+        "attemptId": "5001",
+        "callId": "call-1",
+        "targetStatus": "IN_CALL",
+        "attemptStatus": "IN_CALL",
+        "callStatus": "connected",
+        "handoffStatus": "connected",
+        "phase": "human_call",
+        "elapsedSeconds": 5,
+        "endReason": None,
+        "errorMessage": None,
+        "canEndActiveCall": True,
+    }
+
+
+@pytest.mark.anyio
+async def test_status_returns_404_without_attempt(database) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    service = LinphoneTestService(
+        database,
+        settings_obj=_linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+    )
+    async with database() as session:
+        with pytest.raises(CustomException) as caught:
+            await service.get_status(session, "000000", 1001)
+
+    assert caught.value.status_code == 404
+
+
+class _EndCallServiceFake:
+    def __init__(self) -> None:
+        self.end_calls: list[tuple[str, str]] = []
+
+    async def end_session(self, call_id: str, *, end_reason: str):
+        self.end_calls.append((call_id, end_reason))
+
+
+@pytest.mark.anyio
+async def test_end_active_call_uses_attempt_call_id_and_is_idempotent(database) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    await _seed_test_status(database)
+    ai_call_service = _EndCallServiceFake()
+    service = LinphoneTestService(
+        database,
+        settings_obj=_linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+        ai_call_service_factory=lambda db: ai_call_service,
+    )
+
+    first = await service.end_active_call(
+        tenant_id="000000",
+        task_id=1001,
+        idempotency_key="end-1",
+    )
+    second = await service.end_active_call(
+        tenant_id="000000",
+        task_id=1001,
+        idempotency_key="end-1",
+    )
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, 1001)
+    assert first.accepted is True
+    assert second.accepted is True
+    assert ai_call_service.end_calls == [
+        ("call-1", "outbound_task_manual_end"),
+    ]
+    assert task.status == "RUNNING"
+
+
+@pytest.mark.anyio
+async def test_end_active_call_rejects_when_no_active_attempt(database) -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    service = LinphoneTestService(
+        database,
+        settings_obj=_linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+        ai_call_service_factory=lambda db: _EndCallServiceFake(),
+    )
+
+    with pytest.raises(CustomException) as caught:
+        await service.end_active_call(
+            tenant_id="000000",
+            task_id=1001,
+            idempotency_key="end-1",
+        )
+
+    assert caught.value.status_code == 409
 
 
 def _attempt(
