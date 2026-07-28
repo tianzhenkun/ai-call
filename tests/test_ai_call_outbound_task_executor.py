@@ -185,7 +185,12 @@ async def test_executor_skips_future_task_and_completes_due_task_once(database) 
     )
     task_id, target_ids = await _seed_task(database, now=now)
     dialer = SequenceDialer([DialResult(call_result="connected", duration_ms=1200)])
-    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    executor = OutboundTaskExecutor(
+        database,
+        dialer,
+        now_provider=lambda: now,
+        business_timezone="UTC",
+    )
 
     assert await executor.run_once() == 1
     assert await executor.run_once() == 0
@@ -426,6 +431,31 @@ async def test_closed_window_task_does_not_starve_later_due_task(database) -> No
         due_task = await session.get(AiCallOutboundTaskModel, due_task_id)
     assert closed_task is not None and closed_task.status == "SCHEDULED"
     assert due_task is not None and due_task.status == "COMPLETED"
+
+
+@pytest.mark.anyio
+async def test_scheduled_time_uses_configured_business_timezone(database) -> None:
+    now = datetime(2026, 7, 28, 2, 0, tzinfo=timezone.utc)
+    task_id, _ = await _seed_task(
+        database,
+        now=now,
+        execution_mode="scheduled",
+        scheduled_at=datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc),
+        snapshot=_snapshot(
+            call_windows=[{"startTime": "09:00", "endTime": "11:00"}],
+        ),
+    )
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="connected")]),
+        now_provider=lambda: now,
+        business_timezone="Asia/Shanghai",
+    )
+
+    assert await executor.run_once() == 1
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+    assert task is not None and task.status == "COMPLETED"
 
 
 @pytest.mark.anyio

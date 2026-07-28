@@ -169,6 +169,7 @@ class OutboundTaskExecutor:
             )
 
     async def _claim_due_tasks(self, now: datetime) -> None:
+        schedule_now = self._schedule_comparison_now(now)
         async with self.session_factory() as db:
             claimed_count = 0
             last_id = 0
@@ -181,7 +182,7 @@ class OutboundTaskExecutor:
                             AiCallOutboundTaskModel.id > last_id,
                             or_(
                                 AiCallOutboundTaskModel.execution_mode == "immediate",
-                                AiCallOutboundTaskModel.scheduled_at <= now,
+                                AiCallOutboundTaskModel.scheduled_at <= schedule_now,
                             ),
                         )
                         .order_by(AiCallOutboundTaskModel.id)
@@ -210,6 +211,12 @@ class OutboundTaskExecutor:
                     if claimed_count >= self.task_batch_size:
                         break
             await db.commit()
+
+    def _schedule_comparison_now(self, now: datetime) -> datetime:
+        """兼容现有 API 将业务本地时间字符串按 UTC 标签持久化的契约。"""
+        aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        business_now = aware_now.astimezone(self.business_timezone)
+        return business_now.replace(tzinfo=timezone.utc)
 
     async def _list_running_task_ids(self, now: datetime) -> list[int]:
         async with self.session_factory() as db:
