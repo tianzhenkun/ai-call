@@ -322,6 +322,11 @@ class AiCallRecordService:
         self,
         *,
         call_id: str | None = None,
+        task_id: int | None = None,
+        target_id: int | None = None,
+        phone_number: str | None = None,
+        customer_name: str | None = None,
+        call_result: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -333,6 +338,11 @@ class AiCallRecordService:
     ) -> tuple[list[AiCallRecordModel], int]:
         return await self.repository.list_records(
             call_id=call_id,
+            task_id=task_id,
+            target_id=target_id,
+            phone_number=phone_number,
+            customer_name=customer_name,
+            call_result=call_result,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -364,9 +374,17 @@ class AiCallRecordService:
         return await self.repository.get_last_event(call_id)
 
     def record_to_dict(self, record: AiCallRecordModel) -> dict[str, Any]:
+        outbound_context = getattr(record, "_outbound_context", {})
         return {
             "id": str(record.id),
             "callId": record.call_id,
+            "taskId": outbound_context.get("taskId"),
+            "targetId": outbound_context.get("targetId"),
+            "taskName": outbound_context.get("taskName"),
+            "customerName": outbound_context.get("customerName"),
+            "phoneNumber": outbound_context.get("phoneNumber"),
+            "attemptNo": outbound_context.get("attemptNo"),
+            "callResult": outbound_context.get("callResult"),
             "businessType": record.business_type,
             "businessId": record.business_id,
             "sceneCode": record.scene_code,

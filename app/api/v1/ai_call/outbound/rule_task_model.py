@@ -141,3 +141,50 @@ class AiCallOutboundTargetModel(MappedBase):
     latest_result: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallOutboundAttemptModel(MappedBase):
+    """一次正式拨打尝试；一个外呼对象可因重试产生多条记录。"""
+
+    __tablename__ = "ai_call_outbound_attempt"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "target_id",
+            "attempt_no",
+            name="uk_outbound_attempt_target_no",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            name="uk_outbound_attempt_call",
+        ),
+        Index(
+            "idx_outbound_attempt_task",
+            "tenant_id",
+            "task_id",
+            "started_at",
+        ),
+        Index(
+            "idx_outbound_attempt_target",
+            "tenant_id",
+            "target_id",
+            "attempt_no",
+        ),
+        {"comment": "通用外呼拨打尝试与通话记录关联"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    call_result: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(String(1000))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

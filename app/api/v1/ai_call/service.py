@@ -643,6 +643,11 @@ class AiCallService:
         self,
         *,
         call_id: str | None = None,
+        task_id: int | None = None,
+        target_id: int | None = None,
+        phone_number: str | None = None,
+        customer_name: str | None = None,
+        call_result: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -655,6 +660,11 @@ class AiCallService:
         self._ensure_record_service()
         rows, total = await self.record_service.list_records(
             call_id=call_id,
+            task_id=task_id,
+            target_id=target_id,
+            phone_number=phone_number,
+            customer_name=customer_name,
+            call_result=call_result,
             business_type=business_type,
             business_id=business_id,
             status=status,

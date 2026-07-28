@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Select, asc, desc, func, or_, select, update
+from sqlalchemy import Select, and_, asc, desc, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -22,6 +22,11 @@ from app.api.v1.ai_call.model import (
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
     AiCallVoiceProfileModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.utils.id_util import generate_snowflake_id
 
@@ -117,6 +122,11 @@ class AiCallRecordRepository:
         self,
         *,
         call_id: str | None = None,
+        task_id: int | None = None,
+        target_id: int | None = None,
+        phone_number: str | None = None,
+        customer_name: str | None = None,
+        call_result: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -129,6 +139,11 @@ class AiCallRecordRepository:
         stmt = self._record_filters(
             select(AiCallRecordModel),
             call_id=call_id,
+            task_id=task_id,
+            target_id=target_id,
+            phone_number=phone_number,
+            customer_name=customer_name,
+            call_result=call_result,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -139,6 +154,11 @@ class AiCallRecordRepository:
         count_stmt = self._record_filters(
             select(func.count()).select_from(AiCallRecordModel),
             call_id=call_id,
+            task_id=task_id,
+            target_id=target_id,
+            phone_number=phone_number,
+            customer_name=customer_name,
+            call_result=call_result,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -156,7 +176,63 @@ class AiCallRecordRepository:
             .limit(safe_page_size)
         )
         rows = (await self.db.execute(stmt)).scalars().all()
+        await self._attach_outbound_context(rows)
         return list(rows), total
+
+    async def _attach_outbound_context(
+        self,
+        records: list[AiCallRecordModel],
+    ) -> None:
+        call_ids = [record.call_id for record in records]
+        if not call_ids:
+            return
+        context_rows = (
+            await self.db.execute(
+                select(
+                    AiCallOutboundAttemptModel.call_id,
+                    AiCallOutboundAttemptModel.task_id,
+                    AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundAttemptModel.attempt_no,
+                    AiCallOutboundAttemptModel.call_result,
+                    AiCallOutboundTaskModel.task_name,
+                    AiCallOutboundTargetModel.phone_number,
+                    AiCallOutboundTargetModel.customer_name,
+                )
+                .join(
+                    AiCallOutboundTargetModel,
+                    and_(
+                        AiCallOutboundTargetModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallOutboundTargetModel.id
+                        == AiCallOutboundAttemptModel.target_id,
+                    ),
+                )
+                .join(
+                    AiCallOutboundTaskModel,
+                    and_(
+                        AiCallOutboundTaskModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallOutboundTaskModel.id
+                        == AiCallOutboundAttemptModel.task_id,
+                    ),
+                )
+                .where(AiCallOutboundAttemptModel.call_id.in_(call_ids))
+            )
+        ).all()
+        contexts = {
+            row.call_id: {
+                "taskId": str(row.task_id),
+                "targetId": str(row.target_id),
+                "taskName": row.task_name,
+                "phoneNumber": row.phone_number,
+                "customerName": row.customer_name,
+                "attemptNo": row.attempt_no,
+                "callResult": row.call_result,
+            }
+            for row in context_rows
+        }
+        for record in records:
+            record._outbound_context = contexts.get(record.call_id, {})
 
     async def append_event(
         self,
@@ -1270,8 +1346,55 @@ class AiCallRecordRepository:
 
     @staticmethod
     def _record_filters(stmt: Select, **filters) -> Select:
+        has_outbound_filters = any(
+            filters.get(key)
+            for key in (
+                "task_id",
+                "target_id",
+                "phone_number",
+                "customer_name",
+                "call_result",
+            )
+        )
+        if has_outbound_filters:
+            stmt = stmt.join(
+                AiCallOutboundAttemptModel,
+                AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
+            ).join(
+                AiCallOutboundTargetModel,
+                and_(
+                    AiCallOutboundTargetModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                    AiCallOutboundTargetModel.id
+                    == AiCallOutboundAttemptModel.target_id,
+                ),
+            )
         if filters.get("call_id"):
             stmt = stmt.where(AiCallRecordModel.call_id == filters["call_id"])
+        if filters.get("task_id"):
+            stmt = stmt.where(
+                AiCallOutboundAttemptModel.task_id == filters["task_id"],
+            )
+        if filters.get("target_id"):
+            stmt = stmt.where(
+                AiCallOutboundAttemptModel.target_id == filters["target_id"],
+            )
+        if filters.get("phone_number"):
+            stmt = stmt.where(
+                AiCallOutboundTargetModel.phone_number.contains(
+                    filters["phone_number"].strip(),
+                )
+            )
+        if filters.get("customer_name"):
+            stmt = stmt.where(
+                AiCallOutboundTargetModel.customer_name.contains(
+                    filters["customer_name"].strip(),
+                )
+            )
+        if filters.get("call_result"):
+            stmt = stmt.where(
+                AiCallOutboundAttemptModel.call_result == filters["call_result"],
+            )
         if filters.get("business_type"):
             stmt = stmt.where(AiCallRecordModel.business_type == filters["business_type"])
         if filters.get("business_id"):

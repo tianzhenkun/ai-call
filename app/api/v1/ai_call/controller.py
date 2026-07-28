@@ -303,6 +303,11 @@ async def preview_prompt_profile_controller(
 async def list_records_controller(
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     call_id: Annotated[str | None, Query(alias="callId")] = None,
+    task_id: Annotated[int | None, Query(alias="taskId", gt=0)] = None,
+    target_id: Annotated[int | None, Query(alias="targetId", gt=0)] = None,
+    phone_number: Annotated[str | None, Query(alias="phoneNumber")] = None,
+    customer_name: Annotated[str | None, Query(alias="customerName")] = None,
+    call_result: Annotated[str | None, Query(alias="callResult")] = None,
     business_type: Annotated[str | None, Query(alias="businessType")] = None,
     business_id: Annotated[str | None, Query(alias="businessId")] = None,
     status: str | None = None,
@@ -314,6 +319,11 @@ async def list_records_controller(
 ) -> JSONResponse:
     result = await service.list_records(
         call_id=call_id,
+        task_id=task_id,
+        target_id=target_id,
+        phone_number=phone_number,
+        customer_name=customer_name,
+        call_result=call_result,
         business_type=business_type,
         business_id=business_id,
         status=status,
