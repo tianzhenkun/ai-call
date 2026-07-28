@@ -813,6 +813,58 @@ async def test_stale_recovery_finishes_legacy_null_dialer_attempt(database) -> N
 
 
 @pytest.mark.anyio
+async def test_stale_mock_attempt_updates_record_with_real_managed_executor(
+    database,
+) -> None:
+    clock = [datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)]
+    task_id, target_ids = await _seed_task(database, now=clock[0])
+    blocking_dialer = BlockingDialer()
+    interrupted_executor = OutboundTaskExecutor(
+        database,
+        blocking_dialer,
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+    interrupted_run = asyncio.create_task(interrupted_executor.run_once())
+    await asyncio.wait_for(blocking_dialer.started.wait(), timeout=0.5)
+    interrupted_run.cancel()
+    await asyncio.gather(interrupted_run, return_exceptions=True)
+
+    clock[0] += timedelta(minutes=5)
+    recovery_executor = OutboundTaskExecutor(
+        database,
+        LifecycleDialer(),
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+
+    assert await recovery_executor.run_once() == 0
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        record = await session.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == attempt.call_id
+            )
+        )
+    assert task is not None and task.status == "COMPLETED"
+    assert target is not None and target.status == "COMPLETED"
+    assert attempt is not None
+    assert attempt.dialer_type == "mock"
+    assert attempt.status == "FAILED"
+    assert record is not None
+    assert record.status == "failed"
+    assert record.end_reason == "call_failed"
+    assert record.failure_stage == "outbound_mock"
+
+
+@pytest.mark.anyio
 async def test_executor_skips_future_task_and_completes_due_task_once(database) -> None:
     now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
     future_task_id, _ = await _seed_task(
@@ -1318,6 +1370,100 @@ async def test_pause_waits_for_current_attempt_then_keeps_remaining_pending(data
     assert task is not None
     assert task.status == "PAUSED"
     assert task.completed_targets == 1
+    assert [target.status for target in targets] == ["COMPLETED", "PENDING"]
+
+
+@pytest.mark.anyio
+async def test_stop_waits_for_in_call_attempt_before_stopping(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now, target_count=2)
+    dialer = LifecycleDialer()
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    run_task = asyncio.create_task(executor.run_once())
+    await asyncio.wait_for(dialer.connected.wait(), timeout=0.5)
+
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        await service.run_action(session, "tenant-a", task_id, "stop")
+        await session.commit()
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        targets = (
+            await session.scalars(
+                select(AiCallOutboundTargetModel)
+                .where(AiCallOutboundTargetModel.id.in_(target_ids))
+                .order_by(AiCallOutboundTargetModel.source_row_number)
+            )
+        ).all()
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+    assert task is not None and task.status == "STOPPING"
+    assert [target.status for target in targets] == ["IN_CALL", "CANCELLED"]
+    assert attempt is not None and attempt.status == "IN_CALL"
+    assert not run_task.done()
+
+    dialer.release.set()
+    assert await run_task == 1
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        targets = (
+            await session.scalars(
+                select(AiCallOutboundTargetModel)
+                .where(AiCallOutboundTargetModel.id.in_(target_ids))
+                .order_by(AiCallOutboundTargetModel.source_row_number)
+            )
+        ).all()
+    assert task is not None and task.status == "STOPPED"
+    assert [target.status for target in targets] == ["COMPLETED", "CANCELLED"]
+
+
+@pytest.mark.anyio
+async def test_pause_waits_for_in_call_attempt_before_pausing(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now, target_count=2)
+    dialer = LifecycleDialer()
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    run_task = asyncio.create_task(executor.run_once())
+    await asyncio.wait_for(dialer.connected.wait(), timeout=0.5)
+
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        await service.run_action(session, "tenant-a", task_id, "pause")
+        await session.commit()
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        targets = (
+            await session.scalars(
+                select(AiCallOutboundTargetModel)
+                .where(AiCallOutboundTargetModel.id.in_(target_ids))
+                .order_by(AiCallOutboundTargetModel.source_row_number)
+            )
+        ).all()
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+    assert task is not None and task.status == "PAUSING"
+    assert [target.status for target in targets] == ["IN_CALL", "PENDING"]
+    assert attempt is not None and attempt.status == "IN_CALL"
+    assert not run_task.done()
+
+    dialer.release.set()
+    assert await run_task == 1
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        targets = (
+            await session.scalars(
+                select(AiCallOutboundTargetModel)
+                .where(AiCallOutboundTargetModel.id.in_(target_ids))
+                .order_by(AiCallOutboundTargetModel.source_row_number)
+            )
+        ).all()
+    assert task is not None and task.status == "PAUSED"
     assert [target.status for target in targets] == ["COMPLETED", "PENDING"]
 
 

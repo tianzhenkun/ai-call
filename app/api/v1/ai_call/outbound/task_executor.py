@@ -754,7 +754,7 @@ class OutboundTaskExecutor:
             attempt.ended_at = now
             attempt.updated_at = now
 
-            if not self.dialer.manages_call_record:
+            if attempt.dialer_type in {None, "mock"}:
                 record = await db.scalar(
                     select(AiCallRecordModel).where(
                         AiCallRecordModel.call_id == call_id
