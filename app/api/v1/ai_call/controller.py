@@ -7,10 +7,13 @@ from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
+from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 
+from .outbound.controller import _identity
 from .schema import (
     AcceptHandoffOut,
     AcceptHandoffRequest,
@@ -301,6 +304,7 @@ async def preview_prompt_profile_controller(
     summary="查询通话记录列表",
 )
 async def list_records_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     call_id: Annotated[str | None, Query(alias="callId")] = None,
     task_id: Annotated[int | None, Query(alias="taskId", gt=0)] = None,
@@ -317,7 +321,9 @@ async def list_records_controller(
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 10,
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.list_records(
+        tenant_id=tenant_id,
         call_id=call_id,
         task_id=task_id,
         target_id=target_id,

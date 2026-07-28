@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
@@ -12,10 +14,12 @@ from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
 from app.core.base_model import MappedBase
+from app.core.dependencies import get_current_user
 from app.services.ai_call.record_service import AiCallRecordService
 
 
@@ -33,6 +37,9 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
 
     response = TestClient(app).get(
         "/ai-call/records",
@@ -47,6 +54,7 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
 
     assert response.status_code == 200
     assert service.query == {
+        "tenant_id": "tenant-a",
         "call_id": None,
         "task_id": 101,
         "target_id": 201,
@@ -78,6 +86,12 @@ def test_outbound_attempt_model_has_no_physical_foreign_keys() -> None:
         "error_message",
     } <= {column.name for column in attempt_table.columns}
     assert not attempt_table.foreign_keys
+    unique_column_sets = {
+        frozenset(column.name for column in constraint.columns)
+        for constraint in attempt_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert frozenset({"call_id"}) in unique_column_sets
 
 
 @pytest.mark.anyio
@@ -186,6 +200,7 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
 
         service = AiCallRecordService(AiCallRecordRepository(session))
         rows, total = await service.list_records(
+            tenant_id="tenant-a",
             task_id=101,
             target_id=201,
             phone_number="13800138011",
@@ -204,8 +219,173 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
         assert payload["attemptNo"] == 1
         assert payload["callResult"] == "no_answer"
 
-        empty_rows, empty_total = await service.list_records(task_id=999)
+        empty_rows, empty_total = await service.list_records(
+            tenant_id="tenant-a",
+            task_id=999,
+        )
         assert empty_rows == []
         assert empty_total == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_record_list_is_tenant_scoped_and_rejects_inconsistent_target_task() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+
+    def task(task_id: int, tenant_id: str) -> AiCallOutboundTaskModel:
+        return AiCallOutboundTaskModel(
+            id=task_id,
+            tenant_id=tenant_id,
+            validation_id=task_id,
+            idempotency_key=f"task-{task_id}",
+            request_fingerprint=f"fingerprint-{task_id}",
+            task_name=f"任务{task_id}",
+            task_mode="batch",
+            status="RUNNING",
+            total_targets=1,
+            completed_targets=0,
+            connected_targets=0,
+            failed_targets=0,
+            execution_mode="immediate",
+            scheduled_at=None,
+            started_at=now,
+            ended_at=None,
+            prompt_profile_id=None,
+            prompt_name="提示词",
+            scene_code="intro_geo",
+            voice="Tina",
+            voice_name="甜甜 Tina",
+            rule_id=1,
+            rule_name="工作日规则",
+            rule_summary="09:00–12:00",
+            config_snapshot_json="{}",
+            error_message=None,
+            created_by=1,
+            created_by_name="管理员",
+            created_at=now,
+            updated_at=now,
+        )
+
+    def target(
+        target_id: int,
+        tenant_id: str,
+        task_id: int,
+        phone_number: str,
+    ) -> AiCallOutboundTargetModel:
+        return AiCallOutboundTargetModel(
+            id=target_id,
+            tenant_id=tenant_id,
+            task_id=task_id,
+            validation_id=task_id,
+            source_validation_row_id=target_id,
+            source_row_number=2,
+            phone_number=phone_number,
+            customer_name=f"客户{target_id}",
+            status="PENDING",
+            attempt_count=0,
+            latest_result=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def record(record_id: int, call_id: str) -> AiCallRecordModel:
+        return AiCallRecordModel(
+            id=record_id,
+            call_id=call_id,
+            business_type=None,
+            business_id=None,
+            scene_code="intro_geo",
+            prompt_source_key=None,
+            entry_type="sip_outbound",
+            room_name=f"room-{record_id}",
+            participant_identity=f"sip-{record_id}",
+            status="completed",
+            started_at=now,
+        )
+
+    async with session_maker() as session:
+        session.add_all(
+            [
+                task(101, "tenant-a"),
+                task(102, "tenant-b"),
+                task(103, "tenant-a"),
+                target(201, "tenant-a", 101, "13800138011"),
+                target(202, "tenant-b", 102, "13900139012"),
+                target(203, "tenant-a", 103, "13700137013"),
+                record(301, "call-tenant-a"),
+                record(302, "call-tenant-b"),
+                record(303, "call-inconsistent"),
+            ]
+        )
+        session.add_all(
+            [
+                AiCallOutboundAttemptModel(
+                    id=401,
+                    tenant_id="tenant-a",
+                    task_id=101,
+                    target_id=201,
+                    attempt_no=1,
+                    call_id="call-tenant-a",
+                    status="COMPLETED",
+                    call_result="connected",
+                    error_message=None,
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=402,
+                    tenant_id="tenant-b",
+                    task_id=102,
+                    target_id=202,
+                    attempt_no=1,
+                    call_id="call-tenant-b",
+                    status="COMPLETED",
+                    call_result="connected",
+                    error_message=None,
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=403,
+                    tenant_id="tenant-a",
+                    task_id=101,
+                    target_id=203,
+                    attempt_no=1,
+                    call_id="call-inconsistent",
+                    status="COMPLETED",
+                    call_result="connected",
+                    error_message=None,
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+        service = AiCallRecordService(AiCallRecordRepository(session))
+        rows, total = await service.list_records(
+            tenant_id="tenant-a",
+            task_id=101,
+        )
+        assert total == 1
+        assert [row.call_id for row in rows] == ["call-tenant-a"]
+
+        blank_rows, blank_total = await service.list_records(
+            tenant_id="tenant-a",
+            phone_number="   ",
+        )
+        assert blank_total == 1
+        assert [row.call_id for row in blank_rows] == ["call-tenant-a"]
 
     await engine.dispose()

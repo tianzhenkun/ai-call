@@ -1,5 +1,6 @@
 -- Phase H3: 通用外呼拨打尝试与通话记录关联
 -- PostgreSQL 迁移；仅新增表，无物理外键。
+-- 当前阶段提供关联结构和查询能力；真实拨打写入由后续任务执行器接入。
 
 CREATE TABLE IF NOT EXISTS ai_call_outbound_attempt (
     id bigint PRIMARY KEY,
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_attempt (
     CONSTRAINT uk_outbound_attempt_target_no
         UNIQUE (tenant_id, target_id, attempt_no),
     CONSTRAINT uk_outbound_attempt_call
-        UNIQUE (tenant_id, call_id)
+        UNIQUE (call_id)
 );
 
 COMMENT ON TABLE ai_call_outbound_attempt

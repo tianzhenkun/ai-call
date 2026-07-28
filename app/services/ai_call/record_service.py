@@ -321,6 +321,7 @@ class AiCallRecordService:
     async def list_records(
         self,
         *,
+        tenant_id: str | None = None,
         call_id: str | None = None,
         task_id: int | None = None,
         target_id: int | None = None,
@@ -337,6 +338,7 @@ class AiCallRecordService:
         page_size: int = 10,
     ) -> tuple[list[AiCallRecordModel], int]:
         return await self.repository.list_records(
+            tenant_id=tenant_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,

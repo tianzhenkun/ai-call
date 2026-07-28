@@ -144,7 +144,7 @@ class AiCallOutboundTargetModel(MappedBase):
 
 
 class AiCallOutboundAttemptModel(MappedBase):
-    """一次正式拨打尝试；一个外呼对象可因重试产生多条记录。"""
+    """一次正式拨打尝试；由后续任务执行器在真实拨打链路中写入。"""
 
     __tablename__ = "ai_call_outbound_attempt"
     __table_args__ = (
@@ -155,7 +155,6 @@ class AiCallOutboundAttemptModel(MappedBase):
             name="uk_outbound_attempt_target_no",
         ),
         UniqueConstraint(
-            "tenant_id",
             "call_id",
             name="uk_outbound_attempt_call",
         ),

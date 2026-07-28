@@ -642,6 +642,7 @@ class AiCallService:
     async def list_records(
         self,
         *,
+        tenant_id: str,
         call_id: str | None = None,
         task_id: int | None = None,
         target_id: int | None = None,
@@ -659,6 +660,7 @@ class AiCallService:
     ) -> dict:
         self._ensure_record_service()
         rows, total = await self.record_service.list_records(
+            tenant_id=tenant_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,
