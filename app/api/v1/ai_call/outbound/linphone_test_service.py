@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.api.v1.ai_call.model import (
+    AiCallAgentProfileModel,
+    AiCallAgentSceneScopeModel,
+    AiCallHandoffAgentModel,
+)
+from app.config.setting import settings
+from app.services.ai_call.livekit_sip import (
+    SipOutboundConfig,
+    SipOutboundPreflightResult,
+    validate_sip_outbound_preflight,
+)
+
+from .linphone_test_schema import LinphoneTestCapabilityOut
+from .rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
+)
+
+DEFAULT_TENANT_ID = "000000"
+LINPHONE_ACTIVE_SLOT = "linphone_test"
+ACTIVE_ATTEMPT_STATUSES = ("DIALING", "IN_CALL")
+AGENT_HEARTBEAT_SECONDS = 30
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class LinphoneTestService:
+    """评估正式外呼任务能否进入本机 Linphone 测试。"""
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        settings_obj: Any = settings,
+        now: Callable[[], datetime] = _utc_now,
+        sip_preflight: Callable[[str], SipOutboundPreflightResult] | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.settings = settings_obj
+        self.now = now
+        self.sip_preflight = sip_preflight or self._default_sip_preflight
+
+    async def get_capability(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        task_id: int,
+    ) -> LinphoneTestCapabilityOut:
+        enabled = bool(self.settings.AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED)
+        if not enabled:
+            return self._unavailable(
+                enabled=False,
+                reason="Linphone 测试功能未启用",
+            )
+        if tenant_id != DEFAULT_TENANT_ID:
+            return self._unavailable(
+                enabled=True,
+                reason="Linphone 测试仅支持默认租户 000000",
+            )
+
+        task = await db.scalar(
+            select(AiCallOutboundTaskModel)
+            .where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.id == task_id,
+            )
+            .limit(1)
+        )
+        if task is None:
+            return self._unavailable(enabled=True, reason="外呼任务不存在")
+
+        available_agent_count = await self._available_agent_count(
+            db,
+            tenant_id=tenant_id,
+            scene_code=task.scene_code,
+        )
+        same_task_active = await self._active_attempt(
+            db,
+            tenant_id=tenant_id,
+            task_id=task_id,
+        )
+        if same_task_active is not None:
+            return self._unavailable(
+                enabled=True,
+                reason="该任务已有进行中的 Linphone 测试通话",
+                available_agent_count=available_agent_count,
+                active_call_id=same_task_active.call_id,
+                can_end_active_call=True,
+            )
+
+        if task.status != "SCHEDULED":
+            return self._unavailable(
+                enabled=True,
+                reason="仅支持状态为 SCHEDULED 的外呼任务",
+                available_agent_count=available_agent_count,
+            )
+        if task.task_mode != "single":
+            return self._unavailable(
+                enabled=True,
+                reason="仅支持 single 模式的外呼任务",
+                available_agent_count=available_agent_count,
+            )
+
+        targets = list(
+            (
+                await db.scalars(
+                    select(AiCallOutboundTargetModel)
+                    .where(
+                        AiCallOutboundTargetModel.tenant_id == tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_id,
+                    )
+                    .order_by(AiCallOutboundTargetModel.id)
+                    .limit(2)
+                )
+            ).all()
+        )
+        if len(targets) != 1:
+            return self._unavailable(
+                enabled=True,
+                reason="任务必须且只能包含一条外呼对象",
+                available_agent_count=available_agent_count,
+            )
+
+        target = targets[0]
+        if target.status != "PENDING":
+            return self._unavailable(
+                enabled=True,
+                reason="外呼对象必须处于 PENDING 状态",
+                available_agent_count=available_agent_count,
+            )
+        if target.phone_number != self.settings.AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE:
+            return self._unavailable(
+                enabled=True,
+                reason="外呼号码必须为允许的 Linphone 测试号码",
+                available_agent_count=available_agent_count,
+            )
+
+        other_task_active = await db.scalar(
+            select(AiCallOutboundAttemptModel.id)
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.task_id != task_id,
+                AiCallOutboundAttemptModel.active_slot == LINPHONE_ACTIVE_SLOT,
+                AiCallOutboundAttemptModel.status.in_(ACTIVE_ATTEMPT_STATUSES),
+            )
+            .limit(1)
+        )
+        if other_task_active is not None:
+            return self._unavailable(
+                enabled=True,
+                reason="当前租户已有其他任务进行中的 Linphone 测试通话",
+                available_agent_count=available_agent_count,
+            )
+
+        preflight = self.sip_preflight(target.phone_number)
+        if not preflight.ok:
+            return self._unavailable(
+                enabled=True,
+                reason=preflight.message or "SIP 外呼预检失败",
+                available_agent_count=available_agent_count,
+            )
+
+        return LinphoneTestCapabilityOut(
+            enabled=True,
+            eligible=True,
+            available_agent_count=available_agent_count,
+        )
+
+    async def _active_attempt(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        task_id: int,
+    ) -> AiCallOutboundAttemptModel | None:
+        return await db.scalar(
+            select(AiCallOutboundAttemptModel)
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.task_id == task_id,
+                AiCallOutboundAttemptModel.active_slot == LINPHONE_ACTIVE_SLOT,
+                AiCallOutboundAttemptModel.status.in_(ACTIVE_ATTEMPT_STATUSES),
+            )
+            .order_by(AiCallOutboundAttemptModel.started_at.desc())
+            .limit(1)
+        )
+
+    async def _available_agent_count(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        scene_code: str,
+    ) -> int:
+        cutoff = self.now() - timedelta(seconds=AGENT_HEARTBEAT_SECONDS)
+        count = await db.scalar(
+            select(func.count(func.distinct(AiCallAgentProfileModel.agent_identity)))
+            .select_from(AiCallAgentProfileModel)
+            .join(
+                AiCallAgentSceneScopeModel,
+                and_(
+                    AiCallAgentSceneScopeModel.tenant_id == AiCallAgentProfileModel.tenant_id,
+                    AiCallAgentSceneScopeModel.agent_identity
+                    == AiCallAgentProfileModel.agent_identity,
+                ),
+            )
+            .join(
+                AiCallHandoffAgentModel,
+                and_(
+                    AiCallHandoffAgentModel.tenant_id == AiCallAgentProfileModel.tenant_id,
+                    AiCallHandoffAgentModel.agent_identity
+                    == AiCallAgentProfileModel.agent_identity,
+                ),
+            )
+            .where(
+                AiCallAgentProfileModel.tenant_id == tenant_id,
+                AiCallAgentProfileModel.enabled.is_(True),
+                AiCallAgentSceneScopeModel.scene_code == scene_code,
+                AiCallHandoffAgentModel.status == "available",
+                AiCallHandoffAgentModel.active_handoff_id.is_(None),
+                AiCallHandoffAgentModel.last_seen_at.is_not(None),
+                AiCallHandoffAgentModel.last_seen_at >= cutoff,
+            )
+        )
+        return int(count or 0)
+
+    def _default_sip_preflight(
+        self,
+        callee_phone_number: str,
+    ) -> SipOutboundPreflightResult:
+        config = SipOutboundConfig.from_settings(self.settings)
+        return validate_sip_outbound_preflight(
+            config,
+            callee_phone_number=callee_phone_number,
+        )
+
+    @staticmethod
+    def _unavailable(
+        *,
+        enabled: bool,
+        reason: str,
+        available_agent_count: int = 0,
+        active_call_id: str | None = None,
+        can_end_active_call: bool = False,
+    ) -> LinphoneTestCapabilityOut:
+        return LinphoneTestCapabilityOut(
+            enabled=enabled,
+            eligible=False,
+            reasons=[reason],
+            available_agent_count=available_agent_count,
+            active_call_id=active_call_id,
+            can_end_active_call=can_end_active_call,
+        )

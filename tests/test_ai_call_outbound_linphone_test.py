@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +10,16 @@ from sqlalchemy import String, UniqueConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel
+from app.api.v1.ai_call.model import (
+    AiCallAgentProfileModel,
+    AiCallAgentSceneScopeModel,
+    AiCallHandoffAgentModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
+)
 from app.api.v1.ai_call.outbound.task_executor import OutboundDialRequest
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
@@ -73,6 +82,12 @@ def test_linphone_command_schema_uses_camel_case_and_string_ids() -> None:
     }
 
 
+def test_linphone_test_service_is_importable() -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    assert LinphoneTestService is not None
+
+
 def test_linphone_safety_settings_are_closed_by_default() -> None:
     assert Settings.model_fields["AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED"].default is False
     assert (
@@ -87,6 +102,417 @@ def test_linphone_safety_settings_are_closed_by_default() -> None:
         == 30
     )
     assert Settings.model_fields["AI_CALL_OUTBOUND_EXECUTOR_ENABLED"].default is False
+
+
+CAPABILITY_NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+ALLOWED_CALLEE = "19900001001"
+
+
+def _linphone_settings(
+    *,
+    enabled: bool = True,
+    allowed_callee: str = ALLOWED_CALLEE,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED=enabled,
+        AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE=allowed_callee,
+    )
+
+
+class _PreflightFake:
+    def __init__(self, *, ok: bool = True, message: str | None = None) -> None:
+        self.ok = ok
+        self.message = message
+        self.calls: list[str] = []
+
+    def __call__(self, callee_phone_number: str) -> SimpleNamespace:
+        self.calls.append(callee_phone_number)
+        return SimpleNamespace(ok=self.ok, message=self.message)
+
+
+def _outbound_task(
+    *,
+    task_id: int = 1001,
+    tenant_id: str = "000000",
+    status: str = "SCHEDULED",
+    task_mode: str = "single",
+    scene_code: str = "intro_contract",
+) -> AiCallOutboundTaskModel:
+    return AiCallOutboundTaskModel(
+        id=task_id,
+        tenant_id=tenant_id,
+        validation_id=2001,
+        idempotency_key=f"task-{task_id}",
+        request_fingerprint=f"fingerprint-{task_id}",
+        task_name=f"task-{task_id}",
+        task_mode=task_mode,
+        status=status,
+        total_targets=1,
+        completed_targets=0,
+        connected_targets=0,
+        failed_targets=0,
+        execution_mode="manual",
+        prompt_profile_id=None,
+        prompt_name="测试提示词",
+        scene_code=scene_code,
+        voice="Cherry",
+        voice_name="测试音色",
+        rule_id=3001,
+        rule_name="测试规则",
+        rule_summary="测试规则摘要",
+        config_snapshot_json="{}",
+        created_by=1,
+        created_by_name="tester",
+        created_at=CAPABILITY_NOW,
+        updated_at=CAPABILITY_NOW,
+    )
+
+
+def _outbound_target(
+    target_id: int = 4001,
+    *,
+    task_id: int = 1001,
+    tenant_id: str = "000000",
+    phone_number: str = ALLOWED_CALLEE,
+    status: str = "PENDING",
+) -> AiCallOutboundTargetModel:
+    return AiCallOutboundTargetModel(
+        id=target_id,
+        tenant_id=tenant_id,
+        task_id=task_id,
+        validation_id=2001,
+        source_validation_row_id=target_id + 10000,
+        source_row_number=target_id,
+        phone_number=phone_number,
+        customer_name="测试客户",
+        status=status,
+        attempt_count=0,
+        created_at=CAPABILITY_NOW,
+        updated_at=CAPABILITY_NOW,
+    )
+
+
+def _active_linphone_attempt(
+    attempt_id: int,
+    *,
+    task_id: int,
+    tenant_id: str = "000000",
+    status: str = "DIALING",
+) -> AiCallOutboundAttemptModel:
+    return AiCallOutboundAttemptModel(
+        id=attempt_id,
+        tenant_id=tenant_id,
+        task_id=task_id,
+        target_id=attempt_id + 10000,
+        attempt_no=1,
+        call_id=f"active-call-{attempt_id}",
+        dialer_type="linphone_test",
+        test_scenario="ai_only",
+        command_idempotency_key=f"command-{attempt_id}",
+        active_slot="linphone_test",
+        status=status,
+        started_at=CAPABILITY_NOW,
+        created_at=CAPABILITY_NOW,
+        updated_at=CAPABILITY_NOW,
+    )
+
+
+async def _seed_capability_task(
+    database,
+    *,
+    task: AiCallOutboundTaskModel | None = None,
+    targets: list[AiCallOutboundTargetModel] | None = None,
+    attempts: list[AiCallOutboundAttemptModel] | None = None,
+) -> None:
+    async with database() as session, session.begin():
+        if task is not None:
+            session.add(task)
+        session.add_all(targets or [])
+        session.add_all(attempts or [])
+
+
+async def _get_capability(
+    database,
+    *,
+    tenant_id: str = "000000",
+    task_id: int = 1001,
+    settings_obj: SimpleNamespace | None = None,
+    preflight: _PreflightFake | None = None,
+):
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    fake = preflight or _PreflightFake()
+    service = LinphoneTestService(
+        session_factory=database,
+        settings_obj=settings_obj or _linphone_settings(),
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=fake,
+    )
+    async with database() as session:
+        result = await service.get_capability(session, tenant_id, task_id)
+    return result, fake
+
+
+@pytest.mark.anyio
+async def test_capability_returns_early_when_feature_is_disabled(database) -> None:
+    result, preflight = await _get_capability(
+        database,
+        settings_obj=_linphone_settings(enabled=False),
+    )
+
+    assert result.enabled is False
+    assert result.eligible is False
+    assert result.reasons == ["Linphone 测试功能未启用"]
+    assert preflight.calls == []
+
+
+@pytest.mark.anyio
+async def test_capability_rejects_non_default_tenant_without_querying_sip(database) -> None:
+    result, preflight = await _get_capability(database, tenant_id="tenant-a")
+
+    assert result.eligible is False
+    assert result.reasons == ["Linphone 测试仅支持默认租户 000000"]
+    assert preflight.calls == []
+
+
+@pytest.mark.anyio
+async def test_capability_rejects_missing_task(database) -> None:
+    result, preflight = await _get_capability(database)
+
+    assert result.eligible is False
+    assert result.reasons == ["外呼任务不存在"]
+    assert preflight.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("task", "targets", "attempts", "expected_reason"),
+    [
+        (
+            _outbound_task(status="RUNNING"),
+            [_outbound_target()],
+            [],
+            "仅支持状态为 SCHEDULED 的外呼任务",
+        ),
+        (
+            _outbound_task(task_mode="batch"),
+            [_outbound_target()],
+            [],
+            "仅支持 single 模式的外呼任务",
+        ),
+        (
+            _outbound_task(),
+            [_outbound_target(), _outbound_target(4002)],
+            [],
+            "任务必须且只能包含一条外呼对象",
+        ),
+        (
+            _outbound_task(),
+            [_outbound_target(status="DIALING")],
+            [],
+            "外呼对象必须处于 PENDING 状态",
+        ),
+        (
+            _outbound_task(),
+            [_outbound_target(phone_number="19900001002")],
+            [],
+            "外呼号码必须为允许的 Linphone 测试号码",
+        ),
+        (
+            _outbound_task(),
+            [_outbound_target()],
+            [_active_linphone_attempt(5001, task_id=1002)],
+            "当前租户已有其他任务进行中的 Linphone 测试通话",
+        ),
+    ],
+)
+async def test_capability_rejects_ineligible_task_states(
+    database,
+    task,
+    targets,
+    attempts,
+    expected_reason,
+) -> None:
+    await _seed_capability_task(
+        database,
+        task=task,
+        targets=targets,
+        attempts=attempts,
+    )
+
+    result, _ = await _get_capability(database)
+
+    assert result.eligible is False
+    assert result.reasons == [expected_reason]
+    assert result.can_end_active_call is False
+
+
+@pytest.mark.anyio
+async def test_capability_uses_preflight_failure_message(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(),
+        targets=[_outbound_target()],
+    )
+    preflight = _PreflightFake(ok=False, message="SIP trunk 配置缺失")
+
+    result, preflight = await _get_capability(database, preflight=preflight)
+
+    assert result.eligible is False
+    assert result.reasons == ["SIP trunk 配置缺失"]
+    assert preflight.calls == [ALLOWED_CALLEE]
+
+
+@pytest.mark.anyio
+async def test_capability_is_eligible_for_single_pending_allowed_target(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(),
+        targets=[_outbound_target()],
+    )
+
+    result, preflight = await _get_capability(database)
+
+    assert result.enabled is True
+    assert result.eligible is True
+    assert result.reasons == []
+    assert result.active_call_id is None
+    assert result.can_end_active_call is False
+    assert preflight.calls == [ALLOWED_CALLEE]
+
+
+@pytest.mark.anyio
+async def test_capability_exposes_same_task_active_call(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(status="RUNNING"),
+        targets=[_outbound_target(status="DIALING")],
+        attempts=[_active_linphone_attempt(5001, task_id=1001, status="IN_CALL")],
+    )
+
+    result, preflight = await _get_capability(database)
+
+    assert result.eligible is False
+    assert result.reasons == ["该任务已有进行中的 Linphone 测试通话"]
+    assert result.active_call_id == "active-call-5001"
+    assert result.can_end_active_call is True
+    assert preflight.calls == []
+
+
+async def _seed_agent(
+    database,
+    *,
+    row_id: int,
+    agent_identity: str,
+    tenant_id: str = "000000",
+    enabled: bool = True,
+    scene_codes: tuple[str, ...] = ("intro_contract",),
+    status: str = "available",
+    last_seen_at: datetime | None = CAPABILITY_NOW,
+    active_handoff_id: str | None = None,
+) -> None:
+    async with database() as session, session.begin():
+        session.add(
+            AiCallAgentProfileModel(
+                id=row_id,
+                tenant_id=tenant_id,
+                agent_identity=agent_identity,
+                user_id=row_id,
+                enabled=enabled,
+                created_by=1,
+                created_at=CAPABILITY_NOW,
+                updated_by=1,
+                updated_at=CAPABILITY_NOW,
+            )
+        )
+        session.add_all(
+            [
+                AiCallAgentSceneScopeModel(
+                    id=row_id * 100 + index,
+                    tenant_id=tenant_id,
+                    agent_identity=agent_identity,
+                    scene_code=scene_code,
+                    created_by=1,
+                    created_at=CAPABILITY_NOW,
+                )
+                for index, scene_code in enumerate(scene_codes, start=1)
+            ]
+        )
+        session.add(
+            AiCallHandoffAgentModel(
+                id=row_id,
+                tenant_id=tenant_id,
+                agent_identity=agent_identity,
+                skill_group="default",
+                status=status,
+                active_handoff_id=active_handoff_id,
+                active_call_id=None,
+                console_session_id=f"session-{row_id}",
+                last_seen_at=last_seen_at,
+                status_updated_at=CAPABILITY_NOW,
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_capability_counts_only_distinct_available_agents_in_scene(database) -> None:
+    await _seed_capability_task(
+        database,
+        task=_outbound_task(),
+        targets=[_outbound_target()],
+    )
+    await _seed_agent(
+        database,
+        row_id=1,
+        agent_identity="eligible",
+        scene_codes=("intro_contract", "intro_document"),
+    )
+    await _seed_agent(
+        database,
+        row_id=2,
+        agent_identity="other-tenant",
+        tenant_id="tenant-a",
+    )
+    await _seed_agent(
+        database,
+        row_id=3,
+        agent_identity="disabled",
+        enabled=False,
+    )
+    await _seed_agent(
+        database,
+        row_id=4,
+        agent_identity="wrong-scope",
+        scene_codes=("intro_document",),
+    )
+    await _seed_agent(
+        database,
+        row_id=5,
+        agent_identity="paused",
+        status="paused",
+    )
+    await _seed_agent(
+        database,
+        row_id=6,
+        agent_identity="offline",
+        status="offline",
+    )
+    await _seed_agent(
+        database,
+        row_id=7,
+        agent_identity="stale",
+        last_seen_at=CAPABILITY_NOW - timedelta(seconds=31),
+    )
+    await _seed_agent(
+        database,
+        row_id=8,
+        agent_identity="active-handoff",
+        active_handoff_id="handoff-8",
+    )
+
+    result, _ = await _get_capability(database)
+
+    assert result.available_agent_count == 1
 
 
 def _attempt(
