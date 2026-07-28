@@ -505,7 +505,7 @@ class OutboundRuleTaskService:
         task_id: int,
         request: UpdateTaskScheduleRequest,
     ) -> AcceptedCommandOut:
-        task = await self._get_task(db, tenant_id, task_id)
+        task = await self._get_task_for_update(db, tenant_id, task_id)
         if task.status != "SCHEDULED":
             raise CustomException(
                 msg="仅待执行任务可以修改名称和计划执行时间",
@@ -526,19 +526,7 @@ class OutboundRuleTaskService:
         task_id: int,
         action: str,
     ) -> AcceptedCommandOut:
-        task = await db.scalar(
-            select(AiCallOutboundTaskModel)
-            .where(
-                AiCallOutboundTaskModel.tenant_id == tenant_id,
-                AiCallOutboundTaskModel.id == task_id,
-            )
-            .with_for_update()
-        )
-        if task is None:
-            raise CustomException(
-                msg="外呼任务不存在",
-                status_code=status.HTTP_404_NOT_FOUND,
-            )
+        task = await self._get_task_for_update(db, tenant_id, task_id)
         allowed = {
             "pause": {"RUNNING"},
             "resume": {"PAUSED"},
@@ -776,6 +764,27 @@ class OutboundRuleTaskService:
                 AiCallOutboundTaskModel.tenant_id == tenant_id,
                 AiCallOutboundTaskModel.id == task_id,
             )
+        )
+        if task is None:
+            raise CustomException(
+                msg="外呼任务不存在",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return task
+
+    @staticmethod
+    async def _get_task_for_update(
+        db: AsyncSession,
+        tenant_id: str,
+        task_id: int,
+    ) -> AiCallOutboundTaskModel:
+        task = await db.scalar(
+            select(AiCallOutboundTaskModel)
+            .where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.id == task_id,
+            )
+            .with_for_update()
         )
         if task is None:
             raise CustomException(

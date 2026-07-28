@@ -81,6 +81,29 @@ def _create_task_request(config: dict, validation_id: int) -> CreateTaskRequest:
     })
 
 
+@pytest.mark.anyio
+async def test_task_write_query_uses_row_lock() -> None:
+    marker = object()
+
+    class CapturingSession:
+        statement = None
+
+        async def scalar(self, statement):
+            self.statement = statement
+            return marker
+
+    session = CapturingSession()
+    result = await OutboundRuleTaskService._get_task_for_update(
+        session,
+        "tenant-a",
+        123,
+    )
+
+    assert result is marker
+    assert session.statement is not None
+    assert session.statement._for_update_arg is not None
+
+
 @pytest.fixture
 async def database(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'outbound-task.db'}")
