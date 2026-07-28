@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -19,6 +19,7 @@ from app.api.v1.ai_call.model import (
 )
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.core.logger import log
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     SipOutboundPreflightResult,
@@ -38,6 +39,8 @@ from .rule_task_model import (
 from .rule_task_schema import AcceptedCommandOut
 from .task_executor import (
     ClaimedAttempt,
+    DialResult,
+    OutboundDialRequest,
     OutboundTaskExecutor,
     TaskKey,
 )
@@ -97,6 +100,7 @@ class LinphoneTestService:
         executor: OutboundTaskExecutor | None = None,
         dispatch: Callable[[ClaimedAttempt], None] | None = None,
         ai_call_service_factory: Callable[[AsyncSession], Any] | None = None,
+        room_exists: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.settings = settings_obj
@@ -107,6 +111,7 @@ class LinphoneTestService:
         self.ai_call_service_factory = (
             ai_call_service_factory or self._default_ai_call_service_factory
         )
+        self.room_exists = room_exists or self._default_room_exists
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._end_command_results: dict[
             tuple[str, int, str],
@@ -423,6 +428,199 @@ class LinphoneTestService:
             self._end_command_results[result_key] = result
             return result
 
+    async def reconcile_once(self) -> int:
+        """恢复重启后遗留的本机 Linphone 活动测试。"""
+        async with self.session_factory() as db:
+            attempt_ids = list(
+                (
+                    await db.scalars(
+                        select(AiCallOutboundAttemptModel.id)
+                        .where(
+                            AiCallOutboundAttemptModel.dialer_type
+                            == LINPHONE_ACTIVE_SLOT,
+                            AiCallOutboundAttemptModel.status.in_(
+                                ACTIVE_ATTEMPT_STATUSES
+                            ),
+                            AiCallOutboundAttemptModel.active_slot
+                            == LINPHONE_ACTIVE_SLOT,
+                        )
+                        .order_by(AiCallOutboundAttemptModel.started_at)
+                        .limit(50)
+                    )
+                ).all()
+            )
+
+        recovered = 0
+        for attempt_id in attempt_ids:
+            if await self._reconcile_attempt(attempt_id):
+                recovered += 1
+        return recovered
+
+    async def _reconcile_attempt(self, attempt_id: int) -> bool:
+        now = self.now()
+        async with self.session_factory() as db:
+            attempt = await db.scalar(
+                select(AiCallOutboundAttemptModel)
+                .where(
+                    AiCallOutboundAttemptModel.id == attempt_id,
+                    AiCallOutboundAttemptModel.dialer_type
+                    == LINPHONE_ACTIVE_SLOT,
+                    AiCallOutboundAttemptModel.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                    AiCallOutboundAttemptModel.active_slot == LINPHONE_ACTIVE_SLOT,
+                )
+                .limit(1)
+            )
+            if attempt is None:
+                return False
+            task = await db.scalar(
+                select(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == attempt.tenant_id,
+                    AiCallOutboundTaskModel.id == attempt.task_id,
+                )
+                .limit(1)
+            )
+            target = await db.scalar(
+                select(AiCallOutboundTargetModel)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == attempt.tenant_id,
+                    AiCallOutboundTargetModel.task_id == attempt.task_id,
+                    AiCallOutboundTargetModel.id == attempt.target_id,
+                )
+                .limit(1)
+            )
+            if task is None or target is None:
+                return False
+            record = await db.scalar(
+                select(AiCallRecordModel)
+                .where(AiCallRecordModel.call_id == attempt.call_id)
+                .limit(1)
+            )
+
+            if record is not None and str(record.status or "").lower() in {
+                "completed",
+                "failed",
+            }:
+                result = self._dial_result_from_record(record, now)
+            else:
+                if record is not None and await self.room_exists(record.room_name):
+                    return False
+                if not self._recovery_grace_elapsed(attempt.started_at, now):
+                    return False
+                if record is None:
+                    result = DialResult(
+                        call_result="call_failed",
+                        error_message="Linphone 测试恢复失败：宽限期内未生成通话记录",
+                    )
+                else:
+                    record.status = "failed"
+                    record.end_reason = "linphone_test_recovery_room_missing"
+                    record.failure_stage = "linphone_test_recovery"
+                    record.failure_message = (
+                        "Linphone 测试恢复失败：LiveKit Room 已不存在"
+                    )
+                    record.ended_at = now
+                    if record.answered_at is not None:
+                        record.duration_ms = self._duration_ms(
+                            record.answered_at,
+                            now,
+                        )
+                    await db.commit()
+                    result = self._dial_result_from_record(record, now)
+
+            request = OutboundDialRequest(
+                tenant_id=attempt.tenant_id,
+                task_id=task.id,
+                target_id=target.id,
+                attempt_no=attempt.attempt_no,
+                phone_number=target.phone_number,
+                customer_name=target.customer_name,
+                scene_code=task.scene_code,
+                voice=task.voice,
+                prompt_profile_id=task.prompt_profile_id,
+            )
+            call_id = attempt.call_id
+
+        await self.executor._finish_attempt(request, call_id, result, now)
+        return True
+
+    def _recovery_grace_elapsed(
+        self,
+        started_at: datetime,
+        now: datetime,
+    ) -> bool:
+        grace_seconds = max(
+            0,
+            int(
+                getattr(
+                    self.settings,
+                    "AI_CALL_OUTBOUND_LINPHONE_RECOVERY_GRACE_SECONDS",
+                    30,
+                )
+            ),
+        )
+        return self._duration_ms(started_at, now) >= grace_seconds * 1000
+
+    @classmethod
+    def _dial_result_from_record(
+        cls,
+        record: AiCallRecordModel,
+        now: datetime,
+    ) -> DialResult:
+        if record.answered_at is not None:
+            return DialResult(
+                call_result="connected",
+                duration_ms=cls._duration_ms(
+                    record.answered_at,
+                    record.ended_at or now,
+                ),
+            )
+        end_reason = str(record.end_reason or "").strip()
+        normalized_reason = end_reason.lower()
+        if normalized_reason in {
+            "busy",
+            "busy_here",
+            "callee_busy",
+            "sip_busy",
+            "user_busy",
+        }:
+            call_result = "busy"
+        elif normalized_reason in {
+            "connect_timeout",
+            "no_answer",
+            "ringing_timeout",
+            "sip_connect_timeout",
+            "user_unavailable",
+        }:
+            call_result = "no_answer"
+        else:
+            call_result = "call_failed"
+        return DialResult(
+            call_result=call_result,
+            error_message=(
+                record.failure_message or end_reason or "Linphone 测试恢复失败"
+            ),
+        )
+
+    @staticmethod
+    def _duration_ms(started_at: datetime, ended_at: datetime) -> int:
+        if started_at.tzinfo is None and ended_at.tzinfo is not None:
+            started_at = started_at.replace(tzinfo=ended_at.tzinfo)
+        elif started_at.tzinfo is not None and ended_at.tzinfo is None:
+            ended_at = ended_at.replace(tzinfo=started_at.tzinfo)
+        return max(0, int((ended_at - started_at).total_seconds() * 1000))
+
+    async def _default_room_exists(self, room_name: str) -> bool:
+        from app.services.ai_call.livekit_room import LiveKitRoomManager
+
+        manager = LiveKitRoomManager(
+            self.settings.LIVEKIT_URL,
+            self.settings.LIVEKIT_API_KEY,
+            self.settings.LIVEKIT_API_SECRET,
+            self.settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
+        )
+        return await manager.room_exists(room_name)
+
     async def _active_attempt(
         self,
         db: AsyncSession,
@@ -562,3 +760,50 @@ class LinphoneTestService:
             active_call_id=active_call_id,
             can_end_active_call=can_end_active_call,
         )
+
+
+class LinphoneTestRecoveryWorker:
+    """周期性恢复因 API 进程重启而遗留的 Linphone 测试。"""
+
+    def __init__(
+        self,
+        service: LinphoneTestService,
+        *,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        self.service = service
+        self.poll_interval_seconds = max(0.05, poll_interval_seconds)
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(
+            self._run(),
+            name="ai-call-linphone-test-recovery-worker",
+        )
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self.service.reconcile_once()
+            except Exception:
+                log.exception("AI Call 本机 Linphone 测试恢复 worker 轮询失败")
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(),
+                    timeout=self.poll_interval_seconds,
+                )
+            except TimeoutError:
+                continue

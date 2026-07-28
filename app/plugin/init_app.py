@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
     await _recover_ai_call_outbound_validations()
     ai_call_outbound_task_worker = await _start_ai_call_outbound_task_worker()
+    ai_call_linphone_test_worker = await _start_ai_call_linphone_test_worker()
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             await _init_ai_call_standalone_oss_config()
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
             yield
             log.info("✅ AI Call standalone 模式关闭")
         finally:
+            await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
             await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
             await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
             await _stop_ai_call_event_worker(ai_call_event_worker)
@@ -78,6 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         )
 
     except Exception as e:
+        await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
         await _stop_ai_call_event_worker(ai_call_event_worker)
@@ -91,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     try:
         yield
     finally:
+        await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
         await _stop_ai_call_event_worker(ai_call_event_worker)
@@ -152,6 +156,38 @@ async def _stop_ai_call_outbound_task_worker(worker) -> None:
         return
     await worker.stop()
     log.info("✅ AI Call 通用外呼模拟执行器已关闭")
+
+
+async def _start_ai_call_linphone_test_worker():
+    if (
+        not settings.SQL_DB_ENABLE
+        or not settings.AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED
+    ):
+        return None
+    from app.api.v1.ai_call.outbound.linphone_test_service import (
+        LinphoneTestRecoveryWorker,
+        LinphoneTestService,
+    )
+    from app.core.database import async_db_session
+
+    service = LinphoneTestService(async_db_session)
+    worker = LinphoneTestRecoveryWorker(
+        service,
+        poll_interval_seconds=settings.AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS,
+    )
+    await worker.start()
+    log.warning(
+        "AI Call 本机 Linphone 测试恢复 worker 已启动；"
+        "普通任务自动执行器保持独立开关"
+    )
+    return worker
+
+
+async def _stop_ai_call_linphone_test_worker(worker) -> None:
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 本机 Linphone 测试恢复 worker 已关闭")
 
 
 async def _start_ai_call_event_worker():

@@ -1194,6 +1194,292 @@ def test_linphone_test_postgres_migration_adds_columns_and_unique_indexes() -> N
     assert "jsonb" not in migration
 
 
+async def _seed_recovery_case(
+    database,
+    *,
+    record_status: str | None,
+    room_exists: bool,
+    age_seconds: int = 31,
+    answered: bool = False,
+    attempt_status: str = "IN_CALL",
+):
+    from app.api.v1.ai_call.outbound.linphone_test_service import LinphoneTestService
+
+    started_at = CAPABILITY_NOW - timedelta(seconds=age_seconds)
+    task = _outbound_task(status="RUNNING")
+    task.started_at = started_at
+    target = _outbound_target(status=attempt_status)
+    target.attempt_count = 1
+    attempt = _active_linphone_attempt(
+        5001,
+        task_id=task.id,
+        status=attempt_status,
+    )
+    attempt.target_id = target.id
+    attempt.call_id = "recovery-call-1"
+    attempt.started_at = started_at
+    attempt.created_at = started_at
+    attempt.updated_at = started_at
+    async with database() as session, session.begin():
+        session.add_all([task, target, attempt])
+        if record_status is not None:
+            session.add(
+                AiCallRecordModel(
+                    id=6001,
+                    call_id=attempt.call_id,
+                    business_type="outbound_task",
+                    business_id=str(task.id),
+                    scene_code=task.scene_code,
+                    entry_type="sip_outbound",
+                    room_name="room-recovery-call-1",
+                    participant_identity="sip-recovery-call-1",
+                    status=record_status,
+                    started_at=started_at,
+                    answered_at=(
+                        started_at + timedelta(seconds=1) if answered else None
+                    ),
+                    ended_at=(
+                        CAPABILITY_NOW
+                        if record_status in {"completed", "failed"}
+                        else None
+                    ),
+                )
+            )
+
+    async def fake_room_exists(room_name: str) -> bool:
+        assert room_name == "room-recovery-call-1"
+        return room_exists
+
+    settings_obj = _linphone_settings()
+    settings_obj.AI_CALL_OUTBOUND_LINPHONE_RECOVERY_GRACE_SECONDS = 30
+    return LinphoneTestService(
+        database,
+        settings_obj=settings_obj,
+        now=lambda: CAPABILITY_NOW,
+        sip_preflight=_PreflightFake(),
+        room_exists=fake_room_exists,
+    )
+
+
+async def _load_recovery_state(database) -> dict[str, Any]:
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, 1001)
+        target = await session.get(AiCallOutboundTargetModel, 4001)
+        attempt = await session.get(AiCallOutboundAttemptModel, 5001)
+        record = await session.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == "recovery-call-1"
+            )
+        )
+    return {
+        "task": task,
+        "target": target,
+        "attempt": attempt,
+        "record": record,
+    }
+
+
+@pytest.mark.anyio
+async def test_recovery_finishes_terminal_record(database) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status="completed",
+        room_exists=False,
+        answered=True,
+    )
+
+    assert await service.reconcile_once() == 1
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "COMPLETED"
+    assert state["attempt"].active_slot is None
+    assert state["attempt"].call_result == "connected"
+    assert state["target"].status == "COMPLETED"
+    assert state["target"].latest_result == "connected"
+    assert state["task"].status == "COMPLETED"
+    assert state["task"].completed_targets == 1
+    assert state["task"].connected_targets == 1
+    assert state["record"].status == "completed"
+
+
+@pytest.mark.anyio
+async def test_recovery_keeps_active_record_when_room_exists(database) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status="connected",
+        room_exists=True,
+    )
+
+    assert await service.reconcile_once() == 0
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "IN_CALL"
+    assert state["attempt"].active_slot == "linphone_test"
+    assert state["attempt"].call_result is None
+    assert state["target"].status == "IN_CALL"
+    assert state["target"].latest_result is None
+    assert state["task"].status == "RUNNING"
+    assert state["task"].completed_targets == 0
+    assert state["record"].status == "connected"
+
+
+@pytest.mark.anyio
+async def test_recovery_waits_inside_missing_room_grace(database) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status="connected",
+        room_exists=False,
+        age_seconds=10,
+    )
+
+    assert await service.reconcile_once() == 0
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "IN_CALL"
+    assert state["attempt"].active_slot == "linphone_test"
+    assert state["attempt"].call_result is None
+    assert state["target"].status == "IN_CALL"
+    assert state["target"].latest_result is None
+    assert state["task"].status == "RUNNING"
+    assert state["record"].status == "connected"
+
+
+@pytest.mark.anyio
+async def test_recovery_fails_unanswered_call_after_room_grace(database) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status="ready",
+        room_exists=False,
+        answered=False,
+    )
+
+    assert await service.reconcile_once() == 1
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "FAILED"
+    assert state["attempt"].active_slot is None
+    assert state["attempt"].call_result == "call_failed"
+    assert state["target"].status == "COMPLETED"
+    assert state["target"].latest_result == "call_failed"
+    assert state["task"].status == "COMPLETED"
+    assert state["task"].completed_targets == 1
+    assert state["task"].failed_targets == 1
+    assert state["record"].status == "failed"
+    assert state["record"].failure_stage == "linphone_test_recovery"
+    assert state["record"].failure_message
+
+
+@pytest.mark.anyio
+async def test_recovery_preserves_connected_result_when_answered_room_disappears(
+    database,
+) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status="connected",
+        room_exists=False,
+        answered=True,
+    )
+
+    assert await service.reconcile_once() == 1
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "COMPLETED"
+    assert state["attempt"].active_slot is None
+    assert state["attempt"].call_result == "connected"
+    assert state["target"].status == "COMPLETED"
+    assert state["target"].latest_result == "connected"
+    assert state["task"].status == "COMPLETED"
+    assert state["task"].connected_targets == 1
+    assert state["record"].status == "failed"
+    assert state["record"].failure_stage == "linphone_test_recovery"
+    assert state["record"].failure_message
+
+
+@pytest.mark.anyio
+async def test_recovery_fails_attempt_without_record_after_start_grace(
+    database,
+) -> None:
+    service = await _seed_recovery_case(
+        database,
+        record_status=None,
+        room_exists=False,
+    )
+
+    assert await service.reconcile_once() == 1
+    state = await _load_recovery_state(database)
+    assert state["attempt"].status == "FAILED"
+    assert state["attempt"].active_slot is None
+    assert state["attempt"].call_result == "call_failed"
+    assert state["target"].status == "COMPLETED"
+    assert state["target"].latest_result == "call_failed"
+    assert state["task"].status == "COMPLETED"
+    assert state["task"].failed_targets == 1
+    assert state["record"] is None
+
+
+class _RecoveryServiceFake:
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.recovered_after_error = asyncio.Event()
+
+    async def reconcile_once(self) -> int:
+        self.call_count += 1
+        if self.call_count == 1:
+            raise RuntimeError("temporary database error")
+        self.recovered_after_error.set()
+        return 0
+
+
+@pytest.mark.anyio
+async def test_recovery_worker_survives_one_round_failure() -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_service import (
+        LinphoneTestRecoveryWorker,
+    )
+
+    service = _RecoveryServiceFake()
+    worker = LinphoneTestRecoveryWorker(service, poll_interval_seconds=0.01)
+
+    await worker.start()
+    await asyncio.wait_for(service.recovered_after_error.wait(), timeout=1)
+    await worker.stop()
+
+    assert service.call_count >= 2
+
+
+@pytest.mark.anyio
+async def test_lifespan_starts_and_stops_linphone_recovery_worker(
+    monkeypatch,
+) -> None:
+    from app.plugin import init_app
+
+    app = FastAPI()
+    calls: list[tuple[str, Any]] = []
+    worker = object()
+
+    async def start_worker():
+        calls.append(("start", None))
+        return worker
+
+    async def stop_worker(value) -> None:
+        calls.append(("stop", value))
+
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_STANDALONE_ENABLE",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", False, raising=False)
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_RECORDING_ENABLED",
+        False,
+        raising=False,
+    )
+    monkeypatch.setattr(init_app, "_start_ai_call_linphone_test_worker", start_worker)
+    monkeypatch.setattr(init_app, "_stop_ai_call_linphone_test_worker", stop_worker)
+
+    async with init_app.lifespan(app):
+        assert calls == [("start", None)]
+
+    assert calls == [("start", None), ("stop", worker)]
+
+
 class _FakeSession:
     def __init__(self, owner: "_FakeSessionFactory", index: int) -> None:
         self.owner = owner
