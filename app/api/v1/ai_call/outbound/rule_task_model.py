@@ -169,6 +169,16 @@ class AiCallOutboundAttemptModel(MappedBase):
             "call_id",
             name="uk_outbound_attempt_call",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "command_idempotency_key",
+            name="uk_outbound_attempt_tenant_command",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "active_slot",
+            name="uk_outbound_attempt_tenant_active_slot",
+        ),
         Index(
             "idx_outbound_attempt_task",
             "tenant_id",
@@ -192,6 +202,10 @@ class AiCallOutboundAttemptModel(MappedBase):
     target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
     call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dialer_type: Mapped[str | None] = mapped_column(String(32))
+    test_scenario: Mapped[str | None] = mapped_column(String(32))
+    command_idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    active_slot: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     call_result: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(1000))
