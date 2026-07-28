@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 from pydantic import Field, field_validator
 
@@ -8,7 +8,7 @@ from .rule_task_schema import AcceptedCommandOut
 from .schema import OutboundSchema
 
 
-class LinphoneTestScenario(StrEnum):
+class LinphoneTestScenario(str, Enum):
     AI_ONLY = "ai_only"
     HANDOFF = "handoff"
 

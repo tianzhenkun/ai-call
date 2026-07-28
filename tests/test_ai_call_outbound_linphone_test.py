@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,8 +31,11 @@ def test_linphone_command_schema_uses_camel_case_and_string_ids() -> None:
         LinphoneTestAcceptedOut,
         LinphoneTestCapabilityOut,
         LinphoneTestRunIn,
+        LinphoneTestScenario,
     )
 
+    ai_only = LinphoneTestRunIn.model_validate({"scenario": "ai_only"})
+    handoff = LinphoneTestRunIn.model_validate({"scenario": "handoff"})
     capability = LinphoneTestCapabilityOut(
         enabled=True,
         eligible=False,
@@ -46,8 +50,13 @@ def test_linphone_command_schema_uses_camel_case_and_string_ids() -> None:
         call_id="call-1",
     )
 
-    assert LinphoneTestRunIn.model_validate({"scenario": "ai_only"}).scenario == "ai_only"
-    assert LinphoneTestRunIn.model_validate({"scenario": "handoff"}).scenario == "handoff"
+    assert LinphoneTestScenario.__bases__ == (str, Enum)
+    assert isinstance(ai_only.scenario.value, str)
+    assert isinstance(handoff.scenario.value, str)
+    assert ai_only.scenario == "ai_only"
+    assert handoff.scenario == "handoff"
+    assert ai_only.model_dump_json(by_alias=True) == '{"scenario":"ai_only"}'
+    assert handoff.model_dump_json(by_alias=True) == '{"scenario":"handoff"}'
     assert capability.model_dump(by_alias=True) == {
         "enabled": True,
         "eligible": False,
