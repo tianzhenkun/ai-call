@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     ai_call_offline_asr_worker = await _start_ai_call_offline_asr_worker()
     ai_call_recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
     ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
+    await _recover_ai_call_outbound_validations()
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             await _init_ai_call_standalone_oss_config()
@@ -346,6 +347,15 @@ async def _stop_ai_call_recording_reconcile_worker(worker) -> None:
         return
     await worker.stop()
     log.info("✅ AI Call 录音对账 worker 已关闭")
+
+
+async def _recover_ai_call_outbound_validations() -> None:
+    if not settings.SQL_DB_ENABLE:
+        return
+    from app.api.v1.ai_call.outbound.controller import get_outbound_validation_service
+
+    await get_outbound_validation_service().recover_pending()
+    log.info("✅ AI Call 通用外呼名单校验恢复扫描完成")
 
 
 def register_middlewares(app: FastAPI) -> None:
