@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel
 from app.api.v1.ai_call.outbound.task_executor import OutboundDialRequest
+from app.config.setting import Settings
 from app.core.base_model import MappedBase
 
 
@@ -22,6 +23,61 @@ async def database(tmp_path):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     yield factory
     await engine.dispose()
+
+
+def test_linphone_command_schema_uses_camel_case_and_string_ids() -> None:
+    from app.api.v1.ai_call.outbound.linphone_test_schema import (
+        LinphoneTestAcceptedOut,
+        LinphoneTestCapabilityOut,
+        LinphoneTestRunIn,
+    )
+
+    capability = LinphoneTestCapabilityOut(
+        enabled=True,
+        eligible=False,
+        reasons=["已有测试通话"],
+        available_agent_count=2,
+        active_call_id="call-1",
+        can_end_active_call=True,
+    )
+    accepted = LinphoneTestAcceptedOut(
+        task_id=1001,
+        attempt_id=2001,
+        call_id="call-1",
+    )
+
+    assert LinphoneTestRunIn.model_validate({"scenario": "ai_only"}).scenario == "ai_only"
+    assert LinphoneTestRunIn.model_validate({"scenario": "handoff"}).scenario == "handoff"
+    assert capability.model_dump(by_alias=True) == {
+        "enabled": True,
+        "eligible": False,
+        "reasons": ["已有测试通话"],
+        "availableAgentCount": 2,
+        "activeCallId": "call-1",
+        "canEndActiveCall": True,
+    }
+    assert accepted.model_dump(by_alias=True) == {
+        "accepted": True,
+        "taskId": "1001",
+        "attemptId": "2001",
+        "callId": "call-1",
+    }
+
+
+def test_linphone_safety_settings_are_closed_by_default() -> None:
+    assert Settings.model_fields["AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED"].default is False
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE"].default
+        == "19900001001"
+    )
+    assert Settings.model_fields["AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS"].default == 1.0
+    assert (
+        Settings.model_fields[
+            "AI_CALL_OUTBOUND_LINPHONE_RECOVERY_GRACE_SECONDS"
+        ].default
+        == 30
+    )
+    assert Settings.model_fields["AI_CALL_OUTBOUND_EXECUTOR_ENABLED"].default is False
 
 
 def _attempt(
