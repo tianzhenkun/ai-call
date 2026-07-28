@@ -153,11 +153,13 @@ class FakeRecordService:
         business_id: str | None,
         room_name: str,
         participant_identity: str,
+        business_type: str | None = None,
         callee_phone_number_hash: str | None = None,
         callee_phone_number_masked: str | None = None,
     ) -> None:
         self.created_sip_records.append({
             "call_id": call_id,
+            "business_type": business_type,
             "business_id": business_id,
             "room_name": room_name,
             "participant_identity": participant_identity,
@@ -682,6 +684,7 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     assert record_service.created_sip_records == [
         {
             "call_id": result.call_id,
+            "business_type": None,
             "business_id": "geo_task_001",
             "room_name": result.room_name,
             "participant_identity": result.participant_identity,
@@ -736,6 +739,50 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     }
     assert sip_answered.source == "sip"
     assert media_connected.source == "livekit"
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_reuses_internal_call_id_for_outbound_task() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        call_id="call-task-1",
+        business_type="outbound_task",
+        business_id="1001",
+        scene_code="intro_geo",
+    )
+
+    assert result.call_id == "call-task-1"
+    assert result.room_name == "ai-call-call-task-1"
+    assert result.participant_identity == "sip-call-task-1"
+    assert room_manager.created_rooms == ["ai-call-call-task-1"]
+    assert agent_runner.started_sessions[0].call_id == "call-task-1"
+    assert agent_runner.started_sessions[0].participant_identity == "sip-call-task-1"
+    assert sip_client.created[0]["room_name"] == "ai-call-call-task-1"
+    assert sip_client.created[0]["participant_identity"] == "sip-call-task-1"
+    assert record_service.created_sip_records == [
+        {
+            "call_id": "call-task-1",
+            "business_type": "outbound_task",
+            "business_id": "1001",
+            "room_name": "ai-call-call-task-1",
+            "participant_identity": "sip-call-task-1",
+            "callee_phone_number_hash": _callee_hash("13800000000"),
+            "callee_phone_number_masked": "138****0000",
+        }
+    ]
+    events = service.orchestrator.event_store.list_all("call-task-1")
+    assert events
+    assert {event.call_id for event in events} == {"call-task-1"}
 
 
 @pytest.mark.anyio
@@ -1154,3 +1201,17 @@ def test_create_sip_session_controller_accepts_dynamic_callee_without_browser_to
     assert "sipCallIdFull" not in data
     assert "calleePhoneNumber" not in data
     assert sip_client.created[0]["callee_phone_number"] == "13800000000"
+    assert "call_id" not in CreateSipSessionRequest.model_fields
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/ai-call/sip-sessions",
+            json={
+                "calleePhoneNumber": "13800000000",
+                "callId": "call-external-1",
+                "sceneCode": "intro_geo",
+            },
+        )
+
+    assert rejected.status_code == 422
+    assert len(sip_client.created) == 1

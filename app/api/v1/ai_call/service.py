@@ -197,6 +197,8 @@ class AiCallService:
         *,
         callee_phone_number: str,
         voice: str | None,
+        call_id: str | None = None,
+        business_type: str | None = None,
         business_id: str | None = None,
         scene_code: str | None = None,
         business_params: dict | None = None,
@@ -220,11 +222,12 @@ class AiCallService:
         )
 
         resolved_voice = await self._resolve_voice(voice)
-        call_id = f"call_{generate_snowflake_id()}"
-        room_name = f"ai-call-{call_id}"
-        participant_identity = f"sip-{call_id}"
+        resolved_call_id = call_id or f"call_{generate_snowflake_id()}"
+        room_name = f"ai-call-{resolved_call_id}"
+        participant_identity = f"sip-{resolved_call_id}"
         await self.record_service.create_sip_record(
-            call_id=call_id,
+            call_id=resolved_call_id,
+            business_type=business_type,
             business_id=business_id,
             room_name=room_name,
             participant_identity=participant_identity,
@@ -234,18 +237,18 @@ class AiCallService:
         sip_invite_sent = False
         try:
             self._record_sip_preflight(
-                call_id=call_id,
+                call_id=resolved_call_id,
                 callee_phone_number=callee_phone_number,
             )
             prompt_effective_config = await self._resolve_prompt_effective_config(
-                call_id=call_id,
+                call_id=resolved_call_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
                 debug_prompt=None,
             )
             await self.record_service.update_prompt_context(
-                call_id,
+                resolved_call_id,
                 scene_code=scene_code,
                 prompt_source_key=(
                     prompt_effective_config.prompt_source_key
@@ -256,12 +259,12 @@ class AiCallService:
             room_session = await self.orchestrator.create_sip_session(
                 voice=resolved_voice,
                 prompt=None,
-                call_id=call_id,
+                call_id=resolved_call_id,
                 prompt_effective_config=prompt_effective_config,
             )
-            await self.record_service.mark_status(call_id, room_session.status)
+            await self.record_service.mark_status(resolved_call_id, room_session.status)
             self._record_sip_event(
-                call_id=call_id,
+                call_id=resolved_call_id,
                 event_type="sip_invite_sent",
                 payload={
                     "participantIdentity": participant_identity,
@@ -288,12 +291,12 @@ class AiCallService:
                 }
                 failure_payload.update(exc.details)
                 self._record_sip_event(
-                    call_id=call_id,
+                    call_id=resolved_call_id,
                     event_type="sip_failed",
                     payload=failure_payload,
                 )
             await self.record_service.fail_session(
-                call_id,
+                resolved_call_id,
                 end_reason=exc.error_id,
                 failure_stage=self._failure_stage_for_end_reason(exc.error_id),
                 failure_message=exc.msg,
@@ -301,32 +304,32 @@ class AiCallService:
             raise self._to_custom_exception(exc) from exc
 
         self._record_successful_sip_participant(
-            call_id=call_id,
+            call_id=resolved_call_id,
             sip_participant=sip_participant,
         )
         await self.record_service.mark_answered(
-            room_session.call_id,
+            resolved_call_id,
             datetime.now(timezone.utc),
         )
         if self.recording_service is not None:
             await self.recording_service.start_for_session(
-                call_id=room_session.call_id,
-                room_name=room_session.room_name,
-                customer_participant_identity=room_session.participant_identity,
-                ai_participant_identity=f"agent-{room_session.call_id}",
+                call_id=resolved_call_id,
+                room_name=room_name,
+                customer_participant_identity=participant_identity,
+                ai_participant_identity=f"agent-{resolved_call_id}",
             )
-        await self.orchestrator.start_opening(room_session.call_id)
+        await self.orchestrator.start_opening(resolved_call_id)
         if self.recording_service is not None:
             await self.recording_service.start_session_participant_recordings(
-                call_id=room_session.call_id,
-                room_name=room_session.room_name,
-                customer_participant_identity=room_session.participant_identity,
-                ai_participant_identity=f"agent-{room_session.call_id}",
+                call_id=resolved_call_id,
+                room_name=room_name,
+                customer_participant_identity=participant_identity,
+                ai_participant_identity=f"agent-{resolved_call_id}",
             )
         return CreateSipSessionResult(
-            call_id=room_session.call_id,
-            room_name=room_session.room_name,
-            participant_identity=room_session.participant_identity,
+            call_id=resolved_call_id,
+            room_name=room_name,
+            participant_identity=participant_identity,
             status=room_session.status,
             effective_config=room_session.effective_config,
             sip_call_id=sip_participant.sip_call_id,
