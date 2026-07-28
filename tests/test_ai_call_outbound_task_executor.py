@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import AiCallRecordModel
@@ -18,9 +19,11 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
 from app.api.v1.ai_call.outbound.task_executor import (
     DialResult,
+    MockOutboundDialer,
     OutboundDialRequest,
     OutboundTaskExecutor,
     OutboundTaskWorker,
+    TaskKey,
 )
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
@@ -60,31 +63,119 @@ async def database(tmp_path):
 
 
 class SequenceDialer:
+    dialer_type = "mock"
+    manages_call_record = False
+
     def __init__(self, results: list[DialResult]) -> None:
         self.results = list(results)
         self.requests: list[OutboundDialRequest] = []
+        self.call_ids: list[str] = []
 
-    async def dial(self, request: OutboundDialRequest) -> DialResult:
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del on_connected
         self.requests.append(request)
+        self.call_ids.append(call_id)
         return self.results.pop(0)
 
 
 class FailingDialer:
-    async def dial(self, request: OutboundDialRequest) -> DialResult:
-        del request
+    dialer_type = "mock"
+    manages_call_record = False
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del request, call_id, on_connected
         raise RuntimeError("mock gateway unavailable")
 
 
 class BlockingDialer:
+    dialer_type = "mock"
+    manages_call_record = False
+
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def dial(self, request: OutboundDialRequest) -> DialResult:
-        del request
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del request, call_id, on_connected
         self.started.set()
         await self.release.wait()
         return DialResult(call_result="connected")
+
+
+class LifecycleDialer:
+    dialer_type = "linphone_test"
+    manages_call_record = True
+
+    def __init__(self) -> None:
+        self.call_ids: list[str] = []
+        self.connected = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del request
+        self.call_ids.append(call_id)
+        await on_connected()
+        await on_connected()
+        self.connected.set()
+        await self.release.wait()
+        return DialResult(call_result="connected", duration_ms=3000)
+
+
+class RealStartupFailDialer:
+    dialer_type = "linphone_test"
+    manages_call_record = True
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del request, call_id, on_connected
+        raise RuntimeError("SIP startup failed before record")
+
+
+class RealResultDialer:
+    dialer_type = "linphone_test"
+    manages_call_record = True
+
+    def __init__(self, result: DialResult) -> None:
+        self.result = result
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected,
+    ) -> DialResult:
+        del request, call_id, on_connected
+        return self.result
 
 
 def _snapshot(
@@ -182,6 +273,307 @@ async def _seed_task(
     return task_id, target_ids
 
 
+def test_mock_dialer_declares_non_record_managed_protocol() -> None:
+    dialer = MockOutboundDialer()
+
+    assert dialer.dialer_type == "mock"
+    assert dialer.manages_call_record is False
+
+
+@pytest.mark.anyio
+async def test_manual_claim_bypasses_schedule_and_window_and_writes_metadata(
+    database,
+) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(
+        database,
+        now=now,
+        execution_mode="scheduled",
+        scheduled_at=now + timedelta(days=1),
+        snapshot=_snapshot(
+            call_windows=[{"startTime": "09:00", "endTime": "10:00"}],
+        ),
+    )
+    executor = OutboundTaskExecutor(
+        database,
+        LifecycleDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+    )
+
+    claimed = await executor.claim_manual_test(
+        TaskKey("tenant-a", task_id),
+        command_idempotency_key="command-1",
+        test_scenario="ai_only",
+        active_slot="linphone_test",
+    )
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == claimed.call_id
+            )
+        )
+        record_count = int(
+            await session.scalar(select(func.count(AiCallRecordModel.id))) or 0
+        )
+
+    assert task is not None and task.status == "RUNNING"
+    assert task.started_at == _sqlite_time(now)
+    assert target is not None and target.status == "DIALING"
+    assert target.attempt_count == 1
+    assert attempt is not None
+    assert attempt.status == "DIALING"
+    assert attempt.dialer_type == "linphone_test"
+    assert attempt.test_scenario == "ai_only"
+    assert attempt.command_idempotency_key == "command-1"
+    assert attempt.active_slot == "linphone_test"
+    assert record_count == 0
+
+
+@pytest.mark.anyio
+async def test_execute_claimed_reuses_call_id_and_preserves_in_call_intermediate_state(
+    database,
+) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    dialer = LifecycleDialer()
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    claimed = await executor.claim_manual_test(
+        TaskKey("tenant-a", task_id),
+        command_idempotency_key="command-lifecycle",
+        test_scenario="ai_only",
+        active_slot="linphone_test",
+    )
+
+    execution = asyncio.create_task(executor.execute_claimed(claimed))
+    await asyncio.wait_for(dialer.connected.wait(), timeout=0.5)
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == claimed.call_id
+            )
+        )
+    assert dialer.call_ids == [claimed.call_id]
+    assert task is not None and task.status == "RUNNING"
+    assert target is not None and target.status == "IN_CALL"
+    assert attempt is not None and attempt.status == "IN_CALL"
+    assert attempt.active_slot == "linphone_test"
+
+    dialer.release.set()
+    await execution
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == claimed.call_id
+            )
+        )
+    assert task is not None and task.status == "COMPLETED"
+    assert target is not None and target.status == "COMPLETED"
+    assert target.latest_result == "connected"
+    assert attempt is not None and attempt.status == "COMPLETED"
+    assert attempt.call_result == "connected"
+    assert attempt.active_slot is None
+
+
+@pytest.mark.anyio
+async def test_real_startup_failure_without_record_still_finishes_attempt(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        RealStartupFailDialer(),
+        now_provider=lambda: now,
+    )
+    claimed = await executor.claim_manual_test(
+        TaskKey("tenant-a", task_id),
+        command_idempotency_key="command-startup-fail",
+        test_scenario="ai_only",
+        active_slot="linphone_test",
+    )
+
+    await executor.execute_claimed(claimed)
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == claimed.call_id
+            )
+        )
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == claimed.call_id)
+        )
+    assert task is not None and task.status == "COMPLETED"
+    assert task.failed_targets == 1
+    assert target is not None and target.status == "COMPLETED"
+    assert target.latest_result == "call_failed"
+    assert attempt is not None and attempt.status == "FAILED"
+    assert attempt.error_message == "SIP startup failed before record"
+    assert attempt.active_slot is None
+    assert record is None
+
+
+@pytest.mark.anyio
+async def test_real_managed_record_fields_are_not_overwritten(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, _ = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        RealResultDialer(
+            DialResult(call_result="call_failed", error_message="executor result")
+        ),
+        now_provider=lambda: now,
+    )
+    claimed = await executor.claim_manual_test(
+        TaskKey("tenant-a", task_id),
+        command_idempotency_key="command-real-record",
+        test_scenario="ai_only",
+        active_slot="linphone_test",
+    )
+    async with database() as session:
+        session.add(
+            AiCallRecordModel(
+                id=generate_snowflake_id(),
+                call_id=claimed.call_id,
+                follow_up_id=None,
+                business_type="outbound_task",
+                business_id=str(task_id),
+                scene_code="intro_contract",
+                prompt_source_key="prompt-1",
+                entry_type="sip",
+                room_name=f"ai-call-{claimed.call_id}",
+                participant_identity=f"sip-{claimed.call_id}",
+                callee_phone_number_hash=None,
+                callee_phone_number_masked=None,
+                status="failed",
+                end_reason="provider_hangup",
+                failure_stage="sip_runtime",
+                failure_message="provider detail",
+                started_at=now,
+                answered_at=now,
+                ended_at=now,
+                duration_ms=1234,
+            )
+        )
+        await session.commit()
+
+    await executor.execute_claimed(claimed)
+
+    async with database() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == claimed.call_id)
+        )
+    assert record is not None
+    assert record.status == "failed"
+    assert record.end_reason == "provider_hangup"
+    assert record.failure_stage == "sip_runtime"
+    assert record.failure_message == "provider detail"
+    assert record.duration_ms == 1234
+
+
+@pytest.mark.anyio
+async def test_manual_claim_unique_guards_roll_back_task_transition(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    first_task_id, _ = await _seed_task(database, now=now)
+    command_task_id, _ = await _seed_task(database, now=now)
+    slot_task_id, _ = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        LifecycleDialer(),
+        now_provider=lambda: now,
+    )
+    await executor.claim_manual_test(
+        TaskKey("tenant-a", first_task_id),
+        command_idempotency_key="same-command",
+        test_scenario="ai_only",
+        active_slot="same-slot",
+    )
+
+    with pytest.raises(IntegrityError):
+        await executor.claim_manual_test(
+            TaskKey("tenant-a", command_task_id),
+            command_idempotency_key="same-command",
+            test_scenario="ai_only",
+            active_slot="different-slot",
+        )
+    with pytest.raises(IntegrityError):
+        await executor.claim_manual_test(
+            TaskKey("tenant-a", slot_task_id),
+            command_idempotency_key="different-command",
+            test_scenario="ai_only",
+            active_slot="same-slot",
+        )
+
+    async with database() as session:
+        command_task = await session.get(AiCallOutboundTaskModel, command_task_id)
+        slot_task = await session.get(AiCallOutboundTaskModel, slot_task_id)
+        conflicting_attempts = int(
+            await session.scalar(
+                select(func.count(AiCallOutboundAttemptModel.id)).where(
+                    AiCallOutboundAttemptModel.task_id.in_(
+                        [command_task_id, slot_task_id]
+                    )
+                )
+            )
+            or 0
+        )
+    assert command_task is not None and command_task.status == "SCHEDULED"
+    assert slot_task is not None and slot_task.status == "SCHEDULED"
+    assert conflicting_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_stale_recovery_ignores_real_managed_attempt(database) -> None:
+    clock = [datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)]
+    task_id, target_ids = await _seed_task(database, now=clock[0])
+    claiming_executor = OutboundTaskExecutor(
+        database,
+        LifecycleDialer(),
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+    claimed = await claiming_executor.claim_manual_test(
+        TaskKey("tenant-a", task_id),
+        command_idempotency_key="command-stale-real",
+        test_scenario="ai_only",
+        active_slot="linphone_test",
+    )
+
+    clock[0] += timedelta(minutes=5)
+    recovery_dialer = SequenceDialer([])
+    recovery_executor = OutboundTaskExecutor(
+        database,
+        recovery_dialer,
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+
+    assert await recovery_executor.run_once() == 0
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == claimed.call_id
+            )
+        )
+    assert task is not None and task.status == "RUNNING"
+    assert target is not None and target.status == "DIALING"
+    assert attempt is not None and attempt.status == "DIALING"
+    assert recovery_dialer.requests == []
+
+
 @pytest.mark.anyio
 async def test_executor_skips_future_task_and_completes_due_task_once(database) -> None:
     now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
@@ -245,6 +637,7 @@ async def test_executor_skips_future_task_and_completes_due_task_once(database) 
     assert record.duration_ms == 1200
     assert len(dialer.requests) == 1
     assert dialer.requests[0].target_id == target_ids[0]
+    assert dialer.call_ids == [attempts[0].call_id]
 
 
 @pytest.mark.anyio

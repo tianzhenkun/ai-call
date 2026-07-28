@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -61,18 +61,39 @@ class TaskKey:
     task_id: int
 
 
+ConnectedCallback = Callable[[], Awaitable[None]]
+
+
 class OutboundDialer(Protocol):
-    async def dial(self, request: OutboundDialRequest) -> DialResult: ...
+    dialer_type: str
+    manages_call_record: bool
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected: ConnectedCallback,
+    ) -> DialResult: ...
 
 
 class MockOutboundDialer:
     """只产生数据库演练结果，不发起网络或 SIP 请求。"""
 
+    dialer_type = "mock"
+    manages_call_record = False
+
     def __init__(self, call_result: str = "connected") -> None:
         self.call_result = call_result
 
-    async def dial(self, request: OutboundDialRequest) -> DialResult:
-        del request
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected: ConnectedCallback,
+    ) -> DialResult:
+        del request, call_id, on_connected
         if self.call_result == "connected":
             return DialResult(call_result="connected")
         return DialResult(
@@ -116,21 +137,180 @@ class OutboundTaskExecutor:
                 if claimed is None:
                     await self._refresh_task_counters(task_key, self.now_provider())
                     break
-                try:
-                    result = await self.dialer.dial(claimed.request)
-                except Exception as exc:
-                    result = DialResult(
-                        call_result="call_failed",
-                        error_message=str(exc) or exc.__class__.__name__,
-                    )
-                await self._finish_attempt(
-                    claimed.request,
-                    claimed.call_id,
-                    result,
-                    self.now_provider(),
-                )
+                await self.execute_claimed(claimed)
                 processed += 1
         return processed
+
+    async def claim_manual_test(
+        self,
+        task_key: TaskKey,
+        command_idempotency_key: str,
+        test_scenario: str,
+        active_slot: str,
+    ) -> ClaimedAttempt:
+        now = self.now_provider()
+        async with self.session_factory() as db:
+            task = await db.scalar(
+                select(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == task_key.tenant_id,
+                    AiCallOutboundTaskModel.id == task_key.task_id,
+                )
+                .with_for_update()
+            )
+            if task is None or task.status != "SCHEDULED":
+                raise ValueError("人工测试只接受 SCHEDULED 任务")
+
+            targets = (
+                await db.scalars(
+                    select(AiCallOutboundTargetModel)
+                    .where(
+                        AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_key.task_id,
+                    )
+                    .order_by(AiCallOutboundTargetModel.id)
+                    .limit(2)
+                    .with_for_update()
+                )
+            ).all()
+            if (
+                task.total_targets != 1
+                or len(targets) != 1
+                or targets[0].status != "PENDING"
+            ):
+                raise ValueError("人工测试只接受单个 PENDING 对象的任务")
+            target = targets[0]
+            attempt_no = target.attempt_count + 1
+
+            task_result = await db.execute(
+                update(AiCallOutboundTaskModel)
+                .where(
+                    AiCallOutboundTaskModel.tenant_id == task_key.tenant_id,
+                    AiCallOutboundTaskModel.id == task_key.task_id,
+                    AiCallOutboundTaskModel.status == "SCHEDULED",
+                )
+                .values(
+                    status="RUNNING",
+                    started_at=now,
+                    next_dispatch_at=None,
+                    updated_at=now,
+                )
+            )
+            target_result = await db.execute(
+                update(AiCallOutboundTargetModel)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
+                    AiCallOutboundTargetModel.task_id == task_key.task_id,
+                    AiCallOutboundTargetModel.id == target.id,
+                    AiCallOutboundTargetModel.status == "PENDING",
+                )
+                .values(
+                    status="DIALING",
+                    attempt_count=AiCallOutboundTargetModel.attempt_count + 1,
+                    next_attempt_at=None,
+                    updated_at=now,
+                )
+            )
+            if task_result.rowcount != 1 or target_result.rowcount != 1:
+                await db.rollback()
+                raise ValueError("任务或对象状态已变化，无法认领人工测试")
+
+            request = OutboundDialRequest(
+                tenant_id=task.tenant_id,
+                task_id=task.id,
+                target_id=target.id,
+                attempt_no=attempt_no,
+                phone_number=target.phone_number,
+                customer_name=target.customer_name,
+                scene_code=task.scene_code,
+                voice=task.voice,
+                prompt_profile_id=task.prompt_profile_id,
+            )
+            call_id = uuid4().hex
+            db.add(
+                AiCallOutboundAttemptModel(
+                    id=generate_snowflake_id(),
+                    tenant_id=request.tenant_id,
+                    task_id=request.task_id,
+                    target_id=request.target_id,
+                    attempt_no=request.attempt_no,
+                    call_id=call_id,
+                    dialer_type=self.dialer.dialer_type,
+                    test_scenario=test_scenario,
+                    command_idempotency_key=command_idempotency_key,
+                    active_slot=active_slot,
+                    status="DIALING",
+                    call_result=None,
+                    error_message=None,
+                    started_at=now,
+                    ended_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            if not self.dialer.manages_call_record:
+                db.add(self._mock_record(request, call_id, now))
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            return ClaimedAttempt(request=request, call_id=call_id)
+
+    async def execute_claimed(self, claimed: ClaimedAttempt) -> None:
+        try:
+            result = await self.dialer.dial(
+                claimed.request,
+                call_id=claimed.call_id,
+                on_connected=lambda: self._mark_in_call(claimed),
+            )
+        except Exception as exc:
+            result = DialResult(
+                call_result="call_failed",
+                error_message=str(exc) or exc.__class__.__name__,
+            )
+        await self._finish_attempt(
+            claimed.request,
+            claimed.call_id,
+            result,
+            self.now_provider(),
+        )
+
+    async def _mark_in_call(self, claimed: ClaimedAttempt) -> None:
+        async with self.session_factory() as db:
+            attempt = await db.scalar(
+                select(AiCallOutboundAttemptModel)
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id
+                    == claimed.request.tenant_id,
+                    AiCallOutboundAttemptModel.task_id == claimed.request.task_id,
+                    AiCallOutboundAttemptModel.target_id == claimed.request.target_id,
+                    AiCallOutboundAttemptModel.call_id == claimed.call_id,
+                )
+                .with_for_update()
+            )
+            target = await db.scalar(
+                select(AiCallOutboundTargetModel)
+                .where(
+                    AiCallOutboundTargetModel.tenant_id
+                    == claimed.request.tenant_id,
+                    AiCallOutboundTargetModel.task_id == claimed.request.task_id,
+                    AiCallOutboundTargetModel.id == claimed.request.target_id,
+                )
+                .with_for_update()
+            )
+            if attempt is None or target is None:
+                return
+            if attempt.status == "IN_CALL" and target.status == "IN_CALL":
+                return
+            if attempt.status != "DIALING" or target.status != "DIALING":
+                return
+            now = self.now_provider()
+            attempt.status = "IN_CALL"
+            attempt.updated_at = now
+            target.status = "IN_CALL"
+            target.updated_at = now
+            await db.commit()
 
     async def _recover_stale_attempts(self, now: datetime) -> None:
         cutoff = now - timedelta(seconds=self.dialing_timeout_seconds)
@@ -141,6 +321,10 @@ class OutboundTaskExecutor:
                     .where(
                         AiCallOutboundAttemptModel.status == "DIALING",
                         AiCallOutboundAttemptModel.started_at <= cutoff,
+                        or_(
+                            AiCallOutboundAttemptModel.dialer_type.is_(None),
+                            AiCallOutboundAttemptModel.dialer_type == "mock",
+                        ),
                     )
                     .order_by(AiCallOutboundAttemptModel.started_at)
                     .limit(self.target_batch_size)
@@ -331,7 +515,7 @@ class OutboundTaskExecutor:
                     AiCallOutboundTargetModel.tenant_id == tenant_id,
                     AiCallOutboundTargetModel.task_id == task_id,
                     AiCallOutboundTargetModel.status.in_(
-                        ["PENDING", "DIALING", "RETRY_WAIT"]
+                        ["PENDING", "DIALING", "IN_CALL", "RETRY_WAIT"]
                     ),
                 )
             )
@@ -471,6 +655,7 @@ class OutboundTaskExecutor:
                         target_id=request.target_id,
                         attempt_no=request.attempt_no,
                         call_id=call_id,
+                        dialer_type=self.dialer.dialer_type,
                         status="DIALING",
                         call_result=None,
                         error_message=None,
@@ -480,7 +665,8 @@ class OutboundTaskExecutor:
                         updated_at=now,
                     )
                 )
-                db.add(self._mock_record(request, call_id, now))
+                if not self.dialer.manages_call_record:
+                    db.add(self._mock_record(request, call_id, now))
                 await db.commit()
                 return ClaimedAttempt(request=request, call_id=call_id)
             await db.rollback()
@@ -550,13 +736,13 @@ class OutboundTaskExecutor:
                 )
                 .with_for_update()
             )
-            record = await db.scalar(
-                select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
-            )
-            if task is None or target is None or attempt is None or record is None:
+            if task is None or target is None or attempt is None:
                 await db.rollback()
                 return
-            if attempt.status != "DIALING" or target.status != "DIALING":
+            if (
+                attempt.status not in {"DIALING", "IN_CALL"}
+                or target.status not in {"DIALING", "IN_CALL"}
+            ):
                 await db.rollback()
                 return
 
@@ -564,16 +750,26 @@ class OutboundTaskExecutor:
             attempt.status = "COMPLETED" if connected else "FAILED"
             attempt.call_result = result.call_result
             attempt.error_message = result.error_message
+            attempt.active_slot = None
             attempt.ended_at = now
             attempt.updated_at = now
 
-            record.status = "completed" if connected else "failed"
-            record.end_reason = result.call_result
-            record.failure_stage = None if connected else "outbound_mock"
-            record.failure_message = None if connected else result.error_message
-            record.answered_at = now if connected else None
-            record.ended_at = now
-            record.duration_ms = max(0, result.duration_ms)
+            if not self.dialer.manages_call_record:
+                record = await db.scalar(
+                    select(AiCallRecordModel).where(
+                        AiCallRecordModel.call_id == call_id
+                    )
+                )
+                if record is not None:
+                    record.status = "completed" if connected else "failed"
+                    record.end_reason = result.call_result
+                    record.failure_stage = None if connected else "outbound_mock"
+                    record.failure_message = (
+                        None if connected else result.error_message
+                    )
+                    record.answered_at = now if connected else None
+                    record.ended_at = now
+                    record.duration_ms = max(0, result.duration_ms)
 
             target.latest_result = result.call_result
             target.updated_at = now
