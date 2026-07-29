@@ -19,6 +19,8 @@ from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
+    AiCallAgentProfileModel,
+    AiCallAgentSceneScopeModel,
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
@@ -354,6 +356,7 @@ async def test_app_handoff_trigger_worker_enables_transcript_trigger(monkeypatch
     try:
         assert worker is not None
         assert worker.transcript_trigger_enabled is True
+        assert worker.trigger_service.availability_service_factory is not None
     finally:
         await init_app._stop_ai_call_handoff_trigger_worker(worker)
 
@@ -667,6 +670,56 @@ async def append_record_event(
         source=source,
         event_time=event_time,
         payload_json=json.dumps(payload, ensure_ascii=False) if payload else None,
+    )
+
+
+def _availability_agent_rows(
+    *,
+    row_id: int,
+    agent_identity: str,
+    scene_code: str,
+    status: str,
+    last_seen_at: datetime,
+    enabled: bool = True,
+    active_handoff_id: str | None = None,
+) -> tuple[
+    AiCallAgentProfileModel,
+    AiCallAgentSceneScopeModel,
+    AiCallHandoffAgentModel,
+]:
+    now = datetime.now(timezone.utc)
+    return (
+        AiCallAgentProfileModel(
+            id=row_id,
+            tenant_id="000000",
+            agent_identity=agent_identity,
+            user_id=row_id,
+            enabled=enabled,
+            created_by=1,
+            created_at=now,
+            updated_by=1,
+            updated_at=now,
+        ),
+        AiCallAgentSceneScopeModel(
+            id=row_id,
+            tenant_id="000000",
+            agent_identity=agent_identity,
+            scene_code=scene_code,
+            created_by=1,
+            created_at=now,
+        ),
+        AiCallHandoffAgentModel(
+            id=row_id,
+            tenant_id="000000",
+            agent_identity=agent_identity,
+            skill_group="default",
+            status=status,
+            active_handoff_id=active_handoff_id,
+            active_call_id=None,
+            console_session_id=None,
+            last_seen_at=last_seen_at,
+            status_updated_at=now,
+        ),
     )
 
 
@@ -1154,6 +1207,130 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+@pytest.mark.anyio
+async def test_handoff_availability_counts_online_and_available_agents(
+    b1_service,
+) -> None:
+    try:
+        from app.services.ai_call.handoff_availability_service import (
+            AiCallHandoffAvailabilityService,
+        )
+    except ModuleNotFoundError:
+        pytest.fail("handoff availability service is missing")
+
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    await record_service.repository.update_record(
+        result.call_id,
+        scene_code="intro_geo",
+    )
+    now = datetime.now(timezone.utc)
+    record_service.repository.db.add_all(
+        [
+            *_availability_agent_rows(
+                row_id=101,
+                agent_identity="agent-available",
+                scene_code="intro_geo",
+                status="available",
+                last_seen_at=now,
+            ),
+            *_availability_agent_rows(
+                row_id=102,
+                agent_identity="agent-busy",
+                scene_code="intro_geo",
+                status="in_call",
+                last_seen_at=now,
+                active_handoff_id="handoff-busy",
+            ),
+        ]
+    )
+    await record_service.repository.db.flush()
+
+    snapshot = await AiCallHandoffAvailabilityService(
+        record_service.repository.db
+    ).get_for_call(result.call_id)
+
+    assert snapshot.online_agent_count == 2
+    assert snapshot.available_agent_count == 1
+
+
+@pytest.mark.anyio
+async def test_handoff_availability_excludes_stale_paused_and_wrong_scene_agents(
+    b1_service,
+) -> None:
+    try:
+        from app.services.ai_call.handoff_availability_service import (
+            AiCallHandoffAvailabilityService,
+        )
+    except ModuleNotFoundError:
+        pytest.fail("handoff availability service is missing")
+
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    await record_service.repository.update_record(
+        result.call_id,
+        scene_code="intro_geo",
+    )
+    now = datetime.now(timezone.utc)
+    record_service.repository.db.add_all(
+        [
+            *_availability_agent_rows(
+                row_id=201,
+                agent_identity="agent-stale",
+                scene_code="intro_geo",
+                status="available",
+                last_seen_at=now - timedelta(seconds=31),
+            ),
+            *_availability_agent_rows(
+                row_id=202,
+                agent_identity="agent-paused",
+                scene_code="intro_geo",
+                status="paused",
+                last_seen_at=now,
+            ),
+            *_availability_agent_rows(
+                row_id=203,
+                agent_identity="agent-other-scene",
+                scene_code="intro_contract",
+                status="available",
+                last_seen_at=now,
+            ),
+        ]
+    )
+    await record_service.repository.db.flush()
+
+    snapshot = await AiCallHandoffAvailabilityService(
+        record_service.repository.db
+    ).get_for_call(result.call_id)
+
+    assert snapshot.online_agent_count == 0
+    assert snapshot.available_agent_count == 0
+
+
+@pytest.mark.anyio
+async def test_handoff_availability_requires_existing_call(b1_service) -> None:
+    try:
+        from app.services.ai_call.handoff_availability_service import (
+            AiCallHandoffAvailabilityService,
+        )
+    except ModuleNotFoundError:
+        pytest.fail("handoff availability service is missing")
+
+    _service, record_service = b1_service
+    with pytest.raises(CustomException, match="通话记录不存在"):
+        await AiCallHandoffAvailabilityService(
+            record_service.repository.db
+        ).get_for_call("missing-call")
 
 
 @pytest.mark.anyio

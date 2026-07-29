@@ -507,6 +507,7 @@ class AiCallHandoffTriggerService:
         customer_intent_enabled: bool = True,
         threshold: float = 0.8,
         timeout_seconds: float = 1.0,
+        availability_service_factory: Callable[[AsyncSession], Any] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.service_factory = service_factory
@@ -515,6 +516,7 @@ class AiCallHandoffTriggerService:
         self.customer_intent_enabled = customer_intent_enabled
         self.threshold = max(0.0, min(threshold, 1.0))
         self.timeout_seconds = max(0.2, timeout_seconds)
+        self.availability_service_factory = availability_service_factory
         self._pending_confirmations: dict[str, PendingHandoffConfirmation] = {}
         self._recent_confirmation_candidates: dict[
             str, RecentHandoffConfirmationCandidate

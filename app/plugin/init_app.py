@@ -248,6 +248,9 @@ async def _start_ai_call_handoff_trigger_worker():
         get_default_ai_call_service,
     )
     from app.core.database import async_db_session
+    from app.services.ai_call.handoff_availability_service import (
+        AiCallHandoffAvailabilityService,
+    )
     from app.services.ai_call.handoff_trigger_service import (
         AiCallHandoffTriggerService,
         AiCallHandoffTriggerWorker,
@@ -268,6 +271,7 @@ async def _start_ai_call_handoff_trigger_worker():
         customer_intent_enabled=settings.AI_CALL_HANDOFF_CUSTOMER_INTENT_ENABLED,
         threshold=settings.AI_CALL_HANDOFF_INTENT_THRESHOLD,
         timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
+        availability_service_factory=AiCallHandoffAvailabilityService,
     )
     worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
     await worker.start()
