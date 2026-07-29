@@ -101,6 +101,16 @@ class AiCallOutboundTaskModel(MappedBase):
     rule_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     rule_name: Mapped[str] = mapped_column(String(100), nullable=False)
     rule_summary: Mapped[str] = mapped_column(String(500), nullable=False)
+    line_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="任务绑定的SIP线路ID，无物理外键",
+    )
+    line_name: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="创建任务时的线路名称",
+    )
     config_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
     error_message: Mapped[str | None] = mapped_column(String(1000))
     created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -209,6 +219,31 @@ class AiCallOutboundAttemptModel(MappedBase):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     call_result: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(1000))
+    line_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="本次拨打实际使用的线路ID，无物理外键",
+    )
+    line_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="本次拨打实际使用的线路编码",
+    )
+    provider_status_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="SIP Provider状态码",
+    )
+    provider_reason: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="SIP Provider原始原因",
+    )
+    hangup_cause: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="标准化挂机原因",
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

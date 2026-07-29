@@ -52,6 +52,16 @@ class AiCallOutboundValidationModel(MappedBase):
         nullable=False,
         comment="待创建任务配置JSON",
     )
+    line_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="校验时绑定的SIP线路ID，无物理外键",
+    )
+    line_snapshot_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="校验时固化的非敏感SIP线路快照JSON",
+    )
     valid_target_count: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
