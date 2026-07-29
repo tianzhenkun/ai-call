@@ -21,6 +21,7 @@ from .rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from .sip_line_schema import SipLineSnapshot
 
 TERMINAL_TARGET_STATUSES = {"COMPLETED", "CANCELLED"}
 
@@ -40,6 +41,7 @@ class OutboundDialRequest:
     scene_code: str
     voice: str
     prompt_profile_id: str | None
+    line: SipLineSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,9 @@ class DialResult:
     call_result: str
     error_message: str | None = None
     duration_ms: int = 0
+    provider_status_code: str | None = None
+    provider_reason: str | None = None
+    hangup_cause: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +230,7 @@ class OutboundTaskExecutor:
                 scene_code=task.scene_code,
                 voice=task.voice,
                 prompt_profile_id=task.prompt_profile_id,
+                line=self._task_line_snapshot(task),
             )
             call_id = uuid4().hex
             db.add(
@@ -242,6 +248,19 @@ class OutboundTaskExecutor:
                     status="DIALING",
                     call_result=None,
                     error_message=None,
+                    line_id=(
+                        int(request.line.line_id)
+                        if request.line is not None
+                        else None
+                    ),
+                    line_code=(
+                        request.line.line_code
+                        if request.line is not None
+                        else None
+                    ),
+                    provider_status_code=None,
+                    provider_reason=None,
+                    hangup_cause=None,
                     started_at=now,
                     ended_at=None,
                     created_at=now,
@@ -358,6 +377,7 @@ class OutboundTaskExecutor:
                         scene_code=task.scene_code,
                         voice=task.voice,
                         prompt_profile_id=task.prompt_profile_id,
+                        line=self._task_line_snapshot(task),
                     ),
                     attempt.call_id,
                 ))
@@ -573,6 +593,14 @@ class OutboundTaskExecutor:
                 or not self._within_call_window(task, now)
             ):
                 return None
+            line = self._task_line_snapshot(task)
+            if self.dialer.dialer_type == "sip" and line is None:
+                task.status = "FAILED"
+                task.error_message = "任务缺少有效的 SIP 线路快照"
+                task.ended_at = now
+                task.updated_at = now
+                await db.commit()
+                return None
             candidates = (
                 await db.scalars(
                     select(AiCallOutboundTargetModel.id)
@@ -645,6 +673,7 @@ class OutboundTaskExecutor:
                     scene_code=task.scene_code,
                     voice=task.voice,
                     prompt_profile_id=task.prompt_profile_id,
+                    line=line,
                 )
                 call_id = uuid4().hex
                 db.add(
@@ -659,6 +688,19 @@ class OutboundTaskExecutor:
                         status="DIALING",
                         call_result=None,
                         error_message=None,
+                        line_id=(
+                            int(request.line.line_id)
+                            if request.line is not None
+                            else None
+                        ),
+                        line_code=(
+                            request.line.line_code
+                            if request.line is not None
+                            else None
+                        ),
+                        provider_status_code=None,
+                        provider_reason=None,
+                        hangup_cause=None,
                         started_at=now,
                         ended_at=None,
                         created_at=now,
@@ -750,6 +792,9 @@ class OutboundTaskExecutor:
             attempt.status = "COMPLETED" if connected else "FAILED"
             attempt.call_result = result.call_result
             attempt.error_message = result.error_message
+            attempt.provider_status_code = result.provider_status_code
+            attempt.provider_reason = result.provider_reason
+            attempt.hangup_cause = result.hangup_cause
             attempt.active_slot = None
             attempt.ended_at = now
             attempt.updated_at = now
@@ -926,6 +971,22 @@ class OutboundTaskExecutor:
             for window in windows
         )
 
+    @staticmethod
+    def _task_line_snapshot(
+        task: AiCallOutboundTaskModel,
+    ) -> SipLineSnapshot | None:
+        try:
+            snapshot = json.loads(task.config_snapshot_json)
+            raw_line = snapshot.get("sipLine")
+            if not isinstance(raw_line, dict):
+                return None
+            line = SipLineSnapshot.model_validate(raw_line)
+            if task.line_id is not None and int(line.line_id) != task.line_id:
+                return None
+            return line
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def _next_call_window_at(
         self,
         task: AiCallOutboundTaskModel,
@@ -995,7 +1056,7 @@ class OutboundTaskWorker:
             try:
                 await self.executor.run_once()
             except Exception:
-                log.exception("AI Call 通用外呼模拟执行器轮询失败")
+                log.exception("AI Call 通用外呼执行器轮询失败")
             try:
                 await asyncio.wait_for(
                     self._stopping.wait(),

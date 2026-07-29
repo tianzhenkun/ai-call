@@ -254,6 +254,28 @@ async def test_dial_marks_connected_once_after_answer_and_media(database):
 
 
 @pytest.mark.anyio
+async def test_dial_does_not_report_connected_without_media_evidence(database):
+    service = FakeAiCallService()
+    dialer = build_dialer(database, service)
+    connected = AsyncMock()
+
+    task = asyncio.create_task(
+        dialer.dial(
+            dial_request(),
+            call_id="call-no-media",
+            on_connected=connected,
+        )
+    )
+    await service.session_created.wait()
+    await finish_record(database, "call-no-media", answered=True)
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result.call_result == "call_failed"
+    assert result.error_message == "未检测到媒体接通证据"
+    connected.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_dial_returns_failure_when_session_creation_fails_without_record(database):
     service = FakeAiCallService(error=RuntimeError("provider unavailable"))
     result = await build_dialer(database, service).dial(

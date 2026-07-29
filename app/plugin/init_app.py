@@ -134,9 +134,22 @@ async def _start_ai_call_outbound_task_worker():
     )
     from app.core.database import async_db_session
 
+    if settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
+        if not settings.AI_CALL_SIP_OUTBOUND_ENABLED:
+            raise RuntimeError(
+                "AI Call 正式 SIP 拨号模式已启用，但 SIP 外呼总开关未启用"
+            )
+        from app.api.v1.ai_call.outbound.sip_outbound_dialer import (
+            SipOutboundDialer,
+        )
+
+        dialer = SipOutboundDialer(async_db_session)
+    else:
+        dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
+
     executor = OutboundTaskExecutor(
         async_db_session,
-        MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT),
+        dialer,
         task_batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TASK_BATCH_SIZE,
         target_batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
         business_timezone=settings.AI_CALL_OUTBOUND_TIMEZONE,
@@ -147,7 +160,9 @@ async def _start_ai_call_outbound_task_worker():
         poll_interval_seconds=settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS,
     )
     await worker.start()
-    log.warning("AI Call 通用外呼模拟执行器已启动，不会发起真实 SIP 呼叫")
+    log.warning(
+        f"AI Call 通用外呼执行器已启动，dialer_type={dialer.dialer_type}"
+    )
     return worker
 
 
@@ -155,7 +170,7 @@ async def _stop_ai_call_outbound_task_worker(worker) -> None:
     if worker is None:
         return
     await worker.stop()
-    log.info("✅ AI Call 通用外呼模拟执行器已关闭")
+    log.info("✅ AI Call 通用外呼执行器已关闭")
 
 
 async def _start_ai_call_linphone_test_worker():
