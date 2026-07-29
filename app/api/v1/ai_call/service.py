@@ -25,6 +25,9 @@ from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
 from app.services.ai_call.handoff_service import AiCallHandoffService
+from app.services.ai_call.handoff_unanswered_service import (
+    AiCallHandoffUnansweredService,
+)
 from app.services.ai_call.interrupt_summary import build_interrupt_summary
 from app.services.ai_call.livekit_egress import LiveKitEgressManager
 from app.services.ai_call.livekit_sip import (
@@ -788,6 +791,7 @@ class AiCallService:
         source: str,
         reason: str | None,
         request_message: str | None,
+        waiting_prompt_kind: str = "default",
     ) -> dict:
         self._ensure_handoff_service()
         try:
@@ -841,7 +845,11 @@ class AiCallService:
             refreshed = await self.handoff_service.get_current(call_id)
             if refreshed is not None:
                 handoff = refreshed
-        self._schedule_handoff_timeout(handoff)
+        if waiting_prompt_kind != "none":
+            self._schedule_handoff_timeout(
+                handoff,
+                waiting_prompt_kind=waiting_prompt_kind,
+            )
         if created:
             from app.services.ai_call.agent_console_reconciler import (
                 publish_agent_console_event,
@@ -1038,6 +1046,7 @@ class AiCallService:
         handoff_id: str,
         failure_stage: str,
         failure_message: str | None,
+        end_reason: str | None = None,
     ) -> dict:
         self._ensure_handoff_service()
         handoff = await self.handoff_service.fail(
@@ -1045,6 +1054,24 @@ class AiCallService:
             failure_stage=failure_stage,
             failure_message=failure_message,
         )
+        if end_reason:
+            updated = await self.handoff_service.repository.update_handoff(
+                handoff.handoff_id,
+                end_reason=end_reason,
+            )
+            if updated is not None:
+                handoff = updated
+        unanswered_reasons = {
+            "no_online_agent": "转人工时当前场景没有在线坐席",
+            "handoff_service_unavailable": "转人工服务暂时不可用",
+        }
+        if end_reason in unanswered_reasons:
+            await AiCallHandoffUnansweredService(
+                self.handoff_service.repository
+            ).ensure_for_handoff(
+                handoff,
+                reason=unanswered_reasons[end_reason],
+            )
         self._record_handoff_event_best_effort(
             call_id=handoff.call_id,
             event_type="handoff_failed",
@@ -1053,11 +1080,12 @@ class AiCallService:
             payload={
                 "failureStage": handoff.failure_stage,
                 "failureMessage": handoff.failure_message,
+                "endReason": handoff.end_reason,
             },
         )
         self._trigger_handoff_exception_close(
             handoff,
-            call_end_reason="handoff_failed",
+            call_end_reason=end_reason or "handoff_failed",
         )
         return self.handoff_service.handoff_to_dict(handoff)
 
@@ -1542,11 +1570,19 @@ class AiCallService:
                 call_end_reason="handoff_timeout",
             )
 
-    def _schedule_handoff_timeout(self, handoff) -> None:
+    def _schedule_handoff_timeout(
+        self,
+        handoff,
+        *,
+        waiting_prompt_kind: str = "default",
+    ) -> None:
         if self.handoff_exception_manager is None:
             return
         self.handoff_exception_manager.schedule_timeout(handoff)
-        self.handoff_exception_manager.start_waiting_tone(handoff)
+        self.handoff_exception_manager.start_waiting_tone(
+            handoff,
+            prompt_kind=waiting_prompt_kind,
+        )
 
     def _cancel_handoff_timeout(self, handoff, *, reason: str) -> None:
         if self.handoff_exception_manager is None:

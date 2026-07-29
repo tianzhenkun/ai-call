@@ -427,6 +427,14 @@ class RecentHandoffConfirmationCandidate:
     timestamp: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class TriggeredHandoff:
+    handoff: dict[str, Any]
+    waiting_prompt_kind: str
+    online_agent_count: int | None = None
+    available_agent_count: int | None = None
+
+
 class AiCallHandoffTriggerService:
     RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
     EXPLICIT_TRANSFER_DELTA_COMMANDS = frozenset(
@@ -633,7 +641,7 @@ class AiCallHandoffTriggerService:
             },
         )
         try:
-            handoff = await self._create_handoff(
+            triggered = await self._create_handoff(
                 call_id=event.call_id,
                 reason=result.reason or "customer_request",
                 request_message=self._truncate(result.summary or transcript, 500),
@@ -654,12 +662,15 @@ class AiCallHandoffTriggerService:
             "handoff_auto_triggered",
             "handoff",
             {
-                "handoffId": handoff.get("handoffId"),
-                "status": handoff.get("status"),
+                "handoffId": triggered.handoff.get("handoffId"),
+                "status": triggered.handoff.get("status"),
                 "source": "customer",
                 "reason": result.reason or "customer_request",
                 "confidence": result.confidence,
                 "transcriptPreview": self._truncate(transcript, 120),
+                "waitingPromptKind": triggered.waiting_prompt_kind,
+                "onlineAgentCount": triggered.online_agent_count,
+                "availableAgentCount": triggered.available_agent_count,
             },
         )
 
@@ -747,7 +758,7 @@ class AiCallHandoffTriggerService:
             },
         )
         try:
-            handoff = await self._create_handoff(
+            triggered = await self._create_handoff(
                 call_id=event.call_id,
                 reason=reason,
                 request_message=self._truncate(request_message, 500),
@@ -768,13 +779,16 @@ class AiCallHandoffTriggerService:
             "handoff_auto_triggered",
             "handoff",
             {
-                "handoffId": handoff.get("handoffId"),
-                "status": handoff.get("status"),
+                "handoffId": triggered.handoff.get("handoffId"),
+                "status": triggered.handoff.get("status"),
                 "source": "customer",
                 "reason": reason,
                 "confidence": 1.0,
                 "classifierSource": "realtime_tool",
                 "toolCallId": event.payload.get("toolCallId"),
+                "waitingPromptKind": triggered.waiting_prompt_kind,
+                "onlineAgentCount": triggered.online_agent_count,
+                "availableAgentCount": triggered.available_agent_count,
             },
         )
 
@@ -861,7 +875,7 @@ class AiCallHandoffTriggerService:
             },
         )
         try:
-            handoff = await self._create_handoff(
+            triggered = await self._create_handoff(
                 call_id=event.call_id,
                 reason=confirmation.reason,
                 request_message=self._truncate(confirmation.request_message, 500),
@@ -882,14 +896,17 @@ class AiCallHandoffTriggerService:
             "handoff_auto_triggered",
             "handoff",
             {
-                "handoffId": handoff.get("handoffId"),
-                "status": handoff.get("status"),
+                "handoffId": triggered.handoff.get("handoffId"),
+                "status": triggered.handoff.get("status"),
                 "source": "customer",
                 "reason": confirmation.reason,
                 "confidence": 1.0,
                 "classifierSource": classifier_source,
                 "toolCallId": confirmation.tool_call_id,
                 "transcriptPreview": self._truncate(transcript, 120),
+                "waitingPromptKind": triggered.waiting_prompt_kind,
+                "onlineAgentCount": triggered.online_agent_count,
+                "availableAgentCount": triggered.available_agent_count,
             },
         )
 
@@ -905,15 +922,79 @@ class AiCallHandoffTriggerService:
         call_id: str,
         reason: str,
         request_message: str,
-    ) -> dict:
+    ) -> TriggeredHandoff:
         async with self.session_factory() as db:
             async with db.begin():
                 service = self.service_factory(db)
-                return await service.create_handoff(
+                if self.availability_service_factory is None:
+                    handoff = await service.create_handoff(
+                        call_id=call_id,
+                        source="customer",
+                        reason=reason,
+                        request_message=request_message,
+                    )
+                    return TriggeredHandoff(
+                        handoff=handoff,
+                        waiting_prompt_kind="default",
+                    )
+
+                availability = None
+                availability_error: Exception | None = None
+                try:
+                    availability = await self.availability_service_factory(
+                        db
+                    ).get_for_call(call_id)
+                except Exception as exc:
+                    availability_error = exc
+
+                waiting_prompt_kind = (
+                    "none"
+                    if availability_error is not None
+                    or availability is None
+                    or availability.online_agent_count == 0
+                    else (
+                        "available"
+                        if availability.available_agent_count > 0
+                        else "busy"
+                    )
+                )
+                handoff = await service.create_handoff(
                     call_id=call_id,
                     source="customer",
                     reason=reason,
                     request_message=request_message,
+                    waiting_prompt_kind=waiting_prompt_kind,
+                )
+                if availability_error is not None:
+                    handoff = await service.fail_handoff(
+                        handoff_id=handoff["handoffId"],
+                        failure_stage="availability_check",
+                        failure_message=(
+                            "坐席可用性查询失败: "
+                            f"{type(availability_error).__name__}"
+                        ),
+                        end_reason="handoff_service_unavailable",
+                    )
+                elif availability is not None and availability.online_agent_count == 0:
+                    handoff = await service.fail_handoff(
+                        handoff_id=handoff["handoffId"],
+                        failure_stage="availability_check",
+                        failure_message="当前场景没有在线可接范围坐席",
+                        end_reason="no_online_agent",
+                    )
+                return TriggeredHandoff(
+                    handoff=handoff,
+                    waiting_prompt_kind=waiting_prompt_kind,
+                    online_agent_count=(
+                        availability.online_agent_count
+                        if availability is not None
+                        else None
+                    ),
+                    available_agent_count=(
+                        availability.available_agent_count
+                        if availability is not None
+                        else None
+                    ),
                 )
 
     def _append_ignored(

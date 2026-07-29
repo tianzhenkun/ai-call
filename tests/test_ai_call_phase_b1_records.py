@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
@@ -24,6 +24,7 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordingModel,
@@ -46,6 +47,7 @@ from app.services.ai_call.dialogue_service import (
 from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.handoff_availability_service import HandoffAgentAvailability
 from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
 from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.handoff_trigger_service import (
@@ -193,6 +195,21 @@ class FakeHandoffIntentClassifier:
     async def classify(self, *, transcript: str) -> HandoffIntentResult:
         self.transcripts.append(transcript)
         return self.result
+
+
+class FakeHandoffAvailabilityService:
+    def __init__(self, result: HandoffAgentAvailability) -> None:
+        self.result = result
+        self.call_ids: list[str] = []
+
+    async def get_for_call(self, call_id: str) -> HandoffAgentAvailability:
+        self.call_ids.append(call_id)
+        return self.result
+
+
+class FailingHandoffAvailabilityService:
+    async def get_for_call(self, call_id: str) -> HandoffAgentAvailability:
+        raise RuntimeError(f"availability failed for {call_id}")
 
 
 class SlowHandoffIntentClassifier:
@@ -1537,6 +1554,236 @@ async def test_customer_partial_handoff_is_created_only_after_affirmative_confir
         assert "handoff_confirmation_requested" in event_types
         assert "handoff_confirmation_confirmed" in event_types
         assert "handoff_auto_triggered" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("snapshot", "expected_prompt_kind"),
+    [
+        (HandoffAgentAvailability(online_agent_count=1, available_agent_count=1), "available"),
+        (HandoffAgentAvailability(online_agent_count=1, available_agent_count=0), "busy"),
+    ],
+)
+async def test_handoff_availability_routes_requested_pool(
+    b1_service,
+    snapshot: HandoffAgentAvailability,
+    expected_prompt_kind: str,
+) -> None:
+    service, _record_service = b1_service
+    availability = FakeHandoffAvailabilityService(snapshot)
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        availability_service_factory=lambda _db: availability,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await b1_service.event_worker.flush_pending()
+        b1_service.event_worker.detach_all()
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "handoff_tool_requested",
+            "agent",
+            {
+                "toolCallId": "handoff_tool_available",
+                "reason": "customer_request",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["rows"][0]["status"] == "requested"
+        assert availability.call_ids == [result.call_id]
+        triggered = next(
+            event
+            for event in service.orchestrator.event_store.list_all(result.call_id)
+            if event.type == "handoff_auto_triggered"
+        )
+        assert triggered.payload["waitingPromptKind"] == expected_prompt_kind
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_without_online_agent_fails_and_creates_one_follow_up(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    availability = FakeHandoffAvailabilityService(
+        HandoffAgentAvailability(online_agent_count=0, available_agent_count=0)
+    )
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        availability_service_factory=lambda _db: availability,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await b1_service.event_worker.flush_pending()
+        b1_service.event_worker.detach_all()
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "handoff_tool_requested",
+            "agent",
+            {
+                "toolCallId": "handoff_tool_no_online",
+                "reason": "customer_request",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["status"] == "failed"
+        assert handoffs["rows"][0]["endReason"] == "no_online_agent"
+        assert handoffs["rows"][0]["failureStage"] == "availability_check"
+
+        follow_ups = list(
+            (
+                await record_service.repository.db.execute(
+                    select(AiCallFollowUpTaskModel).where(
+                        AiCallFollowUpTaskModel.source_handoff_id
+                        == handoffs["rows"][0]["handoffId"]
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(follow_ups) == 1
+        assert follow_ups[0].source_type == "handoff_unanswered"
+        assert follow_ups[0].status == "pending"
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_availability_failure_is_not_reported_as_agent_busy(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        availability_service_factory=lambda _db: FailingHandoffAvailabilityService(),
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await b1_service.event_worker.flush_pending()
+        b1_service.event_worker.detach_all()
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "handoff_tool_requested",
+            "agent",
+            {
+                "toolCallId": "handoff_tool_availability_error",
+                "reason": "customer_request",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["status"] == "failed"
+        assert handoffs["rows"][0]["endReason"] == "handoff_service_unavailable"
+        assert handoffs["rows"][0]["failureStage"] == "availability_check"
+
+        follow_ups = list(
+            (
+                await record_service.repository.db.execute(
+                    select(AiCallFollowUpTaskModel).where(
+                        AiCallFollowUpTaskModel.source_handoff_id
+                        == handoffs["rows"][0]["handoffId"]
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(follow_ups) == 1
     finally:
         worker.detach_all()
         await worker.stop()

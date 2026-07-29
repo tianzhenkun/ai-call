@@ -130,7 +130,13 @@ class AiCallHandoffExceptionManager:
             payload={"deadlineAt": deadline.isoformat()},
         )
 
-    def start_waiting_tone(self, handoff: AiCallHandoffModel) -> None:
+    def start_waiting_tone(
+        self,
+        handoff: AiCallHandoffModel,
+        *,
+        prompt_kind: str = "default",
+    ) -> None:
+        del prompt_kind
         has_waiting_tone = self.waiting_tone_enabled and self.waiting_tone_audio_path is not None
         if self.system_prompt_player is None or (
             self.waiting_prompt_audio_path is None and not has_waiting_tone
