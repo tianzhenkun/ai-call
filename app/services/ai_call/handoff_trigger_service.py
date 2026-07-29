@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 import httpx
@@ -437,6 +437,7 @@ class TriggeredHandoff:
 
 class AiCallHandoffTriggerService:
     RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
+    RECENT_TRIGGER_DEDUP_WINDOW_SECONDS = 5.0
     EXPLICIT_TRANSFER_DELTA_COMMANDS = frozenset(
         {
             "转人工",
@@ -470,6 +471,7 @@ class AiCallHandoffTriggerService:
         "转人工吧",
     )
     CONFIRMATION_TRANSFER_URGE_PATTERNS = (
+        "转吧",
         "转啊",
         "快转",
         "赶紧转",
@@ -488,9 +490,12 @@ class AiCallHandoffTriggerService:
         "为什么不转",
     )
     CONFIRMATION_DECLINE_PATTERNS = (
+        "不是",
         "不可以",
         "不行",
         "不好",
+        "不想",
+        "不想转",
         "不用",
         "不用了",
         "不要",
@@ -561,6 +566,14 @@ class AiCallHandoffTriggerService:
                 transcript=transcript,
                 confidence=0.0,
                 classifier_source="transcript_trust",
+            )
+            return
+        if self._has_recent_auto_trigger(event_store, event.call_id):
+            self._append_ignored(
+                event_store,
+                event.call_id,
+                reason="duplicate_trigger",
+                transcript=transcript,
             )
             return
         if await self._has_active_handoff(event.call_id):
@@ -687,6 +700,15 @@ class AiCallHandoffTriggerService:
                 event_store,
                 event.call_id,
                 reason="disabled",
+                transcript=request_message,
+                classifier_source="realtime_tool",
+            )
+            return
+        if self._has_recent_auto_trigger(event_store, event.call_id):
+            self._append_ignored(
+                event_store,
+                event.call_id,
+                reason="duplicate_trigger",
                 transcript=request_message,
                 classifier_source="realtime_tool",
             )
@@ -924,29 +946,32 @@ class AiCallHandoffTriggerService:
         request_message: str,
     ) -> TriggeredHandoff:
         async with self.session_factory() as db:
-            async with db.begin():
-                service = self.service_factory(db)
-                if self.availability_service_factory is None:
+            if self.availability_service_factory is None:
+                async with db.begin():
+                    service = self.service_factory(db)
                     handoff = await service.create_handoff(
                         call_id=call_id,
                         source="customer",
                         reason=reason,
                         request_message=request_message,
                     )
-                    return TriggeredHandoff(
-                        handoff=handoff,
-                        waiting_prompt_kind="default",
-                    )
+                return TriggeredHandoff(
+                    handoff=handoff,
+                    waiting_prompt_kind="default",
+                )
 
-                availability = None
-                availability_error: Exception | None = None
-                try:
+            availability = None
+            availability_error: Exception | None = None
+            try:
+                async with db.begin():
                     availability = await self.availability_service_factory(
                         db
                     ).get_for_call(call_id)
-                except Exception as exc:
-                    availability_error = exc
+            except Exception as exc:
+                availability_error = exc
 
+            async with db.begin():
+                service = self.service_factory(db)
                 waiting_prompt_kind = (
                     "none"
                     if availability_error is not None
@@ -996,6 +1021,20 @@ class AiCallHandoffTriggerService:
                         else None
                     ),
                 )
+
+    @classmethod
+    def _has_recent_auto_trigger(
+        cls,
+        event_store: InMemoryEventStore,
+        call_id: str,
+    ) -> bool:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=cls.RECENT_TRIGGER_DEDUP_WINDOW_SECONDS
+        )
+        return any(
+            event.type == "handoff_auto_triggered" and event.timestamp >= cutoff
+            for event in reversed(event_store.list_all(call_id))
+        )
 
     def _append_ignored(
         self,
@@ -1110,18 +1149,23 @@ class AiCallHandoffTriggerService:
 
     @classmethod
     def _is_confirmation_accepted(cls, normalized: str) -> bool:
-        return any(
+        if cls._is_confirmation_declined(normalized):
+            return False
+        if normalized in cls.CONFIRMATION_ACCEPT_PATTERNS:
+            return True
+        if any(
             pattern in normalized
-            for pattern in (
-                cls.CONFIRMATION_ACCEPT_PATTERNS
-                + cls.CONFIRMATION_TRANSFER_URGE_PATTERNS
-            )
+            for pattern in cls.CONFIRMATION_TRANSFER_URGE_PATTERNS
+        ):
+            return True
+        return any(
+            normalized == f"{affirmation}{transfer}"
+            for affirmation in ("是", "是的", "确认", "可以", "好的", "好")
+            for transfer in ("转人工", "转客服", "找人工", "找客服")
         )
 
     @classmethod
     def _is_confirmation_declined(cls, normalized: str) -> bool:
-        if any(pattern in normalized for pattern in cls.CONFIRMATION_TRANSFER_URGE_PATTERNS):
-            return False
         return any(pattern in normalized for pattern in cls.CONFIRMATION_DECLINE_PATTERNS)
 
     @staticmethod

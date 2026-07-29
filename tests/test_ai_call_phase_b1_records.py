@@ -212,6 +212,22 @@ class FailingHandoffAvailabilityService:
         raise RuntimeError(f"availability failed for {call_id}")
 
 
+class DatabaseFailingHandoffAvailabilityService:
+    def __init__(self, db) -> None:
+        self.db = db
+
+    async def get_for_call(self, call_id: str) -> HandoffAgentAvailability:
+        _ = call_id
+        try:
+            await self.db.execute(
+                text("SELECT * FROM ai_call_missing_handoff_availability_table")
+            )
+        except Exception:
+            await self.db.rollback()
+            raise
+        raise AssertionError("缺失表查询必须失败")
+
+
 class SlowHandoffIntentClassifier:
     def __init__(self) -> None:
         self.transcripts: list[str] = []
@@ -1560,6 +1576,82 @@ async def test_customer_partial_handoff_is_created_only_after_affirmative_confir
 
 
 @pytest.mark.anyio
+async def test_customer_partial_handoff_rejects_negative_confirmation(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_negative_confirmation",
+                "reason": "customer_request",
+                "confirmationRequired": True,
+            },
+        )
+        await worker.flush_pending()
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={
+                "item_id": "negative_confirmation",
+                "transcript": "不是，我不想转人工。",
+            },
+        )
+        await worker.flush_pending()
+
+        assert await service.list_handoffs(result.call_id) == {"rows": [], "total": 0}
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_declined" in event_types
+        assert "handoff_confirmation_confirmed" not in event_types
+        assert "handoff_auto_triggered" not in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("snapshot", "expected_prompt_kind"),
     [
@@ -1715,6 +1807,85 @@ async def test_handoff_without_online_agent_fails_and_creates_one_follow_up(
 
 
 @pytest.mark.anyio
+async def test_same_turn_transcript_and_tool_create_only_one_terminal_handoff(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    availability = FakeHandoffAvailabilityService(
+        HandoffAgentAvailability(online_agent_count=0, available_agent_count=0)
+    )
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=True,
+            confidence=0.99,
+            reason="customer_request",
+            summary="用户明确要求转人工",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        availability_service_factory=lambda _db: availability,
+    )
+    worker = AiCallHandoffTriggerWorker(
+        trigger_service,
+        transcript_trigger_enabled=True,
+    )
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await b1_service.event_worker.flush_pending()
+        b1_service.event_worker.detach_all()
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "user_transcript_done",
+            "provider",
+            {"item_id": "handoff_same_turn", "transcript": "我要转人工。"},
+        )
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "handoff_tool_requested",
+            "agent",
+            {
+                "toolCallId": "handoff_tool_same_turn",
+                "reason": "customer_request",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["status"] == "failed"
+        assert handoffs["rows"][0]["endReason"] == "no_online_agent"
+
+        follow_ups = list(
+            (await record_service.repository.db.execute(select(AiCallFollowUpTaskModel)))
+            .scalars()
+            .all()
+        )
+        assert len(follow_ups) == 1
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
 async def test_handoff_availability_failure_is_not_reported_as_agent_busy(
     b1_service,
 ) -> None:
@@ -1784,6 +1955,67 @@ async def test_handoff_availability_failure_is_not_reported_as_agent_busy(
             .all()
         )
         assert len(follow_ups) == 1
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
+async def test_handoff_availability_database_error_uses_fresh_transaction(
+    b1_service,
+) -> None:
+    service, _record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        availability_service_factory=DatabaseFailingHandoffAvailabilityService,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await b1_service.event_worker.flush_pending()
+        b1_service.event_worker.detach_all()
+        service.orchestrator.event_store.append(
+            result.call_id,
+            "handoff_tool_requested",
+            "agent",
+            {
+                "toolCallId": "handoff_tool_database_error",
+                "reason": "customer_request",
+            },
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["status"] == "failed"
+        assert handoffs["rows"][0]["endReason"] == "handoff_service_unavailable"
+        assert handoffs["rows"][0]["failureStage"] == "availability_check"
     finally:
         worker.detach_all()
         await worker.stop()
