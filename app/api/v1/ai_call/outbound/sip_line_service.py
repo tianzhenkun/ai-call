@@ -131,7 +131,6 @@ class SipLineService:
             select(AiCallSipLineModel.id).where(
                 AiCallSipLineModel.tenant_id == tenant_id,
                 AiCallSipLineModel.line_code == request.line_code,
-                AiCallSipLineModel.deleted.is_(False),
             )
         )
         if duplicate is not None:
@@ -173,6 +172,8 @@ class SipLineService:
                 msg="线路编码创建后不可修改",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        if line.default_marker == DEFAULT_MARKER and not request.enabled:
+            self._ensure_not_default(line)
         for field, value in request.model_dump().items():
             setattr(line, field, value)
         line.health_status = "UNKNOWN"

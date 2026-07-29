@@ -255,6 +255,39 @@ async def test_default_line_cannot_be_disabled_or_deleted(database) -> None:
 
 
 @pytest.mark.anyio
+async def test_update_cannot_disable_default_line(database) -> None:
+    service = SipLineService(settings=Settings())
+    async with database() as db:
+        line = await service.create_line(db, "tenant-a", 1, _line_request("line-a"))
+        await service.set_default(db, "tenant-a", 1, line.id)
+        disabled_request = _line_request("line-a").model_copy(
+            update={"enabled": False}
+        )
+        with pytest.raises(CustomException, match="先指定其他默认线路") as exc_info:
+            await service.update_line(
+                db,
+                "tenant-a",
+                1,
+                line.id,
+                disabled_request,
+            )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.anyio
+async def test_soft_deleted_line_code_cannot_be_reused(database) -> None:
+    service = SipLineService(settings=Settings())
+    async with database() as db:
+        line = await service.create_line(db, "tenant-a", 1, _line_request("line-a"))
+        await service.delete(db, "tenant-a", 1, line.id)
+        with pytest.raises(CustomException, match="线路编码已存在") as exc_info:
+            await service.create_line(db, "tenant-a", 1, _line_request("line-a"))
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.anyio
 async def test_preflight_updates_health_without_creating_sip_participant(database) -> None:
     checker = PassingPreflightChecker()
     settings = Settings(
