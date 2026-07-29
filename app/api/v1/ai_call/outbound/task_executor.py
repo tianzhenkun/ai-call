@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
 
@@ -21,9 +21,27 @@ from .rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from .sip_line_model import AiCallSipLineModel
 from .sip_line_schema import SipLineSnapshot
 
 TERMINAL_TARGET_STATUSES = {"COMPLETED", "CANCELLED"}
+BUSY_END_REASONS = {
+    "busy",
+    "busy_here",
+    "callee_busy",
+    "sip_busy",
+    "user_busy",
+    "sip_486",
+}
+NO_ANSWER_END_REASONS = {
+    "connect_timeout",
+    "no_answer",
+    "ringing_timeout",
+    "sip_connect_timeout",
+    "user_unavailable",
+    "sip_408",
+    "sip_480",
+}
 
 
 def _utc_now() -> datetime:
@@ -52,6 +70,7 @@ class DialResult:
     provider_status_code: str | None = None
     provider_reason: str | None = None
     hangup_cause: str | None = None
+    retry_allowed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +139,7 @@ class OutboundTaskExecutor:
         now_provider: Callable[[], datetime] = _utc_now,
         business_timezone: str = "Asia/Shanghai",
         dialing_timeout_seconds: int = 300,
+        managed_attempt_timeout_seconds: int = 900,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
@@ -128,6 +148,10 @@ class OutboundTaskExecutor:
         self.now_provider = now_provider
         self.business_timezone = ZoneInfo(business_timezone)
         self.dialing_timeout_seconds = max(1, dialing_timeout_seconds)
+        self.managed_attempt_timeout_seconds = max(
+            self.dialing_timeout_seconds,
+            managed_attempt_timeout_seconds,
+        )
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -333,23 +357,46 @@ class OutboundTaskExecutor:
 
     async def _recover_stale_attempts(self, now: datetime) -> None:
         cutoff = now - timedelta(seconds=self.dialing_timeout_seconds)
+        managed_cutoff = now - timedelta(
+            seconds=self.managed_attempt_timeout_seconds
+        )
         async with self.session_factory() as db:
             attempts = (
                 await db.scalars(
                     select(AiCallOutboundAttemptModel)
                     .where(
-                        AiCallOutboundAttemptModel.status == "DIALING",
                         AiCallOutboundAttemptModel.started_at <= cutoff,
                         or_(
-                            AiCallOutboundAttemptModel.dialer_type.is_(None),
-                            AiCallOutboundAttemptModel.dialer_type == "mock",
+                            (
+                                (AiCallOutboundAttemptModel.status == "DIALING")
+                                & (
+                                    AiCallOutboundAttemptModel.dialer_type.is_(
+                                        None
+                                    )
+                                    | (
+                                        AiCallOutboundAttemptModel.dialer_type
+                                        == "mock"
+                                    )
+                                )
+                            ),
+                            (
+                                AiCallOutboundAttemptModel.status.in_(
+                                    {"DIALING", "IN_CALL"}
+                                )
+                                & (
+                                    AiCallOutboundAttemptModel.dialer_type
+                                    == "sip"
+                                )
+                            ),
                         ),
                     )
                     .order_by(AiCallOutboundAttemptModel.started_at)
                     .limit(self.target_batch_size)
                 )
             ).all()
-            recovery_items: list[tuple[OutboundDialRequest, str]] = []
+            recovery_items: list[
+                tuple[OutboundDialRequest, str, DialResult]
+            ] = []
             for attempt in attempts:
                 task = await db.scalar(
                     select(AiCallOutboundTaskModel).where(
@@ -364,31 +411,88 @@ class OutboundTaskExecutor:
                         AiCallOutboundTargetModel.id == attempt.target_id,
                     )
                 )
-                if task is None or target is None or target.status != "DIALING":
+                if (
+                    task is None
+                    or target is None
+                    or target.status != attempt.status
+                ):
                     continue
-                recovery_items.append((
-                    OutboundDialRequest(
-                        tenant_id=attempt.tenant_id,
-                        task_id=task.id,
-                        target_id=target.id,
-                        attempt_no=attempt.attempt_no,
-                        phone_number=target.phone_number,
-                        customer_name=target.customer_name,
-                        scene_code=task.scene_code,
-                        voice=task.voice,
-                        prompt_profile_id=task.prompt_profile_id,
-                        line=self._task_line_snapshot(task),
-                    ),
-                    attempt.call_id,
-                ))
-        for request, call_id in recovery_items:
+                request = OutboundDialRequest(
+                    tenant_id=attempt.tenant_id,
+                    task_id=task.id,
+                    target_id=target.id,
+                    attempt_no=attempt.attempt_no,
+                    phone_number=target.phone_number,
+                    customer_name=target.customer_name,
+                    scene_code=task.scene_code,
+                    voice=task.voice,
+                    prompt_profile_id=task.prompt_profile_id,
+                    line=self._task_line_snapshot(task),
+                )
+                if attempt.dialer_type in {None, "mock"}:
+                    result = DialResult(
+                        call_result="call_failed",
+                        error_message="执行器中断，拨打结果未知",
+                    )
+                else:
+                    record = await db.scalar(
+                        select(AiCallRecordModel).where(
+                            AiCallRecordModel.call_id == attempt.call_id
+                        )
+                    )
+                    media_connected = bool(
+                        await db.scalar(
+                            select(
+                                exists().where(
+                                    AiCallEventModel.call_id == attempt.call_id,
+                                    AiCallEventModel.event_type
+                                    == "media_connected",
+                                )
+                            )
+                        )
+                    )
+                    if (
+                        record is not None
+                        and str(record.status or "").lower()
+                        in {"completed", "failed"}
+                    ):
+                        result = self._terminal_sip_record_result(
+                            record,
+                            media_connected=media_connected,
+                        )
+                    elif record is None:
+                        result = DialResult(
+                            call_result="call_failed",
+                            error_message=(
+                                "正式 SIP 执行器中断且未找到通话记录，禁止自动重拨"
+                            ),
+                            retry_allowed=False,
+                        )
+                    elif (
+                        attempt.status == "DIALING"
+                        and record.answered_at is not None
+                        and media_connected
+                    ):
+                        attempt.status = "IN_CALL"
+                        attempt.updated_at = now
+                        target.status = "IN_CALL"
+                        target.updated_at = now
+                        continue
+                    elif attempt.started_at <= managed_cutoff:
+                        result = DialResult(
+                            call_result="call_failed",
+                            error_message="正式 SIP 通话状态对账超时，禁止自动重拨",
+                            retry_allowed=False,
+                        )
+                    else:
+                        continue
+                recovery_items.append((request, attempt.call_id, result))
+            await db.commit()
+        for request, call_id, result in recovery_items:
             await self._finish_attempt(
                 request,
                 call_id,
-                DialResult(
-                    call_result="call_failed",
-                    error_message="执行器中断，拨打结果未知",
-                ),
+                result,
                 now,
             )
 
@@ -601,6 +705,38 @@ class OutboundTaskExecutor:
                 task.updated_at = now
                 await db.commit()
                 return None
+            if self.dialer.dialer_type == "sip" and line is not None:
+                current_line = await db.scalar(
+                    select(AiCallSipLineModel)
+                    .where(
+                        AiCallSipLineModel.tenant_id == task.tenant_id,
+                        AiCallSipLineModel.id == int(line.line_id),
+                        AiCallSipLineModel.enabled.is_(True),
+                        AiCallSipLineModel.deleted.is_(False),
+                    )
+                    .with_for_update()
+                )
+                if current_line is None:
+                    task.status = "FAILED"
+                    task.error_message = "任务绑定的 SIP 线路已停用或删除"
+                    task.ended_at = now
+                    task.updated_at = now
+                    await db.commit()
+                    return None
+                active_line_attempts = int(
+                    await db.scalar(
+                        select(func.count(AiCallOutboundAttemptModel.id)).where(
+                            AiCallOutboundAttemptModel.tenant_id == task.tenant_id,
+                            AiCallOutboundAttemptModel.line_id == current_line.id,
+                            AiCallOutboundAttemptModel.status.in_(
+                                {"DIALING", "IN_CALL"}
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                if active_line_attempts >= current_line.max_concurrency:
+                    return None
             candidates = (
                 await db.scalars(
                     select(AiCallOutboundTargetModel.id)
@@ -743,6 +879,45 @@ class OutboundTaskExecutor:
             duration_ms=None,
         )
 
+    @staticmethod
+    def _terminal_sip_record_result(
+        record: AiCallRecordModel,
+        *,
+        media_connected: bool,
+    ) -> DialResult:
+        duration_ms = max(0, int(record.duration_ms or 0))
+        if record.answered_at is not None and media_connected:
+            return DialResult(
+                call_result="connected",
+                duration_ms=duration_ms,
+            )
+        if record.answered_at is not None:
+            return DialResult(
+                call_result="call_failed",
+                error_message="未检测到媒体接通证据",
+                duration_ms=duration_ms,
+                retry_allowed=False,
+            )
+        reason = str(record.end_reason or "").strip().lower()
+        error_message = record.failure_message or record.end_reason
+        if reason in BUSY_END_REASONS:
+            return DialResult(
+                call_result="busy",
+                error_message=error_message,
+                duration_ms=duration_ms,
+            )
+        if reason in NO_ANSWER_END_REASONS:
+            return DialResult(
+                call_result="no_answer",
+                error_message=error_message,
+                duration_ms=duration_ms,
+            )
+        return DialResult(
+            call_result="call_failed",
+            error_message=error_message or "SIP 外呼失败",
+            duration_ms=duration_ms,
+        )
+
     async def _finish_attempt(
         self,
         request: OutboundDialRequest,
@@ -825,7 +1000,10 @@ class OutboundTaskExecutor:
             else:
                 retry_interval = (
                     None
-                    if task.status in {"STOPPING", "STOPPED", "CANCELLED"}
+                    if (
+                        not result.retry_allowed
+                        or task.status in {"STOPPING", "STOPPED", "CANCELLED"}
+                    )
                     else self._retry_interval(task, request.attempt_no, result.call_result)
                 )
                 if retry_interval is None:

@@ -10,13 +10,14 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
 from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
+from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.task_executor import (
     DialResult,
     MockOutboundDialer,
@@ -123,6 +124,11 @@ class BlockingDialer:
         self.started.set()
         await self.release.wait()
         return DialResult(call_result="connected")
+
+
+class BlockingSipDialer(BlockingDialer):
+    dialer_type = "sip"
+    manages_call_record = True
 
 
 class LifecycleDialer:
@@ -242,6 +248,45 @@ async def _seed_task(
     task_id = generate_snowflake_id()
     target_ids = [generate_snowflake_id() for _ in range(target_count)]
     async with database() as session:
+        if line_snapshot is not None:
+            existing_line = await session.get(
+                AiCallSipLineModel,
+                int(line_snapshot["lineId"]),
+            )
+            if existing_line is None:
+                session.add(
+                    AiCallSipLineModel(
+                        id=int(line_snapshot["lineId"]),
+                        tenant_id="tenant-a",
+                        line_code=str(line_snapshot["lineCode"]),
+                        line_name=str(line_snapshot["lineName"]),
+                        enabled=True,
+                        default_marker="OUTBOUND",
+                        adapter_type=str(line_snapshot["adapterType"]),
+                        route_mode=str(line_snapshot["routeMode"]),
+                        trunk_id=line_snapshot["trunkId"],
+                        proxy_host=line_snapshot["proxyHost"],
+                        proxy_port=line_snapshot["proxyPort"],
+                        auth_mode=str(line_snapshot["authMode"]),
+                        caller_number=str(line_snapshot["callerNumber"]),
+                        destination_country=str(
+                            line_snapshot["destinationCountry"]
+                        ),
+                        max_concurrency=int(line_snapshot["maxConcurrency"]),
+                        originate_timeout_seconds=int(
+                            line_snapshot["originateTimeoutSeconds"]
+                        ),
+                        health_status="AVAILABLE",
+                        health_message=None,
+                        last_checked_at=now,
+                        deleted=False,
+                        deleted_at=None,
+                        created_by=1,
+                        updated_by=1,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
         session.add(
             AiCallOutboundTaskModel(
                 id=task_id,
@@ -395,6 +440,78 @@ async def test_sip_executor_fails_task_without_line_snapshot(database) -> None:
     assert task.error_message == "任务缺少有效的 SIP 线路快照"
     assert target is not None and target.status == "PENDING"
     assert attempts == []
+
+
+@pytest.mark.anyio
+async def test_sip_executor_does_not_dial_disabled_snapshotted_line(database) -> None:
+    now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    dialer = SipSequenceDialer([DialResult(call_result="connected")])
+    task_id, target_ids = await _seed_task(
+        database,
+        now=now,
+        line_snapshot=available_line_snapshot(),
+    )
+    async with database() as db:
+        line = await db.get(AiCallSipLineModel, 340700000000000001)
+        assert line is not None
+        line.enabled = False
+        await db.commit()
+
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+
+    assert await executor.run_once() == 0
+    assert dialer.requests == []
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+    assert task is not None and task.status == "FAILED"
+    assert task.error_message == "任务绑定的 SIP 线路已停用或删除"
+    assert target is not None and target.attempt_count == 0
+
+
+@pytest.mark.anyio
+async def test_sip_executor_respects_persisted_line_concurrency(database) -> None:
+    now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    line = available_line_snapshot()
+    task_id, _ = await _seed_task(
+        database,
+        now=now,
+        line_snapshot=line,
+    )
+    async with database() as db:
+        db.add(
+            AiCallOutboundAttemptModel(
+                id=generate_snowflake_id(),
+                tenant_id="tenant-a",
+                task_id=generate_snowflake_id(),
+                target_id=generate_snowflake_id(),
+                attempt_no=1,
+                call_id="existing-live-call",
+                dialer_type="sip",
+                status="IN_CALL",
+                call_result=None,
+                error_message=None,
+                line_id=int(line["lineId"]),
+                line_code=str(line["lineCode"]),
+                provider_status_code=None,
+                provider_reason=None,
+                hangup_cause=None,
+                started_at=now,
+                ended_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await db.commit()
+    dialer = SipSequenceDialer([DialResult(call_result="connected")])
+
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+
+    assert await executor.run_once() == 0
+    assert dialer.requests == []
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+    assert task is not None and task.status == "RUNNING"
 
 
 def test_mock_dialer_declares_non_record_managed_protocol() -> None:
@@ -873,6 +990,149 @@ async def test_stale_recovery_ignores_real_managed_attempt(database) -> None:
     assert target is not None and target.status == "DIALING"
     assert attempt is not None and attempt.status == "DIALING"
     assert recovery_dialer.requests == []
+
+
+@pytest.mark.anyio
+async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
+    database,
+) -> None:
+    clock = [datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)]
+    task_id, target_ids = await _seed_task(
+        database,
+        now=clock[0],
+        line_snapshot=available_line_snapshot(),
+    )
+    blocking_dialer = BlockingSipDialer()
+    executor = OutboundTaskExecutor(
+        database,
+        blocking_dialer,
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+    interrupted_run = asyncio.create_task(executor.run_once())
+    await asyncio.wait_for(blocking_dialer.started.wait(), timeout=0.5)
+    interrupted_run.cancel()
+    await asyncio.gather(interrupted_run, return_exceptions=True)
+
+    async with database() as db:
+        attempt = await db.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        assert attempt is not None
+        answered_at = clock[0] + timedelta(seconds=2)
+        db.add(
+            AiCallRecordModel(
+                id=generate_snowflake_id(),
+                call_id=attempt.call_id,
+                business_type="outbound_task",
+                business_id=str(task_id),
+                scene_code="intro_contract",
+                prompt_source_key="prompt-1",
+                entry_type="sip_outbound",
+                room_name=f"ai-call-{attempt.call_id}",
+                participant_identity=f"sip-{attempt.call_id}",
+                callee_phone_number_hash=None,
+                callee_phone_number_masked=None,
+                status="completed",
+                end_reason="remote_hangup",
+                failure_stage=None,
+                failure_message=None,
+                started_at=clock[0],
+                answered_at=answered_at,
+                ended_at=clock[0] + timedelta(seconds=20),
+                duration_ms=18000,
+            )
+        )
+        db.add(
+            AiCallEventModel(
+                id=generate_snowflake_id(),
+                call_id=attempt.call_id,
+                event_id=f"event-{generate_snowflake_id()}",
+                event_type="media_connected",
+                source="livekit",
+                event_time=answered_at,
+                payload_json=None,
+            )
+        )
+        await db.commit()
+
+    clock[0] += timedelta(minutes=5)
+    recovery_dialer = SipSequenceDialer([])
+    recovery_executor = OutboundTaskExecutor(
+        database,
+        recovery_dialer,
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+
+    assert await recovery_executor.run_once() == 0
+    assert recovery_dialer.requests == []
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await db.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+    assert task is not None and task.status == "COMPLETED"
+    assert target is not None and target.latest_result == "connected"
+    assert attempt is not None and attempt.status == "COMPLETED"
+
+
+@pytest.mark.anyio
+async def test_stale_sip_attempt_without_record_fails_without_retry(database) -> None:
+    clock = [datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)]
+    line = available_line_snapshot()
+    task_id, target_ids = await _seed_task(
+        database,
+        now=clock[0],
+        line_snapshot=line,
+        snapshot=_snapshot(
+            retry_count=1,
+            retry_intervals_minutes=[1],
+            retryable_results=["call_failed"],
+            line_snapshot=line,
+        ),
+    )
+    blocking_dialer = BlockingSipDialer()
+    executor = OutboundTaskExecutor(
+        database,
+        blocking_dialer,
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+    interrupted_run = asyncio.create_task(executor.run_once())
+    await asyncio.wait_for(blocking_dialer.started.wait(), timeout=0.5)
+    interrupted_run.cancel()
+    await asyncio.gather(interrupted_run, return_exceptions=True)
+
+    clock[0] += timedelta(minutes=5)
+    recovery_executor = OutboundTaskExecutor(
+        database,
+        SipSequenceDialer([]),
+        now_provider=lambda: clock[0],
+        dialing_timeout_seconds=300,
+    )
+
+    assert await recovery_executor.run_once() == 0
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await db.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+    assert task is not None and task.status == "COMPLETED"
+    assert target is not None and target.status == "COMPLETED"
+    assert target.next_attempt_at is None
+    assert attempt is not None and attempt.status == "FAILED"
+    assert attempt.error_message == (
+        "正式 SIP 执行器中断且未找到通话记录，禁止自动重拨"
+    )
 
 
 @pytest.mark.anyio

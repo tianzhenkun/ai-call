@@ -278,13 +278,11 @@ def validate_sip_outbound_preflight(
     *,
     callee_phone_number: str,
 ) -> SipOutboundPreflightResult:
+    line_preflight = validate_sip_outbound_line_config(config)
+    if not line_preflight.ok:
+        return line_preflight
+
     callee = _normalize_optional(callee_phone_number)
-    if not config.enabled:
-        return _preflight_failed(
-            "sip_outbound_disabled",
-            "sip_config",
-            "SIP 真实外呼未启用",
-        )
     if not callee or not re.fullmatch(r"\+?\d{5,20}", callee):
         return _preflight_failed(
             "invalid_callee_number",
@@ -298,6 +296,18 @@ def validate_sip_outbound_preflight(
             "callee_number",
             "被叫号码不在允许拨打前缀内",
         )
+    return SipOutboundPreflightResult(ok=True)
+
+
+def validate_sip_outbound_line_config(
+    config: SipOutboundConfig,
+) -> SipOutboundPreflightResult:
+    if not config.enabled:
+        return _preflight_failed(
+            "sip_outbound_disabled",
+            "sip_config",
+            "SIP 真实外呼未启用",
+        )
     if not (_normalize_optional(config.trunk_id) or _normalize_optional(config.trunk_hostname)):
         return _preflight_failed(
             "sip_trunk_missing",
@@ -310,6 +320,8 @@ def validate_sip_outbound_preflight(
             "sip_trunk",
             "SIP 主叫显号缺失",
         )
+    if _normalize_optional(config.trunk_id):
+        return SipOutboundPreflightResult(ok=True)
     if config.signaling_port <= 0 or config.signaling_port > 65535:
         return _preflight_failed(
             "sip_signaling_port_invalid",
@@ -378,7 +390,24 @@ def _safe_exception_details(exc: Exception) -> dict[str, str]:
     raw_message = str(exc).strip()
     details = {"rawErrorType": exc.__class__.__name__}
     if raw_message:
-        details["rawErrorMessage"] = _sanitize_error_message(raw_message)[:500]
+        safe_message = _sanitize_error_message(raw_message)[:500]
+        details["rawErrorMessage"] = safe_message
+        status_match = re.search(r"(?i)\bSIP[\s_:-]?([1-6]\d{2})\b", safe_message)
+        if status_match:
+            details["providerStatusCode"] = status_match.group(1)
+        hangup_match = re.search(
+            r"(?i)\bhangup[_\s-]?cause\s*[:=]\s*([A-Z0-9_-]+)",
+            safe_message,
+        )
+        if hangup_match:
+            details["hangupCause"] = hangup_match.group(1)
+        provider_reason = re.split(
+            r"(?i)\s*[;,]\s*hangup[_\s-]?cause\s*[:=]",
+            safe_message,
+            maxsplit=1,
+        )[0].strip()
+        if status_match and provider_reason:
+            details["providerReason"] = provider_reason
     return details
 
 

@@ -292,6 +292,7 @@ async def test_preflight_updates_health_without_creating_sip_participant(databas
     checker = PassingPreflightChecker()
     settings = Settings(
         AI_CALL_SIP_OUTBOUND_ENABLED=True,
+        AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES="199",
         SIP_PUBLIC_IP="127.0.0.1",
         SIP_RTP_RANGE="16384-16484",
     )
@@ -355,7 +356,35 @@ async def test_preflight_distinguishes_bad_config_from_unreachable_livekit(datab
         )
         await db.commit()
     assert unavailable.health_status == "UNAVAILABLE"
-    assert unavailable.health_message == "LiveKit unavailable"
+    assert unavailable.health_message == "LiveKit API 连接失败（RuntimeError）"
+
+
+@pytest.mark.anyio
+async def test_preflight_health_message_never_persists_credentials(database) -> None:
+    class CredentialLeakingChecker:
+        async def check(self, config) -> None:
+            del config
+            raise RuntimeError(
+                "Authorization: Bearer abc api_key: key123 password=secret123"
+            )
+
+    service = SipLineService(
+        settings=Settings(
+            AI_CALL_SIP_OUTBOUND_ENABLED=True,
+            SIP_PUBLIC_IP="127.0.0.1",
+            SIP_RTP_RANGE="16384-16484",
+        ),
+        preflight_checker=CredentialLeakingChecker(),
+    )
+    async with database() as db:
+        line = await service.create_line(db, "tenant-a", 1, _line_request("safe"))
+        result = await service.preflight(db, "tenant-a", 1, line.id)
+
+    assert result.health_status == "UNAVAILABLE"
+    assert result.health_message == "LiveKit API 连接失败（RuntimeError）"
+    assert "abc" not in result.health_message
+    assert "key123" not in result.health_message
+    assert "secret123" not in result.health_message
 
 
 def test_sip_line_routes_are_registered() -> None:

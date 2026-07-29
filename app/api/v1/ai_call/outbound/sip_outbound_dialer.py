@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Protocol
 
 from sqlalchemy import exists, select
@@ -67,12 +69,16 @@ class SipOutboundDialer:
         settings: Settings = settings,
         poll_seconds: float = 0.5,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        reconciliation_grace_seconds: int = 60,
     ) -> None:
         self.session_factory = session_factory
         self.ai_call_service_factory = ai_call_service_factory
         self.settings = settings
         self.poll_seconds = max(0.0, poll_seconds)
         self.sleep = sleep
+        self.monotonic = monotonic
+        self.reconciliation_grace_seconds = max(0, reconciliation_grace_seconds)
 
     async def dial(
         self,
@@ -83,6 +89,11 @@ class SipOutboundDialer:
     ) -> DialResult:
         line = self._request_line(request)
         config = self.build_sip_config(line)
+        reconciliation_deadline = self.monotonic() + (
+            line.originate_timeout_seconds
+            + config.max_call_duration_seconds
+            + self.reconciliation_grace_seconds
+        )
         create_error: Exception | None = None
 
         async with self.session_factory() as db:
@@ -122,11 +133,14 @@ class SipOutboundDialer:
             if self._is_terminal(record):
                 if self._is_connected(record, media_connected):
                     await on_connected()
-                return self._map_evidenced_terminal(record, media_connected)
-            return DialResult(
+                return self._with_exception_diagnostics(
+                    self._map_evidenced_terminal(record, media_connected),
+                    create_error,
+                )
+            return self._with_exception_diagnostics(DialResult(
                 call_result="call_failed",
                 error_message=self._error_message(create_error),
-            )
+            ), create_error)
 
         connected_notified = False
         while True:
@@ -139,6 +153,12 @@ class SipOutboundDialer:
                 connected_notified = True
             if self._is_terminal(record):
                 return self._map_evidenced_terminal(record, media_connected)
+            if self.monotonic() >= reconciliation_deadline:
+                return DialResult(
+                    call_result="call_failed",
+                    error_message="SIP 通话状态对账超时，禁止自动重拨",
+                    retry_allowed=False,
+                )
             await self.sleep(self.poll_seconds)
 
     def build_sip_config(self, line: SipLineSnapshot) -> SipOutboundConfig:
@@ -276,6 +296,7 @@ class SipOutboundDialer:
                 hangup_cause=SipOutboundDialer._hangup_cause(
                     record.failure_message
                 ),
+                retry_allowed=False,
             )
         return SipOutboundDialer.map_terminal_record(record)
 
@@ -299,3 +320,33 @@ class SipOutboundDialer:
     def _error_message(exc: Exception) -> str:
         message = getattr(exc, "msg", None) or str(exc).strip()
         return str(message or exc.__class__.__name__)[:500]
+
+    @staticmethod
+    def _with_exception_diagnostics(
+        result: DialResult,
+        exc: Exception,
+    ) -> DialResult:
+        cause = exc
+        while cause.__cause__ is not None:
+            cause = cause.__cause__
+        details = getattr(cause, "details", None)
+        if not isinstance(details, dict):
+            return result
+        return replace(
+            result,
+            provider_status_code=(
+                str(details["providerStatusCode"])
+                if details.get("providerStatusCode")
+                else result.provider_status_code
+            ),
+            provider_reason=(
+                str(details["providerReason"])
+                if details.get("providerReason")
+                else result.provider_reason
+            ),
+            hangup_cause=(
+                str(details["hangupCause"])
+                if details.get("hangupCause")
+                else result.hangup_cause
+            ),
+        )

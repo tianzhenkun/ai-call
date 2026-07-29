@@ -31,6 +31,7 @@ from app.services.ai_call.livekit_sip import (
     LiveKitSipClient,
     SipOutboundConfig,
     SipOutboundPreflightResult,
+    validate_sip_outbound_line_config,
     validate_sip_outbound_preflight,
 )
 from app.services.ai_call.orchestrator import AiCallOrchestrator, AiCallRuntimeConfig
@@ -529,6 +530,20 @@ def test_sip_preflight_rejects_callee_outside_allowed_prefixes() -> None:
     assert result.stage == "callee_number"
 
 
+def test_managed_trunk_line_preflight_does_not_require_inline_network() -> None:
+    result = validate_sip_outbound_line_config(
+        SipOutboundConfig(
+            enabled=True,
+            trunk_id="ST_provider",
+            caller_number="1000",
+            public_ip="",
+            rtp_range="",
+        )
+    )
+
+    assert result.ok is True
+
+
 @pytest.mark.anyio
 async def test_livekit_sip_client_builds_create_participant_payload_for_fake_sdk() -> None:
     captured_payloads: list[CreateSipParticipantPayload] = []
@@ -637,6 +652,16 @@ def test_livekit_sip_client_embeds_inline_trunk_in_official_request() -> None:
     assert request.trunk.auth_username == "037100000000"
 
 
+def test_sip_sdk_error_details_extract_provider_diagnostics() -> None:
+    details = livekit_sip_module._safe_exception_details(
+        RuntimeError("SIP 486 Busy Here; hangup_cause=USER_BUSY")
+    )
+
+    assert details["providerStatusCode"] == "486"
+    assert details["providerReason"] == "SIP 486 Busy Here"
+    assert details["hangupCause"] == "USER_BUSY"
+
+
 @pytest.mark.anyio
 async def test_livekit_sip_client_raises_aicall_error_when_preflight_fails() -> None:
     client = LiveKitSipClient(
@@ -727,11 +752,10 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
     assert "session_ready" in event_types
     assert "sip_invite_sent" in event_types
     assert "sip_answered" in event_types
-    assert "media_connected" in event_types
+    assert "media_connected" not in event_types
     assert "opening_started" in event_types
     sip_invite = next(event for event in events if event.type == "sip_invite_sent")
     sip_answered = next(event for event in events if event.type == "sip_answered")
-    media_connected = next(event for event in events if event.type == "media_connected")
     assert sip_invite.payload == {
         "participantIdentity": result.participant_identity,
         "calleePhoneNumberMasked": "138****0000",
@@ -739,7 +763,37 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
         "ringingTimeoutSeconds": 30,
     }
     assert sip_answered.source == "sip"
-    assert media_connected.source == "livekit"
+
+
+@pytest.mark.anyio
+async def test_sip_audio_track_webhook_records_independent_media_evidence() -> None:
+    service, *_ = build_service_with_sip_fakes()
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+
+    handled = await service.handle_livekit_webhook_event(
+        event_type="track_published",
+        room_name=result.room_name,
+        participant_identity=result.participant_identity,
+        payload={"track": {"type": "AUDIO", "sid": "TR_audio"}},
+    )
+
+    assert handled == {
+        "handled": True,
+        "action": "record_media_connected",
+        "callId": result.call_id,
+    }
+    events = service.orchestrator.event_store.list_all(result.call_id)
+    media_connected = [
+        event for event in events if event.type == "media_connected"
+    ]
+    assert len(media_connected) == 1
+    assert media_connected[0].source == "livekit"
 
 
 @pytest.mark.anyio

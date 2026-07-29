@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -13,7 +12,7 @@ from app.config.setting import Settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
-    validate_sip_outbound_preflight,
+    validate_sip_outbound_line_config,
 )
 from app.utils.id_util import generate_snowflake_id
 
@@ -198,6 +197,14 @@ class SipLineService:
                 status_code=status.HTTP_409_CONFLICT,
             )
         await db.execute(
+            select(AiCallSipLineModel.id)
+            .where(
+                AiCallSipLineModel.tenant_id == tenant_id,
+                AiCallSipLineModel.deleted.is_(False),
+            )
+            .with_for_update()
+        )
+        await db.execute(
             update(AiCallSipLineModel)
             .where(
                 AiCallSipLineModel.tenant_id == tenant_id,
@@ -299,10 +306,7 @@ class SipLineService:
         line = await self.get_line(db, tenant_id, line_id)
         checked_at = _now()
         config = self.to_sip_config(line)
-        preflight = validate_sip_outbound_preflight(
-            config,
-            callee_phone_number=line.caller_number,
-        )
+        preflight = validate_sip_outbound_line_config(config)
         if not preflight.ok:
             line.health_status = "MISCONFIGURED"
             line.health_message = preflight.message or "SIP 线路配置不完整"
@@ -395,9 +399,4 @@ class SipLineService:
 
     @staticmethod
     def _safe_health_message(exc: Exception) -> str:
-        message = str(exc).strip() or exc.__class__.__name__
-        return re.sub(
-            r"(?i)(authorization|token|api[_-]?key|secret|password)=\S+",
-            r"\1=<redacted>",
-            message,
-        )[:500]
+        return f"LiveKit API 连接失败（{exc.__class__.__name__}）"

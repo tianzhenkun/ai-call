@@ -154,6 +154,11 @@ async def _start_ai_call_outbound_task_worker():
         target_batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
         business_timezone=settings.AI_CALL_OUTBOUND_TIMEZONE,
         dialing_timeout_seconds=settings.AI_CALL_OUTBOUND_DIALING_TIMEOUT_SECONDS,
+        managed_attempt_timeout_seconds=(
+            settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS
+            + settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS
+            + 60
+        ),
     )
     worker = OutboundTaskWorker(
         executor,

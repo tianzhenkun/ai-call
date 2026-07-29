@@ -284,6 +284,10 @@ class AiCallService:
                 ringing_timeout_seconds=ringing_timeout_seconds,
                 wait_until_answered=True,
             )
+            self._record_successful_sip_participant(
+                call_id=resolved_call_id,
+                sip_participant=sip_participant,
+            )
         except AiCallError as exc:
             if sip_invite_sent:
                 failure_payload = {
@@ -306,10 +310,6 @@ class AiCallService:
             )
             raise self._to_custom_exception(exc) from exc
 
-        self._record_successful_sip_participant(
-            call_id=resolved_call_id,
-            sip_participant=sip_participant,
-        )
         await self.record_service.mark_answered(
             resolved_call_id,
             datetime.now(timezone.utc),
@@ -577,7 +577,7 @@ class AiCallService:
         participant_identity: str | None,
         payload: dict[str, Any] | None = None,
     ) -> dict:
-        if event_type != "participant_left":
+        if event_type not in {"participant_left", "track_published"}:
             return {"handled": False, "reason": "unsupported_event"}
         call_id = self._call_id_from_sip_participant(participant_identity)
         if call_id is None:
@@ -590,6 +590,27 @@ class AiCallService:
             return {"handled": False, "reason": "session_not_found"}
         if session.status not in RUNNING_STATUSES:
             return {"handled": False, "reason": "session_not_running"}
+
+        if event_type == "track_published":
+            track = (payload or {}).get("track")
+            track_type = track.get("type") if isinstance(track, dict) else None
+            if str(track_type or "").upper() != "AUDIO":
+                return {"handled": False, "reason": "non_audio_track"}
+            self._record_sip_event(
+                call_id=call_id,
+                event_type="media_connected",
+                source="livekit",
+                payload={
+                    "participantIdentity": participant_identity,
+                    "trackSid": track.get("sid"),
+                    "evidence": "audio_track_published",
+                },
+            )
+            return {
+                "handled": True,
+                "action": "record_media_connected",
+                "callId": call_id,
+            }
 
         self._record_sip_event(
             call_id=call_id,
@@ -1186,6 +1207,16 @@ class AiCallService:
         call_id: str,
         sip_participant: CreateSipParticipantResult,
     ) -> None:
+        sip_call_status = str(sip_participant.sip_call_status or "").lower()
+        if sip_call_status not in {"active", "answered", "connected"}:
+            raise AiCallError(
+                error_id="sip_answer_not_confirmed",
+                msg="SIP Participant 未返回已接听状态",
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                details={
+                    "sipCallStatus": sip_participant.sip_call_status or "",
+                },
+            )
         payload = {
             "participantIdentity": sip_participant.participant_identity,
             "sipCallId": sip_participant.sip_call_id,
@@ -1198,13 +1229,6 @@ class AiCallService:
             event_type="sip_answered",
             payload=payload,
         )
-        if sip_participant.sip_call_status:
-            self._record_sip_event(
-                call_id=call_id,
-                event_type="media_connected",
-                payload=payload,
-                source="livekit",
-            )
 
     @staticmethod
     def _call_id_from_sip_participant(participant_identity: str | None) -> str | None:
