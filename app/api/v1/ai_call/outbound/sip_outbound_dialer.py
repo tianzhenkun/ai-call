@@ -41,6 +41,13 @@ NO_ANSWER_END_REASONS = {
 class AiCallServiceLike(Protocol):
     async def create_sip_session(self, **kwargs): ...
 
+    async def terminate_sip_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+    ) -> None: ...
+
 
 AiCallServiceFactory = Callable[
     [AsyncSession, SipOutboundConfig],
@@ -129,7 +136,15 @@ class SipOutboundDialer:
                     create_error = exc
 
         if create_error is not None:
-            record, media_connected = await self._read_evidence(call_id)
+            try:
+                record, media_connected = await self._read_evidence(call_id)
+            except Exception as evidence_error:
+                return await self._handle_uncertain_error(
+                    request,
+                    call_id=call_id,
+                    error=evidence_error,
+                    end_reason="outbound_create_reconciliation_error",
+                )
             if self._is_terminal(record):
                 if self._is_connected(record, media_connected):
                     await on_connected()
@@ -137,29 +152,108 @@ class SipOutboundDialer:
                     self._map_evidenced_terminal(record, media_connected),
                     create_error,
                 )
-            return self._with_exception_diagnostics(DialResult(
-                call_result="call_failed",
-                error_message=self._error_message(create_error),
-            ), create_error)
+            return await self._handle_uncertain_error(
+                request,
+                call_id=call_id,
+                error=create_error,
+                end_reason="outbound_create_error",
+            )
 
         connected_notified = False
-        while True:
-            record, media_connected = await self._read_evidence(call_id)
-            if (
-                not connected_notified
-                and self._is_connected(record, media_connected)
-            ):
-                await on_connected()
-                connected_notified = True
-            if self._is_terminal(record):
-                return self._map_evidenced_terminal(record, media_connected)
-            if self.monotonic() >= reconciliation_deadline:
-                return DialResult(
-                    call_result="call_failed",
-                    error_message="SIP 通话状态对账超时，禁止自动重拨",
-                    retry_allowed=False,
+        try:
+            while True:
+                record, media_connected = await self._read_evidence(call_id)
+                if (
+                    not connected_notified
+                    and self._is_connected(record, media_connected)
+                ):
+                    await on_connected()
+                    connected_notified = True
+                if self._is_terminal(record):
+                    return self._map_evidenced_terminal(record, media_connected)
+                if self.monotonic() >= reconciliation_deadline:
+                    cleaned = await self.terminate(
+                        request,
+                        call_id=call_id,
+                        end_reason="outbound_reconcile_timeout",
+                    )
+                    if not cleaned:
+                        return DialResult(
+                            call_result="call_failed",
+                            error_message=(
+                                "SIP 通话状态对账超时，资源清理失败，保持待对账"
+                            ),
+                            retry_allowed=False,
+                            settle_attempt=False,
+                        )
+                    return DialResult(
+                        call_result="call_failed",
+                        error_message="SIP 通话状态对账超时，禁止自动重拨",
+                        retry_allowed=False,
+                    )
+                await self.sleep(self.poll_seconds)
+        except Exception as exc:
+            return await self._handle_uncertain_error(
+                request,
+                call_id=call_id,
+                error=exc,
+                end_reason="outbound_reconcile_error",
+                retry_allowed=False,
+            )
+
+    async def _handle_uncertain_error(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        error: Exception,
+        end_reason: str,
+        retry_allowed: bool = True,
+    ) -> DialResult:
+        result = self._with_exception_diagnostics(
+            DialResult(
+                call_result="call_failed",
+                error_message=self._error_message(error),
+                retry_allowed=retry_allowed,
+            ),
+            error,
+        )
+        if await self.terminate(
+            request,
+            call_id=call_id,
+            end_reason=end_reason,
+        ):
+            return result
+        return replace(
+            result,
+            error_message=(
+                f"{self._error_message(error)}；SIP 资源清理失败，保持待对账"
+            ),
+            retry_allowed=False,
+            settle_attempt=False,
+        )
+
+    async def terminate(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        end_reason: str,
+    ) -> bool:
+        line = self._request_line(request)
+        config = self.build_sip_config(line)
+        async with self.session_factory() as db:
+            service = self.ai_call_service_factory(db, config)
+            try:
+                await service.terminate_sip_session(
+                    call_id,
+                    end_reason=end_reason,
                 )
-            await self.sleep(self.poll_seconds)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                return False
+        return True
 
     def build_sip_config(self, line: SipLineSnapshot) -> SipOutboundConfig:
         trunk_hostname = ""
@@ -326,19 +420,31 @@ class SipOutboundDialer:
         result: DialResult,
         exc: Exception,
     ) -> DialResult:
-        cause = exc
-        while cause.__cause__ is not None:
+        cause: BaseException | None = exc
+        details: dict | None = None
+        while cause is not None:
+            candidate = getattr(cause, "details", None)
+            if isinstance(candidate, dict) and candidate:
+                details = candidate
+                break
             cause = cause.__cause__
-        details = getattr(cause, "details", None)
-        if not isinstance(details, dict):
+        if details is None:
             return result
+        provider_status_code = (
+            str(details["providerStatusCode"])
+            if details.get("providerStatusCode")
+            else result.provider_status_code
+        )
+        call_result = result.call_result
+        if call_result == "call_failed":
+            if provider_status_code == "486":
+                call_result = "busy"
+            elif provider_status_code in {"408", "480"}:
+                call_result = "no_answer"
         return replace(
             result,
-            provider_status_code=(
-                str(details["providerStatusCode"])
-                if details.get("providerStatusCode")
-                else result.provider_status_code
-            ),
+            call_result=call_result,
+            provider_status_code=provider_status_code,
             provider_reason=(
                 str(details["providerReason"])
                 if details.get("providerReason")
@@ -348,5 +454,15 @@ class SipOutboundDialer:
                 str(details["hangupCause"])
                 if details.get("hangupCause")
                 else result.hangup_cause
+            ),
+            retry_allowed=(
+                False
+                if details.get("cleanupFailed")
+                else result.retry_allowed
+            ),
+            settle_attempt=(
+                False
+                if details.get("cleanupFailed")
+                else result.settle_attempt
             ),
         )

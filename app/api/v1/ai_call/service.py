@@ -289,6 +289,26 @@ class AiCallService:
                 sip_participant=sip_participant,
             )
         except AiCallError as exc:
+            cleanup_error: Exception | None = None
+            if sip_invite_sent:
+                try:
+                    await self._cleanup_sip_resources(
+                        call_id=resolved_call_id,
+                        room_name=room_name,
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_error = cleanup_exc
+                    exc = AiCallError(
+                        error_id=exc.error_id,
+                        msg=f"{exc.msg}；SIP 资源清理失败，保持待对账",
+                        status_code=exc.status_code,
+                        details={
+                            **exc.details,
+                            "cleanupFailed": True,
+                            "cleanupErrorType": type(cleanup_exc).__name__,
+                            "cleanupMessage": str(cleanup_exc)[:200],
+                        },
+                    )
             if sip_invite_sent:
                 failure_payload = {
                     "errorId": exc.error_id,
@@ -302,12 +322,13 @@ class AiCallService:
                     event_type="sip_failed",
                     payload=failure_payload,
                 )
-            await self.record_service.fail_session(
-                resolved_call_id,
-                end_reason=exc.error_id,
-                failure_stage=self._failure_stage_for_end_reason(exc.error_id),
-                failure_message=exc.msg,
-            )
+            if cleanup_error is None:
+                await self.record_service.fail_session(
+                    resolved_call_id,
+                    end_reason=exc.error_id,
+                    failure_stage=self._failure_stage_for_end_reason(exc.error_id),
+                    failure_message=exc.msg,
+                )
             raise self._to_custom_exception(exc) from exc
 
         await self.record_service.mark_answered(
@@ -584,19 +605,26 @@ class AiCallService:
             return {"handled": False, "reason": "non_sip_participant"}
         if room_name and room_name != f"ai-call-{call_id}":
             return {"handled": False, "reason": "room_mismatch"}
-        try:
-            session = await self.orchestrator.get_session(call_id)
-        except AiCallError:
-            return {"handled": False, "reason": "session_not_found"}
-        if session.status not in RUNNING_STATUSES:
-            return {"handled": False, "reason": "session_not_running"}
 
         if event_type == "track_published":
             track = (payload or {}).get("track")
             track_type = track.get("type") if isinstance(track, dict) else None
             if str(track_type or "").upper() != "AUDIO":
                 return {"handled": False, "reason": "non_audio_track"}
-            self._record_sip_event(
+            if self.record_service is None:
+                return {"handled": False, "reason": "record_service_unavailable"}
+            record = await self.record_service.get_record(call_id)
+            if record is None:
+                return {"handled": False, "reason": "record_not_found"}
+            if record.entry_type != "sip_outbound":
+                return {"handled": False, "reason": "not_sip_outbound"}
+            if room_name and record.room_name != room_name:
+                return {"handled": False, "reason": "record_room_mismatch"}
+            if participant_identity != record.participant_identity:
+                return {"handled": False, "reason": "record_participant_mismatch"}
+            if str(record.status or "").lower() in {"completed", "failed"}:
+                return {"handled": False, "reason": "record_terminal"}
+            event = self._record_sip_event(
                 call_id=call_id,
                 event_type="media_connected",
                 source="livekit",
@@ -606,11 +634,21 @@ class AiCallService:
                     "evidence": "audio_track_published",
                 },
             )
+            if event is None:
+                return {"handled": False, "reason": "event_record_failed"}
+            await self.record_service.mirror_runtime_events([event])
             return {
                 "handled": True,
                 "action": "record_media_connected",
                 "callId": call_id,
             }
+
+        try:
+            session = await self.orchestrator.get_session(call_id)
+        except AiCallError:
+            return {"handled": False, "reason": "session_not_found"}
+        if session.status not in RUNNING_STATUSES:
+            return {"handled": False, "reason": "session_not_running"}
 
         self._record_sip_event(
             call_id=call_id,
@@ -630,6 +668,67 @@ class AiCallService:
             "callId": call_id,
             "endReason": "remote_hangup",
         }
+
+    async def terminate_sip_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+    ) -> None:
+        room_name = f"ai-call-{call_id}"
+        if self.record_service is not None:
+            record = await self.record_service.get_record(call_id)
+            if record is not None and record.room_name:
+                room_name = record.room_name
+        await self._cleanup_sip_resources(
+            call_id=call_id,
+            room_name=room_name,
+        )
+        if self.record_service is not None:
+            await self.record_service.fail_session(
+                call_id,
+                end_reason=end_reason,
+                failure_stage="reconciliation",
+                failure_message="SIP 通话状态对账超时并已终止资源",
+            )
+
+    async def _cleanup_sip_resources(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+    ) -> None:
+        await self.orchestrator.livekit_room_manager.delete_room(room_name)
+        cleanup_errors: list[str] = []
+        try:
+            await self.orchestrator.agent_runner.stop(call_id)
+        except Exception as exc:
+            cleanup_errors.append(
+                f"agent_runner.stop: {type(exc).__name__}: {str(exc)[:160]}"
+            )
+        if self.recording_service is not None:
+            try:
+                await self.recording_service.stop_for_session(call_id)
+            except Exception as exc:
+                cleanup_errors.append(
+                    "recording_service.stop_for_session: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+        if cleanup_errors:
+            raise AiCallError(
+                error_id="sip_cleanup_incomplete",
+                msg="SIP 房间已终止，但本地资源清理未完成",
+                details={"cleanupErrors": cleanup_errors},
+            )
+        try:
+            session = self.orchestrator.registry.get(call_id)
+        except AiCallError:
+            return
+        if session.status in RUNNING_STATUSES:
+            self.orchestrator.registry.transition(
+                call_id,
+                CallSessionStatus.FAILED,
+            )
 
     async def end_session(
         self,
@@ -1153,7 +1252,7 @@ class AiCallService:
         event_type: str,
         payload: dict[str, Any] | None = None,
         source: str = "sip",
-    ) -> None:
+    ) -> AiCallEvent | None:
         try:
             self.orchestrator.record_sip_event(
                 call_id=call_id,
@@ -1161,8 +1260,14 @@ class AiCallService:
                 payload=payload,
                 source=source,
             )
+            return self.orchestrator.event_store.list_all(call_id)[-1]
+        except AiCallError as exc:
+            if exc.error_id != "session_not_found":
+                return None
+            events = self.orchestrator.event_store.list_all(call_id)
+            return events[-1] if events else None
         except Exception:
-            return
+            return None
 
     def _record_sip_preflight(
         self,

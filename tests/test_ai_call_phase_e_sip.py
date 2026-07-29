@@ -71,6 +71,7 @@ class CapturingAgentRunner:
         self.started_sessions: list[CallSession] = []
         self.started_opening_call_ids: list[str] = []
         self.stopped_call_ids: list[str] = []
+        self.stop_error: Exception | None = None
 
     async def start(self, session: CallSession) -> None:
         self.started_sessions.append(session)
@@ -87,6 +88,8 @@ class CapturingAgentRunner:
 
     async def stop(self, call_id: str) -> None:
         self.stopped_call_ids.append(call_id)
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 class FakeSipClient:
@@ -94,10 +97,12 @@ class FakeSipClient:
         self,
         error: AiCallError | None = None,
         preflight_result: SipOutboundPreflightResult | None = None,
+        sip_call_status: str = "active",
     ) -> None:
         self.created: list[dict[str, object]] = []
         self.error = error
         self.preflight_result = preflight_result
+        self.sip_call_status = sip_call_status
         self.preflighted_callees: list[str] = []
 
     def preflight(self, *, callee_phone_number: str) -> SipOutboundPreflightResult:
@@ -130,7 +135,7 @@ class FakeSipClient:
             sip_call_id="short-call-id",
             sip_call_id_full="full-call-id",
             sip_trunk_id="trunk_123",
-            sip_call_status="active",
+            sip_call_status=self.sip_call_status,
             raw_status="created",
         )
 
@@ -147,6 +152,7 @@ class FakeRecordService:
         self.active_sip_records_by_callee_hash: dict[str, object] = {}
         self.active_sip_record_lookups: list[str] = []
         self.prompt_context_updates: list[dict[str, object]] = []
+        self.persisted_events: list[object] = []
 
     async def create_sip_record(
         self,
@@ -220,6 +226,37 @@ class FakeRecordService:
     async def get_active_sip_record_by_callee_hash(self, callee_phone_number_hash: str):
         self.active_sip_record_lookups.append(callee_phone_number_hash)
         return self.active_sip_records_by_callee_hash.get(callee_phone_number_hash)
+
+    async def get_record(self, call_id: str):
+        row = next(
+            (
+                item
+                for item in self.created_sip_records
+                if item["call_id"] == call_id
+            ),
+            None,
+        )
+        if row is None:
+            return None
+        status = next(
+            (
+                value
+                for updated_call_id, value in reversed(self.status_updates)
+                if updated_call_id == call_id
+            ),
+            CallSessionStatus.CREATED.value,
+        )
+        return SimpleNamespace(
+            call_id=call_id,
+            room_name=row["room_name"],
+            participant_identity=row["participant_identity"],
+            entry_type="sip_outbound",
+            status=status,
+        )
+
+    async def mirror_runtime_events(self, events):
+        self.persisted_events.extend(events)
+        return events
 
 
 class FakeRecordingService:
@@ -767,7 +804,9 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
 
 @pytest.mark.anyio
 async def test_sip_audio_track_webhook_records_independent_media_evidence() -> None:
-    service, *_ = build_service_with_sip_fakes()
+    service, _room_manager, _agent_runner, _sip_client, record_service, _resolver = (
+        build_service_with_sip_fakes()
+    )
     result = await service.create_sip_session(
         callee_phone_number="13800000000",
         voice=None,
@@ -794,6 +833,56 @@ async def test_sip_audio_track_webhook_records_independent_media_evidence() -> N
     ]
     assert len(media_connected) == 1
     assert media_connected[0].source == "livekit"
+    assert record_service.persisted_events == media_connected
+
+
+@pytest.mark.anyio
+async def test_sip_audio_track_webhook_uses_persisted_record_across_workers() -> None:
+    (
+        creator_service,
+        _creator_room_manager,
+        _creator_agent_runner,
+        sip_client,
+        record_service,
+        prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    result = await creator_service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+    webhook_orchestrator = AiCallOrchestrator(
+        config=build_runtime_config(),
+        livekit_room_manager=FakeLiveKitRoomManager(),
+        agent_runner=CapturingAgentRunner(),
+        registry=InMemorySessionRegistry(),
+        event_store=InMemoryEventStore(),
+    )
+    webhook_service = AiCallService(
+        webhook_orchestrator,
+        record_service=record_service,
+        sip_client=sip_client,
+        prompt_resolver=prompt_resolver,
+        prompt_composer=PromptComposer(handoff_component_enabled=True),
+    )
+
+    handled = await webhook_service.handle_livekit_webhook_event(
+        event_type="track_published",
+        room_name=result.room_name,
+        participant_identity=result.participant_identity,
+        payload={"track": {"type": "AUDIO", "sid": "TR_cross_worker"}},
+    )
+
+    assert handled == {
+        "handled": True,
+        "action": "record_media_connected",
+        "callId": result.call_id,
+    }
+    assert len(record_service.persisted_events) == 1
+    assert record_service.persisted_events[0].call_id == result.call_id
+    assert record_service.persisted_events[0].type == "media_connected"
 
 
 @pytest.mark.anyio
@@ -1099,6 +1188,9 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
     failed = record_service.failed_sessions[0]
     assert failed["end_reason"] == "sip_create_participant_failed"
     assert failed["failure_stage"] == "sip"
+    assert service.orchestrator.livekit_room_manager.deleted_rooms == [
+        f"ai-call-{failed['call_id']}"
+    ]
 
     call_id = str(failed["call_id"])
     events = service.orchestrator.event_store.list_all(call_id)
@@ -1116,6 +1208,64 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
         "rawErrorType": "TwirpError",
         "rawErrorMessage": "callee already has an active SIP call",
     }
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_cleans_room_when_answer_status_is_uncertain() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        _sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    service.sip_client = FakeSipClient(sip_call_status="ringing")
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.create_sip_session(
+            callee_phone_number="13800000000",
+            voice=None,
+            business_id="geo_task_001",
+            scene_code="intro_geo",
+            business_params={},
+            ringing_timeout_seconds=30,
+        )
+
+    assert exc_info.value.msg == "SIP Participant 未返回已接听状态"
+    assert len(record_service.failed_sessions) == 1
+    call_id = str(record_service.failed_sessions[0]["call_id"])
+    assert room_manager.deleted_rooms == [f"ai-call-{call_id}"]
+    assert agent_runner.stopped_call_ids == [call_id]
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_keeps_record_pending_when_cleanup_is_incomplete() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        _sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    service.sip_client = FakeSipClient(sip_call_status="ringing")
+    agent_runner.stop_error = RuntimeError("agent stop failed")
+
+    with pytest.raises(CustomException) as exc_info:
+        await service.create_sip_session(
+            callee_phone_number="13800000000",
+            voice=None,
+            business_id="geo_task_001",
+            scene_code="intro_geo",
+            business_params={},
+            ringing_timeout_seconds=30,
+        )
+
+    assert exc_info.value.msg.endswith("SIP 资源清理失败，保持待对账")
+    assert room_manager.deleted_rooms
+    assert agent_runner.stopped_call_ids
+    assert record_service.failed_sessions == []
 
 
 @pytest.mark.anyio

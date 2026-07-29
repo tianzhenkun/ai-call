@@ -71,6 +71,7 @@ class DialResult:
     provider_reason: str | None = None
     hangup_cause: str | None = None
     retry_allowed: bool = True
+    settle_attempt: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,10 +309,24 @@ class OutboundTaskExecutor:
                 on_connected=lambda: self._mark_in_call(claimed),
             )
         except Exception as exc:
+            requires_cleanup = (
+                self.dialer.manages_call_record
+                and self.dialer.dialer_type == "sip"
+            )
+            if requires_cleanup:
+                if not await self._terminate_managed_call(
+                    claimed.request,
+                    call_id=claimed.call_id,
+                    end_reason="outbound_dialer_error",
+                ):
+                    return
             result = DialResult(
                 call_result="call_failed",
                 error_message=str(exc) or exc.__class__.__name__,
+                retry_allowed=not requires_cleanup,
             )
+        if not result.settle_attempt:
+            return
         await self._finish_attempt(
             claimed.request,
             claimed.call_id,
@@ -395,7 +410,7 @@ class OutboundTaskExecutor:
                 )
             ).all()
             recovery_items: list[
-                tuple[OutboundDialRequest, str, DialResult]
+                tuple[OutboundDialRequest, str, DialResult, bool]
             ] = []
             for attempt in attempts:
                 task = await db.scalar(
@@ -434,6 +449,7 @@ class OutboundTaskExecutor:
                         call_result="call_failed",
                         error_message="执行器中断，拨打结果未知",
                     )
+                    requires_cleanup = False
                 else:
                     record = await db.scalar(
                         select(AiCallRecordModel).where(
@@ -460,6 +476,7 @@ class OutboundTaskExecutor:
                             record,
                             media_connected=media_connected,
                         )
+                        requires_cleanup = False
                     elif record is None:
                         result = DialResult(
                             call_result="call_failed",
@@ -468,6 +485,7 @@ class OutboundTaskExecutor:
                             ),
                             retry_allowed=False,
                         )
+                        requires_cleanup = True
                     elif (
                         attempt.status == "DIALING"
                         and record.answered_at is not None
@@ -484,17 +502,47 @@ class OutboundTaskExecutor:
                             error_message="正式 SIP 通话状态对账超时，禁止自动重拨",
                             retry_allowed=False,
                         )
+                        requires_cleanup = True
                     else:
                         continue
-                recovery_items.append((request, attempt.call_id, result))
+                recovery_items.append(
+                    (request, attempt.call_id, result, requires_cleanup)
+                )
             await db.commit()
-        for request, call_id, result in recovery_items:
+        for request, call_id, result, requires_cleanup in recovery_items:
+            if requires_cleanup and not await self._terminate_managed_call(
+                request,
+                call_id=call_id,
+                end_reason="outbound_stale_recovery",
+            ):
+                continue
             await self._finish_attempt(
                 request,
                 call_id,
                 result,
                 now,
             )
+
+    async def _terminate_managed_call(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        end_reason: str,
+    ) -> bool:
+        terminate = getattr(self.dialer, "terminate", None)
+        if not callable(terminate):
+            return False
+        try:
+            return bool(
+                await terminate(
+                    request,
+                    call_id=call_id,
+                    end_reason=end_reason,
+                )
+            )
+        except Exception:
+            return False
 
     async def _reconcile_transitional_tasks(self, now: datetime) -> None:
         async with self.session_factory() as db:

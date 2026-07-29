@@ -32,10 +32,17 @@ async def database(tmp_path):
 
 
 class FakeAiCallService:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        terminate_error: Exception | None = None,
+    ) -> None:
         self.error = error
+        self.terminate_error = terminate_error
         self.session_created = asyncio.Event()
         self.requests: list[dict[str, object]] = []
+        self.terminated: list[dict[str, str]] = []
 
     async def create_sip_session(self, **kwargs):
         self.requests.append(kwargs)
@@ -43,6 +50,19 @@ class FakeAiCallService:
         if self.error is not None:
             raise self.error
         return SimpleNamespace(call_id=kwargs["call_id"])
+
+    async def terminate_sip_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+    ) -> None:
+        self.terminated.append({
+            "call_id": call_id,
+            "end_reason": end_reason,
+        })
+        if self.terminate_error is not None:
+            raise self.terminate_error
 
 
 def line_snapshot() -> SipLineSnapshot:
@@ -304,6 +324,70 @@ async def test_dial_stops_polling_at_reconciliation_deadline(database):
     assert result.call_result == "call_failed"
     assert result.retry_allowed is False
     assert result.error_message == "SIP 通话状态对账超时，禁止自动重拨"
+    assert service.terminated == [{
+        "call_id": "call-timeout",
+        "end_reason": "outbound_reconcile_timeout",
+    }]
+
+
+@pytest.mark.anyio
+async def test_dial_keeps_attempt_unsettled_when_timeout_cleanup_fails(database):
+    service = FakeAiCallService(
+        terminate_error=RuntimeError("room delete failed"),
+    )
+    monotonic_values = iter([0.0, 700.0])
+    dialer = SipOutboundDialer(
+        database,
+        ai_call_service_factory=lambda db, config: service,
+        settings=Settings(
+            AI_CALL_SIP_OUTBOUND_ENABLED=True,
+            AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES="199",
+            AI_CALL_SIP_MAX_CALL_DURATION_SECONDS=600,
+            SIP_PUBLIC_IP="127.0.0.1",
+        ),
+        sleep=zero_sleep,
+        monotonic=lambda: next(monotonic_values),
+        reconciliation_grace_seconds=30,
+    )
+
+    result = await dialer.dial(
+        dial_request(),
+        call_id="call-cleanup-failed",
+        on_connected=AsyncMock(),
+    )
+
+    assert result.call_result == "call_failed"
+    assert result.settle_attempt is False
+    assert result.retry_allowed is False
+    assert result.error_message == "SIP 通话状态对账超时，资源清理失败，保持待对账"
+
+
+@pytest.mark.anyio
+async def test_dial_cleans_up_before_settling_unexpected_reconciliation_error(
+    database,
+    monkeypatch,
+):
+    service = FakeAiCallService()
+    dialer = build_dialer(database, service)
+    monkeypatch.setattr(
+        dialer,
+        "_read_evidence",
+        AsyncMock(side_effect=RuntimeError("database read failed")),
+    )
+
+    result = await dialer.dial(
+        dial_request(),
+        call_id="call-read-error",
+        on_connected=AsyncMock(),
+    )
+
+    assert result.call_result == "call_failed"
+    assert result.retry_allowed is False
+    assert result.settle_attempt is True
+    assert service.terminated == [{
+        "call_id": "call-read-error",
+        "end_reason": "outbound_reconcile_error",
+    }]
 
 
 @pytest.mark.anyio
@@ -322,7 +406,7 @@ async def test_dial_returns_failure_when_session_creation_fails_without_record(d
 
 @pytest.mark.anyio
 async def test_dial_preserves_provider_diagnostics_from_real_error_chain(database):
-    cause = AiCallError(
+    provider_error = AiCallError(
         error_id="sip_create_participant_failed",
         msg="LiveKit SIP Participant 创建失败",
         details={
@@ -332,7 +416,10 @@ async def test_dial_preserves_provider_diagnostics_from_real_error_chain(databas
         },
     )
     try:
-        raise CustomException(msg=cause.msg) from cause
+        try:
+            raise provider_error from RuntimeError("raw SDK failure")
+        except AiCallError as cause:
+            raise CustomException(msg=cause.msg) from cause
     except CustomException as error:
         service = FakeAiCallService(error=error)
 
@@ -345,6 +432,7 @@ async def test_dial_preserves_provider_diagnostics_from_real_error_chain(databas
     assert result.provider_status_code == "486"
     assert result.provider_reason == "SIP 486 Busy Here"
     assert result.hangup_cause == "USER_BUSY"
+    assert result.call_result == "busy"
 
 
 @pytest.mark.parametrize(
