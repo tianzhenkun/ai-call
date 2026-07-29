@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -23,11 +24,14 @@ from app.api.v1.ai_call.outbound.model import (
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTargetModel
 from app.api.v1.ai_call.outbound.schema import BatchValidationRequest
 from app.api.v1.ai_call.outbound.service import OutboundValidationService
+from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
+from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException, handle_exception
+from app.utils.id_util import generate_snowflake_id
 
 
 def _xlsx(rows: list[list[object | None]]) -> bytes:
@@ -110,6 +114,38 @@ async def database(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        now = datetime.now(timezone.utc)
+        session.add(
+            AiCallSipLineModel(
+                id=generate_snowflake_id(),
+                tenant_id="tenant-a",
+                line_code="default-a",
+                line_name="租户A默认线路",
+                enabled=True,
+                default_marker="OUTBOUND",
+                adapter_type="livekit_sip",
+                route_mode="inline_hostname",
+                trunk_id=None,
+                proxy_host="127.0.0.1",
+                proxy_port=5089,
+                auth_mode="ip_allowlist",
+                caller_number="10000",
+                destination_country="CN",
+                max_concurrency=1,
+                originate_timeout_seconds=45,
+                health_status="AVAILABLE",
+                health_message="测试线路",
+                last_checked_at=now,
+                deleted=False,
+                deleted_at=None,
+                created_by=20,
+                updated_by=20,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
     yield factory
     await engine.dispose()
 
@@ -624,3 +660,45 @@ async def test_validation_does_not_create_formal_outbound_targets(database) -> N
     assert "ai_call_outbound_validation_row" in table_names
     assert "ai_call_outbound_target" in table_names
     assert target_count == 0
+
+
+@pytest.mark.anyio
+async def test_batch_validation_binds_default_sip_line(database) -> None:
+    service = OutboundValidationService(database)
+    validation_id, _ = await _accept(
+        service,
+        database,
+        _xlsx([["手机号", "客户名称"], ["13800138000", "张先生"]]),
+    )
+
+    async with database() as session:
+        validation = await session.get(AiCallOutboundValidationModel, validation_id)
+        line = await session.scalar(
+            select(AiCallSipLineModel).where(
+                AiCallSipLineModel.tenant_id == "tenant-a",
+                AiCallSipLineModel.default_marker == "OUTBOUND",
+            )
+        )
+
+    assert line is not None
+    assert validation.line_id == line.id
+    snapshot = json.loads(validation.line_snapshot_json)
+    assert snapshot["lineId"] == str(line.id)
+    assert "password" not in validation.line_snapshot_json.lower()
+    assert "secret" not in validation.line_snapshot_json.lower()
+
+
+@pytest.mark.anyio
+async def test_batch_validation_rejects_missing_default_sip_line(database) -> None:
+    service = OutboundValidationService(database, line_service=SipLineService())
+    with pytest.raises(
+        CustomException,
+        match="当前租户没有可用的默认外呼线路",
+    ) as exc_info:
+        await _accept(
+            service,
+            database,
+            _xlsx([["手机号", "客户名称"], ["13800138000", "张先生"]]),
+            tenant_id="tenant-no-line",
+        )
+    assert exc_info.value.status_code == 409

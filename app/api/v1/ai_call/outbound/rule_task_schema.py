@@ -177,6 +177,8 @@ class OutboundTaskOut(OutboundSchema):
     rule_id: str
     rule_name: str
     rule_summary: str
+    line_id: str | None = None
+    line_name: str | None = None
     created_by_name: str | None = None
     created_at: str
     updated_at: str

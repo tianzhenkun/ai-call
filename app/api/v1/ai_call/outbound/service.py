@@ -26,6 +26,7 @@ from app.utils.id_util import generate_snowflake_id
 
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
 from .schema import BatchValidationRequest, ValidationIssueOut, ValidationResultOut
+from .sip_line_service import SipLineService
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -47,9 +48,11 @@ class OutboundValidationService:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         parse_batch_size: int = DEFAULT_PARSE_BATCH_SIZE,
+        line_service: SipLineService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.parse_batch_size = max(1, parse_batch_size)
+        self.line_service = line_service or SipLineService()
         self._tasks: set[asyncio.Task] = set()
 
     async def accept_batch(
@@ -68,6 +71,7 @@ class OutboundValidationService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
+        line = await self.line_service.resolve_default(db, tenant_id)
         temp_path: str | None = None
         try:
             temp_path, file_size = await self._save_upload(file)
@@ -85,6 +89,8 @@ class OutboundValidationService:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
+                line_id=line.id,
+                line_snapshot_json=self.line_service.snapshot_json(line),
                 valid_target_count=0,
                 issue_count=0,
                 issue_stats_json="{}",

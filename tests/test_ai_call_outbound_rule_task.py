@@ -26,6 +26,8 @@ from app.api.v1.ai_call.outbound.rule_task_schema import (
     UpdateTaskScheduleRequest,
 )
 from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
+from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
+from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.utils.id_util import generate_snowflake_id
@@ -110,6 +112,39 @@ async def database(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        now = _now()
+        for tenant_id in ("tenant-a", "tenant-b", "tenant-c"):
+            session.add(
+                AiCallSipLineModel(
+                    id=generate_snowflake_id(),
+                    tenant_id=tenant_id,
+                    line_code=f"default-{tenant_id}",
+                    line_name=f"{tenant_id}默认线路",
+                    enabled=True,
+                    default_marker="OUTBOUND",
+                    adapter_type="livekit_sip",
+                    route_mode="inline_hostname",
+                    trunk_id=None,
+                    proxy_host="127.0.0.1",
+                    proxy_port=5089,
+                    auth_mode="ip_allowlist",
+                    caller_number="10000",
+                    destination_country="CN",
+                    max_concurrency=1,
+                    originate_timeout_seconds=45,
+                    health_status="AVAILABLE",
+                    health_message="测试线路",
+                    last_checked_at=now,
+                    deleted=False,
+                    deleted_at=None,
+                    created_by=10,
+                    updated_by=10,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await session.commit()
     yield factory
     await engine.dispose()
 
@@ -160,6 +195,7 @@ async def _seed_passed_validation(
     validation_id = generate_snowflake_id()
     async with database() as session:
         now = _now()
+        line = await SipLineService().resolve_default(session, tenant_id)
         session.add(
             AiCallOutboundValidationModel(
                 id=validation_id,
@@ -170,6 +206,8 @@ async def _seed_passed_validation(
                 temp_file_path=None,
                 file_size=1,
                 task_config_json=json.dumps(config, ensure_ascii=False),
+                line_id=line.id,
+                line_snapshot_json=SipLineService().snapshot_json(line),
                 valid_target_count=len(rows),
                 issue_count=0,
                 issue_stats_json="{}",
@@ -358,6 +396,8 @@ async def test_single_validation_checks_phone_and_all_references(database) -> No
         await session.commit()
     assert validation.status == "PASSED"
     assert validation.valid_target_count == 1
+    assert validation.line_id is not None
+    assert json.loads(validation.line_snapshot_json)["lineId"] == str(validation.line_id)
 
     async with database() as session:
         row = await session.scalar(
@@ -416,6 +456,12 @@ async def test_batch_task_creation_copies_targets_in_batches_and_is_idempotent(d
     assert task.status == "SCHEDULED"
     assert task.scheduled_at is None
     assert task.total_targets == 5
+    assert task.line_id is not None
+    assert task.line_name == "tenant-a默认线路"
+    task_snapshot = json.loads(task.config_snapshot_json)
+    assert task_snapshot["sipLine"]["lineId"] == str(task.line_id)
+    assert "password" not in task.config_snapshot_json.lower()
+    assert "secret" not in task.config_snapshot_json.lower()
 
     async with database() as session:
         same, created_again = await service.create_task(
@@ -568,6 +614,71 @@ async def test_task_creation_rejects_invalid_validation_config_and_deleted_rule(
                 "其他租户",
                 "idem-other-tenant",
                 _create_task_request(config, validation_id),
+            )
+
+
+@pytest.mark.anyio
+async def test_task_creation_rejects_disabled_or_invalid_snapshotted_line(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="batch",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("13800138000", "客户")],
+    )
+    request = _create_task_request(config, validation_id)
+
+    async with database() as session:
+        line = await session.scalar(
+            select(AiCallSipLineModel).where(
+                AiCallSipLineModel.tenant_id == "tenant-a",
+                AiCallSipLineModel.default_marker == "OUTBOUND",
+            )
+        )
+        line.enabled = False
+        await session.commit()
+
+    async with database() as session:
+        with pytest.raises(CustomException, match="线路已停用"):
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-disabled-line",
+                request,
+            )
+
+    async with database() as session:
+        line = await session.scalar(
+            select(AiCallSipLineModel).where(
+                AiCallSipLineModel.tenant_id == "tenant-a",
+                AiCallSipLineModel.default_marker == "OUTBOUND",
+            )
+        )
+        validation = await session.get(AiCallOutboundValidationModel, validation_id)
+        line.enabled = True
+        validation.line_snapshot_json = "{}"
+        await session.commit()
+
+    async with database() as session:
+        with pytest.raises(CustomException, match="线路快照无效"):
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-invalid-line-snapshot",
+                request,
             )
 
 

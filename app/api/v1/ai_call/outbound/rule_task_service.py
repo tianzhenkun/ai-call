@@ -32,6 +32,9 @@ from .rule_task_schema import (
     UpdateTaskScheduleRequest,
 )
 from .service import PHONE_PATTERN
+from .sip_line_model import AiCallSipLineModel
+from .sip_line_schema import SipLineSnapshot
+from .sip_line_service import SipLineService
 
 DEFAULT_TARGET_COPY_BATCH_SIZE = 500
 
@@ -52,9 +55,11 @@ class OutboundRuleTaskService:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         target_copy_batch_size: int = DEFAULT_TARGET_COPY_BATCH_SIZE,
+        line_service: SipLineService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.target_copy_batch_size = max(1, target_copy_batch_size)
+        self.line_service = line_service or SipLineService()
 
     @staticmethod
     def metadata_out() -> CallRuleMetadataOut:
@@ -238,6 +243,7 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         await self._resolve_references(db, tenant_id, request)
+        line = await self.line_service.resolve_default(db, tenant_id)
         now = _now()
         validation = AiCallOutboundValidationModel(
             id=generate_snowflake_id(),
@@ -248,6 +254,8 @@ class OutboundRuleTaskService:
             temp_file_path=None,
             file_size=0,
             task_config_json=_json(request.config_dict()),
+            line_id=line.id,
+            line_snapshot_json=self.line_service.snapshot_json(line),
             valid_target_count=1,
             issue_count=0,
             issue_stats_json="{}",
@@ -326,6 +334,11 @@ class OutboundRuleTaskService:
                 msg="只有 PASSED 校验结果可以创建任务",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        line, line_snapshot = await self._resolve_validation_line(
+            db,
+            tenant_id,
+            validation,
+        )
         validation_config = self._load_object(validation.task_config_json)
         request_config = request.config_dict()
         if validation_config != request_config:
@@ -355,6 +368,7 @@ class OutboundRuleTaskService:
                 "targetModel": voice.target_model,
             },
             "rule": self.rule_out(rule).model_dump(mode="json", by_alias=True),
+            "sipLine": line_snapshot.model_dump(mode="json", by_alias=True),
         }
         task = AiCallOutboundTaskModel(
             id=generate_snowflake_id(),
@@ -381,6 +395,8 @@ class OutboundRuleTaskService:
             rule_id=rule.id,
             rule_name=rule.rule_name,
             rule_summary=self._rule_summary(rule),
+            line_id=line.id,
+            line_name=line.line_name,
             config_snapshot_json=_json(snapshot),
             error_message=None,
             created_by=user_id,
@@ -403,6 +419,49 @@ class OutboundRuleTaskService:
             )
         await db.flush()
         return task, True
+
+    async def _resolve_validation_line(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        validation: AiCallOutboundValidationModel,
+    ) -> tuple[AiCallSipLineModel, SipLineSnapshot]:
+        if validation.line_id is None or not validation.line_snapshot_json:
+            raise CustomException(
+                msg="校验结果缺少 SIP 外呼线路，请重新校验",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        try:
+            snapshot = SipLineSnapshot.model_validate_json(
+                validation.line_snapshot_json
+            )
+        except Exception as exc:
+            raise CustomException(
+                msg="校验结果中的 SIP 线路快照无效，请重新校验",
+                status_code=status.HTTP_409_CONFLICT,
+            ) from exc
+        if snapshot.line_id != str(validation.line_id):
+            raise CustomException(
+                msg="校验结果中的 SIP 线路快照不一致，请重新校验",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        try:
+            line = await self.line_service.get_line(
+                db,
+                tenant_id,
+                validation.line_id,
+            )
+        except CustomException as exc:
+            raise CustomException(
+                msg="校验绑定的 SIP 外呼线路已失效，请重新校验",
+                status_code=status.HTTP_409_CONFLICT,
+            ) from exc
+        if not line.enabled:
+            raise CustomException(
+                msg="校验绑定的 SIP 外呼线路已停用，请重新校验",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return line, snapshot
 
     async def _copy_targets(
         self,
@@ -829,6 +888,8 @@ class OutboundRuleTaskService:
             rule_id=str(task.rule_id),
             rule_name=task.rule_name,
             rule_summary=task.rule_summary,
+            line_id=str(task.line_id) if task.line_id is not None else None,
+            line_name=task.line_name,
             created_by_name=task.created_by_name,
             created_at=OutboundRuleTaskService._format_datetime(task.created_at) or "",
             updated_at=OutboundRuleTaskService._format_datetime(task.updated_at) or "",
