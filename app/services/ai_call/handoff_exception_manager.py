@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,7 +36,20 @@ class SystemPromptPlayerProtocol(Protocol):
 
 RecordingServiceFactory = Callable[[AiCallRecordRepository], AiCallRecordingService | None]
 
+DEFAULT_WAITING_PROMPT_TEXT = "正在为您转接人工客服，请稍候。"
+DEFAULT_BUSY_WAITING_PROMPT_TEXT = "当前人工坐席繁忙，正在为您排队转接，请稍候。"
 DEFAULT_UNAVAILABLE_PROMPT_TEXT = "当前暂时没有人工接入，我先帮您记录需求，稍后安排顾问联系您。"
+DEFAULT_NO_ONLINE_AGENT_PROMPT_TEXT = (
+    "当前暂无人工坐席在线，我先为您记录需求，稍后安排工作人员联系您。"
+)
+DEFAULT_BUSY_TIMEOUT_PROMPT_TEXT = "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
+DEFAULT_SERVICE_UNAVAILABLE_PROMPT_TEXT = "人工转接服务暂时不可用，我先为您记录需求。"
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffPrompt:
+    audio_path: Path | None
+    text: str
 
 
 class AiCallHandoffExceptionManager:
@@ -51,11 +65,22 @@ class AiCallHandoffExceptionManager:
         timeout_seconds: int = 30,
         exception_close_enabled: bool = True,
         waiting_prompt_audio_path: str | Path | None = None,
+        waiting_prompt_text: str | None = DEFAULT_WAITING_PROMPT_TEXT,
+        busy_waiting_prompt_audio_path: str | Path | None = None,
+        busy_waiting_prompt_text: str | None = DEFAULT_BUSY_WAITING_PROMPT_TEXT,
         waiting_tone_enabled: bool = False,
         waiting_tone_audio_path: str | Path | None = None,
         waiting_tone_interval_seconds: float = 0.0,
         unavailable_prompt_audio_path: str | Path | None = None,
         unavailable_prompt_text: str | None = DEFAULT_UNAVAILABLE_PROMPT_TEXT,
+        no_online_agent_prompt_audio_path: str | Path | None = None,
+        no_online_agent_prompt_text: str | None = DEFAULT_NO_ONLINE_AGENT_PROMPT_TEXT,
+        busy_timeout_prompt_audio_path: str | Path | None = None,
+        busy_timeout_prompt_text: str | None = DEFAULT_BUSY_TIMEOUT_PROMPT_TEXT,
+        service_unavailable_prompt_audio_path: str | Path | None = None,
+        service_unavailable_prompt_text: str | None = (
+            DEFAULT_SERVICE_UNAVAILABLE_PROMPT_TEXT
+        ),
     ) -> None:
         self.orchestrator = orchestrator
         self.session_factory = session_factory
@@ -63,20 +88,53 @@ class AiCallHandoffExceptionManager:
         self.system_prompt_player = system_prompt_player
         self.timeout_seconds = max(1, timeout_seconds)
         self.exception_close_enabled = exception_close_enabled
-        self.waiting_prompt_audio_path = (
-            Path(waiting_prompt_audio_path).expanduser() if waiting_prompt_audio_path else None
+        default_waiting_prompt = self._build_prompt(
+            waiting_prompt_audio_path,
+            waiting_prompt_text,
         )
+        busy_waiting_prompt = (
+            self._build_prompt(
+                busy_waiting_prompt_audio_path,
+                busy_waiting_prompt_text,
+            )
+            if busy_waiting_prompt_audio_path
+            else default_waiting_prompt
+        )
+        self.waiting_prompts = {
+            "default": default_waiting_prompt,
+            "available": default_waiting_prompt,
+            "busy": busy_waiting_prompt,
+        }
         self.waiting_tone_enabled = waiting_tone_enabled
         self.waiting_tone_audio_path = (
             Path(waiting_tone_audio_path).expanduser() if waiting_tone_audio_path else None
         )
         self.waiting_tone_interval_seconds = max(0.0, waiting_tone_interval_seconds)
-        self.unavailable_prompt_audio_path = (
-            Path(unavailable_prompt_audio_path).expanduser()
-            if unavailable_prompt_audio_path
-            else None
+        default_exception_prompt = self._build_prompt(
+            unavailable_prompt_audio_path,
+            unavailable_prompt_text,
         )
-        self.unavailable_prompt_text = self._strip_prompt_text(unavailable_prompt_text)
+        self.exception_prompts = {
+            "default": default_exception_prompt,
+            "no_online_agent": self._build_prompt(
+                no_online_agent_prompt_audio_path,
+                no_online_agent_prompt_text,
+            )
+            if no_online_agent_prompt_audio_path
+            else default_exception_prompt,
+            "handoff_timeout": self._build_prompt(
+                busy_timeout_prompt_audio_path,
+                busy_timeout_prompt_text,
+            )
+            if busy_timeout_prompt_audio_path
+            else default_exception_prompt,
+            "handoff_service_unavailable": self._build_prompt(
+                service_unavailable_prompt_audio_path,
+                service_unavailable_prompt_text,
+            )
+            if service_unavailable_prompt_audio_path
+            else default_exception_prompt,
+        }
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._closure_tasks: dict[str, asyncio.Task] = {}
         self._waiting_tone_tasks: dict[str, asyncio.Task] = {}
@@ -136,10 +194,13 @@ class AiCallHandoffExceptionManager:
         *,
         prompt_kind: str = "default",
     ) -> None:
-        del prompt_kind
+        prompt = self.waiting_prompts.get(
+            prompt_kind,
+            self.waiting_prompts["default"],
+        )
         has_waiting_tone = self.waiting_tone_enabled and self.waiting_tone_audio_path is not None
         if self.system_prompt_player is None or (
-            self.waiting_prompt_audio_path is None and not has_waiting_tone
+            prompt.audio_path is None and not has_waiting_tone
         ):
             return
         if handoff.status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
@@ -154,6 +215,7 @@ class AiCallHandoffExceptionManager:
                     call_id=handoff.call_id,
                     room_name=handoff.room_name,
                     handoff_status=handoff.status,
+                    prompt=prompt,
                 )
             )
         except RuntimeError as exc:
@@ -340,17 +402,19 @@ class AiCallHandoffExceptionManager:
         call_id: str,
         room_name: str,
         handoff_status: str,
+        prompt: HandoffPrompt,
     ) -> None:
         assert self.system_prompt_player is not None
         try:
-            if self.waiting_prompt_audio_path is not None:
+            if prompt.audio_path is not None:
                 await self._play_prompt_audio(
                     call_id=call_id,
                     room_name=room_name,
                     handoff_id=handoff_id,
                     handoff_status=handoff_status,
-                    audio_path=self.waiting_prompt_audio_path,
+                    audio_path=prompt.audio_path,
                     event_prefix="handoff_prompt",
+                    event_payload=self._prompt_event_payload(prompt),
                 )
             if not self.waiting_tone_enabled or self.waiting_tone_audio_path is None:
                 return
@@ -417,6 +481,7 @@ class AiCallHandoffExceptionManager:
             room_name=room_name,
             handoff_id=handoff_id,
             handoff_status=handoff_status,
+            call_end_reason=call_end_reason,
         )
         async with self.session_factory() as db:
             async with db.begin():
@@ -590,17 +655,22 @@ class AiCallHandoffExceptionManager:
         room_name: str,
         handoff_id: str,
         handoff_status: str,
+        call_end_reason: str = "default",
     ) -> None:
-        if self.unavailable_prompt_audio_path is None:
+        prompt = self.exception_prompts.get(
+            call_end_reason,
+            self.exception_prompts["default"],
+        )
+        if prompt.audio_path is None:
             return
         await self._play_prompt_audio(
             call_id=call_id,
             room_name=room_name,
             handoff_id=handoff_id,
             handoff_status=handoff_status,
-            audio_path=self.unavailable_prompt_audio_path,
+            audio_path=prompt.audio_path,
             event_prefix="handoff_unavailable_prompt",
-            event_payload=self._unavailable_prompt_event_payload(),
+            event_payload=self._prompt_event_payload(prompt),
         )
 
     async def _play_prompt_audio(
@@ -658,10 +728,22 @@ class AiCallHandoffExceptionManager:
             source="system",
         )
 
-    def _unavailable_prompt_event_payload(self) -> dict[str, Any]:
-        if self.unavailable_prompt_text is None:
+    @staticmethod
+    def _prompt_event_payload(prompt: HandoffPrompt) -> dict[str, Any]:
+        if not prompt.text:
             return {}
-        return {"promptText": self.unavailable_prompt_text}
+        return {"promptText": prompt.text}
+
+    @classmethod
+    def _build_prompt(
+        cls,
+        audio_path: str | Path | None,
+        text: str | None,
+    ) -> HandoffPrompt:
+        return HandoffPrompt(
+            audio_path=Path(audio_path).expanduser() if audio_path else None,
+            text=cls._strip_prompt_text(text) or "",
+        )
 
     def _record_handoff_event(
         self,

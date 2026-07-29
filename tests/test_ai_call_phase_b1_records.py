@@ -3111,6 +3111,128 @@ async def test_handoff_lazy_expire_records_expired_event(b1_service) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("reason", "expected_file", "expected_text"),
+    [
+        (
+            "no_online_agent",
+            "handoff-no-online-agent.wav",
+            "当前暂无人工坐席在线，我先为您记录需求，稍后安排工作人员联系您。",
+        ),
+        (
+            "handoff_timeout",
+            "handoff-busy-timeout.wav",
+            "当前人工坐席繁忙，暂未接通，我先为您记录需求。",
+        ),
+        (
+            "handoff_service_unavailable",
+            "handoff-service-unavailable.wav",
+            "人工转接服务暂时不可用，我先为您记录需求。",
+        ),
+    ],
+)
+async def test_handoff_exception_prompt_is_selected_by_reason(
+    b1_service,
+    tmp_path,
+    reason: str,
+    expected_file: str,
+    expected_text: str,
+) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    prompt_player = FakeSystemPromptPlayer()
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        system_prompt_player=prompt_player,
+        unavailable_prompt_audio_path=tmp_path / "handoff-unavailable.wav",
+        no_online_agent_prompt_audio_path=tmp_path / "handoff-no-online-agent.wav",
+        no_online_agent_prompt_text=(
+            "当前暂无人工坐席在线，我先为您记录需求，稍后安排工作人员联系您。"
+        ),
+        busy_timeout_prompt_audio_path=tmp_path / "handoff-busy-timeout.wav",
+        busy_timeout_prompt_text="当前人工坐席繁忙，暂未接通，我先为您记录需求。",
+        service_unavailable_prompt_audio_path=(
+            tmp_path / "handoff-service-unavailable.wav"
+        ),
+        service_unavailable_prompt_text="人工转接服务暂时不可用，我先为您记录需求。",
+    )
+
+    await manager._play_unavailable_prompt(
+        call_id=result.call_id,
+        room_name=result.room_name,
+        handoff_id="handoff-prompt-selection",
+        handoff_status="failed",
+        call_end_reason=reason,
+    )
+
+    assert prompt_player.played == [
+        (result.call_id, result.room_name, str(tmp_path / expected_file))
+    ]
+    started = next(
+        event
+        for event in service.orchestrator.event_store.list_all(result.call_id)
+        if event.type == "handoff_unavailable_prompt_started"
+    )
+    assert started.payload["promptText"] == expected_text
+
+
+@pytest.mark.anyio
+async def test_handoff_busy_waiting_prompt_is_selected(
+    b1_service,
+    tmp_path,
+) -> None:
+    service, _record_service = b1_service
+    prompt_player = FakeSystemPromptPlayer()
+    manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        system_prompt_player=prompt_player,
+        timeout_seconds=60,
+        waiting_prompt_audio_path=tmp_path / "handoff-waiting.wav",
+        busy_waiting_prompt_audio_path=tmp_path / "handoff-busy-waiting.wav",
+        busy_waiting_prompt_text="当前人工坐席繁忙，正在为您排队转接，请稍候。",
+    )
+    service.handoff_exception_manager = manager
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await service.create_handoff(
+            call_id=result.call_id,
+            source="customer",
+            reason="customer_request",
+            request_message="转人工",
+            waiting_prompt_kind="busy",
+        )
+        await wait_until(lambda: len(prompt_player.played) == 1)
+
+        assert prompt_player.played == [
+            (
+                result.call_id,
+                result.room_name,
+                str(tmp_path / "handoff-busy-waiting.wav"),
+            )
+        ]
+        started = next(
+            event
+            for event in service.orchestrator.event_store.list_all(result.call_id)
+            if event.type == "handoff_prompt_started"
+        )
+        assert started.payload["promptText"] == (
+            "当前人工坐席繁忙，正在为您排队转接，请稍候。"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.anyio
 async def test_handoff_timeout_plays_unavailable_prompt_before_auto_end(
     b1_service,
     tmp_path,

@@ -1891,6 +1891,15 @@ def _ensure_default_handoff_exception_manager(
             waiting_prompt_audio_path=_strip_or_none(
                 settings.AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH
             ),
+            waiting_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_WAITING_PROMPT_TEXT
+            ),
+            busy_waiting_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_AUDIO_PATH
+            ),
+            busy_waiting_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT
+            ),
             waiting_tone_enabled=settings.AI_CALL_HANDOFF_WAITING_TONE_ENABLED,
             waiting_tone_audio_path=settings.AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH,
             waiting_tone_interval_seconds=settings.AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS,
@@ -1899,6 +1908,24 @@ def _ensure_default_handoff_exception_manager(
             ),
             unavailable_prompt_text=_strip_or_none(
                 settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT
+            ),
+            no_online_agent_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_AUDIO_PATH
+            ),
+            no_online_agent_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_TEXT
+            ),
+            busy_timeout_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_AUDIO_PATH
+            ),
+            busy_timeout_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT
+            ),
+            service_unavailable_prompt_audio_path=_strip_or_none(
+                settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_AUDIO_PATH
+            ),
+            service_unavailable_prompt_text=_strip_or_none(
+                settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_TEXT
             ),
         )
     return _default_handoff_exception_manager

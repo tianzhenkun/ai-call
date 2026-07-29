@@ -222,6 +222,13 @@ class Settings(BaseSettings):
     AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-waiting.wav"
     )
+    AI_CALL_HANDOFF_WAITING_PROMPT_TEXT: str = "正在为您转接人工客服，请稍候。"
+    AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-busy-waiting.wav"
+    )
+    AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT: str = (
+        "当前人工坐席繁忙，正在为您排队转接，请稍候。"
+    )
     AI_CALL_HANDOFF_WAITING_TONE_ENABLED: bool = True
     AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH: str = str(
         BASE_DIR / "static/ai-call/audio/handoff-ringback.wav"
@@ -232,6 +239,24 @@ class Settings(BaseSettings):
     )
     AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT: str = (
         "当前暂时没有人工接入，我先帮您记录需求，稍后安排顾问联系您。"
+    )
+    AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-no-online-agent.wav"
+    )
+    AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_TEXT: str = (
+        "当前暂无人工坐席在线，我先为您记录需求，稍后安排工作人员联系您。"
+    )
+    AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-busy-timeout.wav"
+    )
+    AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT: str = (
+        "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
+    )
+    AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_AUDIO_PATH: str | None = str(
+        BASE_DIR / "static/ai-call/audio/handoff-service-unavailable.wav"
+    )
+    AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_TEXT: str = (
+        "人工转接服务暂时不可用，我先为您记录需求。"
     )
     AI_CALL_HANDOFF_TIMEOUT_SECONDS: int = 30
     AI_CALL_AGENT_CLAIM_CONNECT_TIMEOUT_SECONDS: int = 15
