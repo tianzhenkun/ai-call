@@ -13,6 +13,7 @@
 ## 文件结构
 
 - 创建 `app/services/ai_call/handoff_availability_service.py`：只负责读取某通电话对应租户与场景的在线坐席数和空闲坐席数。
+- 创建 `app/services/ai_call/handoff_unanswered_service.py`：为无人在线和等待超时统一构造幂等的人工未接回访任务数据。
 - 修改 `app/services/ai_call/agent_runner.py`：区分无关误触发与“转”“人工”等需要确认的残缺转人工表达。
 - 修改 `app/services/ai_call/handoff_trigger_service.py`：保存待确认状态、消费客户确认，并按坐席可用性快照选择转人工路径。
 - 修改 `app/api/v1/ai_call/service.py`：允许调用方传入等待提示类型，并让失败原因驱动确定性的异常提示。
@@ -295,6 +296,7 @@ git commit -m "feat(ai-call): inspect handoff agent availability"
 **文件：**
 - 修改：`app/services/ai_call/handoff_trigger_service.py`
 - 修改：`app/api/v1/ai_call/service.py`
+- 创建：`app/services/ai_call/handoff_unanswered_service.py`
 - 测试：`tests/test_ai_call_phase_b1_records.py`
 
 - [ ] **步骤 1：编写三个失败测试**
@@ -321,6 +323,9 @@ async def test_handoff_without_online_agent_fails_without_waiting(...):
     assert row["status"] == "failed"
     assert row["endReason"] == "no_online_agent"
     assert row["failureStage"] == "availability_check"
+    follow_ups = await list_follow_ups_for_handoff(row["handoffId"])
+    assert len(follow_ups) == 1
+    assert follow_ups[0].source_type == "handoff_unanswered"
 ```
 
 - [ ] **步骤 2：运行测试确认失败**
@@ -376,7 +381,56 @@ async def fail_handoff(
 
 `end_reason` 存在时通过现有 repository 更新 handoff 的 `end_reason`，异常协调器使用该原因选择提示；不修改 `AiCallHandoffService`，避免与当前话后状态收敛改动交叉。
 
-- [ ] **步骤 5：运行定向测试**
+- [ ] **步骤 5：幂等创建无人在线回访任务**
+
+创建 `handoff_unanswered_service.py`，集中构造现有 `create_unanswered_follow_up_if_missing()` 所需字段：
+
+```python
+class AiCallHandoffUnansweredService:
+    def __init__(self, repository: AiCallRecordRepository) -> None:
+        self.repository = repository
+
+    async def ensure_for_handoff(
+        self,
+        handoff: AiCallHandoffModel,
+        *,
+        reason: str,
+    ) -> None:
+        record = await self.repository.get_record(handoff.call_id)
+        await self.repository.create_unanswered_follow_up_if_missing(
+            {
+                "id": generate_snowflake_id(),
+                "tenant_id": handoff.tenant_id,
+                "source_type": "handoff_unanswered",
+                "source_call_id": handoff.call_id,
+                "source_handoff_id": handoff.handoff_id,
+                "scene_code": handoff.scene_code,
+                "business_type": record.business_type if record is not None else None,
+                "business_id": record.business_id if record is not None else None,
+                "contact_ref": f"call:{handoff.call_id}",
+                "masked_contact": (
+                    record.callee_phone_number_masked
+                    if record is not None and record.callee_phone_number_masked
+                    else "未提供"
+                ),
+                "owner_agent_identity": None,
+                "status": "pending",
+                "follow_up_reason": reason,
+                "customer_callback_at": None,
+                "summary": None,
+                "closed_reason": None,
+                "closed_remark": None,
+                "completed_at": None,
+                "closed_at": None,
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+```
+
+`AiCallService.fail_handoff(..., end_reason="no_online_agent")` 在同一数据库事务中调用该服务；依赖现有 `(tenant_id, source_handoff_id)` 唯一约束和 upsert 保证重复触发只产生一条任务。
+
+- [ ] **步骤 6：运行定向测试**
 
 ```bash
 uv run pytest tests/test_ai_call_phase_b1_records.py \
@@ -385,10 +439,11 @@ uv run pytest tests/test_ai_call_phase_b1_records.py \
 
 预期：全部通过。
 
-- [ ] **步骤 6：提交**
+- [ ] **步骤 7：提交**
 
 ```bash
 git add app/services/ai_call/handoff_trigger_service.py \
+  app/services/ai_call/handoff_unanswered_service.py \
   app/api/v1/ai_call/service.py \
   tests/test_ai_call_phase_b1_records.py
 git commit -m "feat(ai-call): route handoff by agent availability"
