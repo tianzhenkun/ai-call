@@ -1694,7 +1694,11 @@ def enqueue_ai_call_semantic_analysis(call_id: str, scene_code: str | None = Non
         _default_semantic_analysis_worker.enqueue(call_id, scene_code=scene_code)
 
 
-def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService:
+def get_default_ai_call_service(
+    db: AsyncSession | None = None,
+    *,
+    sip_config: SipOutboundConfig | None = None,
+) -> AiCallService:
     global _default_orchestrator
     if _default_orchestrator is None:
         _default_orchestrator = AiCallOrchestrator.from_settings(settings)
@@ -1728,7 +1732,7 @@ def get_default_ai_call_service(db: AsyncSession | None = None) -> AiCallService
         prompt_repository=repository,
         prompt_resolver=_build_prompt_resolver(repository, _default_orchestrator),
         prompt_composer=_build_prompt_composer(_default_orchestrator),
-        sip_client=_build_sip_client(),
+        sip_client=_build_sip_client(config=sip_config),
     )
 
 
@@ -1827,9 +1831,11 @@ def _build_recording_service(repository: AiCallRecordRepository) -> AiCallRecord
     )
 
 
-def _build_sip_client() -> LiveKitSipClient:
+def _build_sip_client(
+    config: SipOutboundConfig | None = None,
+) -> LiveKitSipClient:
     return LiveKitSipClient(
-        config=SipOutboundConfig.from_settings(settings),
+        config=config or SipOutboundConfig.from_settings(settings),
         livekit_url=settings.LIVEKIT_URL,
         api_key=settings.LIVEKIT_API_KEY,
         api_secret=settings.LIVEKIT_API_SECRET,

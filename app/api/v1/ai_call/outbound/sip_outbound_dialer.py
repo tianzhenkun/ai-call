@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Protocol
+
+from sqlalchemy import exists, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.api.v1.ai_call.service import get_default_ai_call_service
+from app.config.setting import Settings, settings
+from app.services.ai_call.livekit_sip import SipOutboundConfig
+
+from .sip_line_schema import SipLineSnapshot
+from .task_executor import ConnectedCallback, DialResult, OutboundDialRequest
+
+TERMINAL_STATUSES = {"completed", "failed"}
+BUSY_END_REASONS = {
+    "busy",
+    "busy_here",
+    "callee_busy",
+    "sip_busy",
+    "user_busy",
+    "sip_486",
+}
+NO_ANSWER_END_REASONS = {
+    "connect_timeout",
+    "no_answer",
+    "ringing_timeout",
+    "sip_connect_timeout",
+    "user_unavailable",
+    "sip_408",
+    "sip_480",
+}
+
+
+class AiCallServiceLike(Protocol):
+    async def create_sip_session(self, **kwargs): ...
+
+
+AiCallServiceFactory = Callable[
+    [AsyncSession, SipOutboundConfig],
+    AiCallServiceLike,
+]
+
+
+def _default_service_factory(
+    db: AsyncSession,
+    config: SipOutboundConfig,
+) -> AiCallServiceLike:
+    return get_default_ai_call_service(db, sip_config=config)
+
+
+class SipOutboundDialer:
+    """正式 SIP 外呼适配器，只以持久化的接听和媒体事件认定接通。"""
+
+    dialer_type = "sip"
+    manages_call_record = True
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        ai_call_service_factory: AiCallServiceFactory = _default_service_factory,
+        settings: Settings = settings,
+        poll_seconds: float = 0.5,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.session_factory = session_factory
+        self.ai_call_service_factory = ai_call_service_factory
+        self.settings = settings
+        self.poll_seconds = max(0.0, poll_seconds)
+        self.sleep = sleep
+
+    async def dial(
+        self,
+        request: OutboundDialRequest,
+        *,
+        call_id: str,
+        on_connected: ConnectedCallback,
+    ) -> DialResult:
+        line = self._request_line(request)
+        config = self.build_sip_config(line)
+        create_error: Exception | None = None
+
+        async with self.session_factory() as db:
+            service = self.ai_call_service_factory(db, config)
+            try:
+                await service.create_sip_session(
+                    callee_phone_number=request.phone_number,
+                    voice=request.voice,
+                    call_id=call_id,
+                    business_type="outbound_task",
+                    business_id=str(request.task_id),
+                    scene_code=request.scene_code,
+                    business_params={
+                        "customerName": request.customer_name or "",
+                        "targetId": str(request.target_id),
+                        "attemptNo": request.attempt_no,
+                        "lineId": line.line_id,
+                        "lineCode": line.line_code,
+                    },
+                    ringing_timeout_seconds=line.originate_timeout_seconds,
+                )
+            except Exception as exc:
+                create_error = exc
+                try:
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+            else:
+                try:
+                    await db.commit()
+                except Exception as exc:
+                    await db.rollback()
+                    create_error = exc
+
+        if create_error is not None:
+            record, media_connected = await self._read_evidence(call_id)
+            if self._is_terminal(record):
+                if self._is_connected(record, media_connected):
+                    await on_connected()
+                return self.map_terminal_record(record)
+            return DialResult(
+                call_result="call_failed",
+                error_message=self._error_message(create_error),
+            )
+
+        connected_notified = False
+        while True:
+            record, media_connected = await self._read_evidence(call_id)
+            if (
+                not connected_notified
+                and self._is_connected(record, media_connected)
+            ):
+                await on_connected()
+                connected_notified = True
+            if self._is_terminal(record):
+                return self.map_terminal_record(record)
+            await self.sleep(self.poll_seconds)
+
+    def build_sip_config(self, line: SipLineSnapshot) -> SipOutboundConfig:
+        trunk_hostname = ""
+        if line.route_mode == "inline_hostname":
+            if not line.proxy_host or line.proxy_port is None:
+                raise ValueError("内联 SIP 线路缺少代理地址或端口")
+            trunk_hostname = f"{line.proxy_host}:{line.proxy_port}"
+        return SipOutboundConfig(
+            enabled=self.settings.AI_CALL_SIP_OUTBOUND_ENABLED,
+            allowed_callee_prefixes=self.settings.AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES,
+            default_ringing_timeout_seconds=line.originate_timeout_seconds,
+            max_ringing_timeout_seconds=self.settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS,
+            max_call_duration_seconds=self.settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS,
+            trunk_id=line.trunk_id or "",
+            trunk_hostname=trunk_hostname,
+            destination_country=line.destination_country,
+            auth_username="",
+            auth_password="",
+            caller_number=line.caller_number,
+            signaling_port=self.settings.SIP_SIGNALING_PORT,
+            rtp_range=self.settings.SIP_RTP_RANGE,
+            public_ip=self.settings.SIP_PUBLIC_IP,
+            use_external_ip=self.settings.SIP_USE_EXTERNAL_IP,
+        )
+
+    async def _read_evidence(
+        self,
+        call_id: str,
+    ) -> tuple[AiCallRecordModel | None, bool]:
+        async with self.session_factory() as db:
+            record = await db.scalar(
+                select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+            )
+            media_connected = bool(
+                await db.scalar(
+                    select(
+                        exists().where(
+                            AiCallEventModel.call_id == call_id,
+                            AiCallEventModel.event_type == "media_connected",
+                        )
+                    )
+                )
+            )
+        return record, media_connected
+
+    @staticmethod
+    def _request_line(request: OutboundDialRequest) -> SipLineSnapshot:
+        line = getattr(request, "line", None)
+        if isinstance(line, SipLineSnapshot):
+            return line
+        if isinstance(line, dict):
+            return SipLineSnapshot.model_validate(line)
+        raise ValueError("正式 SIP 外呼请求缺少线路快照")
+
+    @staticmethod
+    def _is_connected(
+        record: AiCallRecordModel | None,
+        media_connected: bool,
+    ) -> bool:
+        return (
+            record is not None
+            and record.answered_at is not None
+            and media_connected
+        )
+
+    @staticmethod
+    def _is_terminal(record: AiCallRecordModel | None) -> bool:
+        return (
+            record is not None
+            and str(record.status or "").lower() in TERMINAL_STATUSES
+        )
+
+    @staticmethod
+    def map_terminal_record(record: AiCallRecordModel) -> DialResult:
+        if record.answered_at is not None:
+            return DialResult(
+                call_result="connected",
+                duration_ms=max(0, int(record.duration_ms or 0)),
+            )
+
+        reason = str(record.end_reason or "").strip().lower()
+        error_message = record.failure_message or record.end_reason
+        if reason in BUSY_END_REASONS:
+            return DialResult(
+                call_result="busy",
+                error_message=error_message,
+                duration_ms=max(0, int(record.duration_ms or 0)),
+            )
+        if reason in NO_ANSWER_END_REASONS:
+            return DialResult(
+                call_result="no_answer",
+                error_message=error_message,
+                duration_ms=max(0, int(record.duration_ms or 0)),
+            )
+        return DialResult(
+            call_result="call_failed",
+            error_message=error_message or "SIP 外呼失败",
+            duration_ms=max(0, int(record.duration_ms or 0)),
+        )
+
+    @staticmethod
+    def _error_message(exc: Exception) -> str:
+        message = getattr(exc, "msg", None) or str(exc).strip()
+        return str(message or exc.__class__.__name__)[:500]

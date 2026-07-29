@@ -13,6 +13,7 @@ from livekit import api
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import controller as ai_call_controller
+from app.api.v1.ai_call import service as ai_call_service_module
 from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.schema import CreateSipSessionRequest
@@ -1215,3 +1216,29 @@ def test_create_sip_session_controller_accepts_dynamic_callee_without_browser_to
 
     assert rejected.status_code == 422
     assert len(sip_client.created) == 1
+
+
+def test_build_sip_client_accepts_request_level_config() -> None:
+    config = SipOutboundConfig(
+        enabled=True,
+        trunk_hostname="127.0.0.1:5089",
+        caller_number="1000",
+    )
+
+    client = ai_call_service_module._build_sip_client(config=config)
+
+    assert client.config is config
+
+
+def test_build_sip_client_keeps_settings_default(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "AI_CALL_SIP_OUTBOUND_ENABLED", True)
+    monkeypatch.setattr(
+        settings,
+        "LIVEKIT_SIP_OUTBOUND_TRUNK_HOSTNAME",
+        "sip.default.test:5060",
+    )
+
+    client = ai_call_service_module._build_sip_client()
+
+    assert client.config.enabled is True
+    assert client.config.trunk_hostname == "sip.default.test:5060"
