@@ -5689,6 +5689,65 @@ async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_expli
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_requests_confirmation_for_partial_handoff_intent() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    call_id = "call_handoff_tool_partial"
+    registry.add(
+        CallSession(
+            call_id=call_id,
+            room_name=f"ai-call-{call_id}",
+            participant_identity=f"browser-{call_id}",
+            status=CallSessionStatus.READY,
+            effective_config={
+                "voice": "Tina",
+                "prompt": "简短回答",
+                "vad_type": "server_vad",
+                "vad_threshold": 0.5,
+                "vad_silence_duration_ms": 800,
+            },
+        )
+    )
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+    )
+    runner._pending_turn(call_id).transcript_parts = ["转。"]
+
+    await runner._handle_handoff_tool_done(
+        call_id,
+        provider,
+        ProviderEvent(
+            type="tool_call_done",
+            payload={
+                "call_id": "handoff_tool_partial",
+                "name": "request_handoff",
+                "arguments": json.dumps({"reason": "customer_request"}),
+            },
+        ),
+    )
+
+    requested = next(
+        event for event in store.list(call_id) if event.type == "handoff_tool_requested"
+    )
+    assert requested.payload == {
+        "toolCallId": "handoff_tool_partial",
+        "reason": "customer_request",
+        "confirmationRequired": True,
+        "transcriptPreview": "转。",
+    }
+    assert provider.submitted_tool_results == [
+        (
+            "handoff_tool_partial",
+            "用户的转人工表达不完整。请只询问：您是希望转接人工客服吗？"
+            "不得声称坐席繁忙、暂无人工接入或正在转接。",
+        )
+    ]
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_asks_confirmation_after_business_handoff_tool() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()

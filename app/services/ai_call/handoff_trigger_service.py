@@ -451,6 +451,9 @@ class AiCallHandoffTriggerService:
         "好的",
         "好",
         "嗯",
+        "是",
+        "是的",
+        "确认",
         "转吧",
         "帮我转",
         "给我转",
@@ -687,11 +690,19 @@ class AiCallHandoffTriggerService:
             )
             return
 
-        if reason == "business_escalation":
+        confirmation_required = (
+            reason == "business_escalation"
+            or event.payload.get("confirmationRequired") is True
+        )
+        if confirmation_required:
             tool_call_id = event.payload.get("toolCallId")
             confirmation = PendingHandoffConfirmation(
                 reason=reason,
-                request_message=request_message,
+                request_message=(
+                    "客户确认转人工"
+                    if reason == "customer_request"
+                    else request_message
+                ),
                 tool_call_id=tool_call_id if isinstance(tool_call_id, str) else None,
             )
             event_store.append(

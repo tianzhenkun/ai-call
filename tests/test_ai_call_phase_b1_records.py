@@ -1288,6 +1288,84 @@ async def test_handoff_trigger_worker_creates_customer_handoff_from_tool_request
 
 
 @pytest.mark.anyio
+async def test_customer_partial_handoff_is_created_only_after_affirmative_confirmation(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    classifier = FakeHandoffIntentClassifier(
+        HandoffIntentResult(
+            matched=False,
+            confidence=0.0,
+            reason="not_handoff",
+            summary="不应进入分类器",
+            source="test_classifier",
+        )
+    )
+
+    def service_factory(db):
+        repository = AiCallRecordRepository(db)
+        return AiCallService(
+            service.orchestrator,
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+
+    trigger_service = AiCallHandoffTriggerService(
+        b1_service.session_maker,
+        service_factory,
+        classifier,
+        threshold=0.8,
+        timeout_seconds=0.2,
+    )
+    worker = AiCallHandoffTriggerWorker(trigger_service, transcript_trigger_enabled=True)
+    await worker.start()
+    worker.attach_event_store(service.orchestrator.event_store)
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="handoff_tool_requested",
+            source="agent",
+            payload={
+                "toolCallId": "handoff_tool_partial",
+                "reason": "customer_request",
+                "confirmationRequired": True,
+            },
+        )
+        await worker.flush_pending()
+
+        assert await service.list_handoffs(result.call_id) == {"rows": [], "total": 0}
+
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="user_transcript_done",
+            source="provider",
+            payload={"item_id": "confirm_partial", "transcript": "是的，转人工。"},
+        )
+        await worker.flush_pending()
+
+        handoffs = await service.list_handoffs(result.call_id)
+        assert handoffs["total"] == 1
+        assert handoffs["rows"][0]["status"] == "requested"
+        assert handoffs["rows"][0]["requestReason"] == "customer_request"
+
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_confirmation_requested" in event_types
+        assert "handoff_confirmation_confirmed" in event_types
+        assert "handoff_auto_triggered" in event_types
+    finally:
+        worker.detach_all()
+        await worker.stop()
+
+
+@pytest.mark.anyio
 async def test_handoff_trigger_worker_waits_for_confirmation_on_business_escalation_tool_request(
     b1_service,
 ) -> None:

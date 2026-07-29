@@ -107,6 +107,11 @@ BUSINESS_HANDOFF_CONFIRMATION_TOOL_RESULT = (
 CUSTOMER_HANDOFF_REJECTED_TOOL_RESULT = (
     "未确认用户明确要求转人工。请继续回应用户刚才的话，不要转人工。"
 )
+CUSTOMER_HANDOFF_CONFIRMATION_TOOL_RESULT = (
+    "用户的转人工表达不完整。请只询问：您是希望转接人工客服吗？"
+    "不得声称坐席繁忙、暂无人工接入或正在转接。"
+)
+PARTIAL_HANDOFF_INTENT_VALUES = frozenset({"转", "人工", "客服", "真人"})
 CALL_END_FINAL_RESPONSE_TOOL_RESULT = "已记录。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
 CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "已记录。系统将结束通话，不要再生成额外回复。"
 CALL_END_REJECTED_TOOL_RESULT = "未确认用户要求结束通话。请继续按用户刚才的话推进对话，不要结束通话。"
@@ -6279,6 +6284,38 @@ class RealtimeCallAgentRunner:
                 transcript=transcript
             )
             if not decision.matched or decision.reason != "customer_request":
+                if (
+                    self._normalize_handoff_intent_fragment(transcript)
+                    in PARTIAL_HANDOFF_INTENT_VALUES
+                ):
+                    self._append_event(
+                        call_id,
+                        "handoff_tool_requested",
+                        "agent",
+                        {
+                            "toolCallId": tool_call_id,
+                            "reason": reason,
+                            "confirmationRequired": True,
+                            "transcriptPreview": self._text_preview(transcript),
+                        },
+                    )
+                    try:
+                        await provider.submit_tool_result(
+                            tool_call_id,
+                            CUSTOMER_HANDOFF_CONFIRMATION_TOOL_RESULT,
+                        )
+                        self._queue_response_create(call_id)
+                    except Exception as exc:
+                        self._append_event(
+                            call_id,
+                            "agent_error",
+                            "agent",
+                            {
+                                "message": f"提交转人工确认结果失败: {exc}",
+                                "toolCallId": tool_call_id,
+                            },
+                        )
+                    return
                 self._append_event(
                     call_id,
                     "handoff_tool_ignored",
@@ -6364,6 +6401,14 @@ class RealtimeCallAgentRunner:
         except json.JSONDecodeError:
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _normalize_handoff_intent_fragment(text: str) -> str:
+        return "".join(
+            char.lower()
+            for char in text.strip()
+            if char not in " \t\r\n，。！？,.!?；;：:、"
+        )
 
     def _pending_turn(self, call_id: str, reset_if_finished: bool = False) -> PendingUserTurn:
         turn = self._pending_user_turns.get(call_id)
