@@ -3,21 +3,28 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.outbound.model import AiCallOutboundValidationModel
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.outbound.sip_line_controller import get_sip_line_service
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.sip_line_schema import SipLineIn
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
+from app.api.v1.system.auth.schema import AuthSchema
+from app.api.v1.system.user.model import UserModel
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
-from app.core.exceptions import CustomException
+from app.core.dependencies import get_current_user
+from app.core.exceptions import CustomException, handle_exception
 
 
 @pytest.fixture
@@ -72,6 +79,35 @@ class FailingPreflightChecker:
     async def check(self, config) -> None:
         del config
         raise RuntimeError("LiveKit unavailable")
+
+
+def _auth(db, tenant_id: str) -> AuthSchema:
+    return AuthSchema(
+        db=db,
+        user=UserModel(
+            user_id=20,
+            tenant_id=tenant_id,
+            user_name="operator",
+            nick_name="运营",
+            user_type="sys_user",
+        ),
+        check_data_scope=False,
+    )
+
+
+def _client(database, service: SipLineService, tenant_id: str) -> TestClient:
+    app = FastAPI()
+    handle_exception(app)
+    app.include_router(AiCallRouter)
+
+    async def auth_override():
+        async with database() as session:
+            async with session.begin():
+                yield _auth(session, tenant_id)
+
+    app.dependency_overrides[get_current_user] = auth_override
+    app.dependency_overrides[get_sip_line_service] = lambda: service
+    return TestClient(app)
 
 
 def test_sip_line_model_is_tenant_scoped_without_secrets_or_foreign_keys() -> None:
@@ -287,3 +323,56 @@ async def test_preflight_distinguishes_bad_config_from_unreachable_livekit(datab
         await db.commit()
     assert unavailable.health_status == "UNAVAILABLE"
     assert unavailable.health_message == "LiveKit unavailable"
+
+
+def test_sip_line_routes_are_registered() -> None:
+    paths = {route.path for route in AiCallRouter.routes}
+    assert {
+        "/ai-call/outbound-lines",
+        "/ai-call/outbound-lines/{line_id}",
+        "/ai-call/outbound-lines/{line_id}/set-default",
+        "/ai-call/outbound-lines/{line_id}/enable",
+        "/ai-call/outbound-lines/{line_id}/disable",
+        "/ai-call/outbound-lines/{line_id}/preflight",
+    } <= paths
+
+
+@pytest.mark.anyio
+async def test_sip_line_api_crud_is_tenant_isolated_and_hides_credentials(database) -> None:
+    service = SipLineService(settings=Settings())
+    payload = _line_request("line-api").model_dump(mode="json", by_alias=True)
+
+    with _client(database, service, "tenant-a") as client:
+        created = client.post("/ai-call/outbound-lines", json=payload)
+        assert created.status_code == 200
+        line = created.json()["data"]
+        line_id = line["lineId"]
+        assert line["healthStatus"] == "UNKNOWN"
+        assert "password" not in str(line).lower()
+        assert "secret" not in str(line).lower()
+
+        listed = client.get(
+            "/ai-call/outbound-lines",
+            params={"pageNum": 1, "pageSize": 20},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        assert listed.json()["rows"][0]["lineId"] == line_id
+
+        renamed_payload = {**payload, "lineName": "正式线路"}
+        updated = client.put(
+            f"/ai-call/outbound-lines/{line_id}",
+            json=renamed_payload,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["data"]["lineName"] == "正式线路"
+
+        defaulted = client.post(
+            f"/ai-call/outbound-lines/{line_id}/set-default"
+        )
+        assert defaulted.status_code == 200
+        assert defaulted.json()["data"]["isDefault"] is True
+
+    with _client(database, service, "tenant-b") as client:
+        hidden = client.get(f"/ai-call/outbound-lines/{line_id}")
+        assert hidden.status_code == 404
