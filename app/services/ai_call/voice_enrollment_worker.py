@@ -185,7 +185,10 @@ class VoiceEnrollmentWorker:
                         .values(
                             status=case(
                                 (
-                                    AiCallVoiceEnrollmentModel.status == "RECONCILING",
+                                    AiCallVoiceEnrollmentModel.status.in_((
+                                        "PROCESSING",
+                                        "RECONCILING",
+                                    )),
                                     "RECONCILING",
                                 ),
                                 else_="PROCESSING",
@@ -241,7 +244,9 @@ class VoiceEnrollmentWorker:
         now: datetime,
         lease_expires_at: datetime,
     ) -> None:
-        if row.status != "RECONCILING":
+        if row.status in ("PROCESSING", "RECONCILING"):
+            row.status = "RECONCILING"
+        else:
             row.status = "PROCESSING"
         row.attempt_count += 1
         row.lease_owner = self.worker_id
@@ -290,7 +295,11 @@ class VoiceEnrollmentWorker:
                 ),
             )
         except VoiceProviderResultUnknownError:
-            await self._retry_or_fail(item, reconciliation=True)
+            await self._retry_or_fail(
+                item,
+                reconciliation=True,
+                require_reconciliation=True,
+            )
             return
         except VoiceProviderRetryableError:
             await self._retry_or_fail(item, reconciliation=False)
@@ -337,12 +346,14 @@ class VoiceEnrollmentWorker:
         item: EnrollmentWorkItem,
         *,
         reconciliation: bool,
+        require_reconciliation: bool = False,
     ) -> None:
-        if item.attempt_count > len(RETRY_DELAYS):
+        if item.attempt_count > len(RETRY_DELAYS) and not require_reconciliation:
             await self._fail_enrollment(item)
             return
         now = self.now()
-        retry_at = now + timedelta(seconds=RETRY_DELAYS[item.attempt_count - 1])
+        delay_index = min(item.attempt_count - 1, len(RETRY_DELAYS) - 1)
+        retry_at = now + timedelta(seconds=RETRY_DELAYS[delay_index])
         next_status = "RECONCILING" if reconciliation else "RETRY_WAIT"
         values: dict[str, object] = {
             "status": next_status,
@@ -468,6 +479,7 @@ class VoiceEnrollmentWorker:
             AiCallVoiceEnrollmentModel.tenant_id == item.tenant_id,
             AiCallVoiceEnrollmentModel.lease_owner == self.worker_id,
             AiCallVoiceEnrollmentModel.status == item.status,
+            AiCallVoiceEnrollmentModel.attempt_count == item.attempt_count,
         )
 
     async def _cleanup_terminal_samples(self) -> None:
@@ -673,6 +685,7 @@ class VoiceEnrollmentWorker:
             AiCallVoiceSampleCleanupModel.tenant_id == item.tenant_id,
             AiCallVoiceSampleCleanupModel.lease_owner == self.worker_id,
             AiCallVoiceSampleCleanupModel.status == "PROCESSING",
+            AiCallVoiceSampleCleanupModel.attempt_count == item.attempt_count,
         )
 
 
@@ -682,11 +695,15 @@ def _matching_voice(
     preferred_name: str,
     target_model: str,
 ) -> str | None:
-    expected_suffix = f"-{preferred_name}"
+    legacy_name = f"qwen-omni-vc-{preferred_name}"
+    official_prefix = f"qwen-omni-vc-{preferred_name}-voice-"
     for item in voices:
         if item.target_model != target_model:
             continue
-        if item.voice == preferred_name or item.voice.endswith(expected_suffix):
+        is_official_name = item.voice.startswith(official_prefix) and len(item.voice) > len(
+            official_prefix
+        )
+        if item.voice == preferred_name or item.voice == legacy_name or is_official_name:
             return item.voice
     return None
 

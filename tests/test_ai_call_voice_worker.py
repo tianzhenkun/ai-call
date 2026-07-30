@@ -26,6 +26,7 @@ from app.services.ai_call.voice_enrollment_worker import (
     RETRY_DELAYS,
     SAMPLE_CLEANUP_ERROR_MESSAGE,
     VoiceEnrollmentWorker,
+    _matching_voice,
 )
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
@@ -363,7 +364,7 @@ async def test_claims_due_and_expired_states_with_lease_and_attempt(harness) -> 
     assert [item.status for item in claimed] == [
         "PROCESSING",
         "PROCESSING",
-        "PROCESSING",
+        "RECONCILING",
         "RECONCILING",
     ]
     assert [item.attempt_count for item in claimed] == [1, 2, 3, 2]
@@ -394,6 +395,62 @@ def test_postgres_claim_uses_for_update_skip_locked() -> None:
 
     assert "for update skip locked" in sql
     assert "limit" in sql
+
+
+@pytest.mark.parametrize(
+    "voice",
+    [
+        "vc1",
+        "qwen-omni-vc-vc1",
+        "qwen-omni-vc-vc1-voice-20260730",
+    ],
+)
+def test_matching_voice_accepts_only_supported_qwen_formats(voice: str) -> None:
+    voices = [
+        VoiceListItem(
+            voice=voice,
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    assert (
+        _matching_voice(
+            voices,
+            preferred_name="vc1",
+            target_model=TARGET_MODEL,
+        )
+        == voice
+    )
+
+
+@pytest.mark.parametrize(
+    "voice",
+    [
+        "qwen-omni-vc-vc10-voice-20260730",
+        "qwen-omni-vc-xvc1-voice-20260730",
+        "other-vc1-voice-20260730",
+        "qwen-omni-vc-vc1-voice-",
+        "not-qwen-omni-vc-vc1",
+    ],
+)
+def test_matching_voice_rejects_similar_or_malformed_names(voice: str) -> None:
+    voices = [
+        VoiceListItem(
+            voice=voice,
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    assert (
+        _matching_voice(
+            voices,
+            preferred_name="vc1",
+            target_model=TARGET_MODEL,
+        )
+        is None
+    )
 
 
 @pytest.mark.anyio
@@ -564,6 +621,40 @@ async def test_unknown_create_result_reconciles_without_second_create(harness) -
 
 
 @pytest.mark.anyio
+async def test_last_create_attempt_with_unknown_result_reconciles_before_failure(
+    harness,
+) -> None:
+    task = await harness.seed_enrollment(
+        status="RETRY_WAIT",
+        next_retry_at=NOW,
+        attempt_count=3,
+    )
+    harness.provider.create_error = VoiceProviderResultUnknownError("secret timeout")
+
+    await harness.worker.run_once()
+
+    awaiting_reconciliation = await harness.enrollment(task.id)
+    assert awaiting_reconciliation.status == "RECONCILING"
+    assert awaiting_reconciliation.attempt_count == 4
+    assert len(harness.provider.create_calls) == 1
+
+    harness.clock.advance(RETRY_DELAYS[-1] + 1)
+    harness.provider.list_result = [
+        VoiceListItem(
+            voice="qwen-omni-vc-vc1-voice-final",
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    await harness.worker.run_once()
+
+    assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
+    assert len(harness.provider.create_calls) == 1
+    assert len(harness.provider.list_calls) >= 1
+
+
+@pytest.mark.anyio
 async def test_expired_reconciling_uses_list_and_never_create(harness) -> None:
     task = await harness.seed_enrollment(
         status="RECONCILING",
@@ -605,6 +696,101 @@ async def test_expired_reconciling_uses_list_and_never_create(harness) -> None:
     assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
     assert harness.provider.create_calls == []
     assert len(harness.provider.list_calls) == 2
+
+
+@pytest.mark.anyio
+async def test_expired_processing_reconciles_and_never_creates_again(harness) -> None:
+    task = await harness.seed_enrollment(
+        status="PROCESSING",
+        lease_owner="dead-worker",
+        lease_expires_at=NOW - timedelta(seconds=1),
+        attempt_count=1,
+    )
+    harness.provider.list_result = [
+        VoiceListItem(
+            voice="qwen-omni-vc-vc1",
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    await harness.worker.run_once()
+
+    assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
+    assert harness.provider.create_calls == []
+    assert len(harness.provider.list_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_create_publish_failure_recovers_via_list_without_second_create(
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = await harness.seed_enrollment()
+
+    async def fail_publish(*args, **kwargs) -> None:
+        raise RuntimeError("database publish failed")
+
+    monkeypatch.setattr(harness.worker, "_publish_success", fail_publish)
+
+    await harness.worker.run_once()
+
+    assert (await harness.enrollment(task.id)).status == "PROCESSING"
+    assert len(harness.provider.create_calls) == 1
+
+    second_worker_with_same_owner = VoiceEnrollmentWorker(
+        session_factory=harness.factory,
+        provider=harness.provider,
+        storage=harness.storage,
+        worker_id="worker-a",
+        now=harness.clock,
+        batch_size=10,
+        lease_seconds=60,
+    )
+    harness.clock.advance(61)
+    harness.provider.list_result = [
+        VoiceListItem(
+            voice="qwen-omni-vc-vc1",
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    await second_worker_with_same_owner.run_once()
+
+    assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
+    assert len(harness.provider.create_calls) == 1
+    assert len(harness.provider.list_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_same_owner_stale_attempt_cannot_publish_after_reclaim(harness) -> None:
+    task = await harness.seed_enrollment(
+        status="RECONCILING",
+        lease_owner="worker-a",
+        lease_expires_at=NOW - timedelta(seconds=1),
+    )
+    first_claim = (await harness.worker._claim_enrollments())[0]
+    harness.clock.advance(61)
+    second_claim = (await harness.worker._claim_enrollments())[0]
+
+    await harness.worker._publish_success(
+        first_claim,
+        voice="qwen-omni-vc-stale",
+        request_id=None,
+    )
+
+    after_stale_publish = await harness.enrollment(task.id)
+    assert after_stale_publish.status == "RECONCILING"
+    assert after_stale_publish.provider_voice is None
+
+    await harness.worker._publish_success(
+        second_claim,
+        voice="qwen-omni-vc-current",
+        request_id=None,
+    )
+
+    assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
 
 
 @pytest.mark.anyio
@@ -656,6 +842,31 @@ async def test_cleanup_record_with_enrollment_reference_never_deletes_object(
     assert (
         await harness.enrollment(enrollment.id)
     ).sample_object_key == "voice-samples/referenced.wav"
+
+
+@pytest.mark.anyio
+async def test_same_owner_stale_cleanup_attempt_cannot_finish_after_reclaim(
+    harness,
+) -> None:
+    cleanup = await harness.seed_cleanup(
+        "voice-samples/orphan.wav",
+        status="PROCESSING",
+        lease_owner="worker-a",
+        lease_expires_at=NOW - timedelta(seconds=1),
+    )
+    first_claim = (await harness.worker._claim_cleanup_records())[0]
+    harness.clock.advance(61)
+    second_claim = (await harness.worker._claim_cleanup_records())[0]
+
+    await harness.worker._finish_cleanup(first_claim)
+
+    after_stale_finish = await harness.cleanup(cleanup.id)
+    assert after_stale_finish.status == "PROCESSING"
+    assert after_stale_finish.attempt_count == second_claim.attempt_count
+
+    await harness.worker._finish_cleanup(second_claim)
+
+    assert (await harness.cleanup(cleanup.id)).status == "SUCCEEDED"
 
 
 @pytest.mark.anyio
