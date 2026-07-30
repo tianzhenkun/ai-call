@@ -78,9 +78,7 @@ class QwenVoiceEnrollmentProvider:
         output = body.get("output")
         if not isinstance(output, dict):
             raise VoiceProviderProtocolError("Qwen 创建响应缺少 output")
-        voice = str(output.get("voice") or "").strip()
-        if not voice:
-            raise VoiceProviderProtocolError("Qwen 创建响应缺少 voice")
+        voice = _required_string(output.get("voice"), field="voice")
         return VoiceCreateResult(voice=voice, request_id=request_id)
 
     async def list(
@@ -107,14 +105,18 @@ class QwenVoiceEnrollmentProvider:
         for item in voice_list:
             if not isinstance(item, dict):
                 raise VoiceProviderProtocolError("Qwen 列表响应 voice_list 格式异常")
-            voice = str(item.get("voice") or "").strip()
-            if not voice:
-                raise VoiceProviderProtocolError("Qwen 列表响应缺少 voice")
+            voice = _required_string(item.get("voice"), field="voice")
             result.append(
                 VoiceListItem(
                     voice=voice,
-                    target_model=_optional_string(item.get("target_model")),
-                    gmt_create=_optional_string(item.get("gmt_create")),
+                    target_model=_optional_string(
+                        item.get("target_model"),
+                        field="target_model",
+                    ),
+                    gmt_create=_optional_string(
+                        item.get("gmt_create"),
+                        field="gmt_create",
+                    ),
                 )
             )
         return result
@@ -129,6 +131,7 @@ class QwenVoiceEnrollmentProvider:
         *,
         result_unknown_on_timeout: bool = False,
     ) -> tuple[dict[str, Any], str | None]:
+        network_error: VoiceProviderError | None = None
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout_seconds,
@@ -145,14 +148,17 @@ class QwenVoiceEnrollmentProvider:
                         "input": input_values,
                     },
                 )
-        except (httpx.ReadTimeout, httpx.WriteTimeout):
-            if result_unknown_on_timeout:
-                raise VoiceProviderResultUnknownError(
-                    "Qwen 创建请求超时，执行结果未知"
-                ) from None
-            raise VoiceProviderRetryableError("Qwen 请求超时") from None
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            network_error = VoiceProviderRetryableError("Qwen 请求发送前连接失败")
         except httpx.RequestError:
-            raise VoiceProviderRetryableError("Qwen 请求连接失败") from None
+            if result_unknown_on_timeout:
+                network_error = VoiceProviderResultUnknownError(
+                    "Qwen 创建请求执行结果未知"
+                )
+            else:
+                network_error = VoiceProviderRetryableError("Qwen 请求网络异常")
+        if network_error is not None:
+            raise network_error
 
         if response.status_code == 429 or response.status_code >= 500:
             raise VoiceProviderRetryableError(
@@ -170,18 +176,32 @@ class QwenVoiceEnrollmentProvider:
         try:
             body = response.json()
         except ValueError:
-            raise VoiceProviderProtocolError("Qwen 响应不是有效 JSON") from None
+            protocol_error = VoiceProviderProtocolError("Qwen 响应不是有效 JSON")
+        else:
+            protocol_error = None
+        if protocol_error is not None:
+            raise protocol_error
         if not isinstance(body, dict):
             raise VoiceProviderProtocolError("Qwen 响应不是 JSON 对象")
         return body, _request_id(body)
 
 
-def _optional_string(value: Any) -> str | None:
+def _required_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise VoiceProviderProtocolError(f"Qwen 响应字段 {field} 必须为非空字符串")
+    return value.strip()
+
+
+def _optional_string(value: Any, *, field: str) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
+    if not isinstance(value, str):
+        raise VoiceProviderProtocolError(f"Qwen 响应字段 {field} 必须为字符串或 null")
+    text = value.strip()
     return text or None
 
 
 def _request_id(body: dict[str, Any]) -> str | None:
-    return _optional_string(body.get("request_id") or body.get("requestId"))
+    request_id = _optional_string(body.get("request_id"), field="request_id")
+    camel_request_id = _optional_string(body.get("requestId"), field="requestId")
+    return request_id or camel_request_id

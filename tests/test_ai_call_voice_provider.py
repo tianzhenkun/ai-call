@@ -32,6 +32,23 @@ def _provider(
     )
 
 
+def _exception_chain_text(error: BaseException) -> str:
+    pending = [error]
+    seen: set[int] = set()
+    messages: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        messages.append(str(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(messages)
+
+
 @pytest.mark.anyio
 async def test_create_uses_server_owned_contract_and_bearer_key() -> None:
     seen: dict[str, Any] = {}
@@ -191,6 +208,51 @@ async def test_create_read_or_write_timeout_has_unknown_result(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda request: httpx.ReadError("read failed", request=request),
+        lambda request: httpx.WriteError("write failed", request=request),
+        lambda request: httpx.RemoteProtocolError("protocol failed", request=request),
+        lambda request: httpx.RequestError("request failed", request=request),
+    ],
+)
+async def test_create_errors_after_possible_send_have_unknown_result(
+    error_factory: Callable[[httpx.Request], httpx.RequestError],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_factory(request)
+
+    with pytest.raises(VoiceProviderResultUnknownError):
+        await _provider(handler).create(
+            preferred_name="vc123",
+            audio_data_url=AUDIO_DATA_URL,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda request: httpx.ConnectError("connection failed", request=request),
+        lambda request: httpx.ConnectTimeout("connection timed out", request=request),
+        lambda request: httpx.PoolTimeout("pool timed out", request=request),
+    ],
+)
+async def test_create_errors_before_send_are_retryable(
+    error_factory: Callable[[httpx.Request], httpx.RequestError],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_factory(request)
+
+    with pytest.raises(VoiceProviderRetryableError):
+        await _provider(handler).create(
+            preferred_name="vc123",
+            audio_data_url=AUDIO_DATA_URL,
+        )
+
+
+@pytest.mark.anyio
 async def test_non_create_read_timeout_is_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("read timed out", request=request)
@@ -230,6 +292,86 @@ async def test_create_without_voice_is_protocol_error() -> None:
             preferred_name="vc123",
             audio_data_url=AUDIO_DATA_URL,
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("voice", [1, True, {}, []])
+async def test_create_voice_must_be_string(voice: object) -> None:
+    provider = _provider(
+        lambda _: httpx.Response(
+            200,
+            json={"output": {"voice": voice}, "request_id": "req-create"},
+        )
+    )
+
+    with pytest.raises(VoiceProviderProtocolError, match="voice"):
+        await provider.create(
+            preferred_name="vc123",
+            audio_data_url=AUDIO_DATA_URL,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("voice", [1, True, {}, []])
+async def test_list_item_voice_must_be_string(voice: object) -> None:
+    provider = _provider(
+        lambda _: httpx.Response(
+            200,
+            json={"output": {"voice_list": [{"voice": voice}]}},
+        )
+    )
+
+    with pytest.raises(VoiceProviderProtocolError, match="voice"):
+        await provider.list()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target_model", 1),
+        ("target_model", {}),
+        ("gmt_create", True),
+        ("gmt_create", []),
+    ],
+)
+async def test_list_optional_fields_must_be_string_or_none(
+    field: str,
+    value: object,
+) -> None:
+    provider = _provider(
+        lambda _: httpx.Response(
+            200,
+            json={
+                "output": {
+                    "voice_list": [
+                        {
+                            "voice": "qwen-omni-vc-one",
+                            field: value,
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    with pytest.raises(VoiceProviderProtocolError, match=field):
+        await provider.list()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["request_id", "requestId"])
+@pytest.mark.parametrize("request_id", [1, True, {}, []])
+async def test_request_id_must_be_string_or_none(
+    field: str,
+    request_id: object,
+) -> None:
+    provider = _provider(
+        lambda _: httpx.Response(200, json={field: request_id})
+    )
+
+    with pytest.raises(VoiceProviderProtocolError, match=field):
+        await provider.delete(voice="qwen-omni-vc-one")
 
 
 @pytest.mark.anyio
@@ -274,3 +416,24 @@ async def test_network_error_traceback_does_not_expose_sensitive_values() -> Non
     rendered_traceback = "".join(format_exception(exc_info.value))
     assert API_KEY not in rendered_traceback
     assert AUDIO_DATA_URL not in rendered_traceback
+
+
+@pytest.mark.anyio
+async def test_network_error_object_has_no_sensitive_exception_chain() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"connection failed for {API_KEY} with {AUDIO_DATA_URL}",
+            request=request,
+        )
+
+    with pytest.raises(VoiceProviderRetryableError) as exc_info:
+        await _provider(handler).create(
+            preferred_name="vc123",
+            audio_data_url=AUDIO_DATA_URL,
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    chain_text = _exception_chain_text(exc_info.value)
+    assert API_KEY not in chain_text
+    assert AUDIO_DATA_URL not in chain_text
