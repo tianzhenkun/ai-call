@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
@@ -29,6 +30,7 @@ from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskServic
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+from app.api.v1.ai_call.voice.repository import VoiceRepository
 from app.api.v1.ai_call.voice.service import VoiceDeletionService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
@@ -195,6 +197,7 @@ async def _seed_tenant_voice(
     tenant_id: str = "tenant-a",
     voice: str = "qwen-omni-vc-tenant",
     status: str = "ENABLED",
+    target_model: str = QWEN_OMNI_REALTIME_TARGET_MODEL,
 ) -> int:
     profile_id = generate_snowflake_id()
     async with database() as session:
@@ -208,7 +211,7 @@ async def _seed_tenant_voice(
                 voice_type="自定义复刻",
                 gender="女声",
                 language="zh",
-                target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+                target_model=target_model,
                 provider="qwen",
                 status=status,
                 latest_enrollment_id=None,
@@ -304,11 +307,12 @@ async def test_formal_task_tenant_voice_lookup_uses_profile_row_lock() -> None:
     )
 
     class CapturingSession:
-        statement = None
+        def __init__(self) -> None:
+            self.statements = []
 
         async def scalar(self, statement):
-            self.statement = statement
-            return marker
+            self.statements.append(statement)
+            return None if len(self.statements) == 1 else marker
 
     session = CapturingSession()
     service = OutboundRuleTaskService(lambda: None)
@@ -321,8 +325,11 @@ async def test_formal_task_tenant_voice_lookup_uses_profile_row_lock() -> None:
     )
 
     assert resolved is marker
-    assert session.statement is not None
-    assert session.statement._for_update_arg is not None
+    assert session.statements[0].column_descriptions[0]["entity"] is AiCallVoiceProfileModel
+    assert session.statements[1].column_descriptions[0]["entity"] is AiCallTenantVoiceProfileModel
+    assert session.statements[1]._for_update_arg is not None
+    assert session.statements[1]._for_update_arg.read is True
+    assert "target_model" in str(session.statements[1])
 
 
 @pytest.mark.anyio
@@ -461,6 +468,251 @@ async def test_formal_task_builtin_voice_is_scoped_by_target_model(database) -> 
     snapshot = json.loads(task.config_snapshot_json)
     assert snapshot["voice"]["targetModel"] == QWEN_OMNI_REALTIME_TARGET_MODEL
     assert snapshot["voice"]["displayName"] == "甜甜 Tina"
+
+
+@pytest.mark.anyio
+async def test_formal_task_rejects_tenant_voice_from_other_target_model(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    await _seed_tenant_voice(
+        database,
+        voice="tenant-wrong-model",
+        target_model="other-model",
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="tenant-wrong-model",
+        phone_number="19900001116",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001116", None)],
+    )
+
+    async with database() as session:
+        with pytest.raises(CustomException) as exc_info:
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-wrong-model-voice",
+                _create_task_request(config, validation_id),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert "音色不存在" in exc_info.value.msg
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tenant_status", ["DELETING", "DELETE_FAILED"])
+async def test_formal_task_builtin_voice_wins_over_same_name_unavailable_tenant_voice(
+    database,
+    tenant_status: str,
+) -> None:
+    prompt_id, builtin_voice_id = await _seed_references(database)
+    await _seed_tenant_voice(
+        database,
+        voice="Tina",
+        status=tenant_status,
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        phone_number="19900001117",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001117", None)],
+    )
+
+    async with database() as session:
+        task, _ = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            f"idem-builtin-over-{tenant_status.lower()}",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+
+    snapshot = json.loads(task.config_snapshot_json)
+    assert snapshot["voice"]["id"] == str(builtin_voice_id)
+    assert snapshot["voice"]["displayName"] == "甜甜 Tina"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("first_writer", ["deletion", "task"])
+async def test_sqlite_serializes_task_creation_and_voice_deletion(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+    first_writer: str,
+) -> None:
+    async with database() as session:
+        await session.execute(text("PRAGMA journal_mode=WAL"))
+        await session.commit()
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(database)
+    task_service = OutboundRuleTaskService(database)
+    deletion_service = VoiceDeletionService(session_factory=database)
+    async with database() as session:
+        rule = await task_service.create_rule(
+            session,
+            "tenant-a",
+            10,
+            _rule_payload(),
+        )
+        await session.commit()
+    phone_number = "19900001118" if first_writer == "deletion" else "19900001119"
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-tenant",
+        phone_number=phone_number,
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[(phone_number, None)],
+    )
+    first_read = asyncio.Event()
+    release_first = asyncio.Event()
+    second_sql_attempted = asyncio.Event()
+    first_session = database()
+    second_session = database()
+
+    async def create_formal_task(session):
+        task, _ = await task_service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            f"race-task-{first_writer}",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+        return task
+
+    async def request_voice_deletion(session):
+        return await deletion_service.request_deletion(
+            session,
+            tenant_id="tenant-a",
+            user_id=10,
+            profile_id=profile_id,
+            idempotency_key=f"race-delete-{first_writer}",
+        )
+
+    original_second_execute = second_session.execute
+
+    async def observed_second_execute(statement, *args, **kwargs):
+        if str(statement).strip().upper() == "BEGIN IMMEDIATE":
+            second_sql_attempted.set()
+        return await original_second_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(second_session, "execute", observed_second_execute)
+    try:
+        if first_writer == "deletion":
+            original_summary = VoiceRepository.task_reference_summary
+
+            async def paused_summary(repository, **kwargs):
+                result = await original_summary(repository, **kwargs)
+                first_read.set()
+                await release_first.wait()
+                return result
+
+            original_resolve_voice = task_service._resolve_voice
+
+            async def observed_resolve_voice(*args, **kwargs):
+                result = await original_resolve_voice(*args, **kwargs)
+                second_sql_attempted.set()
+                return result
+
+            monkeypatch.setattr(
+                VoiceRepository,
+                "task_reference_summary",
+                paused_summary,
+            )
+            monkeypatch.setattr(
+                task_service,
+                "_resolve_voice",
+                observed_resolve_voice,
+            )
+            first = asyncio.create_task(request_voice_deletion(first_session))
+            await asyncio.wait_for(first_read.wait(), timeout=2)
+            second = asyncio.create_task(create_formal_task(second_session))
+        else:
+            original_resolve_voice = task_service._resolve_voice
+
+            async def paused_resolve_voice(*args, **kwargs):
+                result = await original_resolve_voice(*args, **kwargs)
+                first_read.set()
+                await release_first.wait()
+                return result
+
+            original_summary = VoiceRepository.task_reference_summary
+
+            async def observed_summary(repository, **kwargs):
+                result = await original_summary(repository, **kwargs)
+                second_sql_attempted.set()
+                return result
+
+            monkeypatch.setattr(
+                task_service,
+                "_resolve_voice",
+                paused_resolve_voice,
+            )
+            monkeypatch.setattr(
+                VoiceRepository,
+                "task_reference_summary",
+                observed_summary,
+            )
+            first = asyncio.create_task(create_formal_task(first_session))
+            await asyncio.wait_for(first_read.wait(), timeout=2)
+            second = asyncio.create_task(request_voice_deletion(second_session))
+
+        await asyncio.wait_for(second_sql_attempted.wait(), timeout=2)
+        release_first.set()
+        first_result, second_result = await asyncio.wait_for(
+            asyncio.gather(first, second, return_exceptions=True),
+            timeout=5,
+        )
+    finally:
+        await first_session.close()
+        await second_session.close()
+
+    assert not isinstance(first_result, Exception)
+    assert isinstance(second_result, CustomException)
+    assert second_result.status_code == 409
+    async with database() as session:
+        stored_task = await session.scalar(
+            select(AiCallOutboundTaskModel).where(
+                AiCallOutboundTaskModel.idempotency_key == f"race-task-{first_writer}"
+            )
+        )
+        profile = await session.get(AiCallTenantVoiceProfileModel, profile_id)
+    if first_writer == "deletion":
+        assert stored_task is None
+        assert profile is not None and profile.status == "DELETING"
+    else:
+        assert stored_task is not None
+        assert profile is not None and profile.status == "ENABLED"
 
 
 @pytest.mark.anyio

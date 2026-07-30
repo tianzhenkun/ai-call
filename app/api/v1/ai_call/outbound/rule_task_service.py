@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.model import AiCallPromptProfileModel, AiCallVoiceProfileModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.core.exceptions import CustomException
+from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.services.ai_call.voice_profile import QWEN_OMNI_REALTIME_TARGET_MODEL
 from app.utils.id_util import generate_snowflake_id
 
@@ -301,6 +302,7 @@ class OutboundRuleTaskService:
                 msg="Idempotency-Key 不合法",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        await begin_sqlite_immediate_write(db)
         validation_id = self._business_id(request.validation_id, "validationId")
         fingerprint = self._fingerprint(request)
         existing = await db.scalar(
@@ -808,21 +810,6 @@ class OutboundRuleTaskService:
         voice: str,
         lock_tenant_voice: bool,
     ) -> AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel:
-        tenant_statement = select(AiCallTenantVoiceProfileModel).where(
-            AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
-            AiCallTenantVoiceProfileModel.voice == voice,
-        )
-        if lock_tenant_voice:
-            tenant_statement = tenant_statement.with_for_update()
-        tenant_voice = await db.scalar(tenant_statement)
-        if tenant_voice is not None:
-            if tenant_voice.status != "ENABLED":
-                raise CustomException(
-                    msg="租户音色当前不可用",
-                    status_code=status.HTTP_409_CONFLICT,
-                )
-            return tenant_voice
-
         builtin_voice = await db.scalar(
             select(AiCallVoiceProfileModel)
             .where(
@@ -832,12 +819,29 @@ class OutboundRuleTaskService:
             .order_by(AiCallVoiceProfileModel.sort_order, AiCallVoiceProfileModel.id)
             .limit(1)
         )
-        if builtin_voice is None:
-            raise CustomException(
-                msg="音色不存在",
-                status_code=status.HTTP_400_BAD_REQUEST,
-            )
-        return builtin_voice
+        if builtin_voice is not None:
+            return builtin_voice
+
+        tenant_statement = select(AiCallTenantVoiceProfileModel).where(
+            AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+            AiCallTenantVoiceProfileModel.target_model == QWEN_OMNI_REALTIME_TARGET_MODEL,
+            AiCallTenantVoiceProfileModel.voice == voice,
+        )
+        if lock_tenant_voice:
+            tenant_statement = tenant_statement.with_for_update(read=True)
+        tenant_voice = await db.scalar(tenant_statement)
+        if tenant_voice is not None:
+            if tenant_voice.status != "ENABLED":
+                raise CustomException(
+                    msg="租户音色当前不可用",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            return tenant_voice
+
+        raise CustomException(
+            msg="音色不存在",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
     @staticmethod
     async def _get_rule(

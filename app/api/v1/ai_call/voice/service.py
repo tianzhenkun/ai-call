@@ -29,6 +29,7 @@ from app.services.ai_call.orchestrator import (
 )
 from app.services.ai_call.prompt_config import PromptEffectiveConfig
 from app.services.ai_call.session_registry import CallSessionStatus
+from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.services.ai_call.voice_sample import (
     VoiceSampleMetadata,
     VoiceSampleStorage,
@@ -889,10 +890,16 @@ class VoiceDeletionService:
                 msg="Idempotency-Key 不合法",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        sqlite_immediate = await begin_sqlite_immediate_write(db)
         existing = await self._find_deletion(db, tenant_id, command_key)
         if existing is not None:
-            return self._resolve_idempotent(existing, profile_id=profile_id)
-        await self._safe_rollback(db)
+            try:
+                return self._resolve_idempotent(existing, profile_id=profile_id)
+            finally:
+                if sqlite_immediate:
+                    await self._safe_rollback(db)
+        if not sqlite_immediate:
+            await self._safe_rollback(db)
 
         repository = VoiceRepository(db)
         profile = await repository.get_tenant_profile(
