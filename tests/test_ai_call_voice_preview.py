@@ -1122,7 +1122,9 @@ async def test_timeout_cleanup_failure_is_retried_in_background(
             voice="Tina",
         )
 
-    await _wait_until(lambda: service.active_session_count == 0)
+    await _wait_until(
+        lambda: service.active_session_count == 0 and service.pending_cleanup_retry_count == 0
+    )
     assert room_manager.delete_attempts == 2
     assert room_manager.external_rooms == set()
     assert service.pending_timeout_count == 0
