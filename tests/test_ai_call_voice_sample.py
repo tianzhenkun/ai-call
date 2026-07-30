@@ -45,6 +45,22 @@ def test_inspect_sample_accepts_valid_wav_and_returns_metadata() -> None:
     assert metadata.sha256 == hashlib.sha256(data).hexdigest()
 
 
+@pytest.mark.parametrize(
+    "content_type",
+    ["audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave; charset=binary"],
+)
+def test_inspect_sample_accepts_wav_mime_aliases_and_returns_canonical_type(
+    content_type: str,
+) -> None:
+    metadata = inspect_sample(
+        _wav_bytes(),
+        filename="voice.wav",
+        content_type=content_type,
+    )
+
+    assert metadata.content_type == "audio/wav"
+
+
 @pytest.mark.parametrize("filename", ["voice.ogg", "voice", "voice.WMA"])
 def test_inspect_sample_rejects_unsupported_extension(filename: str) -> None:
     with pytest.raises(VoiceSampleValidationError, match="仅支持"):
@@ -133,21 +149,62 @@ def test_inspect_sample_hides_media_parser_error() -> None:
     assert error.value.__cause__ is None
 
 
+def test_inspect_sample_rejects_wav_header_with_truncated_frames() -> None:
+    header_only = _wav_bytes(seconds=3)[:44]
+
+    with pytest.raises(
+        VoiceSampleValidationError,
+        match="声音样本文件损坏或格式无法识别",
+    ):
+        inspect_sample(
+            header_only,
+            filename="voice.wav",
+            content_type="audio/wav",
+        )
+
+
+def test_inspect_sample_rejects_wav_container_renamed_as_mp3() -> None:
+    with pytest.raises(VoiceSampleValidationError, match="扩展名.*音频格式"):
+        inspect_sample(
+            _wav_bytes(),
+            filename="voice.mp3",
+            content_type="audio/mpeg",
+        )
+
+
+def test_inspect_sample_rejects_mime_inconsistent_with_extension() -> None:
+    with pytest.raises(VoiceSampleValidationError, match="Content-Type"):
+        inspect_sample(
+            _wav_bytes(),
+            filename="voice.wav",
+            content_type="text/html",
+        )
+
+
 @pytest.mark.parametrize(
-    ("filename", "content_type"),
-    [("voice.mp3", "audio/mpeg"), ("voice.m4a", "audio/mp4")],
+    ("filename", "content_type", "container_mime", "canonical_type"),
+    [
+        ("voice.mp3", "audio/mpeg", "audio/mpeg", "audio/mpeg"),
+        ("voice.mp3", "audio/x-mp3", "audio/mpeg", "audio/mpeg"),
+        ("voice.m4a", "audio/mp4", "audio/mp4", "audio/mp4"),
+        ("voice.m4a", "audio/x-m4a", "audio/mp4", "audio/mp4"),
+        ("voice.m4a", "audio/m4a", "audio/mp4", "audio/mp4"),
+    ],
 )
 def test_inspect_sample_uses_mutagen_metadata_for_compressed_formats(
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
     content_type: str,
+    container_mime: str,
+    canonical_type: str,
 ) -> None:
     seen_data: list[bytes] = []
 
     def fake_mutagen_file(file_object):
         seen_data.append(file_object.read())
         return SimpleNamespace(
-            info=SimpleNamespace(length=8.5, sample_rate=48000, channels=1)
+            info=SimpleNamespace(length=8.5, sample_rate=48000, channels=1),
+            mime=[container_mime],
         )
 
     monkeypatch.setattr(
@@ -165,6 +222,7 @@ def test_inspect_sample_uses_mutagen_metadata_for_compressed_formats(
     assert metadata.duration_seconds == pytest.approx(8.5)
     assert metadata.sample_rate == 48000
     assert metadata.channels == 1
+    assert metadata.content_type == canonical_type
 
 
 def test_inspect_sample_rejects_compressed_file_without_audio_metadata(

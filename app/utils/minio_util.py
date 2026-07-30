@@ -219,6 +219,7 @@ class MinioUtil:
         *,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        now: datetime | None = None,
     ) -> bytes:
         """读取私有对象，只向 MinIO 发送服务端 SigV4 凭据。"""
         try:
@@ -228,6 +229,7 @@ class MinioUtil:
                 object_name,
                 timeout=timeout,
                 transport=transport,
+                now=now,
             )
         except httpx.HTTPStatusError as error:
             failure_message = f"MinIO读取对象失败: HTTP {error.response.status_code}"
@@ -245,6 +247,7 @@ class MinioUtil:
         *,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        now: datetime | None = None,
     ) -> None:
         """删除私有对象。MinIO 的任意 2xx 响应都视为成功。"""
         try:
@@ -254,6 +257,7 @@ class MinioUtil:
                 object_name,
                 timeout=timeout,
                 transport=transport,
+                now=now,
             )
         except httpx.HTTPStatusError as error:
             failure_message = f"MinIO删除对象失败: HTTP {error.response.status_code}"
@@ -272,17 +276,24 @@ class MinioUtil:
         *,
         timeout: float,
         transport: httpx.AsyncBaseTransport | None,
+        now: datetime | None,
     ) -> httpx.Response:
-        endpoint_base, host = cls._endpoint_base_and_host(config)
+        endpoint_base, _ = cls._endpoint_base_and_host(config)
         bucket = str(config["bucket_name"]).strip("/")
         object_path = object_name.lstrip("/")
         access_key = config["access_key"]
         secret_key = config["secret_key"]
         region = (config.get("region") or "").strip() or "us-east-1"
+        object_url = (
+            f"{endpoint_base}/{bucket}/{quote(object_path, safe='/')}"
+        )
+        request = httpx.Request(method, object_url)
+        host = request.headers["host"]
+        canonical_uri = request.url.raw_path.decode("ascii")
 
-        now = datetime.now(timezone.utc)
-        date_stamp = now.strftime("%Y%m%d")
-        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        signed_at = now or datetime.now(timezone.utc)
+        date_stamp = signed_at.strftime("%Y%m%d")
+        amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
         payload_hash = hashlib.sha256(b"").hexdigest()
         signed_headers = {
             "host": host,
@@ -293,7 +304,6 @@ class MinioUtil:
             f"{name}:{value}\n" for name, value in sorted(signed_headers.items())
         )
         signed_header_names = ";".join(sorted(signed_headers))
-        canonical_uri = f"/{bucket}/{quote(object_path, safe='/')}"
         canonical_request = "\n".join(
             [
                 method,
@@ -327,8 +337,8 @@ class MinioUtil:
             "x-amz-content-sha256": payload_hash,
             "x-amz-date": amz_date,
         }
-        url = f"{endpoint_base}{canonical_uri}"
+        request.headers.update(request_headers)
         async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-            response = await client.request(method, url, headers=request_headers)
+            response = await client.send(request)
             response.raise_for_status()
         return response

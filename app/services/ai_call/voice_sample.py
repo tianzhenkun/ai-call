@@ -11,12 +11,44 @@ from mutagen import File as MutagenFile
 
 from app.utils.minio_util import MinioUtil
 
-_SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a"}
 _MAX_SIZE_BYTES = 10 * 1024 * 1024
 _MIN_DURATION_SECONDS = 3
 _MAX_DURATION_SECONDS = 60
 _MIN_SAMPLE_RATE = 24000
 _VOICE_SAMPLE_PREFIX = "ai-call/voice-samples"
+_FORMAT_MISMATCH_MESSAGE = "文件扩展名、音频格式与 Content-Type 不一致"
+
+
+@dataclass(frozen=True)
+class _AudioFormatRule:
+    canonical_content_type: str
+    accepted_content_types: frozenset[str]
+    container_mime_types: frozenset[str]
+
+
+_AUDIO_FORMATS = {
+    ".wav": _AudioFormatRule(
+        canonical_content_type="audio/wav",
+        accepted_content_types=frozenset(
+            {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}
+        ),
+        container_mime_types=frozenset({"audio/wav", "audio/x-wav", "audio/wave"}),
+    ),
+    ".mp3": _AudioFormatRule(
+        canonical_content_type="audio/mpeg",
+        accepted_content_types=frozenset(
+            {"audio/mpeg", "audio/mp3", "audio/x-mp3", "audio/mpeg3", "audio/x-mpeg-3"}
+        ),
+        container_mime_types=frozenset(
+            {"audio/mpeg", "audio/mp3", "audio/x-mp3", "audio/mpeg3", "audio/x-mpeg-3"}
+        ),
+    ),
+    ".m4a": _AudioFormatRule(
+        canonical_content_type="audio/mp4",
+        accepted_content_types=frozenset({"audio/mp4", "audio/x-m4a", "audio/m4a"}),
+        container_mime_types=frozenset({"audio/mp4", "audio/x-m4a", "audio/m4a"}),
+    ),
+}
 
 
 class VoiceSampleValidationError(ValueError):
@@ -74,8 +106,12 @@ def inspect_sample(
     content_type: str,
 ) -> VoiceSampleMetadata:
     extension = Path(filename).suffix.lower()
-    if extension not in _SUPPORTED_EXTENSIONS:
+    format_rule = _AUDIO_FORMATS.get(extension)
+    if format_rule is None:
         raise VoiceSampleValidationError("仅支持 WAV、MP3、M4A 格式")
+    normalized_content_type = content_type.partition(";")[0].strip().lower()
+    if normalized_content_type not in format_rule.accepted_content_types:
+        raise VoiceSampleValidationError(_FORMAT_MISMATCH_MESSAGE)
     if not data:
         raise VoiceSampleValidationError("声音样本不能为空")
     if len(data) >= _MAX_SIZE_BYTES:
@@ -85,7 +121,10 @@ def inspect_sample(
         if extension == ".wav":
             duration_seconds, sample_rate, channels, sample_width = _inspect_wav(data)
         else:
-            duration_seconds, sample_rate, channels = _inspect_compressed(data)
+            duration_seconds, sample_rate, channels = _inspect_compressed(
+                data,
+                expected_mime_types=format_rule.container_mime_types,
+            )
             sample_width = None
     except VoiceSampleValidationError:
         raise
@@ -105,7 +144,7 @@ def inspect_sample(
 
     return VoiceSampleMetadata(
         filename=filename,
-        content_type=content_type,
+        content_type=format_rule.canonical_content_type,
         size_bytes=len(data),
         duration_seconds=duration_seconds,
         sample_rate=sample_rate,
@@ -123,21 +162,39 @@ def _inspect_wav(data: bytes) -> tuple[float, int, int, int]:
     with wave.open(io.BytesIO(data), "rb") as wav_file:
         sample_rate = wav_file.getframerate()
         frame_count = wav_file.getnframes()
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
         if sample_rate <= 0:
+            raise VoiceSampleValidationError("声音样本文件损坏或格式无法识别")
+        frames = wav_file.readframes(frame_count)
+        if len(frames) != frame_count * channels * sample_width:
             raise VoiceSampleValidationError("声音样本文件损坏或格式无法识别")
         return (
             frame_count / sample_rate,
             sample_rate,
-            wav_file.getnchannels(),
-            wav_file.getsampwidth(),
+            channels,
+            sample_width,
         )
 
 
-def _inspect_compressed(data: bytes) -> tuple[float, int, int]:
+def _inspect_compressed(
+    data: bytes,
+    *,
+    expected_mime_types: frozenset[str],
+) -> tuple[float, int, int]:
     audio = MutagenFile(io.BytesIO(data))
     info = getattr(audio, "info", None)
     if info is None:
         raise VoiceSampleValidationError("声音样本文件损坏或格式无法识别")
+    container_mime_types = getattr(audio, "mime", ())
+    if isinstance(container_mime_types, str):
+        container_mime_types = (container_mime_types,)
+    normalized_container_mime_types = {
+        str(value).partition(";")[0].strip().lower()
+        for value in container_mime_types
+    }
+    if not normalized_container_mime_types.intersection(expected_mime_types):
+        raise VoiceSampleValidationError(_FORMAT_MISMATCH_MESSAGE)
     return (
         float(info.length),
         int(info.sample_rate),

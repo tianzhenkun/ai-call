@@ -1,3 +1,6 @@
+import datetime as dt
+import hashlib
+import hmac
 import httpx
 import pytest
 
@@ -87,6 +90,92 @@ def _exception_chain_text(error: BaseException) -> str:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return "\n".join(messages)
+
+
+def _test_hmac_sha256(key: bytes, message: str) -> bytes:
+    return hmac.new(key, message.encode(), hashlib.sha256).digest()
+
+
+def _expected_authorization(request: httpx.Request, *, secret_key: str) -> str:
+    amz_date = request.headers["x-amz-date"]
+    date_stamp = amz_date[:8]
+    region = "cn-north-1"
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_headers = (
+        f"host:{request.headers['host']}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    canonical_request = "\n".join(
+        [
+            request.method,
+            request.url.raw_path.decode("ascii"),
+            "",
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+    signing_key = _test_hmac_sha256(f"AWS4{secret_key}".encode(), date_stamp)
+    signing_key = _test_hmac_sha256(signing_key, region)
+    signing_key = _test_hmac_sha256(signing_key, "s3")
+    signing_key = _test_hmac_sha256(signing_key, "aws4_request")
+    signature = hmac.new(
+        signing_key,
+        string_to_sign.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return (
+        f"AWS4-HMAC-SHA256 Credential=public-key/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("method_name", "http_method"),
+    [("get_object", "GET"), ("delete_object", "DELETE")],
+)
+async def test_private_object_signature_uses_normalized_http_host_and_raw_path(
+    method_name: str,
+    http_method: str,
+) -> None:
+    requests: list[httpx.Request] = []
+    config = {
+        **_private_object_config(),
+        "endpoint": "MINIO.EXAMPLE.COM:443",
+    }
+    signed_at = dt.datetime(2026, 7, 30, 1, 2, 3, tzinfo=dt.timezone.utc)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"sample")
+
+    await getattr(MinioUtil, method_name)(
+        config,
+        "ai-call/voice-samples/中文 sample.wav",
+        transport=httpx.MockTransport(handler),
+        now=signed_at,
+    )
+
+    request = requests[0]
+    assert request.method == http_method
+    assert request.headers["host"] == "minio.example.com"
+    assert request.headers["x-amz-date"] == "20260730T010203Z"
+    assert request.headers["authorization"] == _expected_authorization(
+        request,
+        secret_key=config["secret_key"],
+    )
 
 
 @pytest.mark.anyio
