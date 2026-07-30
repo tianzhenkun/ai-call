@@ -9,6 +9,7 @@ from fastapi.security.utils import get_authorization_scheme_param
 
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.core.logger import log as logger
 
 if TYPE_CHECKING:
     from app.api.v1.system.auth.schema import JWTPayloadSchema
@@ -185,7 +186,12 @@ def decode_access_token(token: str) -> "JWTPayloadSchema":
 
         return JWTPayloadSchema(**new_payload)
 
-    except (jwt.InvalidSignatureError, jwt.DecodeError):
+    except jwt.InvalidSignatureError:
+        logger.warning("JWT认证失败: invalid_signature")
+        raise CustomException(msg="无效认证,请重新登录", code=10401, status_code=401)
+
+    except jwt.DecodeError:
+        logger.warning("JWT认证失败: decode_error")
         raise CustomException(msg="无效认证,请重新登录", code=10401, status_code=401)
 
     except jwt.ExpiredSignatureError:

@@ -228,7 +228,7 @@ class Settings(BaseSettings):
     AI_CALL_SEMANTIC_ANALYSIS_MODEL: str = ""
     AI_CALL_SEMANTIC_ANALYSIS_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_SEMANTIC_ANALYSIS_QUEUE_MAX_SIZE: int = 1000
-    AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS: float = 0.35
+    AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS: float = 0.15
     AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-waiting.wav"
     )

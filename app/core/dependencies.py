@@ -25,6 +25,14 @@ def _subject_permissions(user_info: dict) -> frozenset[str]:
     )
 
 
+async def _get_development_fallback_user() -> UserModel | None:
+    """使用独立只读会话查询本地开发兜底用户。"""
+
+    async with async_db_session() as lookup_db:
+        result = await lookup_db.execute(select(UserModel).limit(1))
+        return result.scalar_one_or_none()
+
+
 async def db_getter() -> AsyncGenerator[AsyncSession, None]:
     """获取数据库会话连接
 
@@ -72,10 +80,8 @@ async def get_current_user(
     if not settings.JWT_ENABLE and not token:
         # 关闭数据权限过滤
         auth = AuthSchema(db=db, check_data_scope=False)
-        # 尝试查询数据库第一个用户作为模拟用户
-        stmt = select(UserModel).limit(1)
-        result = await db.execute(stmt)
-        user = result.scalar_one_or_none()
+        # 认证查询不能占用后续业务写入需要抢占的 SQLite 事务。
+        user = await _get_development_fallback_user()
         if user:
             auth.user = user
             # 设置上下文
@@ -173,9 +179,7 @@ async def _verify_token(
     # 1. 未启用 JWT 且没有传入 token 时，才使用本地开发兜底用户。
     if not settings.JWT_ENABLE and not token:
         auth = AuthSchema(db=db, check_data_scope=False)
-        stmt = select(UserModel).limit(1)
-        result = await db.execute(stmt)
-        user = result.scalar_one_or_none()
+        user = await _get_development_fallback_user()
         if user:
             auth.user = user
         return auth
@@ -226,7 +230,8 @@ async def _verify_token(
 async def get_voice_manager(
     auth: AuthSchema = Depends(get_current_user),
 ) -> AuthSchema:
-    if settings.JWT_ENABLE and "ai_call:voice:manage" not in auth.permissions:
+    allowed_permissions = {"ai_call:voice:manage", "*:*:*"}
+    if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
         raise CustomException(
             msg="无权限操作",
             code=10403,
