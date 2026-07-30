@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect as sa_inspect
@@ -368,9 +369,92 @@ async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
     assert created is True
     snapshot = json.loads(task.config_snapshot_json)
     assert snapshot["voice"] == {
-        "id": str(profile_id),
+        "scope": "TENANT",
+        "profileId": str(profile_id),
         "voice": "qwen-omni-vc-tenant",
-        "displayName": "租户客服音色",
+        "voiceName": "租户客服音色",
+        "voiceType": "自定义复刻",
+        "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
+    }
+    assert task.voice == "qwen-omni-vc-tenant"
+    assert task.voice_name == "租户客服音色"
+    assert task.voice_type == "自定义复刻"
+    assert task.voice_target_model == QWEN_OMNI_REALTIME_TARGET_MODEL
+
+    task_out = service.task_out(task)
+    task_payload = task_out.model_dump(mode="json", by_alias=True)
+    assert task_payload["taskId"] == str(task.id)
+    assert task_payload["voice"] == "qwen-omni-vc-tenant"
+    assert task_payload["voiceName"] == "租户客服音色"
+    assert task_payload["voiceType"] == "自定义复刻"
+    assert task_payload["voiceTargetModel"] == QWEN_OMNI_REALTIME_TARGET_MODEL
+
+
+@pytest.mark.anyio
+async def test_task_history_keeps_voice_snapshot_after_tenant_voice_deleted(
+    database,
+) -> None:
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(
+        database,
+        voice="qwen-omni-vc-history",
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-history",
+        phone_number="19900001118",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001118", None)],
+    )
+
+    async with database() as session:
+        task, _ = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-history-voice",
+            _create_task_request(config, validation_id),
+        )
+        task.status = "COMPLETED"
+        await session.commit()
+        task_id = task.id
+
+    async with database() as session:
+        profile = await session.get(AiCallTenantVoiceProfileModel, profile_id)
+        assert profile is not None
+        profile.status = "DELETED"
+        profile.voice = None
+        profile.display_name = "删除后名称"
+        profile.voice_type = "删除后类型"
+        profile.target_model = "deleted-model"
+        await session.commit()
+
+    async with database() as session:
+        task_out = await service.get_task(session, "tenant-a", task_id)
+        persisted_task = await session.get(AiCallOutboundTaskModel, task_id)
+
+    assert persisted_task is not None
+    assert task_out.voice == "qwen-omni-vc-history"
+    assert task_out.voice_name == "租户客服音色"
+    assert task_out.voice_type == "自定义复刻"
+    assert task_out.voice_target_model == QWEN_OMNI_REALTIME_TARGET_MODEL
+    assert json.loads(persisted_task.config_snapshot_json)["voice"] == {
+        "scope": "TENANT",
+        "profileId": str(profile_id),
+        "voice": "qwen-omni-vc-history",
+        "voiceName": "租户客服音色",
+        "voiceType": "自定义复刻",
         "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
     }
 
@@ -418,7 +502,7 @@ async def test_formal_task_rejects_non_enabled_tenant_voice(database) -> None:
 
 @pytest.mark.anyio
 async def test_formal_task_builtin_voice_is_scoped_by_target_model(database) -> None:
-    prompt_id, _ = await _seed_references(database)
+    prompt_id, builtin_voice_id = await _seed_references(database)
     async with database() as session:
         now = _now()
         session.add(
@@ -466,8 +550,17 @@ async def test_formal_task_builtin_voice_is_scoped_by_target_model(database) -> 
         await session.commit()
 
     snapshot = json.loads(task.config_snapshot_json)
-    assert snapshot["voice"]["targetModel"] == QWEN_OMNI_REALTIME_TARGET_MODEL
-    assert snapshot["voice"]["displayName"] == "甜甜 Tina"
+    assert snapshot["voice"] == {
+        "scope": "BUILTIN",
+        "profileId": str(builtin_voice_id),
+        "voice": "Tina",
+        "voiceName": "甜甜 Tina",
+        "voiceType": "内置",
+        "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
+    }
+    assert snapshot["voice"]["profileId"].isdigit()
+    assert task.voice_type == "内置"
+    assert task.voice_target_model == QWEN_OMNI_REALTIME_TARGET_MODEL
 
 
 @pytest.mark.anyio
@@ -504,6 +597,47 @@ async def test_formal_task_rejects_tenant_voice_from_other_target_model(database
                 10,
                 "管理员",
                 "idem-wrong-model-voice",
+                _create_task_request(config, validation_id),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert "音色不存在" in exc_info.value.msg
+
+
+@pytest.mark.anyio
+async def test_formal_task_rejects_tenant_voice_from_other_tenant(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    await _seed_tenant_voice(
+        database,
+        tenant_id="tenant-b",
+        voice="tenant-b-private-voice",
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="tenant-b-private-voice",
+        phone_number="19900001119",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001119", None)],
+    )
+
+    async with database() as session:
+        with pytest.raises(CustomException) as exc_info:
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-cross-tenant-voice",
                 _create_task_request(config, validation_id),
             )
 
@@ -552,8 +686,9 @@ async def test_formal_task_builtin_voice_wins_over_same_name_unavailable_tenant_
         await session.commit()
 
     snapshot = json.loads(task.config_snapshot_json)
-    assert snapshot["voice"]["id"] == str(builtin_voice_id)
-    assert snapshot["voice"]["displayName"] == "甜甜 Tina"
+    assert snapshot["voice"]["scope"] == "BUILTIN"
+    assert snapshot["voice"]["profileId"] == str(builtin_voice_id)
+    assert snapshot["voice"]["voiceName"] == "甜甜 Tina"
 
 
 @pytest.mark.anyio
@@ -840,6 +975,10 @@ def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
         "validation_id",
         "config_snapshot_json",
         "error_message",
+        "voice",
+        "voice_name",
+        "voice_type",
+        "voice_target_model",
     } <= {column.name for column in AiCallOutboundTaskModel.__table__.columns}
     assert {"tenant_id", "task_id", "validation_id"} <= {
         column.name for column in AiCallOutboundTargetModel.__table__.columns
@@ -852,6 +991,20 @@ def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
         assert not model.__table__.foreign_keys
         assert not sa_inspect(model).relationships
         assert all(column.type.__class__.__name__ != "JSONB" for column in model.__table__.columns)
+
+    migration = (
+        (
+            Path(__file__).parents[1]
+            / "docs"
+            / "livekit-ai-outbound"
+            / "sql"
+            / "phase-h2-outbound-rule-task-postgres.sql"
+        )
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "add column if not exists voice_type" in migration
+    assert "add column if not exists voice_target_model" in migration
 
 
 def test_rule_task_routes_are_registered() -> None:

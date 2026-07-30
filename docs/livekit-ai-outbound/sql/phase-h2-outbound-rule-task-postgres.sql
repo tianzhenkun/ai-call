@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_task (
     scene_code varchar(64) NOT NULL,
     voice varchar(128) NOT NULL,
     voice_name varchar(100),
+    voice_type varchar(32),
+    voice_target_model varchar(64),
     rule_id bigint NOT NULL,
     rule_name varchar(100) NOT NULL,
     rule_summary varchar(500) NOT NULL,
@@ -76,6 +78,16 @@ COMMENT ON COLUMN ai_call_outbound_task.rule_id
     IS '创建时使用的规则ID，仅逻辑关联；删除规则不影响任务快照';
 COMMENT ON COLUMN ai_call_outbound_task.config_snapshot_json
     IS '规则、提示词、音色及请求参数的完整JSON快照文本';
+
+ALTER TABLE ai_call_outbound_task
+    ADD COLUMN IF NOT EXISTS voice_type varchar(32);
+ALTER TABLE ai_call_outbound_task
+    ADD COLUMN IF NOT EXISTS voice_target_model varchar(64);
+
+COMMENT ON COLUMN ai_call_outbound_task.voice_type
+    IS '创建任务时固化的音色类型';
+COMMENT ON COLUMN ai_call_outbound_task.voice_target_model
+    IS '创建任务时固化的目标模型';
 
 CREATE INDEX IF NOT EXISTS idx_outbound_task_tenant_status
     ON ai_call_outbound_task (tenant_id, status, created_at);

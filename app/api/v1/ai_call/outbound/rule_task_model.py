@@ -98,6 +98,8 @@ class AiCallOutboundTaskModel(MappedBase):
     scene_code: Mapped[str] = mapped_column(String(64), nullable=False)
     voice: Mapped[str] = mapped_column(String(128), nullable=False)
     voice_name: Mapped[str | None] = mapped_column(String(100))
+    voice_type: Mapped[str | None] = mapped_column(String(32))
+    voice_target_model: Mapped[str | None] = mapped_column(String(64))
     rule_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     rule_name: Mapped[str] = mapped_column(String(100), nullable=False)
     rule_summary: Mapped[str] = mapped_column(String(500), nullable=False)

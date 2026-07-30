@@ -371,9 +371,13 @@ class OutboundRuleTaskService:
                 "providerKey": prompt.provider_key,
             },
             "voice": {
-                "id": str(voice.id),
+                "scope": (
+                    "TENANT" if isinstance(voice, AiCallTenantVoiceProfileModel) else "BUILTIN"
+                ),
+                "profileId": str(voice.id),
                 "voice": voice.voice,
-                "displayName": voice.display_name,
+                "voiceName": voice.display_name,
+                "voiceType": voice.voice_type,
                 "targetModel": voice.target_model,
             },
             "rule": self.rule_out(rule).model_dump(mode="json", by_alias=True),
@@ -401,6 +405,8 @@ class OutboundRuleTaskService:
             scene_code=prompt.scene_code,
             voice=voice.voice,
             voice_name=voice.display_name,
+            voice_type=voice.voice_type,
+            voice_target_model=voice.target_model,
             rule_id=rule.id,
             rule_name=rule.rule_name,
             rule_summary=self._rule_summary(rule),
@@ -936,6 +942,8 @@ class OutboundRuleTaskService:
             scene_code=task.scene_code,
             voice=task.voice,
             voice_name=task.voice_name,
+            voice_type=task.voice_type,
+            voice_target_model=task.voice_target_model,
             rule_id=str(task.rule_id),
             rule_name=task.rule_name,
             rule_summary=task.rule_summary,

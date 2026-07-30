@@ -174,6 +174,8 @@ class OutboundTaskOut(OutboundSchema):
     scene_code: str
     voice: str
     voice_name: str | None = None
+    voice_type: str | None = None
+    voice_target_model: str | None = None
     rule_id: str
     rule_name: str
     rule_summary: str

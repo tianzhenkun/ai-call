@@ -435,6 +435,29 @@ async def test_executor_passes_snapshotted_line_to_sip_dialer(database) -> None:
 
 
 @pytest.mark.anyio
+async def test_executor_uses_task_voice_snapshot_without_current_voice_asset(
+    database,
+) -> None:
+    now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    task_id, _ = await _seed_task(database, now=now)
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        assert task is not None
+        task.voice = "qwen-omni-vc-deleted"
+        task.voice_name = "已删除的租户音色"
+        task.voice_type = "自定义复刻"
+        task.voice_target_model = "qwen3.5-omni-plus-realtime"
+        await session.commit()
+
+    dialer = SequenceDialer([DialResult(call_result="connected")])
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+
+    assert await executor.run_once() == 1
+    assert len(dialer.requests) == 1
+    assert dialer.requests[0].voice == "qwen-omni-vc-deleted"
+
+
+@pytest.mark.anyio
 async def test_executor_persists_provider_diagnostics(database) -> None:
     now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
     result = DialResult(
