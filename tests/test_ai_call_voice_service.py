@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -146,10 +147,9 @@ async def test_list_merges_global_and_current_tenant_with_two_scoped_queries(
 
     assert [row.voice for row in rows] == ["vc-a", "Tina"]
     assert total == 2
-    assert len(statements) == 2
     global_queries = [
-        statement
-        for statement, _parameters in statements
+        (statement, parameters)
+        for statement, parameters in statements
         if "ai_call_voice_profile" in statement and "ai_call_tenant_voice_profile" not in statement
     ]
     tenant_queries = [
@@ -157,12 +157,11 @@ async def test_list_merges_global_and_current_tenant_with_two_scoped_queries(
         for statement, parameters in statements
         if "ai_call_tenant_voice_profile" in statement
     ]
-    assert len(global_queries) == 1
-    assert len(tenant_queries) == 1
-    tenant_statement, tenant_parameters = tenant_queries[0]
-    assert "tenant_id" in tenant_statement
-    assert "tenant-a" in tenant_parameters
-    assert "tenant-b" not in tenant_parameters
+    assert global_queries
+    assert tenant_queries
+    assert all("tenant_id" in statement for statement, _parameters in tenant_queries)
+    assert all("tenant-a" in parameters for _statement, parameters in tenant_queries)
+    assert all("tenant-b" not in parameters for _statement, parameters in tenant_queries)
 
 
 @pytest.mark.anyio
@@ -350,6 +349,160 @@ async def test_list_sorts_tenant_first_and_paginates_after_merging(
     assert [row.voice for row in last_page] == ["global-old"]
     assert first_total == second_total == last_total == 5
     assert all(isinstance(row.id, str) for row in first_page + second_page + last_page)
+
+
+@pytest.mark.anyio
+async def test_later_page_reads_only_bounded_rows_across_source_boundary(
+    voice_database,
+) -> None:
+    engine, factory = voice_database
+    await _seed(
+        factory,
+        *[
+            _tenant_voice(profile_id=2_000 + index, voice=f"tenant-{index}")
+            for index in range(1, 38)
+        ],
+        *[
+            _global_voice(profile_id=1_000 + index, voice=f"global-{index}")
+            for index in range(1, 38)
+        ],
+    )
+    statements: list[tuple[str, object]] = []
+
+    def capture_sql(
+        _connection,
+        _cursor,
+        statement: str,
+        parameters: object,
+        _context,
+        _executemany,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture_sql)
+    try:
+        async with factory() as database:
+            rows, total = await VoiceRepository(database).list_profiles(
+                tenant_id="tenant-a",
+                target_model=TARGET_MODEL,
+                available_only=False,
+                include_deleted=False,
+                page_num=4,
+                page_size=10,
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture_sql)
+
+    assert [row.voice for row in rows] == [
+        "tenant-7",
+        "tenant-6",
+        "tenant-5",
+        "tenant-4",
+        "tenant-3",
+        "tenant-2",
+        "tenant-1",
+        "global-37",
+        "global-36",
+        "global-35",
+    ]
+    assert total == 74
+    tenant_queries = [
+        (statement, parameters)
+        for statement, parameters in statements
+        if "ai_call_tenant_voice_profile" in statement
+    ]
+    global_queries = [
+        (statement, parameters)
+        for statement, parameters in statements
+        if "ai_call_voice_profile" in statement and "ai_call_tenant_voice_profile" not in statement
+    ]
+    assert tenant_queries
+    assert global_queries
+    assert all("tenant_id" in statement for statement, _parameters in tenant_queries)
+    assert all("tenant-a" in parameters for _statement, parameters in tenant_queries)
+    row_queries = [
+        (statement, parameters)
+        for statement, parameters in statements
+        if "count(" not in statement.lower()
+    ]
+    assert row_queries
+    assert all("limit" in statement.lower() for statement, _parameters in row_queries)
+    tenant_row_parameters = next(
+        parameters
+        for statement, parameters in row_queries
+        if "ai_call_tenant_voice_profile" in statement
+    )
+    global_row_parameters = next(
+        parameters
+        for statement, parameters in row_queries
+        if "ai_call_voice_profile" in statement and "ai_call_tenant_voice_profile" not in statement
+    )
+    assert tuple(tenant_row_parameters)[-2:] == (7, 30)
+    assert tuple(global_row_parameters)[-2:] == (3, 0)
+
+
+def _profile_payload(profile_id: object) -> dict[str, object]:
+    return {
+        "id": profile_id,
+        "scope": "GLOBAL",
+        "voice": "Tina",
+        "display_name": "甜甜 Tina",
+        "voice_type": "内置",
+        "gender": "女声",
+        "language": None,
+        "target_model": TARGET_MODEL,
+        "status": "ENABLED",
+        "error_message": None,
+        "can_preview": True,
+        "can_delete": False,
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "expected"),
+    [
+        (1, "1"),
+        ("1", "1"),
+        ("0001", "1"),
+        (2**63 - 1, str(2**63 - 1)),
+        (str(2**63 - 1), str(2**63 - 1)),
+    ],
+)
+def test_voice_profile_id_accepts_positive_signed_bigint_and_canonicalizes(
+    profile_id: object,
+    expected: str,
+) -> None:
+    assert VoiceProfileOut.model_validate(_profile_payload(profile_id)).id == expected
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    [
+        True,
+        False,
+        None,
+        1.0,
+        {},
+        "",
+        " ",
+        "abc",
+        "+1",
+        "-1",
+        0,
+        "0",
+        -1,
+        2**63,
+        str(2**63),
+    ],
+)
+def test_voice_profile_id_rejects_values_outside_positive_signed_bigint(
+    profile_id: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        VoiceProfileOut.model_validate(_profile_payload(profile_id))
 
 
 @pytest.mark.anyio

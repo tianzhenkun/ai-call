@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import false, select
+from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallVoiceProfileModel
@@ -69,18 +69,67 @@ class VoiceRepository:
                 AiCallTenantVoiceProfileModel.voice != "",
             )
 
-        global_profiles = list((await self.db.execute(global_statement)).scalars().all())
-        tenant_profiles = list((await self.db.execute(tenant_statement)).scalars().all())
-        rows = [
-            *[self._tenant_profile(profile) for profile in tenant_profiles],
-            *[self._global_profile(profile) for profile in global_profiles],
-        ]
-        rows.sort(key=self._sort_key, reverse=True)
-
         safe_page_num = max(1, page_num)
         safe_page_size = max(1, min(page_size, 1000))
-        start = (safe_page_num - 1) * safe_page_size
-        return rows[start : start + safe_page_size], len(rows)
+        combined_offset = (safe_page_num - 1) * safe_page_size
+
+        tenant_total = int(
+            (
+                await self.db.execute(select(func.count()).select_from(tenant_statement.subquery()))
+            ).scalar_one()
+        )
+        global_total = int(
+            (
+                await self.db.execute(select(func.count()).select_from(global_statement.subquery()))
+            ).scalar_one()
+        )
+
+        rows: list[VoiceProfileOut] = []
+        remaining = safe_page_size
+        global_offset = max(0, combined_offset - tenant_total)
+
+        if combined_offset < tenant_total:
+            tenant_limit = min(remaining, tenant_total - combined_offset)
+            tenant_profiles = (
+                (
+                    await self.db.execute(
+                        tenant_statement
+                        .order_by(
+                            AiCallTenantVoiceProfileModel.updated_at.desc(),
+                            AiCallTenantVoiceProfileModel.created_at.desc(),
+                            AiCallTenantVoiceProfileModel.id.desc(),
+                        )
+                        .limit(tenant_limit)
+                        .offset(combined_offset)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            rows.extend(self._tenant_profile(profile) for profile in tenant_profiles)
+            remaining -= len(tenant_profiles)
+            global_offset = 0
+
+        if remaining > 0 and global_offset < global_total:
+            global_profiles = (
+                (
+                    await self.db.execute(
+                        global_statement
+                        .order_by(
+                            AiCallVoiceProfileModel.updated_at.desc(),
+                            AiCallVoiceProfileModel.created_at.desc(),
+                            AiCallVoiceProfileModel.id.desc(),
+                        )
+                        .limit(remaining)
+                        .offset(global_offset)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            rows.extend(self._global_profile(profile) for profile in global_profiles)
+
+        return rows, tenant_total + global_total
 
     @staticmethod
     def _global_profile(profile: AiCallVoiceProfileModel) -> VoiceProfileOut:
@@ -120,13 +169,4 @@ class VoiceRepository:
             can_delete=profile.status in {"ENABLED", "DELETE_FAILED"},
             created_at=profile.created_at,
             updated_at=profile.updated_at,
-        )
-
-    @staticmethod
-    def _sort_key(profile: VoiceProfileOut) -> tuple[object, ...]:
-        return (
-            profile.scope == "TENANT",
-            profile.updated_at,
-            profile.created_at,
-            int(profile.id),
         )

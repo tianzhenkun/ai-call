@@ -41,4 +41,14 @@ class VoiceProfileOut(BaseModel):
     @field_validator("id", mode="before")
     @classmethod
     def stringify_id(cls, value: object) -> str:
-        return str(value)
+        if isinstance(value, bool):
+            raise ValueError("id 必须是正 signed bigint")
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, str) and value.isascii() and value.isdigit():
+            number = int(value, 10)
+        else:
+            raise ValueError("id 必须是十进制整数")
+        if not 1 <= number <= 2**63 - 1:
+            raise ValueError("id 超出正 signed bigint 范围")
+        return str(number)
