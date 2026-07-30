@@ -396,11 +396,11 @@ async def test_list_derives_actions_and_normalizes_invalid_page_values(
     assert by_status["CREATING"].can_preview is False
     assert by_status["CREATING"].can_delete is False
     assert by_status["CREATE_FAILED"].can_preview is False
-    assert by_status["CREATE_FAILED"].can_delete is True
+    assert by_status["CREATE_FAILED"].can_delete is False
     assert by_status["DELETING"].can_preview is False
     assert by_status["DELETING"].can_delete is False
     assert by_status["DELETE_FAILED"].can_preview is False
-    assert by_status["DELETE_FAILED"].can_delete is False
+    assert by_status["DELETE_FAILED"].can_delete is True
 
     global_row = next(row for row in all_profiles if row.voice == "Tina")
     assert global_row.status == "ENABLED"
