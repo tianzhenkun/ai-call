@@ -218,6 +218,25 @@ def _voice_service(
     )
 
 
+def test_voice_service_uses_configured_private_sample_prefix() -> None:
+    service = VoiceEnrollmentService(
+        storage=FakeVoiceSampleStorage(),
+        cleanup_session_factory=lambda: None,
+        target_model=TARGET_MODEL,
+        sample_object_prefix="private/tenant-voice-samples/",
+    )
+
+    object_key = service._sample_object_key(
+        tenant_id="tenant-a",
+        enrollment_id=123,
+        sample_nonce=TEST_SAMPLE_NONCE,
+        content_type="audio/wav",
+    )
+
+    assert object_key.startswith("private/tenant-voice-samples/")
+    assert "//" not in object_key
+
+
 def _sample_key(
     tenant_id: str,
     enrollment_id: int,

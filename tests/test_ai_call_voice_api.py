@@ -312,6 +312,29 @@ def test_create_voice_accepts_multipart_and_returns_202(
     assert service.create_calls[0]["idempotency_key"] == "key-1"
 
 
+def test_disabled_voice_worker_keeps_read_available_but_create_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    client, repository, _service, _lifecycle = _client(
+        monkeypatch,
+        permissions=frozenset({"ai_call:voice:manage"}),
+    )
+    client.app.dependency_overrides.pop(get_voice_enrollment_service)
+
+    read_response = client.get("/ai-call/voice-profiles")
+    create_response = client.post(
+        "/ai-call/voice-enrollments",
+        headers={"Idempotency-Key": "disabled-worker-key"},
+        files=_enrollment_files(),
+    )
+
+    assert read_response.status_code == 200
+    assert repository.calls
+    assert create_response.status_code == 503
+    assert "未启用" in create_response.json()["msg"]
+
+
 def test_create_voice_requires_idempotency_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.concurrency import asynccontextmanager
@@ -41,10 +42,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             await _init_ai_call_standalone_oss_config()
+            await _start_ai_call_voice_worker(app)
             log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
             yield
             log.info("✅ AI Call standalone 模式关闭")
         finally:
+            await _stop_ai_call_voice_worker(app)
             await _stop_ai_call_voice_preview_service(app)
             await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
             await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
@@ -68,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         await DictDataService().init_dict_service(redis=app.state.redis)
         log.info("✅ Redis数据字典初始化完成")
         await OssService.init_active_config()
+        await _start_ai_call_voice_worker(app)
         await SchedulerUtil.init_scheduler(redis=app.state.redis)
         log.info("✅ 定时任务调度器初始化完成")
         from app.common.enums import EnvironmentEnum
@@ -82,6 +86,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         )
 
     except Exception as e:
+        await _stop_ai_call_voice_worker(app)
         await _stop_ai_call_voice_preview_service(app)
         await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
@@ -97,6 +102,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     try:
         yield
     finally:
+        await _stop_ai_call_voice_worker(app)
         await _stop_ai_call_voice_preview_service(app)
         await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
@@ -121,7 +127,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
 
 
 async def _init_ai_call_standalone_oss_config() -> None:
-    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_RECORDING_ENABLED:
+    if not settings.SQL_DB_ENABLE or not (
+        settings.AI_CALL_RECORDING_ENABLED or settings.AI_CALL_VOICE_WORKER_ENABLED
+    ):
         return
     from app.api.v1.system.oss.service import OssService
 
@@ -141,6 +149,114 @@ async def _stop_ai_call_voice_preview_service(app: FastAPI) -> None:
     del app.state.voice_preview_service
     await service.shutdown()
     log.info("✅ AI Call 音色试听服务已关闭")
+
+
+def _active_ai_call_voice_oss_config() -> dict | None:
+    from app.api.v1.system.oss.service import OssService
+
+    return OssService.active_config()
+
+
+async def _verify_ai_call_voice_worker_database(session_factory) -> None:
+    from sqlalchemy import select
+
+    from app.api.v1.ai_call.voice.model import AiCallVoiceEnrollmentModel
+
+    try:
+        async with session_factory() as database:
+            await database.scalar(select(AiCallVoiceEnrollmentModel.id).limit(1))
+            await database.rollback()
+    except Exception as exc:
+        raise RuntimeError("AI Call 音色任务数据库依赖不可用") from exc
+
+
+def _build_ai_call_voice_runtime(
+    *,
+    session_factory,
+    oss_config: dict | None,
+):
+    from app.api.v1.ai_call.voice.service import VoiceEnrollmentService
+    from app.services.ai_call.providers.qwen_voice_enrollment import (
+        QwenVoiceEnrollmentProvider,
+    )
+    from app.services.ai_call.voice_enrollment_worker import VoiceEnrollmentWorker
+    from app.services.ai_call.voice_sample import MinioVoiceSampleStorage
+
+    api_key = settings.DASHSCOPE_API_KEY.strip()
+    if not api_key:
+        raise RuntimeError("AI Call 音色任务已启用，但服务端 DASHSCOPE_API_KEY 未配置")
+    endpoint = settings.AI_CALL_VOICE_ENROLLMENT_ENDPOINT.strip()
+    target_model = settings.AI_CALL_VOICE_TARGET_MODEL.strip()
+    sample_prefix = settings.AI_CALL_VOICE_SAMPLE_OBJECT_PREFIX.strip().strip("/")
+    if not endpoint or not target_model or not sample_prefix:
+        raise RuntimeError("AI Call 音色任务配置不完整")
+
+    required_minio_fields = ("endpoint", "bucket_name", "access_key", "secret_key")
+    if not oss_config or any(
+        not str(oss_config.get(field) or "").strip() for field in required_minio_fields
+    ):
+        raise RuntimeError("AI Call 音色任务所需 MinIO 私有存储配置不完整")
+
+    storage = MinioVoiceSampleStorage(oss_config)
+    provider = QwenVoiceEnrollmentProvider(
+        api_key=api_key,
+        endpoint=endpoint,
+        target_model=target_model,
+    )
+    enrollment_service = VoiceEnrollmentService(
+        storage=storage,
+        cleanup_session_factory=session_factory,
+        target_model=target_model,
+        sample_object_prefix=sample_prefix,
+    )
+    worker = VoiceEnrollmentWorker(
+        session_factory=session_factory,
+        provider=provider,
+        storage=storage,
+        worker_id=f"voice-worker-{uuid4().hex}",
+        batch_size=settings.AI_CALL_VOICE_WORKER_BATCH_SIZE,
+        lease_seconds=settings.AI_CALL_VOICE_WORKER_LEASE_SECONDS,
+        poll_interval_seconds=settings.AI_CALL_VOICE_WORKER_POLL_INTERVAL_SECONDS,
+    )
+    return enrollment_service, worker
+
+
+async def _start_ai_call_voice_worker(app: FastAPI):
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_VOICE_WORKER_ENABLED:
+        return None
+
+    existing = getattr(app.state, "voice_enrollment_worker", None)
+    if existing is not None and existing.running:
+        return existing
+    if existing is not None:
+        await _stop_ai_call_voice_worker(app)
+
+    from app.core.database import async_db_session
+
+    await _verify_ai_call_voice_worker_database(async_db_session)
+    enrollment_service, worker = _build_ai_call_voice_runtime(
+        session_factory=async_db_session,
+        oss_config=_active_ai_call_voice_oss_config(),
+    )
+    await worker.start()
+    app.state.voice_enrollment_service = enrollment_service
+    app.state.voice_enrollment_worker = worker
+    log.info("✅ AI Call 音色任务 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_voice_worker(app: FastAPI) -> None:
+    worker = getattr(app.state, "voice_enrollment_worker", None)
+    try:
+        if worker is not None:
+            await worker.stop()
+    finally:
+        if hasattr(app.state, "voice_enrollment_worker"):
+            del app.state.voice_enrollment_worker
+        if hasattr(app.state, "voice_enrollment_service"):
+            del app.state.voice_enrollment_service
+    if worker is not None:
+        log.info("✅ AI Call 音色任务 worker 已关闭")
 
 
 async def _start_ai_call_outbound_task_worker():

@@ -24,6 +24,7 @@ from app.api.v1.ai_call.voice.repository import (
     BLOCKING_TASK_STATUSES,
     HISTORICAL_TASK_STATUSES,
 )
+from app.core.logger import log
 from app.services.ai_call.providers.qwen_voice_enrollment import (
     VoiceCreateResult,
     VoiceListItem,
@@ -127,6 +128,7 @@ class VoiceEnrollmentWorker:
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         batch_size: int = 20,
         lease_seconds: int = 60,
+        poll_interval_seconds: float = 2.0,
     ) -> None:
         self.session_factory = session_factory
         self.provider = provider
@@ -135,6 +137,59 @@ class VoiceEnrollmentWorker:
         self.now = now
         self.batch_size = min(MAX_BATCH_SIZE, max(1, batch_size))
         self.lease_seconds = max(1, lease_seconds)
+        self.poll_interval_seconds = max(0.01, poll_interval_seconds)
+        self.last_success: datetime | None = None
+        self.last_error_type: str | None = None
+        self._stop_event = asyncio.Event()
+        self._runner_task: asyncio.Task[None] | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._runner_task is not None and not self._runner_task.done()
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        self._stop_event = asyncio.Event()
+        self._runner_task = asyncio.create_task(
+            self._run_loop(),
+            name=f"ai-call-voice-worker-{self.worker_id}",
+        )
+
+    async def stop(self) -> None:
+        task = self._runner_task
+        if task is None:
+            return
+        self._stop_event.set()
+        try:
+            await task
+        finally:
+            if self._runner_task is task:
+                self._runner_task = None
+
+    async def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error_type = type(exc).__name__
+                log.error(
+                    "AI Call 音色任务 worker 单轮执行失败，errorType={}",
+                    self.last_error_type,
+                )
+            else:
+                self.last_success = self.now()
+            if self._stop_event.is_set():
+                break
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self.poll_interval_seconds,
+                )
+            except TimeoutError:
+                pass
 
     async def run_once(self) -> None:
         await self._cleanup_terminal_samples()

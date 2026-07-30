@@ -117,8 +117,8 @@ class _UnavailableVoiceEnrollmentService:
     @staticmethod
     def _raise_unavailable() -> None:
         raise CustomException(
-            msg="音色复刻服务尚未接入",
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            msg="音色复刻功能未启用",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
 

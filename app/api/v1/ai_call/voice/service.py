@@ -1161,6 +1161,7 @@ class VoiceEnrollmentService:
             AbstractAsyncContextManager[AsyncSession],
         ],
         target_model: str,
+        sample_object_prefix: str = "ai-call/voice-samples",
         now: Callable[[], datetime] = _utc_now,
         id_generator: Callable[[], int] = generate_snowflake_id,
         cleanup_id_generator: Callable[[], int] = generate_snowflake_id,
@@ -1169,6 +1170,9 @@ class VoiceEnrollmentService:
         self.storage = storage
         self.cleanup_session_factory = cleanup_session_factory
         self.target_model = target_model
+        self.sample_object_prefix = sample_object_prefix.strip().strip("/")
+        if not self.sample_object_prefix:
+            raise ValueError("sample_object_prefix 不能为空")
         self.now = now
         self.id_generator = id_generator
         self.cleanup_id_generator = cleanup_id_generator
@@ -1640,8 +1644,8 @@ class VoiceEnrollmentService:
             return None, True
         return profile, False
 
-    @staticmethod
     def _sample_object_key(
+        self,
         *,
         tenant_id: str,
         enrollment_id: int,
@@ -1650,7 +1654,7 @@ class VoiceEnrollmentService:
     ) -> str:
         tenant_digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
         extension = SAMPLE_EXTENSION_BY_CONTENT_TYPE[content_type]
-        return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}-{sample_nonce}{extension}"
+        return f"{self.sample_object_prefix}/{tenant_digest}/{enrollment_id}-{sample_nonce}{extension}"
 
     async def _read_and_inspect(
         self,

@@ -199,6 +199,15 @@ class Settings(BaseSettings):
     AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE: str = "19900001001"
     AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS: float = 1.0
     AI_CALL_OUTBOUND_LINPHONE_RECOVERY_GRACE_SECONDS: int = 30
+    AI_CALL_VOICE_WORKER_ENABLED: bool = False
+    AI_CALL_VOICE_WORKER_BATCH_SIZE: int = 10
+    AI_CALL_VOICE_WORKER_POLL_INTERVAL_SECONDS: float = 2.0
+    AI_CALL_VOICE_WORKER_LEASE_SECONDS: int = 60
+    AI_CALL_VOICE_SAMPLE_OBJECT_PREFIX: str = "ai-call/voice-samples"
+    AI_CALL_VOICE_TARGET_MODEL: str = "qwen3.5-omni-plus-realtime"
+    AI_CALL_VOICE_ENROLLMENT_ENDPOINT: str = (
+        "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
+    )
     AI_CALL_OUTBOUND_MOCK_RESULT: Literal[
         "connected",
         "no_answer",
