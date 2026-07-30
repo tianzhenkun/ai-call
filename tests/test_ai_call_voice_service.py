@@ -35,6 +35,7 @@ from app.core.exceptions import CustomException
 TARGET_MODEL = "qwen3.5-omni-plus-realtime"
 OTHER_MODEL = "qwen-omni-turbo-realtime"
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+TEST_SAMPLE_NONCE = "a" * 32
 
 
 class FakeVoiceSampleStorage:
@@ -83,12 +84,41 @@ class BlockingVoiceSampleStorage(FakeVoiceSampleStorage):
         await self.release_put.wait()
 
 
+class StatefulVoiceSampleStorage(FakeVoiceSampleStorage):
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        super().__init__()
+        self.objects = dict(objects)
+
+    async def put(self, *, object_key: str, data: bytes, content_type: str) -> None:
+        await super().put(
+            object_key=object_key,
+            data=data,
+            content_type=content_type,
+        )
+        self.objects[object_key] = data
+
+    async def get(self, object_key: str) -> bytes:
+        return self.objects[object_key]
+
+    async def delete(self, object_key: str) -> None:
+        await super().delete(object_key)
+        self.objects.pop(object_key, None)
+
+
 class SequenceIds:
     def __init__(self, *values: int) -> None:
         self._values = iter(values)
 
     def __call__(self) -> int:
         return next(self._values)
+
+
+class SequenceNonces:
+    def __init__(self, *values: str) -> None:
+        self._values = iter(values)
+
+    def __call__(self) -> bytes:
+        return bytes.fromhex(next(self._values))
 
 
 def _exception_chain(root: BaseException) -> list[BaseException]:
@@ -173,6 +203,7 @@ def _voice_service(
     *,
     ids: tuple[int, ...] = (101, 102),
     cleanup_ids: tuple[int, ...] = (901, 902),
+    nonces: tuple[str, ...] = (TEST_SAMPLE_NONCE,) * 4,
 ) -> VoiceEnrollmentService:
     return VoiceEnrollmentService(
         storage=storage,
@@ -181,12 +212,20 @@ def _voice_service(
         now=lambda: NOW,
         id_generator=SequenceIds(*ids),
         cleanup_id_generator=SequenceIds(*cleanup_ids),
+        sample_nonce_generator=SequenceNonces(*nonces),
     )
 
 
-def _sample_key(tenant_id: str, enrollment_id: int, extension: str = ".wav") -> str:
+def _sample_key(
+    tenant_id: str,
+    enrollment_id: int,
+    extension: str = ".wav",
+    *,
+    nonce: str | None = TEST_SAMPLE_NONCE,
+) -> str:
     tenant_digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
-    return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}{extension}"
+    object_name = f"{enrollment_id}-{nonce}" if nonce is not None else str(enrollment_id)
+    return f"ai-call/voice-samples/{tenant_digest}/{object_name}{extension}"
 
 
 @pytest.fixture
@@ -1245,6 +1284,7 @@ async def test_create_commit_reconciliation_failure_keeps_sample_and_writes_clea
         now=lambda: NOW,
         id_generator=SequenceIds(101, 102),
         cleanup_id_generator=SequenceIds(901),
+        sample_nonce_generator=SequenceNonces(TEST_SAMPLE_NONCE),
     )
 
     async with factory() as database:
@@ -1383,6 +1423,7 @@ async def test_cleanup_compensation_persistence_failure_only_logs_safe_constant(
         target_model=TARGET_MODEL,
         now=lambda: NOW,
         id_generator=SequenceIds(101, 102, 103),
+        sample_nonce_generator=SequenceNonces(TEST_SAMPLE_NONCE),
     )
 
     async with factory() as database:
@@ -1528,6 +1569,73 @@ async def test_create_integrity_failure_without_idempotent_winner_returns_500(
 
     assert caught.value.status_code == 500
     assert storage.delete_calls == [_sample_key("tenant-a", 102)]
+
+
+@pytest.mark.anyio
+async def test_enrollment_id_collision_does_not_overwrite_or_delete_old_sample(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    old_object_key = _sample_key("tenant-a", 102, nonce=None)
+    old_data = b"old-enrollment-sample"
+    storage = StatefulVoiceSampleStorage({old_object_key: old_data})
+    service = _voice_service(storage, factory, ids=(101, 102))
+    old_profile = _tenant_voice(
+        profile_id=900,
+        tenant_id="tenant-a",
+        voice=None,
+        status="CREATING",
+    )
+    old_profile.latest_enrollment_id = 102
+    old_enrollment = AiCallVoiceEnrollmentModel(
+        id=102,
+        tenant_id="tenant-a",
+        voice_profile_id=900,
+        idempotency_key="old-key",
+        request_hash="0" * 64,
+        preferred_name="vc900",
+        language="zh",
+        transcript=None,
+        sample_object_key=old_object_key,
+        sample_sha256="1" * 64,
+        status="PENDING",
+        provider_voice=None,
+        provider_request_id=None,
+        attempt_count=0,
+        next_retry_at=None,
+        lease_owner=None,
+        lease_expires_at=None,
+        error_message=None,
+        cleanup_error_message=None,
+        consent_user_id=7,
+        consent_at=NOW,
+        started_at=None,
+        finished_at=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    async with factory() as database:
+        database.add_all([old_profile, old_enrollment])
+        await database.commit()
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="new-key",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    assert caught.value.status_code == 500
+    assert storage.objects[old_object_key] == old_data
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
+    async with factory() as database:
+        persisted = await database.get(AiCallVoiceEnrollmentModel, 102)
+    assert persisted is not None
+    assert persisted.sample_object_key == old_object_key
 
 
 @pytest.mark.parametrize("winner_hash_matches", [True, False])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -45,6 +46,10 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _random_sample_nonce() -> bytes:
+    return secrets.token_bytes(16)
+
+
 @dataclass(frozen=True)
 class _Reconciliation:
     state: str
@@ -67,6 +72,7 @@ class VoiceEnrollmentService:
         now: Callable[[], datetime] = _utc_now,
         id_generator: Callable[[], int] = generate_snowflake_id,
         cleanup_id_generator: Callable[[], int] = generate_snowflake_id,
+        sample_nonce_generator: Callable[[], bytes] = _random_sample_nonce,
     ) -> None:
         self.storage = storage
         self.cleanup_session_factory = cleanup_session_factory
@@ -74,6 +80,7 @@ class VoiceEnrollmentService:
         self.now = now
         self.id_generator = id_generator
         self.cleanup_id_generator = cleanup_id_generator
+        self.sample_nonce_generator = sample_nonce_generator
 
     async def create(
         self,
@@ -181,14 +188,15 @@ class VoiceEnrollmentService:
 
         await self._safe_rollback(db)
 
-        generated_ids = self._generate_ids(profile_id)
-        if generated_ids is None:
+        sample_identity = self._generate_sample_identity(profile_id)
+        if sample_identity is None:
             self._raise_persistence_failure()
-        profile_id, enrollment_id = generated_ids
+        profile_id, enrollment_id, sample_nonce = sample_identity
 
         object_key = self._sample_object_key(
             tenant_id=tenant_id,
             enrollment_id=enrollment_id,
+            sample_nonce=sample_nonce,
             content_type=metadata.content_type,
         )
         uploaded = await self._put_sample(
@@ -321,16 +329,19 @@ class VoiceEnrollmentService:
             display_name=request.display_name,
         )
 
-    def _generate_ids(
+    def _generate_sample_identity(
         self,
         profile_id: int | None,
-    ) -> tuple[int, int] | None:
+    ) -> tuple[int, int, str] | None:
         try:
             generated_profile_id = profile_id if profile_id is not None else self.id_generator()
             enrollment_id = self.id_generator()
+            nonce = self.sample_nonce_generator()
         except Exception:
             return None
-        return generated_profile_id, enrollment_id
+        if len(nonce) != 16:
+            return None
+        return generated_profile_id, enrollment_id, nonce.hex()
 
     async def _put_sample(
         self,
@@ -542,11 +553,12 @@ class VoiceEnrollmentService:
         *,
         tenant_id: str,
         enrollment_id: int,
+        sample_nonce: str,
         content_type: str,
     ) -> str:
         tenant_digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
         extension = SAMPLE_EXTENSION_BY_CONTENT_TYPE[content_type]
-        return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}{extension}"
+        return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}-{sample_nonce}{extension}"
 
     async def _read_and_inspect(
         self,
