@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -129,6 +129,7 @@ class VoiceEnrollmentWorker:
         batch_size: int = 20,
         lease_seconds: int = 60,
         poll_interval_seconds: float = 2.0,
+        shutdown_grace_seconds: float = 30.0,
     ) -> None:
         self.session_factory = session_factory
         self.provider = provider
@@ -138,6 +139,7 @@ class VoiceEnrollmentWorker:
         self.batch_size = min(MAX_BATCH_SIZE, max(1, batch_size))
         self.lease_seconds = max(1, lease_seconds)
         self.poll_interval_seconds = max(0.01, poll_interval_seconds)
+        self.shutdown_grace_seconds = max(0.01, shutdown_grace_seconds)
         self.last_success: datetime | None = None
         self.last_error_type: str | None = None
         self._stop_event = asyncio.Event()
@@ -162,7 +164,17 @@ class VoiceEnrollmentWorker:
             return
         self._stop_event.set()
         try:
-            await task
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=self.shutdown_grace_seconds,
+            )
+            if not done:
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             if self._runner_task is task:
                 self._runner_task = None
@@ -170,7 +182,7 @@ class VoiceEnrollmentWorker:
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                await self.run_once()
+                succeeded = await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -180,7 +192,8 @@ class VoiceEnrollmentWorker:
                     self.last_error_type,
                 )
             else:
-                self.last_success = self.now()
+                if succeeded is not False:
+                    self.last_success = self.now()
             if self._stop_event.is_set():
                 break
             try:
@@ -191,23 +204,59 @@ class VoiceEnrollmentWorker:
             except TimeoutError:
                 pass
 
-    async def run_once(self) -> None:
+    async def run_once(self) -> bool:
+        succeeded = True
+        if self._stop_event.is_set():
+            return succeeded
         await self._cleanup_terminal_samples()
+        if self._stop_event.is_set():
+            return succeeded
         enrollments = await self._claim_enrollments()
-        await asyncio.gather(
-            *(self._process_enrollment(item) for item in enrollments),
-            return_exceptions=True,
+        succeeded = (
+            await self._run_batch(
+                [self._process_enrollment(item) for item in enrollments]
+            )
+            and succeeded
         )
+        if self._stop_event.is_set():
+            return succeeded
         deletions = await self._claim_deletions()
-        await asyncio.gather(
-            *(self._process_deletion(item) for item in deletions),
-            return_exceptions=True,
+        succeeded = (
+            await self._run_batch(
+                [self._process_deletion(item) for item in deletions]
+            )
+            and succeeded
         )
+        if self._stop_event.is_set():
+            return succeeded
         cleanup_records = await self._claim_cleanup_records()
-        await asyncio.gather(
-            *(self._process_cleanup_record(item) for item in cleanup_records),
-            return_exceptions=True,
+        succeeded = (
+            await self._run_batch(
+                [self._process_cleanup_record(item) for item in cleanup_records]
+            )
+            and succeeded
         )
+        return succeeded
+
+    async def _run_batch(
+        self,
+        operations: list[Awaitable[None]],
+    ) -> bool:
+        if not operations:
+            return True
+        results = await asyncio.gather(*operations, return_exceptions=True)
+        succeeded = True
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                succeeded = False
+                self.last_error_type = type(result).__name__
+                log.error(
+                    "AI Call 音色任务 worker 单任务执行失败，errorType={}",
+                    self.last_error_type,
+                )
+        return succeeded
 
     @staticmethod
     def _enrollment_claim_select(
@@ -364,16 +413,22 @@ class VoiceEnrollmentWorker:
         )
 
     async def _process_enrollment(self, item: EnrollmentWorkItem) -> None:
+        if self._stop_event.is_set():
+            return
         if item.status == "RECONCILING":
             await self._reconcile(item)
             return
         if item.sample_object_key is None:
             await self._fail_enrollment(item)
             return
+        if self._stop_event.is_set():
+            return
         try:
             sample = await self.storage.get(item.sample_object_key)
         except Exception:
             await self._retry_or_fail(item, reconciliation=False)
+            return
+        if self._stop_event.is_set():
             return
         try:
             result = await self.provider.create(
@@ -406,6 +461,8 @@ class VoiceEnrollmentWorker:
         )
 
     async def _reconcile(self, item: EnrollmentWorkItem) -> None:
+        if self._stop_event.is_set():
+            return
         try:
             voices = await self.provider.list(
                 page_index=0,
@@ -727,6 +784,8 @@ class VoiceEnrollmentWorker:
         )
 
     async def _process_deletion(self, item: DeletionWorkItem) -> None:
+        if self._stop_event.is_set():
+            return
         if not item.voice:
             await self._fail_deletion(item)
             return
@@ -739,6 +798,8 @@ class VoiceEnrollmentWorker:
                 item,
                 historical_task_count=historical_count,
             )
+            return
+        if self._stop_event.is_set():
             return
         try:
             request_id = await self.provider.delete(voice=item.voice)
@@ -757,6 +818,8 @@ class VoiceEnrollmentWorker:
         await self._complete_deletion(item, request_id=request_id)
 
     async def _reconcile_deletion(self, item: DeletionWorkItem) -> None:
+        if self._stop_event.is_set():
+            return
         try:
             provider_state = await self._provider_deletion_state(item)
         except Exception:
@@ -797,6 +860,8 @@ class VoiceEnrollmentWorker:
         item: DeletionWorkItem,
     ) -> str:
         for page_index in range(MAX_RECONCILIATION_PAGES):
+            if self._stop_event.is_set():
+                return "INCOMPLETE"
             voices = await self.provider.list(
                 page_index=page_index,
                 page_size=DEFAULT_LIST_PAGE_SIZE,
@@ -1020,6 +1085,8 @@ class VoiceEnrollmentWorker:
             ).all()
             await database.rollback()
         for enrollment_id, object_key in rows:
+            if self._stop_event.is_set():
+                break
             await self._cleanup_enrollment_sample(
                 enrollment_id=enrollment_id,
                 object_key=object_key,
@@ -1031,7 +1098,7 @@ class VoiceEnrollmentWorker:
         enrollment_id: int,
         object_key: str | None,
     ) -> None:
-        if object_key is None:
+        if object_key is None or self._stop_event.is_set():
             return
         delete_failed = False
         try:
@@ -1139,8 +1206,12 @@ class VoiceEnrollmentWorker:
             )
 
     async def _process_cleanup_record(self, item: CleanupWorkItem) -> None:
+        if self._stop_event.is_set():
+            return
         if await self._sample_is_referenced(item.object_key):
             await self._finish_cleanup(item)
+            return
+        if self._stop_event.is_set():
             return
         delete_failed = False
         try:

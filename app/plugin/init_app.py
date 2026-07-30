@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 from typing import Any
 from uuid import uuid4
@@ -160,11 +161,63 @@ def _active_ai_call_voice_oss_config() -> dict | None:
 async def _verify_ai_call_voice_worker_database(session_factory) -> None:
     from sqlalchemy import select
 
-    from app.api.v1.ai_call.voice.model import AiCallVoiceEnrollmentModel
+    from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
+    from app.api.v1.ai_call.voice.model import (
+        AiCallTenantVoiceProfileModel,
+        AiCallVoiceDeletionModel,
+        AiCallVoiceEnrollmentModel,
+        AiCallVoiceSampleCleanupModel,
+    )
 
     try:
         async with session_factory() as database:
-            await database.scalar(select(AiCallVoiceEnrollmentModel.id).limit(1))
+            probes = (
+                select(
+                    AiCallTenantVoiceProfileModel.id,
+                    AiCallTenantVoiceProfileModel.tenant_id,
+                    AiCallTenantVoiceProfileModel.voice,
+                    AiCallTenantVoiceProfileModel.target_model,
+                    AiCallTenantVoiceProfileModel.status,
+                    AiCallTenantVoiceProfileModel.latest_enrollment_id,
+                ).limit(1),
+                select(
+                    AiCallVoiceEnrollmentModel.id,
+                    AiCallVoiceEnrollmentModel.tenant_id,
+                    AiCallVoiceEnrollmentModel.voice_profile_id,
+                    AiCallVoiceEnrollmentModel.sample_object_key,
+                    AiCallVoiceEnrollmentModel.status,
+                    AiCallVoiceEnrollmentModel.attempt_count,
+                    AiCallVoiceEnrollmentModel.lease_owner,
+                    AiCallVoiceEnrollmentModel.lease_expires_at,
+                ).limit(1),
+                select(
+                    AiCallVoiceDeletionModel.id,
+                    AiCallVoiceDeletionModel.tenant_id,
+                    AiCallVoiceDeletionModel.voice_profile_id,
+                    AiCallVoiceDeletionModel.status,
+                    AiCallVoiceDeletionModel.attempt_count,
+                    AiCallVoiceDeletionModel.lease_owner,
+                    AiCallVoiceDeletionModel.lease_expires_at,
+                    AiCallVoiceDeletionModel.reconcile_absent_count,
+                ).limit(1),
+                select(
+                    AiCallVoiceSampleCleanupModel.id,
+                    AiCallVoiceSampleCleanupModel.tenant_id,
+                    AiCallVoiceSampleCleanupModel.object_key,
+                    AiCallVoiceSampleCleanupModel.status,
+                    AiCallVoiceSampleCleanupModel.attempt_count,
+                    AiCallVoiceSampleCleanupModel.lease_owner,
+                    AiCallVoiceSampleCleanupModel.lease_expires_at,
+                ).limit(1),
+                select(
+                    AiCallOutboundTaskModel.id,
+                    AiCallOutboundTaskModel.tenant_id,
+                    AiCallOutboundTaskModel.voice,
+                    AiCallOutboundTaskModel.status,
+                ).limit(1),
+            )
+            for statement in probes:
+                await database.execute(statement)
             await database.rollback()
     except Exception as exc:
         raise RuntimeError("AI Call 音色任务数据库依赖不可用") from exc
@@ -186,7 +239,7 @@ def _build_ai_call_voice_runtime(
     if not api_key:
         raise RuntimeError("AI Call 音色任务已启用，但服务端 DASHSCOPE_API_KEY 未配置")
     endpoint = settings.AI_CALL_VOICE_ENROLLMENT_ENDPOINT.strip()
-    target_model = settings.AI_CALL_VOICE_TARGET_MODEL.strip()
+    target_model = settings.QWEN_REALTIME_MODEL.strip()
     sample_prefix = settings.AI_CALL_VOICE_SAMPLE_OBJECT_PREFIX.strip().strip("/")
     if not endpoint or not target_model or not sample_prefix:
         raise RuntimeError("AI Call 音色任务配置不完整")
@@ -217,44 +270,85 @@ def _build_ai_call_voice_runtime(
         batch_size=settings.AI_CALL_VOICE_WORKER_BATCH_SIZE,
         lease_seconds=settings.AI_CALL_VOICE_WORKER_LEASE_SECONDS,
         poll_interval_seconds=settings.AI_CALL_VOICE_WORKER_POLL_INTERVAL_SECONDS,
+        shutdown_grace_seconds=settings.AI_CALL_VOICE_WORKER_SHUTDOWN_GRACE_SECONDS,
     )
     return enrollment_service, worker
+
+
+class _AiCallVoiceWorkerLifecycle:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.phase = "STOPPED"
+
+
+def _ai_call_voice_worker_lifecycle(app: FastAPI) -> _AiCallVoiceWorkerLifecycle:
+    lifecycle = getattr(app.state, "_ai_call_voice_worker_lifecycle", None)
+    if lifecycle is None:
+        lifecycle = _AiCallVoiceWorkerLifecycle()
+        app.state._ai_call_voice_worker_lifecycle = lifecycle
+    return lifecycle
 
 
 async def _start_ai_call_voice_worker(app: FastAPI):
     if not settings.SQL_DB_ENABLE or not settings.AI_CALL_VOICE_WORKER_ENABLED:
         return None
 
-    existing = getattr(app.state, "voice_enrollment_worker", None)
-    if existing is not None and existing.running:
-        return existing
-    if existing is not None:
-        await _stop_ai_call_voice_worker(app)
+    lifecycle = _ai_call_voice_worker_lifecycle(app)
+    async with lifecycle.lock:
+        existing = getattr(app.state, "voice_enrollment_worker", None)
+        if existing is not None and existing.running:
+            lifecycle.phase = "RUNNING"
+            return existing
+        if existing is not None:
+            lifecycle.phase = "STOPPING"
+            try:
+                await existing.stop()
+            finally:
+                if hasattr(app.state, "voice_enrollment_worker"):
+                    del app.state.voice_enrollment_worker
+                if hasattr(app.state, "voice_enrollment_service"):
+                    del app.state.voice_enrollment_service
 
-    from app.core.database import async_db_session
+        from app.core.database import async_db_session
 
-    await _verify_ai_call_voice_worker_database(async_db_session)
-    enrollment_service, worker = _build_ai_call_voice_runtime(
-        session_factory=async_db_session,
-        oss_config=_active_ai_call_voice_oss_config(),
-    )
-    await worker.start()
-    app.state.voice_enrollment_service = enrollment_service
-    app.state.voice_enrollment_worker = worker
-    log.info("✅ AI Call 音色任务 worker 已启动")
-    return worker
+        lifecycle.phase = "STARTING"
+        worker = None
+        try:
+            await _verify_ai_call_voice_worker_database(async_db_session)
+            enrollment_service, worker = _build_ai_call_voice_runtime(
+                session_factory=async_db_session,
+                oss_config=_active_ai_call_voice_oss_config(),
+            )
+            await worker.start()
+        except BaseException:
+            if worker is not None:
+                try:
+                    await worker.stop()
+                except Exception:
+                    pass
+            lifecycle.phase = "STOPPED"
+            raise
+        app.state.voice_enrollment_service = enrollment_service
+        app.state.voice_enrollment_worker = worker
+        lifecycle.phase = "RUNNING"
+        log.info("✅ AI Call 音色任务 worker 已启动")
+        return worker
 
 
 async def _stop_ai_call_voice_worker(app: FastAPI) -> None:
-    worker = getattr(app.state, "voice_enrollment_worker", None)
-    try:
-        if worker is not None:
-            await worker.stop()
-    finally:
-        if hasattr(app.state, "voice_enrollment_worker"):
-            del app.state.voice_enrollment_worker
-        if hasattr(app.state, "voice_enrollment_service"):
-            del app.state.voice_enrollment_service
+    lifecycle = _ai_call_voice_worker_lifecycle(app)
+    async with lifecycle.lock:
+        lifecycle.phase = "STOPPING"
+        worker = getattr(app.state, "voice_enrollment_worker", None)
+        try:
+            if worker is not None:
+                await worker.stop()
+        finally:
+            if hasattr(app.state, "voice_enrollment_worker"):
+                del app.state.voice_enrollment_worker
+            if hasattr(app.state, "voice_enrollment_service"):
+                del app.state.voice_enrollment_service
+            lifecycle.phase = "STOPPED"
     if worker is not None:
         log.info("✅ AI Call 音色任务 worker 已关闭")
 

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
+from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.dependencies import get_current_user, get_voice_manager
 from app.core.exceptions import CustomException
@@ -26,9 +27,6 @@ from app.services.ai_call.orchestrator import (
     BrowserEventReportResult,
     CreateSessionResult,
     EndSessionResult,
-)
-from app.services.ai_call.voice_profile import (
-    QWEN_OMNI_REALTIME_TARGET_MODEL,
 )
 
 from ..outbound.controller import _identity
@@ -267,7 +265,7 @@ async def list_voice_profiles_controller(
     target_model: Annotated[
         str,
         Query(alias="targetModel"),
-    ] = QWEN_OMNI_REALTIME_TARGET_MODEL,
+    ] = settings.QWEN_REALTIME_MODEL,
     voice_status: Annotated[
         VoiceStatus | None,
         Query(alias="status"),

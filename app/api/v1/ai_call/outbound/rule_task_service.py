@@ -10,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallPromptProfileModel, AiCallVoiceProfileModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
-from app.services.ai_call.voice_profile import QWEN_OMNI_REALTIME_TARGET_MODEL
 from app.utils.id_util import generate_snowflake_id
 
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
@@ -819,7 +819,7 @@ class OutboundRuleTaskService:
         builtin_voice = await db.scalar(
             select(AiCallVoiceProfileModel)
             .where(
-                AiCallVoiceProfileModel.target_model == QWEN_OMNI_REALTIME_TARGET_MODEL,
+                AiCallVoiceProfileModel.target_model == settings.QWEN_REALTIME_MODEL,
                 AiCallVoiceProfileModel.voice == voice,
             )
             .order_by(AiCallVoiceProfileModel.sort_order, AiCallVoiceProfileModel.id)
@@ -830,7 +830,7 @@ class OutboundRuleTaskService:
 
         tenant_statement = select(AiCallTenantVoiceProfileModel).where(
             AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
-            AiCallTenantVoiceProfileModel.target_model == QWEN_OMNI_REALTIME_TARGET_MODEL,
+            AiCallTenantVoiceProfileModel.target_model == settings.QWEN_REALTIME_MODEL,
             AiCallTenantVoiceProfileModel.voice == voice,
         )
         if lock_tenant_voice:

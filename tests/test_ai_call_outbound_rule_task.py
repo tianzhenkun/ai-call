@@ -33,10 +33,12 @@ from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.repository import VoiceRepository
 from app.api.v1.ai_call.voice.service import VoiceDeletionService
+from app.config.setting import settings
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
-from app.services.ai_call.voice_profile import QWEN_OMNI_REALTIME_TARGET_MODEL
 from app.utils.id_util import generate_snowflake_id
+
+QWEN_OMNI_REALTIME_TARGET_MODEL = settings.QWEN_REALTIME_MODEL
 
 
 def _now() -> datetime:
@@ -388,6 +390,55 @@ async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
     assert task_payload["voiceName"] == "租户客服音色"
     assert task_payload["voiceType"] == "自定义复刻"
     assert task_payload["voiceTargetModel"] == QWEN_OMNI_REALTIME_TARGET_MODEL
+
+
+@pytest.mark.anyio
+async def test_formal_task_voice_snapshot_uses_realtime_model_setting(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_model = "qwen-realtime-shared-test"
+    monkeypatch.setattr(settings, "QWEN_REALTIME_MODEL", shared_model)
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(
+        database,
+        voice="qwen-omni-vc-shared",
+        target_model=shared_model,
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-shared",
+        phone_number="19900001111",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001111", None)],
+    )
+
+    async with database() as session:
+        task, created = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-shared-realtime-model",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+
+    snapshot = json.loads(task.config_snapshot_json)
+    assert created is True
+    assert snapshot["voice"]["profileId"] == str(profile_id)
+    assert snapshot["voice"]["targetModel"] == shared_model
+    assert task.voice_target_model == shared_model
 
 
 @pytest.mark.anyio

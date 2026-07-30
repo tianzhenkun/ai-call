@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-QWEN_OMNI_REALTIME_TARGET_MODEL = "qwen3.5-omni-plus-realtime"
-
 VOICE_TYPE_BUILTIN = "内置"
 VOICE_TYPE_CUSTOM_CLONE = "自定义复刻"
 
