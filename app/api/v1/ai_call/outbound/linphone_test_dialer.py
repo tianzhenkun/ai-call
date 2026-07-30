@@ -75,8 +75,8 @@ class LinphoneTestDialer:
                     business_id=str(request.task_id),
                     scene_code=request.scene_code,
                     business_params={
-                        "customer_name": request.customer_name or "",
-                        "target_id": str(request.target_id),
+                        "customerName": request.customer_name or "",
+                        "targetId": str(request.target_id),
                     },
                 )
             except Exception as exc:

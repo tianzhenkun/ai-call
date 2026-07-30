@@ -704,7 +704,7 @@ class _LinphoneRouteServiceFake:
 
 
 def _linphone_route_client(database, service) -> TestClient:
-    from app.api.v1.ai_call.outbound.rule_task_controller import (
+    from app.api.v1.ai_call.outbound.linphone_test_controller import (
         get_linphone_test_service,
     )
 
@@ -735,17 +735,30 @@ def _linphone_route_client(database, service) -> TestClient:
 async def test_linphone_routes_are_registered_and_use_unified_envelope(database) -> None:
     service = _LinphoneRouteServiceFake()
     with _linphone_route_client(database, service) as client:
-        capability = client.get("/ai-call/outbound-tasks/1001/test-capability")
+        capability = client.get("/ai-call/lab/outbound-task-tests/1001/capability")
         accepted = client.post(
-            "/ai-call/outbound-tasks/1001/test-run",
+            "/ai-call/lab/outbound-task-tests/1001/runs",
             headers={"Idempotency-Key": "cmd-route-1"},
             json={"scenario": "ai_only"},
         )
-        test_status = client.get("/ai-call/outbound-tasks/1001/test-status")
+        test_status = client.get("/ai-call/lab/outbound-task-tests/1001/status")
         ended = client.post(
-            "/ai-call/outbound-tasks/1001/active-call/end",
+            "/ai-call/lab/outbound-task-tests/1001/active-call/end",
             headers={"Idempotency-Key": "end-route-1"},
         )
+        legacy_responses = [
+            client.get("/ai-call/outbound-tasks/1001/test-capability"),
+            client.post(
+                "/ai-call/outbound-tasks/1001/test-run",
+                headers={"Idempotency-Key": "legacy-run"},
+                json={"scenario": "ai_only"},
+            ),
+            client.get("/ai-call/outbound-tasks/1001/test-status"),
+            client.post(
+                "/ai-call/outbound-tasks/1001/active-call/end",
+                headers={"Idempotency-Key": "legacy-end"},
+            ),
+        ]
 
     assert capability.status_code == 200
     assert capability.json() == {
@@ -771,12 +784,14 @@ async def test_linphone_routes_are_registered_and_use_unified_envelope(database)
             "callId": "call-1",
         },
     }
-    assert service.start_calls == [{
-        "tenant_id": "000000",
-        "task_id": 1001,
-        "idempotency_key": "cmd-route-1",
-        "scenario": "ai_only",
-    }]
+    assert service.start_calls == [
+        {
+            "tenant_id": "000000",
+            "task_id": 1001,
+            "idempotency_key": "cmd-route-1",
+            "scenario": "ai_only",
+        }
+    ]
     assert test_status.status_code == 200
     assert test_status.json()["data"] == {
         "taskId": "1001",
@@ -799,11 +814,14 @@ async def test_linphone_routes_are_registered_and_use_unified_envelope(database)
         "msg": "结束通话命令已受理",
         "data": {"accepted": True},
     }
-    assert service.end_calls == [{
-        "tenant_id": "000000",
-        "task_id": 1001,
-        "idempotency_key": "end-route-1",
-    }]
+    assert service.end_calls == [
+        {
+            "tenant_id": "000000",
+            "task_id": 1001,
+            "idempotency_key": "end-route-1",
+        }
+    ]
+    assert [response.status_code for response in legacy_responses] == [404] * 4
 
 
 @pytest.mark.anyio
@@ -811,7 +829,7 @@ async def test_linphone_test_run_requires_idempotency_header(database) -> None:
     service = _LinphoneRouteServiceFake()
     with _linphone_route_client(database, service) as client:
         response = client.post(
-            "/ai-call/outbound-tasks/1001/test-run",
+            "/ai-call/lab/outbound-task-tests/1001/runs",
             json={"scenario": "ai_only"},
         )
 
@@ -1679,8 +1697,8 @@ async def test_dial_starts_stable_sip_session_then_waits_for_terminal_record() -
             "business_id": "1001",
             "scene_code": "intro_geo",
             "business_params": {
-                "customer_name": "张三",
-                "target_id": "2001",
+                "customerName": "张三",
+                "targetId": "2001",
             },
         }
     ]

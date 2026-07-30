@@ -17,6 +17,7 @@ from app.utils.id_util import generate_snowflake_id
 
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
 from .rule_task_model import (
+    AiCallOutboundAttemptModel,
     AiCallOutboundRuleModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
@@ -29,6 +30,7 @@ from .rule_task_schema import (
     CallRuleOut,
     CreateTaskRequest,
     OutboundTargetOut,
+    OutboundTaskLineSnapshotOut,
     OutboundTaskOut,
     RetryableResultMeta,
     SingleValidationRequest,
@@ -562,7 +564,18 @@ class OutboundRuleTaskService:
                 .limit(page_size)
             )
         ).all()
-        return [self.task_out(task) for task in tasks], total
+        dialer_types_by_task = await self._attempt_dialer_types_by_task(
+            db,
+            tenant_id,
+            [task.id for task in tasks],
+        )
+        return [
+            self.task_out(
+                task,
+                attempt_dialer_types=dialer_types_by_task.get(task.id, []),
+            )
+            for task in tasks
+        ], total
 
     async def get_task(
         self,
@@ -570,7 +583,16 @@ class OutboundRuleTaskService:
         tenant_id: str,
         task_id: int,
     ) -> OutboundTaskOut:
-        return self.task_out(await self._get_task(db, tenant_id, task_id))
+        task = await self._get_task(db, tenant_id, task_id)
+        dialer_types_by_task = await self._attempt_dialer_types_by_task(
+            db,
+            tenant_id,
+            [task.id],
+        )
+        return self.task_out(
+            task,
+            attempt_dialer_types=dialer_types_by_task.get(task.id, []),
+        )
 
     async def update_schedule(
         self,
@@ -755,7 +777,18 @@ class OutboundRuleTaskService:
                 .limit(page_size)
             )
         ).all()
-        return [self.target_out(target) for target in targets], total
+        latest_dialer_types = await self._latest_dialer_types_by_target(
+            db,
+            tenant_id,
+            [target.id for target in targets],
+        )
+        return [
+            self.target_out(
+                target,
+                latest_dialer_type=latest_dialer_types.get(target.id),
+            )
+            for target in targets
+        ], total
 
     async def _resolve_references(
         self,
@@ -923,7 +956,11 @@ class OutboundRuleTaskService:
         )
 
     @staticmethod
-    def task_out(task: AiCallOutboundTaskModel) -> OutboundTaskOut:
+    def task_out(
+        task: AiCallOutboundTaskModel,
+        *,
+        attempt_dialer_types: list[str] | None = None,
+    ) -> OutboundTaskOut:
         return OutboundTaskOut(
             task_id=str(task.id),
             task_name=task.task_name,
@@ -933,6 +970,7 @@ class OutboundRuleTaskService:
             completed_targets=task.completed_targets,
             connected_targets=task.connected_targets,
             failed_targets=task.failed_targets,
+            attempt_dialer_types=attempt_dialer_types or [],
             execution_mode=task.execution_mode,
             scheduled_at=OutboundRuleTaskService._format_datetime(task.scheduled_at),
             started_at=OutboundRuleTaskService._format_datetime(task.started_at),
@@ -949,6 +987,7 @@ class OutboundRuleTaskService:
             rule_summary=task.rule_summary,
             line_id=str(task.line_id) if task.line_id is not None else None,
             line_name=task.line_name,
+            line_snapshot=OutboundRuleTaskService._task_line_snapshot_out(task),
             created_by_name=task.created_by_name,
             created_at=OutboundRuleTaskService._format_datetime(task.created_at) or "",
             updated_at=OutboundRuleTaskService._format_datetime(task.updated_at) or "",
@@ -956,7 +995,28 @@ class OutboundRuleTaskService:
         )
 
     @staticmethod
-    def target_out(target: AiCallOutboundTargetModel) -> OutboundTargetOut:
+    def _task_line_snapshot_out(
+        task: AiCallOutboundTaskModel,
+    ) -> OutboundTaskLineSnapshotOut | None:
+        try:
+            config_snapshot = json.loads(task.config_snapshot_json)
+            line_snapshot = SipLineSnapshot.model_validate(config_snapshot.get("sipLine"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if task.line_id is not None and line_snapshot.line_id != str(task.line_id):
+            return None
+        return OutboundTaskLineSnapshotOut(
+            line_id=line_snapshot.line_id,
+            line_code=line_snapshot.line_code,
+            line_name=line_snapshot.line_name,
+        )
+
+    @staticmethod
+    def target_out(
+        target: AiCallOutboundTargetModel,
+        *,
+        latest_dialer_type: str | None = None,
+    ) -> OutboundTargetOut:
         return OutboundTargetOut(
             target_id=str(target.id),
             task_id=str(target.task_id),
@@ -965,8 +1025,69 @@ class OutboundRuleTaskService:
             status=target.status,
             attempt_count=target.attempt_count,
             latest_result=target.latest_result,
+            latest_dialer_type=latest_dialer_type,
             updated_at=OutboundRuleTaskService._format_datetime(target.updated_at) or "",
         )
+
+    @staticmethod
+    async def _attempt_dialer_types_by_task(
+        db: AsyncSession,
+        tenant_id: str,
+        task_ids: list[int],
+    ) -> dict[int, list[str]]:
+        if not task_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    AiCallOutboundAttemptModel.task_id,
+                    AiCallOutboundAttemptModel.dialer_type,
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.task_id.in_(task_ids),
+                    AiCallOutboundAttemptModel.dialer_type.is_not(None),
+                )
+                .distinct()
+            )
+        ).all()
+        result: dict[int, set[str]] = {}
+        for task_id, dialer_type in rows:
+            if dialer_type:
+                result.setdefault(task_id, set()).add(dialer_type)
+        return {
+            task_id: sorted(dialer_types)
+            for task_id, dialer_types in result.items()
+        }
+
+    @staticmethod
+    async def _latest_dialer_types_by_target(
+        db: AsyncSession,
+        tenant_id: str,
+        target_ids: list[int],
+    ) -> dict[int, str | None]:
+        if not target_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundAttemptModel.dialer_type,
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.target_id.in_(target_ids),
+                )
+                .order_by(
+                    AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundAttemptModel.attempt_no.desc(),
+                )
+            )
+        ).all()
+        result: dict[int, str | None] = {}
+        for target_id, dialer_type in rows:
+            result.setdefault(target_id, dialer_type)
+        return result
 
     @staticmethod
     def _rule_summary(rule: AiCallOutboundRuleModel) -> str:

@@ -17,6 +17,7 @@ from app.api.v1.ai_call.outbound.model import (
     AiCallOutboundValidationRowModel,
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
     AiCallOutboundRuleModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
@@ -1329,6 +1330,10 @@ async def test_single_task_has_one_target_and_uses_snapshots_after_rule_delete(d
             "idem-single",
             create_request,
         )
+        line = await session.get(AiCallSipLineModel, task.line_id)
+        assert line is not None
+        line.line_code = "renamed-after-task-created"
+        line.line_name = "任务创建后改名的线路"
         await service.delete_rule(session, "tenant-a", 10, rule.id)
         await session.commit()
         task_id = task.id
@@ -1351,6 +1356,105 @@ async def test_single_task_has_one_target_and_uses_snapshots_after_rule_delete(d
     assert "09:00" in task_out.rule_summary
     assert task_out.prompt_name == "合同审查产品介绍"
     assert task_out.voice_name == "甜甜 Tina"
+    assert task_out.line_snapshot is not None
+    assert task_out.line_snapshot.line_id == task_out.line_id
+    assert task_out.line_snapshot.line_code == "default-tenant-a"
+    assert task_out.line_snapshot.line_name == "tenant-a默认线路"
+    assert task_out.line_snapshot.model_dump(mode="json", by_alias=True) == {
+        "lineId": task_out.line_id,
+        "lineCode": "default-tenant-a",
+        "lineName": "tenant-a默认线路",
+    }
+
+
+@pytest.mark.anyio
+async def test_task_and_target_outputs_expose_attempt_dialer_provenance(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        phone_number="19900001001",
+        customer_name="王先生",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001001", "王先生")],
+    )
+
+    async with database() as session:
+        task, _ = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-attempt-provenance",
+            _create_task_request(config, validation_id),
+        )
+        target = await session.scalar(
+            select(AiCallOutboundTargetModel).where(
+                AiCallOutboundTargetModel.task_id == task.id
+            )
+        )
+        assert target is not None
+        now = _now()
+        target.status = "COMPLETED"
+        target.attempt_count = 1
+        target.latest_result = "connected"
+        task.status = "COMPLETED"
+        task.completed_targets = 1
+        task.connected_targets = 1
+        session.add(
+            AiCallOutboundAttemptModel(
+                id=generate_snowflake_id(),
+                tenant_id="tenant-a",
+                task_id=task.id,
+                target_id=target.id,
+                attempt_no=1,
+                call_id="attempt-provenance-call",
+                dialer_type="mock",
+                test_scenario=None,
+                command_idempotency_key=None,
+                active_slot=None,
+                status="COMPLETED",
+                call_result="connected",
+                error_message=None,
+                line_id=task.line_id,
+                line_code="default-tenant-a",
+                provider_status_code=None,
+                provider_reason=None,
+                hangup_cause=None,
+                started_at=now,
+                ended_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+        task_id = task.id
+
+    async with database() as session:
+        task_out = await service.get_task(session, "tenant-a", task_id)
+        targets, total = await service.list_targets(
+            session,
+            "tenant-a",
+            task_id,
+            page_num=1,
+            page_size=20,
+            phone_number=None,
+            customer_name=None,
+            target_status=None,
+        )
+
+    assert task_out.attempt_dialer_types == ["mock"]
+    assert total == 1
+    assert targets[0].latest_dialer_type == "mock"
 
 
 @pytest.mark.anyio

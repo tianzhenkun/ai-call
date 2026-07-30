@@ -318,7 +318,10 @@ class SipLineService:
                 line.health_message = self._safe_health_message(exc)
             else:
                 line.health_status = "AVAILABLE"
-                line.health_message = "线路配置和 LiveKit API 连接正常"
+                line.health_message = (
+                    "基础配置有效，LiveKit API 可连接；"
+                    "未验证运营商 SIP trunk、号码路由、振铃、媒体或真实通话"
+                )
         line.last_checked_at = checked_at
         line.updated_by = user_id
         line.updated_at = checked_at

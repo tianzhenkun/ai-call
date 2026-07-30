@@ -303,6 +303,10 @@ async def test_preflight_updates_health_without_creating_sip_participant(databas
         await db.commit()
 
     assert result.health_status == "AVAILABLE"
+    assert result.health_message == (
+        "基础配置有效，LiveKit API 可连接；"
+        "未验证运营商 SIP trunk、号码路由、振铃、媒体或真实通话"
+    )
     assert result.last_checked_at is not None
     assert len(checker.configs) == 1
     assert checker.configs[0].trunk_hostname == "127.0.0.1:5089"

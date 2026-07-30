@@ -156,6 +156,12 @@ class CreateTaskResultOut(AcceptedCommandOut):
     task_id: str
 
 
+class OutboundTaskLineSnapshotOut(OutboundSchema):
+    line_id: str
+    line_code: str
+    line_name: str
+
+
 class OutboundTaskOut(OutboundSchema):
     task_id: str
     task_name: str
@@ -165,6 +171,7 @@ class OutboundTaskOut(OutboundSchema):
     completed_targets: int
     connected_targets: int
     failed_targets: int
+    attempt_dialer_types: list[str] = Field(default_factory=list)
     execution_mode: Literal["immediate", "scheduled"]
     scheduled_at: str | None = None
     started_at: str | None = None
@@ -181,6 +188,7 @@ class OutboundTaskOut(OutboundSchema):
     rule_summary: str
     line_id: str | None = None
     line_name: str | None = None
+    line_snapshot: OutboundTaskLineSnapshotOut | None = None
     created_by_name: str | None = None
     created_at: str
     updated_at: str
@@ -195,4 +203,5 @@ class OutboundTargetOut(OutboundSchema):
     status: str
     attempt_count: int
     latest_result: str | None = None
+    latest_dialer_type: str | None = None
     updated_at: str
