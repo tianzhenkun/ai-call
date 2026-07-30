@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import io
@@ -15,7 +14,6 @@ _MAX_SIZE_BYTES = 10 * 1024 * 1024
 _MIN_DURATION_SECONDS = 3
 _MAX_DURATION_SECONDS = 60
 _MIN_SAMPLE_RATE = 24000
-_VOICE_SAMPLE_PREFIX = "ai-call/voice-samples"
 _FORMAT_MISMATCH_MESSAGE = "文件扩展名、音频格式与 Content-Type 不一致"
 
 
@@ -29,19 +27,30 @@ class _AudioFormatRule:
 _AUDIO_FORMATS = {
     ".wav": _AudioFormatRule(
         canonical_content_type="audio/wav",
-        accepted_content_types=frozenset(
-            {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}
-        ),
+        accepted_content_types=frozenset({
+            "audio/wav",
+            "audio/x-wav",
+            "audio/wave",
+            "audio/vnd.wave",
+        }),
         container_mime_types=frozenset({"audio/wav", "audio/x-wav", "audio/wave"}),
     ),
     ".mp3": _AudioFormatRule(
         canonical_content_type="audio/mpeg",
-        accepted_content_types=frozenset(
-            {"audio/mpeg", "audio/mp3", "audio/x-mp3", "audio/mpeg3", "audio/x-mpeg-3"}
-        ),
-        container_mime_types=frozenset(
-            {"audio/mpeg", "audio/mp3", "audio/x-mp3", "audio/mpeg3", "audio/x-mpeg-3"}
-        ),
+        accepted_content_types=frozenset({
+            "audio/mpeg",
+            "audio/mp3",
+            "audio/x-mp3",
+            "audio/mpeg3",
+            "audio/x-mpeg-3",
+        }),
+        container_mime_types=frozenset({
+            "audio/mpeg",
+            "audio/mp3",
+            "audio/x-mp3",
+            "audio/mpeg3",
+            "audio/x-mpeg-3",
+        }),
     ),
     ".m4a": _AudioFormatRule(
         canonical_content_type="audio/mp4",
@@ -67,7 +76,13 @@ class VoiceSampleMetadata:
 
 
 class VoiceSampleStorage(Protocol):
-    async def put(self, *, data: bytes, filename: str, content_type: str) -> str:
+    async def put(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+    ) -> None:
         raise NotImplementedError
 
     async def get(self, object_key: str) -> bytes:
@@ -81,16 +96,19 @@ class MinioVoiceSampleStorage:
     def __init__(self, config: dict) -> None:
         self._config = dict(config)
 
-    async def put(self, *, data: bytes, filename: str, content_type: str) -> str:
-        config = {**self._config, "prefix": _VOICE_SAMPLE_PREFIX}
-        _, object_key = await asyncio.to_thread(
-            MinioUtil.upload,
-            config,
+    async def put(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+    ) -> None:
+        await MinioUtil.put_object(
+            self._config,
+            object_key,
             data,
-            filename,
             content_type,
         )
-        return object_key
 
     async def get(self, object_key: str) -> bytes:
         return await MinioUtil.get_object(self._config, object_key)
@@ -129,9 +147,7 @@ def inspect_sample(
     except VoiceSampleValidationError:
         raise
     except Exception:
-        raise VoiceSampleValidationError(
-            "声音样本文件损坏或格式无法识别"
-        ) from None
+        raise VoiceSampleValidationError("声音样本文件损坏或格式无法识别") from None
 
     if not _MIN_DURATION_SECONDS <= duration_seconds <= _MAX_DURATION_SECONDS:
         raise VoiceSampleValidationError("声音样本时长必须在 3～60 秒之间")
@@ -190,8 +206,7 @@ def _inspect_compressed(
     if isinstance(container_mime_types, str):
         container_mime_types = (container_mime_types,)
     normalized_container_mime_types = {
-        str(value).partition(";")[0].strip().lower()
-        for value in container_mime_types
+        str(value).partition(";")[0].strip().lower() for value in container_mime_types
     }
     if not normalized_container_mime_types.intersection(expected_mime_types):
         raise VoiceSampleValidationError(_FORMAT_MISMATCH_MESSAGE)

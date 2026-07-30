@@ -253,7 +253,7 @@ def test_to_data_url_base64_encodes_audio() -> None:
 
 
 @pytest.mark.anyio
-async def test_minio_storage_uses_private_prefix_and_returns_only_object_key(
+async def test_minio_storage_puts_exact_private_object_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = {
@@ -265,17 +265,14 @@ async def test_minio_storage_uses_private_prefix_and_returns_only_object_key(
     }
     seen: dict[str, object] = {}
 
-    def fake_upload(
+    async def fake_put_object(
         received_config: dict,
+        object_key: str,
         data: bytes,
-        filename: str,
         content_type: str,
-    ) -> tuple[str, str]:
-        seen["put"] = (received_config, data, filename, content_type)
-        return (
-            "https://public.example.com/recov/ai-call/voice-samples/object.wav",
-            "ai-call/voice-samples/object.wav",
-        )
+        **_: object,
+    ) -> None:
+        seen["put"] = (received_config, object_key, data, content_type)
 
     async def fake_get(received_config: dict, object_key: str, **_: object) -> bytes:
         seen["get"] = (received_config, object_key)
@@ -284,23 +281,24 @@ async def test_minio_storage_uses_private_prefix_and_returns_only_object_key(
     async def fake_delete(received_config: dict, object_key: str, **_: object) -> None:
         seen["delete"] = (received_config, object_key)
 
-    monkeypatch.setattr("app.utils.minio_util.MinioUtil.upload", fake_upload)
+    monkeypatch.setattr("app.utils.minio_util.MinioUtil.put_object", fake_put_object)
     monkeypatch.setattr("app.utils.minio_util.MinioUtil.get_object", fake_get)
     monkeypatch.setattr("app.utils.minio_util.MinioUtil.delete_object", fake_delete)
     storage = MinioVoiceSampleStorage(config)
 
-    object_key = await storage.put(
+    object_key = "ai-call/voice-samples/tenant-digest/123.wav"
+    result = await storage.put(
+        object_key=object_key,
         data=b"audio",
-        filename="sample.wav",
         content_type="audio/wav",
     )
     stored = await storage.get(object_key)
     await storage.delete(object_key)
 
-    assert object_key == "ai-call/voice-samples/object.wav"
+    assert result is None
     assert stored == b"stored-audio"
-    upload_config, *upload_args = seen["put"]
-    assert upload_config["prefix"] == "ai-call/voice-samples"
-    assert upload_args == [b"audio", "sample.wav", "audio/wav"]
+    put_config, *put_args = seen["put"]
+    assert put_config == config
+    assert put_args == [object_key, b"audio", "audio/wav"]
     assert seen["get"][1] == object_key
     assert seen["delete"][1] == object_key

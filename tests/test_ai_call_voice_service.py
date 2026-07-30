@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import wave
 from contextlib import asynccontextmanager
@@ -48,15 +49,14 @@ class FakeVoiceSampleStorage:
         self.put_calls: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
 
-    async def put(self, *, data: bytes, filename: str, content_type: str) -> str:
+    async def put(self, *, object_key: str, data: bytes, content_type: str) -> None:
         self.put_calls.append({
+            "object_key": object_key,
             "data": data,
-            "filename": filename,
             "content_type": content_type,
         })
         if self.put_error is not None:
             raise self.put_error
-        return f"private/sample-{len(self.put_calls)}"
 
     async def get(self, object_key: str) -> bytes:
         raise NotImplementedError
@@ -73,15 +73,14 @@ class BlockingVoiceSampleStorage(FakeVoiceSampleStorage):
         self.first_put_started = asyncio.Event()
         self.release_put = asyncio.Event()
 
-    async def put(self, *, data: bytes, filename: str, content_type: str) -> str:
+    async def put(self, *, object_key: str, data: bytes, content_type: str) -> None:
         self.put_calls.append({
+            "object_key": object_key,
             "data": data,
-            "filename": filename,
             "content_type": content_type,
         })
         self.first_put_started.set()
         await self.release_put.wait()
-        return f"private/sample-{len(self.put_calls)}"
 
 
 class SequenceIds:
@@ -173,6 +172,7 @@ def _voice_service(
     session_factory: async_sessionmaker,
     *,
     ids: tuple[int, ...] = (101, 102),
+    cleanup_ids: tuple[int, ...] = (901, 902),
 ) -> VoiceEnrollmentService:
     return VoiceEnrollmentService(
         storage=storage,
@@ -180,7 +180,13 @@ def _voice_service(
         target_model=TARGET_MODEL,
         now=lambda: NOW,
         id_generator=SequenceIds(*ids),
+        cleanup_id_generator=SequenceIds(*cleanup_ids),
     )
+
+
+def _sample_key(tenant_id: str, enrollment_id: int, extension: str = ".wav") -> str:
+    tenant_digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
+    return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}{extension}"
 
 
 @pytest.fixture
@@ -813,7 +819,7 @@ async def test_create_persists_normalized_profile_and_enrollment(enrollment_data
         factory,
         ids=(123456789012345678, 223456789012345678),
     )
-    sample = _upload()
+    sample = _upload(filename="../../tenant-a-secret.wav")
     await sample.read(7)
 
     async with factory() as database:
@@ -858,7 +864,14 @@ async def test_create_persists_normalized_profile_and_enrollment(enrollment_data
     assert enrollment.created_at.replace(tzinfo=timezone.utc) == NOW
     assert enrollment.request_hash
     assert enrollment.sample_sha256
-    assert enrollment.sample_object_key == "private/sample-1"
+    assert enrollment.sample_object_key == _sample_key(
+        "tenant-a",
+        223456789012345678,
+    )
+    assert "tenant-a" not in enrollment.sample_object_key
+    assert "secret" not in enrollment.sample_object_key
+    assert ".." not in enrollment.sample_object_key
+    assert storage.put_calls[0]["object_key"] == enrollment.sample_object_key
     assert storage.put_calls[0]["content_type"] == "audio/wav"
 
 
@@ -1049,7 +1062,9 @@ async def test_create_reads_from_start_with_hard_size_limit(enrollment_database)
 
 
 @pytest.mark.anyio
-async def test_create_upload_failure_leaves_database_empty(enrollment_database) -> None:
+async def test_create_write_then_raise_upload_deletes_known_key(
+    enrollment_database,
+) -> None:
     _engine, factory = enrollment_database
     storage = FakeVoiceSampleStorage(put_error=RuntimeError("secret storage credential"))
     service = _voice_service(storage, factory)
@@ -1069,6 +1084,8 @@ async def test_create_upload_failure_leaves_database_empty(enrollment_database) 
         assert await database.scalar(select(AiCallTenantVoiceProfileModel)) is None
         assert await database.scalar(select(AiCallVoiceEnrollmentModel)) is None
     assert caught.value.status_code == 502
+    assert len(storage.put_calls) == 1
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
     assert "secret" not in str(caught.value).lower()
     assert _exception_chain(caught.value) == [caught.value]
 
@@ -1132,13 +1149,130 @@ async def test_create_commit_failure_rolls_back_and_deletes_uploaded_sample(
         assert await database.scalar(select(AiCallTenantVoiceProfileModel)) is None
         assert await database.scalar(select(AiCallVoiceEnrollmentModel)) is None
     assert caught.value.status_code == 500
-    assert storage.delete_calls == ["private/sample-1"]
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
     assert "secret" not in str(caught.value).lower()
     assert _exception_chain(caught.value) == [caught.value]
 
 
 @pytest.mark.anyio
-async def test_create_post_upload_setup_failure_deletes_uploaded_sample(
+async def test_create_flush_failure_rolls_back_and_deletes_uploaded_sample(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, factory)
+
+    async with factory() as database:
+
+        async def fail_flush(*_args, **_kwargs) -> None:
+            raise RuntimeError("database secret")
+
+        monkeypatch.setattr(database, "flush", fail_flush)
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    async with factory() as database:
+        assert await database.scalar(select(AiCallTenantVoiceProfileModel)) is None
+        assert await database.scalar(select(AiCallVoiceEnrollmentModel)) is None
+    assert caught.value.status_code == 500
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
+    assert _exception_chain(caught.value) == [caught.value]
+
+
+@pytest.mark.anyio
+async def test_create_commit_then_raise_reconciles_persisted_winner_without_delete(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, factory)
+
+    async with factory() as database:
+        real_commit = database.commit
+
+        async def commit_then_raise() -> None:
+            await real_commit()
+            raise RuntimeError("connection lost after commit")
+
+        monkeypatch.setattr(database, "commit", commit_then_raise)
+        accepted = await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key="key-1",
+            request=_enrollment_request(),
+            sample=_upload(),
+        )
+
+    async with factory() as database:
+        enrollment = await database.scalar(select(AiCallVoiceEnrollmentModel))
+    assert enrollment is not None
+    assert accepted.enrollment_id == str(enrollment.id)
+    assert storage.delete_calls == []
+
+
+@pytest.mark.anyio
+async def test_create_commit_reconciliation_failure_keeps_sample_and_writes_cleanup(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    factory_calls = 0
+
+    @asynccontextmanager
+    async def fail_reconcile_once():
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            raise RuntimeError("reconciliation unavailable")
+        async with factory() as cleanup_db:
+            yield cleanup_db
+
+    service = VoiceEnrollmentService(
+        storage=storage,
+        cleanup_session_factory=fail_reconcile_once,
+        target_model=TARGET_MODEL,
+        now=lambda: NOW,
+        id_generator=SequenceIds(101, 102),
+        cleanup_id_generator=SequenceIds(901),
+    )
+
+    async with factory() as database:
+
+        async def fail_commit() -> None:
+            raise RuntimeError("commit result unknown")
+
+        monkeypatch.setattr(database, "commit", fail_commit)
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    async with factory() as database:
+        cleanup = await database.scalar(select(AiCallVoiceSampleCleanupModel))
+    assert caught.value.status_code == 500
+    assert storage.delete_calls == []
+    assert cleanup is not None
+    assert cleanup.object_key == _sample_key("tenant-a", 102)
+
+
+@pytest.mark.anyio
+async def test_create_id_generation_failure_happens_before_upload(
     enrollment_database,
 ) -> None:
     _engine, factory = enrollment_database
@@ -1167,7 +1301,8 @@ async def test_create_post_upload_setup_failure_deletes_uploaded_sample(
             )
 
     assert caught.value.status_code == 500
-    assert storage.delete_calls == ["private/sample-1"]
+    assert storage.put_calls == []
+    assert storage.delete_calls == []
     assert "secret" not in str(caught.value).lower()
 
 
@@ -1206,7 +1341,7 @@ async def test_create_cleanup_failure_is_redacted(
 
     assert cleanup is not None
     assert cleanup.tenant_id == "tenant-a"
-    assert cleanup.object_key == "private/sample-1"
+    assert cleanup.object_key == _sample_key("tenant-a", 102)
     assert cleanup.status == "PENDING"
     assert cleanup.attempt_count == 0
     assert cleanup.next_retry_at is None
@@ -1215,7 +1350,7 @@ async def test_create_cleanup_failure_is_redacted(
     rendered = " ".join(warnings + [str(caught.value), cleanup.error_message])
     assert "secret" not in rendered.lower()
     assert "sensitive" not in rendered.lower()
-    assert "private/sample-1" not in rendered
+    assert _sample_key("tenant-a", 102) not in rendered
     assert _exception_chain(caught.value) == [caught.value]
 
 
@@ -1272,8 +1407,127 @@ async def test_cleanup_compensation_persistence_failure_only_logs_safe_constant(
     rendered = " ".join(warnings + [str(caught.value)])
     assert "secret" not in rendered.lower()
     assert "sensitive" not in rendered.lower()
-    assert "private/sample-1" not in rendered
+    assert _sample_key("tenant-a", 102) not in rendered
     assert _exception_chain(caught.value) == [caught.value]
+
+
+@pytest.mark.anyio
+async def test_cleanup_primary_key_collision_retries_with_new_id(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    existing_key = "ai-call/voice-samples/existing/1.wav"
+    target_key = "ai-call/voice-samples/target/2.wav"
+    async with factory() as database:
+        database.add(
+            AiCallVoiceSampleCleanupModel(
+                id=901,
+                tenant_id="tenant-a",
+                object_key=existing_key,
+                status="PENDING",
+                attempt_count=0,
+                next_retry_at=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                error_message="existing",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        await database.commit()
+
+    service = _voice_service(
+        FakeVoiceSampleStorage(),
+        factory,
+        cleanup_ids=(901, 902),
+    )
+    await service._persist_cleanup_compensation(
+        tenant_id="tenant-a",
+        object_key=target_key,
+    )
+
+    async with factory() as database:
+        rows = (
+            (
+                await database.execute(
+                    select(AiCallVoiceSampleCleanupModel).order_by(AiCallVoiceSampleCleanupModel.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(row.id, row.object_key) for row in rows] == [
+        (901, existing_key),
+        (902, target_key),
+    ]
+
+
+@pytest.mark.anyio
+async def test_cleanup_object_key_duplicate_is_treated_as_existing_compensation(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    object_key = "ai-call/voice-samples/target/2.wav"
+    async with factory() as database:
+        database.add(
+            AiCallVoiceSampleCleanupModel(
+                id=901,
+                tenant_id="tenant-a",
+                object_key=object_key,
+                status="PENDING",
+                attempt_count=0,
+                next_retry_at=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                error_message="existing",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        await database.commit()
+
+    service = _voice_service(
+        FakeVoiceSampleStorage(),
+        factory,
+        cleanup_ids=(902,),
+    )
+    await service._persist_cleanup_compensation(
+        tenant_id="tenant-a",
+        object_key=object_key,
+    )
+
+    async with factory() as database:
+        rows = (await database.execute(select(AiCallVoiceSampleCleanupModel))).scalars().all()
+    assert [(row.id, row.object_key) for row in rows] == [(901, object_key)]
+
+
+@pytest.mark.anyio
+async def test_create_integrity_failure_without_idempotent_winner_returns_500(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, factory)
+
+    async with factory() as database:
+
+        async def fail_flush(*_args, **_kwargs) -> None:
+            raise IntegrityError("insert", {}, RuntimeError("primary-key collision"))
+
+        monkeypatch.setattr(database, "flush", fail_flush)
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    assert caught.value.status_code == 500
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
 
 
 @pytest.mark.parametrize("winner_hash_matches", [True, False])
@@ -1368,7 +1622,7 @@ async def test_create_recovers_unique_race_from_persisted_winner(
                 )
             assert caught.value.status_code == 409
 
-    assert storage.delete_calls == ["private/sample-1"]
+    assert storage.delete_calls == [_sample_key("tenant-a", 102)]
 
 
 @pytest.mark.anyio
@@ -1415,7 +1669,55 @@ async def test_reenroll_concurrent_different_keys_only_one_is_accepted(
     assert len(accepted) == 1
     assert len(rejected) == 1
     assert rejected[0].status_code == 409
-    assert len(storage.put_calls) == 1
+    assert len(storage.put_calls) == 2
+    assert len(storage.delete_calls) == 1
+    async with factory() as database:
+        enrollments = (await database.execute(select(AiCallVoiceEnrollmentModel))).scalars().all()
+    assert len(enrollments) == 1
+
+
+@pytest.mark.anyio
+async def test_reenroll_concurrent_same_key_returns_persisted_winner_to_both(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = BlockingVoiceSampleStorage()
+    async with factory() as database:
+        database.add(
+            _tenant_voice(
+                profile_id=101,
+                tenant_id="tenant-a",
+                voice=None,
+                status="CREATE_FAILED",
+            )
+        )
+        await database.commit()
+
+    first_service = _voice_service(storage, factory, ids=(201,))
+    second_service = _voice_service(storage, factory, ids=(301,))
+
+    async def submit(service: VoiceEnrollmentService):
+        async with factory() as database:
+            return await service.reenroll(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=101,
+                idempotency_key="same-key",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    first_task = asyncio.create_task(submit(first_service))
+    await asyncio.wait_for(storage.first_put_started.wait(), timeout=1)
+    second_task = asyncio.create_task(submit(second_service))
+    await asyncio.sleep(0.05)
+    storage.release_put.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first == second
+    assert len(storage.put_calls) == 2
+    assert len(storage.delete_calls) == 1
     async with factory() as database:
         enrollments = (await database.execute(select(AiCallVoiceEnrollmentModel))).scalars().all()
     assert len(enrollments) == 1

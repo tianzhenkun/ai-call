@@ -142,6 +142,85 @@ def _expected_authorization(request: httpx.Request, *, secret_key: str) -> str:
     )
 
 
+def _expected_put_authorization(request: httpx.Request, *, secret_key: str) -> str:
+    amz_date = request.headers["x-amz-date"]
+    date_stamp = amz_date[:8]
+    region = "cn-north-1"
+    payload_hash = hashlib.sha256(request.content).hexdigest()
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    canonical_headers = (
+        f"content-type:{request.headers['content-type']}\n"
+        f"host:{request.headers['host']}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    canonical_request = "\n".join(
+        [
+            request.method,
+            request.url.raw_path.decode("ascii"),
+            "",
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+    signing_key = _test_hmac_sha256(f"AWS4{secret_key}".encode(), date_stamp)
+    signing_key = _test_hmac_sha256(signing_key, region)
+    signing_key = _test_hmac_sha256(signing_key, "s3")
+    signing_key = _test_hmac_sha256(signing_key, "aws4_request")
+    signature = hmac.new(
+        signing_key,
+        string_to_sign.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return (
+        f"AWS4-HMAC-SHA256 Credential=public-key/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+
+@pytest.mark.anyio
+async def test_put_object_uses_exact_key_body_content_type_and_sigv4() -> None:
+    requests: list[httpx.Request] = []
+    object_key = "ai-call/voice-samples/tenant-digest/123.wav"
+    signed_at = dt.datetime(2026, 7, 30, 1, 2, 3, tzinfo=dt.timezone.utc)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    await MinioUtil.put_object(
+        _private_object_config(),
+        object_key,
+        b"sample-body",
+        "audio/wav",
+        transport=httpx.MockTransport(handler),
+        now=signed_at,
+    )
+
+    request = requests[0]
+    assert request.method == "PUT"
+    assert request.url.path == f"/recov/{object_key}"
+    assert request.content == b"sample-body"
+    assert request.headers["content-type"] == "audio/wav"
+    assert request.headers["x-amz-content-sha256"] == hashlib.sha256(
+        b"sample-body"
+    ).hexdigest()
+    assert request.headers["authorization"] == _expected_put_authorization(
+        request,
+        secret_key="private-secret",
+    )
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("method_name", "http_method"),

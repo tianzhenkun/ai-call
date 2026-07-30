@@ -4,7 +4,9 @@ import hashlib
 import json
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Never
 
 from fastapi import UploadFile, status
 from sqlalchemy import select, update
@@ -32,10 +34,22 @@ MAX_SAMPLE_BYTES = 10 * 1024 * 1024
 PROVIDER = "aliyun_qwen"
 CLEANUP_ERROR_MESSAGE = "即时删除声音样本失败，等待后台重试"
 CLEANUP_PERSISTENCE_LOG = "音色样本清理补偿持久化失败，需人工检查后台回收"
+SAMPLE_EXTENSION_BY_CONTENT_TYPE = {
+    "audio/wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+}
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+@dataclass(frozen=True)
+class _Reconciliation:
+    state: str
+    accepted: VoiceEnrollmentAcceptedOut | None = None
+    sample_object_key: str | None = None
 
 
 class VoiceEnrollmentService:
@@ -52,12 +66,14 @@ class VoiceEnrollmentService:
         target_model: str,
         now: Callable[[], datetime] = _utc_now,
         id_generator: Callable[[], int] = generate_snowflake_id,
+        cleanup_id_generator: Callable[[], int] = generate_snowflake_id,
     ) -> None:
         self.storage = storage
         self.cleanup_session_factory = cleanup_session_factory
         self.target_model = target_model
         self.now = now
         self.id_generator = id_generator
+        self.cleanup_id_generator = cleanup_id_generator
 
     async def create(
         self,
@@ -125,18 +141,14 @@ class VoiceEnrollmentService:
 
         data, metadata = await self._read_and_inspect(sample)
         request_hash = self._request_hash(request, metadata.sha256)
-        initial_lookup_failed = False
-        existing = None
-        try:
-            existing = await self._find_enrollment(db, tenant_id, command_key)
-        except Exception:
-            initial_lookup_failed = True
-        if initial_lookup_failed:
+        existing, lookup_failed = await self._lookup_enrollment(
+            db,
+            tenant_id,
+            command_key,
+        )
+        if lookup_failed:
             await self._safe_rollback(db)
-            raise CustomException(
-                msg="音色复刻任务受理失败，请稍后重试",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            self._raise_persistence_failure()
         if existing is not None:
             return await self._resolve_idempotent(
                 db,
@@ -146,19 +158,16 @@ class VoiceEnrollmentService:
                 expected_profile_id=existing_profile_id,
             )
 
-        profile: AiCallTenantVoiceProfileModel | None = None
+        profile_id: int | None = existing_profile_id
         if existing_profile_id is not None:
-            profile_lookup_failed = False
-            try:
-                profile = await self._find_profile(db, tenant_id, existing_profile_id)
-            except Exception:
-                profile_lookup_failed = True
+            profile, profile_lookup_failed = await self._lookup_profile(
+                db,
+                tenant_id,
+                existing_profile_id,
+            )
             if profile_lookup_failed:
                 await self._safe_rollback(db)
-                raise CustomException(
-                    msg="音色复刻任务受理失败，请稍后重试",
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
+                self._raise_persistence_failure()
             if profile is None:
                 raise CustomException(
                     msg="音色资产不存在",
@@ -170,116 +179,219 @@ class VoiceEnrollmentService:
                     status_code=status.HTTP_409_CONFLICT,
                 )
 
-            reservation_failed = False
-            reserved = False
-            try:
-                reserved = await self._reserve_failed_profile(
-                    db,
-                    tenant_id=tenant_id,
-                    profile_id=existing_profile_id,
-                    request=request,
-                )
-            except Exception:
-                reservation_failed = True
-            if reservation_failed:
-                await self._safe_rollback(db)
-                raise CustomException(
-                    msg="音色复刻任务受理失败，请稍后重试",
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-            if not reserved:
-                await self._safe_rollback(db)
-                raise CustomException(
-                    msg="只有创建失败的音色可以重新上传",
-                    status_code=status.HTTP_409_CONFLICT,
-                )
+        await self._safe_rollback(db)
 
-        upload_failed = False
-        object_key = ""
-        try:
-            object_key = await self.storage.put(
-                data=data,
-                filename=metadata.filename,
-                content_type=metadata.content_type,
+        generated_ids = self._generate_ids(profile_id)
+        if generated_ids is None:
+            self._raise_persistence_failure()
+        profile_id, enrollment_id = generated_ids
+
+        object_key = self._sample_object_key(
+            tenant_id=tenant_id,
+            enrollment_id=enrollment_id,
+            content_type=metadata.content_type,
+        )
+        uploaded = await self._put_sample(
+            object_key=object_key,
+            data=data,
+            content_type=metadata.content_type,
+        )
+        if not uploaded:
+            await self._delete_uploaded_sample(
+                tenant_id=tenant_id,
+                object_key=object_key,
             )
-        except Exception:
-            upload_failed = True
-        if upload_failed:
-            await self._safe_rollback(db)
             raise CustomException(
                 msg="声音样本暂存失败，请稍后重试",
                 status_code=status.HTTP_502_BAD_GATEWAY,
             )
 
-        integrity_failed = False
-        persistence_failed = False
+        if existing_profile_id is not None:
+            reserved, reservation_failed = await self._reserve_profile(
+                db,
+                tenant_id=tenant_id,
+                profile_id=existing_profile_id,
+                enrollment_id=enrollment_id,
+                request=request,
+            )
+            if reservation_failed:
+                await self._safe_rollback(db)
+                await self._delete_uploaded_sample(
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+                self._raise_persistence_failure()
+            if not reserved:
+                await self._safe_rollback(db)
+                await self._delete_uploaded_sample(
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+                reconciled = await self._reconcile_enrollment(
+                    tenant_id=tenant_id,
+                    command_key=command_key,
+                    request_hash=request_hash,
+                    expected_profile_id=existing_profile_id,
+                )
+                if reconciled.state == "accepted":
+                    return self._accepted_result(reconciled)
+                if reconciled.state == "failed":
+                    self._raise_persistence_failure()
+                raise CustomException(
+                    msg="只有创建失败的音色可以重新上传",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+
+        flush_state = await self._stage_and_flush(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            command_key=command_key,
+            request=request,
+            request_hash=request_hash,
+            sample_object_key=object_key,
+            sample_sha256=metadata.sha256,
+            profile_id=profile_id,
+            enrollment_id=enrollment_id,
+            create_profile=existing_profile_id is None,
+        )
+        if flush_state != "success":
+            await self._safe_rollback(db)
+            reconciled = await self._reconcile_enrollment(
+                tenant_id=tenant_id,
+                command_key=command_key,
+                request_hash=request_hash,
+                expected_profile_id=existing_profile_id,
+            )
+            await self._delete_if_not_referenced(
+                reconciled=reconciled,
+                tenant_id=tenant_id,
+                object_key=object_key,
+            )
+            if flush_state == "integrity" and reconciled.state == "accepted":
+                return self._accepted_result(reconciled)
+            if flush_state == "integrity" and reconciled.state == "conflict":
+                raise CustomException(
+                    msg="Idempotency-Key 已用于不同请求",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            self._raise_persistence_failure()
+
+        if not await self._commit(db):
+            await self._safe_rollback(db)
+            reconciled = await self._reconcile_enrollment(
+                tenant_id=tenant_id,
+                command_key=command_key,
+                request_hash=request_hash,
+                expected_profile_id=existing_profile_id,
+            )
+            if reconciled.state == "accepted":
+                await self._delete_if_not_referenced(
+                    reconciled=reconciled,
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+                return self._accepted_result(reconciled)
+            if reconciled.state == "conflict":
+                await self._delete_if_not_referenced(
+                    reconciled=reconciled,
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+                raise CustomException(
+                    msg="Idempotency-Key 已用于不同请求",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            if reconciled.state == "missing":
+                await self._delete_uploaded_sample(
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+            else:
+                await self._persist_cleanup_compensation(
+                    tenant_id=tenant_id,
+                    object_key=object_key,
+                )
+            self._raise_persistence_failure()
+
+        return VoiceEnrollmentAcceptedOut(
+            voice_profile_id=profile_id,
+            enrollment_id=enrollment_id,
+            status="CREATING",
+            display_name=request.display_name,
+        )
+
+    def _generate_ids(
+        self,
+        profile_id: int | None,
+    ) -> tuple[int, int] | None:
         try:
-            profile_id, enrollment_id, profile = self._stage_enrollment(
+            generated_profile_id = profile_id if profile_id is not None else self.id_generator()
+            enrollment_id = self.id_generator()
+        except Exception:
+            return None
+        return generated_profile_id, enrollment_id
+
+    async def _put_sample(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+    ) -> bool:
+        try:
+            await self.storage.put(
+                object_key=object_key,
+                data=data,
+                content_type=content_type,
+            )
+        except Exception:
+            return False
+        return True
+
+    async def _stage_and_flush(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        user_id: int,
+        command_key: str,
+        request: VoiceEnrollmentRequest,
+        request_hash: str,
+        sample_object_key: str,
+        sample_sha256: str,
+        profile_id: int,
+        enrollment_id: int,
+        create_profile: bool,
+    ) -> str:
+        try:
+            self._stage_enrollment(
                 db,
                 tenant_id=tenant_id,
                 user_id=user_id,
                 command_key=command_key,
                 request=request,
                 request_hash=request_hash,
-                sample_object_key=object_key,
-                sample_sha256=metadata.sha256,
-                profile=profile,
+                sample_object_key=sample_object_key,
+                sample_sha256=sample_sha256,
+                profile_id=profile_id,
+                enrollment_id=enrollment_id,
+                create_profile=create_profile,
             )
             await db.flush()
-            await db.commit()
         except IntegrityError:
-            integrity_failed = True
+            return "integrity"
         except Exception:
-            persistence_failed = True
+            return "failed"
+        return "success"
 
-        if integrity_failed:
-            await self._safe_rollback(db)
-            await self._delete_uploaded_sample(
-                tenant_id=tenant_id,
-                object_key=object_key,
-            )
-            winner_lookup_failed = False
-            winner = None
-            try:
-                winner = await self._find_enrollment(db, tenant_id, command_key)
-            except Exception:
-                winner_lookup_failed = True
-            if winner is not None:
-                return await self._resolve_idempotent(
-                    db,
-                    tenant_id=tenant_id,
-                    enrollment=winner,
-                    request_hash=request_hash,
-                    expected_profile_id=existing_profile_id,
-                )
-            if winner_lookup_failed:
-                await self._safe_rollback(db)
-                raise CustomException(
-                    msg="音色复刻任务受理失败，请稍后重试",
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-            raise CustomException(
-                msg="幂等请求发生冲突，请重试",
-                status_code=status.HTTP_409_CONFLICT,
-            )
-
-        if persistence_failed:
-            await self._safe_rollback(db)
-            await self._delete_uploaded_sample(
-                tenant_id=tenant_id,
-                object_key=object_key,
-            )
-            raise CustomException(
-                msg="音色复刻任务受理失败，请稍后重试",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        return VoiceEnrollmentAcceptedOut(
-            voice_profile_id=profile_id,
-            enrollment_id=enrollment_id,
-            status="CREATING",
-            display_name=profile.display_name,
-        )
+    @staticmethod
+    async def _commit(db: AsyncSession) -> bool:
+        try:
+            await db.commit()
+        except Exception:
+            return False
+        return True
 
     def _stage_enrollment(
         self,
@@ -292,11 +404,12 @@ class VoiceEnrollmentService:
         request_hash: str,
         sample_object_key: str,
         sample_sha256: str,
-        profile: AiCallTenantVoiceProfileModel | None,
-    ) -> tuple[int, int, AiCallTenantVoiceProfileModel]:
+        profile_id: int,
+        enrollment_id: int,
+        create_profile: bool,
+    ) -> None:
         now = self.now()
-        if profile is None:
-            profile_id = self.id_generator()
+        if create_profile:
             profile = AiCallTenantVoiceProfileModel(
                 id=profile_id,
                 tenant_id=tenant_id,
@@ -318,16 +431,7 @@ class VoiceEnrollmentService:
                 updated_at=now,
             )
             db.add(profile)
-        else:
-            profile_id = profile.id
-            profile.display_name = request.display_name
-            profile.gender = request.gender
-            profile.language = request.language
-            profile.status = "CREATING"
-            profile.error_message = None
-            profile.updated_at = now
 
-        enrollment_id = self.id_generator()
         enrollment = AiCallVoiceEnrollmentModel(
             id=enrollment_id,
             tenant_id=tenant_id,
@@ -356,8 +460,8 @@ class VoiceEnrollmentService:
             updated_at=now,
         )
         db.add(enrollment)
-        profile.latest_enrollment_id = enrollment_id
-        return profile_id, enrollment_id, profile
+        if create_profile:
+            profile.latest_enrollment_id = enrollment_id
 
     async def _reserve_failed_profile(
         self,
@@ -365,6 +469,7 @@ class VoiceEnrollmentService:
         *,
         tenant_id: str,
         profile_id: int,
+        enrollment_id: int,
         request: VoiceEnrollmentRequest,
     ) -> bool:
         result = await db.execute(
@@ -379,12 +484,69 @@ class VoiceEnrollmentService:
                 gender=request.gender,
                 language=request.language,
                 status="CREATING",
+                latest_enrollment_id=enrollment_id,
                 error_message=None,
                 updated_at=self.now(),
             )
             .execution_options(synchronize_session=False)
         )
         return result.rowcount == 1
+
+    async def _reserve_profile(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        enrollment_id: int,
+        request: VoiceEnrollmentRequest,
+    ) -> tuple[bool, bool]:
+        try:
+            reserved = await self._reserve_failed_profile(
+                db,
+                tenant_id=tenant_id,
+                profile_id=profile_id,
+                enrollment_id=enrollment_id,
+                request=request,
+            )
+        except Exception:
+            return False, True
+        return reserved, False
+
+    async def _lookup_enrollment(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        command_key: str,
+    ) -> tuple[AiCallVoiceEnrollmentModel | None, bool]:
+        try:
+            enrollment = await self._find_enrollment(db, tenant_id, command_key)
+        except Exception:
+            return None, True
+        return enrollment, False
+
+    async def _lookup_profile(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        profile_id: int,
+    ) -> tuple[AiCallTenantVoiceProfileModel | None, bool]:
+        try:
+            profile = await self._find_profile(db, tenant_id, profile_id)
+        except Exception:
+            return None, True
+        return profile, False
+
+    @staticmethod
+    def _sample_object_key(
+        *,
+        tenant_id: str,
+        enrollment_id: int,
+        content_type: str,
+    ) -> str:
+        tenant_digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
+        extension = SAMPLE_EXTENSION_BY_CONTENT_TYPE[content_type]
+        return f"ai-call/voice-samples/{tenant_digest}/{enrollment_id}{extension}"
 
     async def _read_and_inspect(
         self,
@@ -520,6 +682,73 @@ class VoiceEnrollmentService:
             display_name=profile.display_name,
         )
 
+    async def _reconcile_enrollment(
+        self,
+        *,
+        tenant_id: str,
+        command_key: str,
+        request_hash: str,
+        expected_profile_id: int | None,
+    ) -> _Reconciliation:
+        failed = False
+        enrollment: AiCallVoiceEnrollmentModel | None = None
+        profile: AiCallTenantVoiceProfileModel | None = None
+        try:
+            async with self.cleanup_session_factory() as reconcile_db:
+                enrollment = await self._find_enrollment(
+                    reconcile_db,
+                    tenant_id,
+                    command_key,
+                )
+                if enrollment is not None:
+                    profile = await self._find_profile(
+                        reconcile_db,
+                        tenant_id,
+                        enrollment.voice_profile_id,
+                    )
+        except Exception:
+            failed = True
+        if failed:
+            return _Reconciliation(state="failed")
+        if enrollment is None:
+            return _Reconciliation(state="missing")
+        if enrollment.request_hash != request_hash or (
+            expected_profile_id is not None and enrollment.voice_profile_id != expected_profile_id
+        ):
+            return _Reconciliation(
+                state="conflict",
+                sample_object_key=enrollment.sample_object_key,
+            )
+        if profile is None:
+            return _Reconciliation(
+                state="failed",
+                sample_object_key=enrollment.sample_object_key,
+            )
+        return _Reconciliation(
+            state="accepted",
+            accepted=VoiceEnrollmentAcceptedOut(
+                voice_profile_id=profile.id,
+                enrollment_id=enrollment.id,
+                status="CREATING",
+                display_name=profile.display_name,
+            ),
+            sample_object_key=enrollment.sample_object_key,
+        )
+
+    async def _delete_if_not_referenced(
+        self,
+        *,
+        reconciled: _Reconciliation,
+        tenant_id: str,
+        object_key: str,
+    ) -> None:
+        if reconciled.sample_object_key == object_key:
+            return
+        await self._delete_uploaded_sample(
+            tenant_id=tenant_id,
+            object_key=object_key,
+        )
+
     async def _delete_uploaded_sample(
         self,
         *,
@@ -543,14 +772,38 @@ class VoiceEnrollmentService:
         tenant_id: str,
         object_key: str,
     ) -> None:
-        persistence_failed = False
+        for _attempt in range(2):
+            outcome = await self._try_persist_cleanup(
+                tenant_id=tenant_id,
+                object_key=object_key,
+            )
+            if outcome == "success":
+                return
+            if outcome != "integrity":
+                log.warning(CLEANUP_PERSISTENCE_LOG)
+                return
+            exists = await self._cleanup_exists(object_key)
+            if exists is True:
+                return
+            if exists is None:
+                log.warning(CLEANUP_PERSISTENCE_LOG)
+                return
+        log.warning(CLEANUP_PERSISTENCE_LOG)
+
+    async def _try_persist_cleanup(
+        self,
+        *,
+        tenant_id: str,
+        object_key: str,
+    ) -> str:
         cleanup_db: AsyncSession | None = None
+        outcome = "success"
         try:
             async with self.cleanup_session_factory() as cleanup_db:
                 now = self.now()
                 cleanup_db.add(
                     AiCallVoiceSampleCleanupModel(
-                        id=self.id_generator(),
+                        id=self.cleanup_id_generator(),
                         tenant_id=tenant_id,
                         object_key=object_key,
                         status="PENDING",
@@ -566,14 +819,44 @@ class VoiceEnrollmentService:
                 await cleanup_db.flush()
                 await cleanup_db.commit()
         except IntegrityError:
-            if cleanup_db is not None:
-                await self._safe_rollback(cleanup_db)
+            outcome = "integrity"
         except Exception:
-            persistence_failed = True
-            if cleanup_db is not None:
-                await self._safe_rollback(cleanup_db)
-        if persistence_failed:
-            log.warning(CLEANUP_PERSISTENCE_LOG)
+            outcome = "failed"
+        if outcome != "success" and cleanup_db is not None:
+            await self._safe_rollback(cleanup_db)
+        return outcome
+
+    async def _cleanup_exists(self, object_key: str) -> bool | None:
+        failed = False
+        existing: AiCallVoiceSampleCleanupModel | None = None
+        try:
+            async with self.cleanup_session_factory() as cleanup_db:
+                existing = await cleanup_db.scalar(
+                    select(AiCallVoiceSampleCleanupModel)
+                    .where(AiCallVoiceSampleCleanupModel.object_key == object_key)
+                    .limit(1)
+                )
+        except Exception:
+            failed = True
+        if failed:
+            return None
+        return existing is not None
+
+    @staticmethod
+    def _raise_persistence_failure() -> Never:
+        raise CustomException(
+            msg="音色复刻任务受理失败，请稍后重试",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    @classmethod
+    def _accepted_result(
+        cls,
+        reconciled: _Reconciliation,
+    ) -> VoiceEnrollmentAcceptedOut:
+        if reconciled.accepted is None:
+            cls._raise_persistence_failure()
+        return reconciled.accepted
 
     @staticmethod
     async def _safe_rollback(db: AsyncSession) -> None:

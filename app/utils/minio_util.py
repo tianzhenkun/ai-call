@@ -240,6 +240,38 @@ class MinioUtil:
         raise CustomException(msg=failure_message, code=RET.SERVERERR.code)
 
     @classmethod
+    async def put_object(
+        cls,
+        config: dict,
+        object_name: str,
+        data: bytes,
+        content_type: str,
+        *,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """使用调用方给定的精确对象键上传私有对象。"""
+        try:
+            await cls._signed_request(
+                "PUT",
+                config,
+                object_name,
+                data=data,
+                content_type=content_type,
+                timeout=timeout,
+                transport=transport,
+                now=now,
+            )
+        except httpx.HTTPStatusError as error:
+            failure_message = f"MinIO上传对象失败: HTTP {error.response.status_code}"
+        except httpx.HTTPError:
+            failure_message = "MinIO上传对象失败: 网络请求异常"
+        else:
+            return
+        raise CustomException(msg=failure_message, code=RET.SERVERERR.code)
+
+    @classmethod
     async def delete_object(
         cls,
         config: dict,
@@ -278,6 +310,30 @@ class MinioUtil:
         transport: httpx.AsyncBaseTransport | None,
         now: datetime | None,
     ) -> httpx.Response:
+        return await cls._signed_request(
+            method,
+            config,
+            object_name,
+            data=b"",
+            content_type=None,
+            timeout=timeout,
+            transport=transport,
+            now=now,
+        )
+
+    @classmethod
+    async def _signed_request(
+        cls,
+        method: str,
+        config: dict,
+        object_name: str,
+        *,
+        data: bytes,
+        content_type: str | None,
+        timeout: float,
+        transport: httpx.AsyncBaseTransport | None,
+        now: datetime | None,
+    ) -> httpx.Response:
         endpoint_base, _ = cls._endpoint_base_and_host(config)
         bucket = str(config["bucket_name"]).strip("/")
         object_path = object_name.lstrip("/")
@@ -287,19 +343,21 @@ class MinioUtil:
         object_url = (
             f"{endpoint_base}/{bucket}/{quote(object_path, safe='/')}"
         )
-        request = httpx.Request(method, object_url)
+        request = httpx.Request(method, object_url, content=data)
         host = request.headers["host"]
         canonical_uri = request.url.raw_path.decode("ascii")
 
         signed_at = now or datetime.now(timezone.utc)
         date_stamp = signed_at.strftime("%Y%m%d")
         amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
-        payload_hash = hashlib.sha256(b"").hexdigest()
+        payload_hash = hashlib.sha256(data).hexdigest()
         signed_headers = {
             "host": host,
             "x-amz-content-sha256": payload_hash,
             "x-amz-date": amz_date,
         }
+        if content_type is not None:
+            signed_headers["content-type"] = content_type
         canonical_headers = "".join(
             f"{name}:{value}\n" for name, value in sorted(signed_headers.items())
         )
@@ -337,6 +395,8 @@ class MinioUtil:
             "x-amz-content-sha256": payload_hash,
             "x-amz-date": amz_date,
         }
+        if content_type is not None:
+            request_headers["Content-Type"] = content_type
         request.headers.update(request_headers)
         async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
             response = await client.send(request)
