@@ -217,8 +217,8 @@ class AiCallEventPersistenceWorker:
                     str(exc),
                 )
 
-    @staticmethod
     def _build_recording_service(
+        self,
         repository: AiCallRecordRepository,
     ) -> AiCallRecordingService:
         manager: LiveKitEgressManager | None = None
@@ -239,6 +239,7 @@ class AiCallEventPersistenceWorker:
             egress_manager=manager,
             participant_recording_enabled=settings.AI_CALL_PARTICIPANT_RECORDING_ENABLED,
             verify_deadline_seconds=settings.AI_CALL_RECORDING_VERIFY_DEADLINE_SECONDS,
+            stop_session_factory=self.session_factory,
         )
 
     @staticmethod

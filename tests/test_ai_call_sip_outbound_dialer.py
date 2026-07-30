@@ -10,7 +10,11 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallEventModel,
+    AiCallRecordingTrackModel,
+    AiCallRecordModel,
+)
 from app.api.v1.ai_call.outbound.sip_line_schema import SipLineSnapshot
 from app.api.v1.ai_call.outbound.sip_outbound_dialer import SipOutboundDialer
 from app.config.setting import Settings
@@ -43,9 +47,14 @@ class FakeAiCallService:
         self.session_created = asyncio.Event()
         self.requests: list[dict[str, object]] = []
         self.terminated: list[dict[str, str]] = []
+        self.before_sip_invite_calls = 0
 
     async def create_sip_session(self, **kwargs):
         self.requests.append(kwargs)
+        before_sip_invite = kwargs.get("before_sip_invite")
+        if before_sip_invite is not None:
+            await before_sip_invite()
+            self.before_sip_invite_calls += 1
         self.session_created.set()
         if self.error is not None:
             raise self.error
@@ -167,6 +176,30 @@ async def add_event(database, call_id: str, event_type: str) -> None:
         await db.commit()
 
 
+async def add_completed_media_tracks(database, call_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with database() as db:
+        for role in ("ai", "customer"):
+            db.add(
+                AiCallRecordingTrackModel(
+                    id=generate_snowflake_id(),
+                    call_id=call_id,
+                    room_name=f"ai-call-{call_id}",
+                    track_role=role,
+                    participant_identity=f"{role}-{call_id}",
+                    handoff_id=None,
+                    status="completed",
+                    egress_id=f"egress-{role}-{call_id}",
+                    oss_id=generate_snowflake_id(),
+                    object_name=f"ai-call/recordings/{call_id}-{role}.ogg",
+                    started_at=now,
+                    ended_at=now,
+                    duration_ms=1200,
+                )
+            )
+        await db.commit()
+
+
 async def finish_record(
     database,
     call_id: str,
@@ -248,6 +281,30 @@ async def test_dial_does_not_mark_connected_after_session_creation(database):
 
 
 @pytest.mark.anyio
+async def test_dial_commits_persisted_record_before_waiting_for_sip_answer(database):
+    service = FakeAiCallService()
+    dialer = build_dialer(database, service)
+
+    task = asyncio.create_task(
+        dialer.dial(
+            dial_request(),
+            call_id="call-pre-invite-commit",
+            on_connected=AsyncMock(),
+        )
+    )
+    await service.session_created.wait()
+    await finish_record(
+        database,
+        "call-pre-invite-commit",
+        answered=False,
+        reason="sip_connect_timeout",
+    )
+    await asyncio.wait_for(task, timeout=1)
+
+    assert service.before_sip_invite_calls == 1
+
+
+@pytest.mark.anyio
 async def test_dial_marks_connected_once_after_answer_and_media(database):
     service = FakeAiCallService()
     dialer = build_dialer(database, service)
@@ -272,6 +329,31 @@ async def test_dial_marks_connected_once_after_answer_and_media(database):
 
     assert result.call_result == "connected"
     assert result.duration_ms == 1200
+    connected.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_dial_accepts_completed_ai_and_customer_tracks_as_media_evidence(
+    database,
+):
+    service = FakeAiCallService()
+    dialer = build_dialer(database, service)
+    connected = AsyncMock()
+
+    task = asyncio.create_task(
+        dialer.dial(
+            dial_request(),
+            call_id="call-track-media",
+            on_connected=connected,
+        )
+    )
+    await service.session_created.wait()
+    await mark_answered(database, "call-track-media")
+    await add_completed_media_tracks(database, "call-track-media")
+    await finish_record(database, "call-track-media", answered=True)
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result.call_result == "connected"
     connected.assert_awaited_once()
 
 

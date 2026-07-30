@@ -6,11 +6,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallEventModel,
+    AiCallRecordingTrackModel,
+    AiCallRecordModel,
+)
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -937,6 +941,66 @@ async def test_execute_claimed_reuses_call_id_and_preserves_in_call_intermediate
 
 
 @pytest.mark.anyio
+async def test_execute_claimed_retries_transient_sqlite_lock_when_settling(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'locked-executor.db'}",
+        connect_args={"timeout": 0.05},
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    database = async_sessionmaker(engine, expire_on_commit=False)
+    task_id, target_ids = await _seed_task(database, now=now)
+    retry_delays: list[float] = []
+
+    try:
+        async with database() as lock_session:
+
+            async def release_sqlite_lock(delay: float) -> None:
+                retry_delays.append(delay)
+                await lock_session.rollback()
+
+            executor = OutboundTaskExecutor(
+                database,
+                RealResultDialer(DialResult(call_result="connected")),
+                now_provider=lambda: now,
+                settle_retry_delays_seconds=(0.25,),
+                sleep=release_sqlite_lock,
+            )
+            claimed = await executor.claim_manual_test(
+                TaskKey("tenant-a", task_id),
+                command_idempotency_key="command-sqlite-lock-retry",
+                test_scenario="ai_only",
+                active_slot="linphone_test",
+            )
+            await lock_session.execute(
+                update(AiCallOutboundTaskModel)
+                .where(AiCallOutboundTaskModel.id == task_id)
+                .values(updated_at=now + timedelta(seconds=1))
+            )
+
+            await executor.execute_claimed(claimed)
+
+        async with database() as session:
+            task = await session.get(AiCallOutboundTaskModel, task_id)
+            target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+            attempt = await session.scalar(
+                select(AiCallOutboundAttemptModel).where(
+                    AiCallOutboundAttemptModel.call_id == claimed.call_id
+                )
+            )
+    finally:
+        await engine.dispose()
+
+    assert retry_delays == [0.25]
+    assert task is not None and task.status == "COMPLETED"
+    assert target is not None and target.status == "COMPLETED"
+    assert attempt is not None and attempt.status == "COMPLETED"
+
+
+@pytest.mark.anyio
 async def test_real_startup_failure_without_record_still_finishes_attempt(database) -> None:
     now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
     task_id, target_ids = await _seed_task(database, now=now)
@@ -1127,8 +1191,10 @@ async def test_stale_recovery_ignores_real_managed_attempt(database) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("media_evidence", ["event", "completed_tracks"])
 async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
     database,
+    media_evidence,
 ) -> None:
     clock = [datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)]
     task_id, target_ids = await _seed_task(
@@ -1179,17 +1245,39 @@ async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
                 duration_ms=18000,
             )
         )
-        db.add(
-            AiCallEventModel(
-                id=generate_snowflake_id(),
-                call_id=attempt.call_id,
-                event_id=f"event-{generate_snowflake_id()}",
-                event_type="media_connected",
-                source="livekit",
-                event_time=answered_at,
-                payload_json=None,
+        if media_evidence == "event":
+            db.add(
+                AiCallEventModel(
+                    id=generate_snowflake_id(),
+                    call_id=attempt.call_id,
+                    event_id=f"event-{generate_snowflake_id()}",
+                    event_type="media_connected",
+                    source="livekit",
+                    event_time=answered_at,
+                    payload_json=None,
+                )
             )
-        )
+        else:
+            for role in ("ai", "customer"):
+                db.add(
+                    AiCallRecordingTrackModel(
+                        id=generate_snowflake_id(),
+                        call_id=attempt.call_id,
+                        room_name=f"ai-call-{attempt.call_id}",
+                        track_role=role,
+                        participant_identity=f"{role}-{attempt.call_id}",
+                        handoff_id=None,
+                        status="completed",
+                        egress_id=f"egress-{role}-{attempt.call_id}",
+                        oss_id=generate_snowflake_id(),
+                        object_name=(
+                            f"ai-call/recordings/{attempt.call_id}-{role}.ogg"
+                        ),
+                        started_at=answered_at,
+                        ended_at=clock[0] + timedelta(seconds=20),
+                        duration_ms=18000,
+                    )
+                )
         await db.commit()
 
     clock[0] += timedelta(minutes=5)
@@ -1493,6 +1581,49 @@ async def test_executor_skips_future_task_and_completes_due_task_once(database) 
     assert len(dialer.requests) == 1
     assert dialer.requests[0].target_id == target_ids[0]
     assert dialer.call_ids == [attempts[0].call_id]
+
+
+@pytest.mark.anyio
+async def test_mock_executor_counts_partial_success_and_failure(database) -> None:
+    now = datetime(2026, 7, 28, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now, target_count=2)
+    dialer = SequenceDialer([
+        DialResult(call_result="connected"),
+        DialResult(call_result="call_failed", error_message="模拟呼叫失败"),
+    ])
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+
+    assert await executor.run_once() == 2
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        targets = (
+            await session.scalars(
+                select(AiCallOutboundTargetModel)
+                .where(AiCallOutboundTargetModel.id.in_(target_ids))
+                .order_by(AiCallOutboundTargetModel.source_row_number)
+            )
+        ).all()
+        attempts = (
+            await session.scalars(
+                select(AiCallOutboundAttemptModel)
+                .where(AiCallOutboundAttemptModel.task_id == task_id)
+                .order_by(AiCallOutboundAttemptModel.created_at)
+            )
+        ).all()
+
+    assert task is not None
+    assert task.status == "COMPLETED"
+    assert task.completed_targets == 2
+    assert task.connected_targets == 1
+    assert task.failed_targets == 1
+    assert [target.status for target in targets] == ["COMPLETED", "COMPLETED"]
+    assert [target.latest_result for target in targets] == [
+        "connected",
+        "call_failed",
+    ]
+    assert [attempt.status for attempt in attempts] == ["COMPLETED", "FAILED"]
+    assert {attempt.dialer_type for attempt in attempts} == {"mock"}
 
 
 @pytest.mark.anyio

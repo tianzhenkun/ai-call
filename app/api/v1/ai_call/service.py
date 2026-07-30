@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -206,6 +207,7 @@ class AiCallService:
         scene_code: str | None = None,
         business_params: dict | None = None,
         ringing_timeout_seconds: int | None = None,
+        before_sip_invite: Callable[[], Awaitable[None]] | None = None,
     ) -> CreateSipSessionResult:
         self._ensure_record_service()
         if self.sip_client is None:
@@ -276,6 +278,8 @@ class AiCallService:
                     "ringingTimeoutSeconds": ringing_timeout_seconds,
                 },
             )
+            if before_sip_invite is not None:
+                await before_sip_invite()
             sip_invite_sent = True
             sip_participant = await self.sip_client.create_participant(
                 room_name=room_name,
@@ -1957,6 +1961,7 @@ def _build_recording_service(repository: AiCallRecordRepository) -> AiCallRecord
         egress_manager=manager,
         participant_recording_enabled=settings.AI_CALL_PARTICIPANT_RECORDING_ENABLED,
         verify_deadline_seconds=settings.AI_CALL_RECORDING_VERIFY_DEADLINE_SECONDS,
+        stop_session_factory=async_db_session,
     )
 
 

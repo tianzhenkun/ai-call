@@ -4757,6 +4757,263 @@ async def test_recording_closure_starts_stops_and_registers_oss(monkeypatch) -> 
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("recording_kind", ["main", "participant"])
+async def test_recording_stop_releases_sqlite_write_lock_before_egress_io(
+    monkeypatch,
+    tmp_path,
+    recording_kind,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'recording-stop-boundary.db'}",
+        connect_args={"timeout": 0.05},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    monkeypatch.setattr(
+        OssService,
+        "_active_config",
+        {
+            "bucket_name": "recordings",
+            "endpoint": "minio.test:9000",
+            "domain": "https://files.test",
+            "is_https": "N",
+            "access_key": "minio",
+            "secret_key": "secret",
+            "region": "",
+        },
+    )
+
+    class BlockingStopEgressManager(FakeEgressManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_started = asyncio.Event()
+            self.release_stop = asyncio.Event()
+
+        async def stop_egress(self, egress_id: str) -> LiveKitEgressStopResult:
+            self.stop_started.set()
+            await self.release_stop.wait()
+            return await super().stop_egress(egress_id)
+
+    call_id = "call_recording_stop_boundary"
+    now = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    fake_egress = BlockingStopEgressManager()
+    participant_identity = f"customer-{call_id}"
+    if recording_kind == "participant":
+        fake_egress.started_participants.append(
+            (
+                f"ai-call-{call_id}",
+                call_id,
+                "customer",
+                participant_identity,
+            )
+        )
+
+    try:
+        async with session_maker() as db:
+            db.add(
+                AiCallRecordModel(
+                    id=1,
+                    call_id=call_id,
+                    business_type=None,
+                    business_id=None,
+                    entry_type="web",
+                    room_name=f"ai-call-{call_id}",
+                    participant_identity=f"customer-{call_id}",
+                    status="created",
+                    started_at=now,
+                )
+            )
+            if recording_kind == "main":
+                db.add(
+                    AiCallRecordingModel(
+                        id=2,
+                        call_id=call_id,
+                        room_name=f"ai-call-{call_id}",
+                        status="recording",
+                        egress_id=f"EG_{call_id}",
+                        object_name=f"ai-call/recordings/{call_id}.mp3",
+                        started_at=now,
+                    )
+                )
+            else:
+                db.add(
+                    AiCallRecordingTrackModel(
+                        id=2,
+                        call_id=call_id,
+                        room_name=f"ai-call-{call_id}",
+                        track_role="customer",
+                        participant_identity=participant_identity,
+                        status="recording",
+                        egress_id=(
+                            f"EG_{call_id}_customer_{participant_identity}"
+                        ),
+                        object_name=(
+                            f"ai-call/recordings/tracks/{call_id}/"
+                            f"customer-{participant_identity}.mp3"
+                        ),
+                        started_at=now,
+                    )
+                )
+            await db.commit()
+
+            service = AiCallRecordingService(
+                AiCallRecordRepository(db),
+                enabled=True,
+                egress_manager=fake_egress,
+                participant_recording_enabled=True,
+                stop_session_factory=session_maker,
+            )
+            stop_task = asyncio.create_task(service.stop_for_session(call_id))
+            await asyncio.wait_for(fake_egress.stop_started.wait(), timeout=0.5)
+
+            async with session_maker() as concurrent_db:
+                if recording_kind == "main":
+                    recording = await concurrent_db.scalar(
+                        select(AiCallRecordingModel).where(
+                            AiCallRecordingModel.call_id == call_id
+                        )
+                    )
+                else:
+                    recording = await concurrent_db.scalar(
+                        select(AiCallRecordingTrackModel).where(
+                            AiCallRecordingTrackModel.call_id == call_id
+                        )
+                    )
+                record = await concurrent_db.scalar(
+                    select(AiCallRecordModel).where(
+                        AiCallRecordModel.call_id == call_id
+                    )
+                )
+                assert recording is not None and recording.status == "stopping"
+                assert record is not None
+                record.status = "concurrent_write"
+                await concurrent_db.commit()
+
+            fake_egress.release_stop.set()
+            await asyncio.wait_for(stop_task, timeout=0.5)
+
+        async with session_maker() as db:
+            if recording_kind == "main":
+                recording = await db.scalar(
+                    select(AiCallRecordingModel).where(
+                        AiCallRecordingModel.call_id == call_id
+                    )
+                )
+            else:
+                recording = await db.scalar(
+                    select(AiCallRecordingTrackModel).where(
+                        AiCallRecordingTrackModel.call_id == call_id
+                    )
+                )
+            record = await db.scalar(
+                select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+            )
+        assert recording is not None and recording.status == "completed"
+        assert record is not None and record.status == "concurrent_write"
+    finally:
+        fake_egress.release_stop.set()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("recording_kind", ["main", "participant"])
+async def test_isolated_recording_stop_timeout_commits_verifying_state(
+    tmp_path,
+    recording_kind,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'recording-stop-timeout.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    call_id = "call_recording_stop_timeout"
+    now = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+    participant_identity = f"customer-{call_id}"
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_maker() as db:
+            db.add(
+                AiCallRecordModel(
+                    id=1,
+                    call_id=call_id,
+                    business_type=None,
+                    business_id=None,
+                    entry_type="web",
+                    room_name=f"ai-call-{call_id}",
+                    participant_identity=participant_identity,
+                    status="created",
+                    started_at=now,
+                )
+            )
+            if recording_kind == "main":
+                db.add(
+                    AiCallRecordingModel(
+                        id=2,
+                        call_id=call_id,
+                        room_name=f"ai-call-{call_id}",
+                        status="recording",
+                        egress_id=f"EG_{call_id}",
+                        object_name=f"ai-call/recordings/{call_id}.mp3",
+                        started_at=now,
+                    )
+                )
+            else:
+                db.add(
+                    AiCallRecordingTrackModel(
+                        id=2,
+                        call_id=call_id,
+                        room_name=f"ai-call-{call_id}",
+                        track_role="customer",
+                        participant_identity=participant_identity,
+                        status="recording",
+                        egress_id=f"EG_{call_id}_customer_{participant_identity}",
+                        object_name=(
+                            f"ai-call/recordings/tracks/{call_id}/"
+                            f"customer-{participant_identity}.mp3"
+                        ),
+                        started_at=now,
+                    )
+                )
+            await db.commit()
+
+            service = AiCallRecordingService(
+                AiCallRecordRepository(db),
+                enabled=True,
+                egress_manager=TimeoutMainStopEgressManager(),
+                participant_recording_enabled=True,
+                stop_session_factory=session_maker,
+            )
+            await service.stop_for_session(call_id)
+
+        async with session_maker() as db:
+            if recording_kind == "main":
+                recording = await db.scalar(
+                    select(AiCallRecordingModel).where(
+                        AiCallRecordingModel.call_id == call_id
+                    )
+                )
+            else:
+                recording = await db.scalar(
+                    select(AiCallRecordingTrackModel).where(
+                        AiCallRecordingTrackModel.call_id == call_id
+                    )
+                )
+
+        assert recording is not None
+        assert recording.status == "verifying"
+        assert recording.stop_requested_at is not None
+        assert recording.next_verify_at is not None
+        assert recording.verify_deadline_at is not None
+        assert recording.last_verify_error is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_participant_recording_closure_records_customer_and_ai_tracks(monkeypatch) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:

@@ -7,14 +7,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Protocol
 
-from sqlalchemy import exists, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.service import get_default_ai_call_service
 from app.config.setting import Settings, settings
 from app.services.ai_call.livekit_sip import SipOutboundConfig
 
+from .media_evidence import has_persisted_media_evidence
 from .sip_line_schema import SipLineSnapshot
 from .task_executor import ConnectedCallback, DialResult, OutboundDialRequest
 
@@ -121,6 +122,7 @@ class SipOutboundDialer:
                         "lineCode": line.line_code,
                     },
                     ringing_timeout_seconds=line.originate_timeout_seconds,
+                    before_sip_invite=db.commit,
                 )
             except Exception as exc:
                 create_error = exc
@@ -287,16 +289,7 @@ class SipOutboundDialer:
             record = await db.scalar(
                 select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
             )
-            media_connected = bool(
-                await db.scalar(
-                    select(
-                        exists().where(
-                            AiCallEventModel.call_id == call_id,
-                            AiCallEventModel.event_type == "media_connected",
-                        )
-                    )
-                )
-            )
+            media_connected = await has_persisted_media_evidence(db, call_id)
         return record, media_connected
 
     @staticmethod

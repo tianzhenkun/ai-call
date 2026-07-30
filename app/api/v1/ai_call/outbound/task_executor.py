@@ -10,12 +10,14 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
 
+from .media_evidence import has_persisted_media_evidence
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -141,6 +143,8 @@ class OutboundTaskExecutor:
         business_timezone: str = "Asia/Shanghai",
         dialing_timeout_seconds: int = 300,
         managed_attempt_timeout_seconds: int = 900,
+        settle_retry_delays_seconds: tuple[float, ...] = (0.0, 0.25, 1.0),
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
@@ -153,6 +157,10 @@ class OutboundTaskExecutor:
             self.dialing_timeout_seconds,
             managed_attempt_timeout_seconds,
         )
+        self.settle_retry_delays_seconds = tuple(
+            max(0.0, delay) for delay in settle_retry_delays_seconds
+        )
+        self.sleep = sleep
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -327,7 +335,7 @@ class OutboundTaskExecutor:
             )
         if not result.settle_attempt:
             return
-        await self._finish_attempt(
+        await self._finish_attempt_with_retry(
             claimed.request,
             claimed.call_id,
             result,
@@ -456,16 +464,9 @@ class OutboundTaskExecutor:
                             AiCallRecordModel.call_id == attempt.call_id
                         )
                     )
-                    media_connected = bool(
-                        await db.scalar(
-                            select(
-                                exists().where(
-                                    AiCallEventModel.call_id == attempt.call_id,
-                                    AiCallEventModel.event_type
-                                    == "media_connected",
-                                )
-                            )
-                        )
+                    media_connected = await has_persisted_media_evidence(
+                        db,
+                        attempt.call_id,
                     )
                     if (
                         record is not None
@@ -516,7 +517,7 @@ class OutboundTaskExecutor:
                 end_reason="outbound_stale_recovery",
             ):
                 continue
-            await self._finish_attempt(
+            await self._finish_attempt_with_retry(
                 request,
                 call_id,
                 result,
@@ -1063,6 +1064,39 @@ class OutboundTaskExecutor:
             await db.flush()
             await self._refresh_task_counters_in_session(db, task, now)
             await db.commit()
+
+    async def _finish_attempt_with_retry(
+        self,
+        request: OutboundDialRequest,
+        call_id: str,
+        result: DialResult,
+        now: datetime,
+    ) -> None:
+        retry_delays = self.settle_retry_delays_seconds
+        for retry_index in range(len(retry_delays) + 1):
+            try:
+                await self._finish_attempt(request, call_id, result, now)
+                return
+            except OperationalError as exc:
+                if (
+                    not self._is_sqlite_database_locked(exc)
+                    or retry_index >= len(retry_delays)
+                ):
+                    raise
+                delay = retry_delays[retry_index]
+                log.warning(
+                    "AI Call 外呼终态写入遇到 SQLite 锁，准备重试: "
+                    "callId={}, retry={}/{}, delaySeconds={}",
+                    call_id,
+                    retry_index + 1,
+                    len(retry_delays),
+                    delay,
+                )
+                await self.sleep(delay)
+
+    @staticmethod
+    def _is_sqlite_database_locked(exc: OperationalError) -> bool:
+        return "database is locked" in str(exc).lower()
 
     async def _refresh_task_counters(
         self,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,12 +38,16 @@ class AiCallRecordingService:
         egress_manager: LiveKitEgressManager | None = None,
         participant_recording_enabled: bool = False,
         verify_deadline_seconds: int = 900,
+        stop_session_factory: async_sessionmaker[AsyncSession] | None = None,
+        transaction_checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.repository = repository
         self.enabled = enabled
         self.egress_manager = egress_manager
         self.participant_recording_enabled = participant_recording_enabled
         self.verify_deadline_seconds = max(30, verify_deadline_seconds)
+        self.stop_session_factory = stop_session_factory
+        self.transaction_checkpoint = transaction_checkpoint
 
     async def start_for_session(
         self,
@@ -169,6 +173,34 @@ class AiCallRecordingService:
     async def stop_for_session(self, call_id: str) -> None:
         if not self.enabled:
             return
+        if (
+            self.stop_session_factory is not None
+            and self.transaction_checkpoint is None
+        ):
+            await self._stop_for_session_in_isolated_session(call_id)
+            return
+        await self._stop_for_session_in_current_session(call_id)
+
+    async def _stop_for_session_in_isolated_session(self, call_id: str) -> None:
+        if self.stop_session_factory is None:
+            return
+        async with self.stop_session_factory() as db:
+            isolated_service = AiCallRecordingService(
+                AiCallRecordRepository(db),
+                enabled=self.enabled,
+                egress_manager=self.egress_manager,
+                participant_recording_enabled=self.participant_recording_enabled,
+                verify_deadline_seconds=self.verify_deadline_seconds,
+                transaction_checkpoint=db.commit,
+            )
+            try:
+                await isolated_service._stop_for_session_in_current_session(call_id)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def _stop_for_session_in_current_session(self, call_id: str) -> None:
         await self._stop_main_recording(call_id)
         await self._stop_participant_recordings(call_id)
 
@@ -185,6 +217,7 @@ class AiCallRecordingService:
             status="stopping",
             stop_requested_at=stop_requested_at,
         )
+        await self._checkpoint_before_external_io()
         try:
             if self.egress_manager is None:
                 raise RuntimeError("录音组件未配置")
@@ -465,6 +498,7 @@ class AiCallRecordingService:
             status="stopping",
             stop_requested_at=stop_requested_at,
         )
+        await self._checkpoint_before_external_io()
         try:
             if self.egress_manager is None:
                 raise RuntimeError("录音组件未配置")
@@ -1087,6 +1121,10 @@ class AiCallRecordingService:
         if file_size is not None and file_size >= 0:
             return file_size
         return None
+
+    async def _checkpoint_before_external_io(self) -> None:
+        if self.transaction_checkpoint is not None:
+            await self.transaction_checkpoint()
 
     def _verify_deadline_at(self, stop_requested_at: datetime) -> datetime:
         return self._aware_datetime(stop_requested_at) + timedelta(

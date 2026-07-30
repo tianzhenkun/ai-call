@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict
+from livekit import api
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
@@ -83,6 +84,9 @@ async def livekit_webhook_controller(
     auth_token = _livekit_webhook_token(authorization)
     webhook_event = _receive_livekit_webhook(body, auth_token)
     payload = MessageToDict(webhook_event, preserving_proto_field_name=False)
+    track = payload.get("track")
+    if webhook_event.event == "track_published" and isinstance(track, dict):
+        track["type"] = api.TrackType.Name(webhook_event.track.type)
     result = schedule_livekit_webhook_event(
         event_type=webhook_event.event,
         room_name=webhook_event.room.name or None,
@@ -106,8 +110,6 @@ def _livekit_webhook_token(authorization: str | None) -> str:
 
 def _receive_livekit_webhook(body: str, auth_token: str):
     try:
-        from livekit import api
-
         receiver = api.WebhookReceiver(
             api.TokenVerifier(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET)
         )

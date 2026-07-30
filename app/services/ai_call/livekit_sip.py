@@ -268,7 +268,10 @@ class LiveKitSipClient:
             sip_call_id=(_extract_value(raw_result, "sip_call_id") or attributes.get("sip.callID")),
             sip_call_id_full=attributes.get("sip.callIDFull"),
             sip_trunk_id=attributes.get("sip.trunkID") or payload.sip_trunk_id or None,
-            sip_call_status=attributes.get("sip.callStatus"),
+            sip_call_status=(
+                attributes.get("sip.callStatus")
+                or ("answered" if payload.wait_until_answered else None)
+            ),
             raw_status=_extract_value(raw_result, "status") or "created",
         )
 

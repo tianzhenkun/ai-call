@@ -639,6 +639,37 @@ async def test_livekit_sip_client_builds_create_participant_payload_for_fake_sdk
     assert result.sip_call_status == "active"
 
 
+@pytest.mark.anyio
+async def test_livekit_sip_client_treats_successful_sync_sdk_result_as_answered() -> None:
+    async def fake_create_participant(
+        payload: CreateSipParticipantPayload,
+    ) -> SimpleNamespace:
+        assert payload.wait_until_answered is True
+        return SimpleNamespace(
+            participant_identity=payload.participant_identity,
+            room_name=payload.room_name,
+            sip_call_id="sdk-call-id",
+        )
+
+    client = LiveKitSipClient(
+        config=SipOutboundConfig(
+            enabled=True,
+            trunk_id="trunk_123",
+            caller_number="037100000000",
+        ),
+        create_participant=fake_create_participant,
+    )
+
+    result = await client.create_participant(
+        room_name="ai-call-call_1",
+        participant_identity="sip-call_1",
+        callee_phone_number="13800000000",
+        wait_until_answered=True,
+    )
+
+    assert result.sip_call_status == "answered"
+
+
 def test_livekit_sip_client_extends_sdk_timeout_when_waiting_until_answered() -> None:
     client = LiveKitSipClient(
         config=SipOutboundConfig(enabled=True),
@@ -800,6 +831,39 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
         "ringingTimeoutSeconds": 30,
     }
     assert sip_answered.source == "sip"
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_persists_record_before_external_sip_invite() -> None:
+    (
+        service,
+        _room_manager,
+        _agent_runner,
+        sip_client,
+        _record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    persisted_before_invite = False
+    original_create_participant = sip_client.create_participant
+
+    async def persist_before_invite() -> None:
+        nonlocal persisted_before_invite
+        persisted_before_invite = True
+
+    async def create_participant(**kwargs):
+        assert persisted_before_invite is True
+        return await original_create_participant(**kwargs)
+
+    sip_client.create_participant = create_participant
+
+    await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+        before_sip_invite=persist_before_invite,
+    )
 
 
 @pytest.mark.anyio
@@ -1166,6 +1230,54 @@ def test_livekit_webhook_controller_queues_signed_event_without_waiting(monkeypa
     assert scheduled[0]["event_type"] == "participant_left"
     assert scheduled[0]["room_name"] == "ai-call-call_queued"
     assert scheduled[0]["participant_identity"] == "sip-call_queued"
+
+
+def test_livekit_webhook_controller_preserves_audio_track_type(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "livekit-key")
+    monkeypatch.setattr(settings, "LIVEKIT_API_SECRET", "livekit-secret")
+    scheduled: list[dict[str, object]] = []
+
+    def fake_schedule_livekit_webhook_event(**kwargs):
+        scheduled.append(kwargs)
+        return {
+            "queued": True,
+            "eventType": kwargs["event_type"],
+            "roomName": kwargs["room_name"],
+            "participantIdentity": kwargs["participant_identity"],
+        }
+
+    monkeypatch.setattr(
+        ai_call_controller,
+        "schedule_livekit_webhook_event",
+        fake_schedule_livekit_webhook_event,
+        raising=False,
+    )
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+
+    with TestClient(app) as client:
+        body = json.dumps(
+            {
+                "event": "track_published",
+                "room": {"name": "ai-call-call_audio"},
+                "participant": {"identity": "sip-call_audio"},
+                "track": {"sid": "TR_audio", "type": "AUDIO"},
+                "id": "EV_audio",
+                "createdAt": 1760000000,
+            },
+            separators=(",", ":"),
+        )
+        response = client.post(
+            "/ai-call/livekit-webhook",
+            content=body,
+            headers={"Authorization": f"Bearer {_livekit_webhook_auth(body)}"},
+        )
+
+    assert response.status_code == 200
+    assert scheduled[0]["payload"]["track"] == {
+        "sid": "TR_audio",
+        "type": "AUDIO",
+    }
 
 
 @pytest.mark.anyio
