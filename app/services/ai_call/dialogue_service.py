@@ -14,6 +14,7 @@ from app.core.logger import log
 from app.services.ai_call.dialogue_merge import (
     OFFLINE_ASR_SOURCE,
     QWEN_REALTIME_SOURCE,
+    is_cross_source_customer_transcript_conflict,
     is_duplicate_dialogue_segment,
     normalize_dialogue_text,
 )
@@ -1427,7 +1428,21 @@ class AiCallDialogueService:
         return any(
             candidate.source == QWEN_REALTIME_SOURCE
             and candidate.speaker_type == "customer"
-            and AiCallDialogueService._time_ranges_overlap(row, candidate)
+            and (
+                AiCallDialogueService._time_ranges_overlap(row, candidate)
+                or is_cross_source_customer_transcript_conflict(
+                    source=row.source,
+                    speaker_type=row.speaker_type,
+                    text=AiCallDialogueService._dialogue_text(row),
+                    started_at=row.started_at,
+                    ended_at=row.ended_at,
+                    candidate_source=candidate.source,
+                    candidate_speaker_type=candidate.speaker_type,
+                    candidate_text=AiCallDialogueService._dialogue_text(candidate),
+                    candidate_started_at=candidate.started_at,
+                    candidate_ended_at=candidate.ended_at,
+                )
+            )
             for candidate in realtime_rows
         )
 

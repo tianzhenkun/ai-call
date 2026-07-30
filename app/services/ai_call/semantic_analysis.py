@@ -28,6 +28,12 @@ from app.api.v1.ai_call.model import (
     AiCallSemanticAnalysisModel,
 )
 from app.core.logger import log
+from app.services.ai_call.dialogue_merge import (
+    is_cross_source_customer_transcript_conflict,
+)
+from app.services.ai_call.post_call_follow_up_service import (
+    AiCallPostCallFollowUpService,
+)
 
 ANALYSIS_SCENE_CODE = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE
 ANALYSIS_STATUS_PENDING = SEMANTIC_ANALYSIS_STATUS_PENDING
@@ -106,6 +112,21 @@ METADATA_TIMESTAMP_PATTERN = re.compile(
 )
 METADATA_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 COMMITMENT_PATTERN = re.compile(r"(会|可以|方便|再联系|回头|稍后|安排|确认)")
+FOLLOW_UP_CONTACT_PATTERN = re.compile(
+    r"(回访|回拨|(?:再|稍后|之后|明天|后天|改天).{0,4}联系|联系我|"
+    r"给我.{0,3}(?:打电话|来电)|打(?:电话)?给我|电话联系|"
+    r"(?:到时候|届时).{0,6}打(?:个|一个)?电话|"
+    r"顾问.{0,6}联系|安排.{0,6}(?:顾问|专人|人员).{0,6}联系)"
+)
+FOLLOW_UP_CONTACT_OFFER_PATTERN = re.compile(
+    r"(回访|回拨|再联系|稍后联系|之后联系|联系您|联系你|"
+    r"给您.{0,3}(?:打电话|来电)|顾问.{0,6}联系|"
+    r"安排.{0,6}(?:顾问|专人|人员))"
+)
+FOLLOW_UP_REFUSAL_PATTERN = re.compile(
+    r"(?:不用|不要|别|无需|不需要|拒绝).{0,6}(?:联系|回访|回拨|打电话)|"
+    r"(?:联系|回访|回拨).{0,6}(?:不用|不要|别)"
+)
 IDENTITY_RESULT_CLAIM_PATTERN = re.compile(
     r"(客户|用户|对方|来电人|联系人).{0,10}(自报|叫|姓名|名字|称呼)"
 )
@@ -123,6 +144,7 @@ OFFLINE_SPAN_REALTIME_DIVERGENCE = "offline_asr_span_realtime_divergence"
 OFFLINE_SHORT_QUESTION_REALTIME_DIVERGENCE = (
     "offline_asr_short_question_realtime_divergence"
 )
+OFFLINE_NEARBY_TRANSCRIPT_CONFLICT = "nearby_transcript_conflict"
 HUMAN_AGENT_TRACK_CROSSTALK_SIGNAL = "human_agent_track_crosstalk"
 HUMAN_AGENT_TRACK_CUSTOMER_OVERLAP = "human_agent_track_customer_overlap"
 TRANSCRIPT_UNCERTAINTY_ANALYSIS_GUIDANCE = (
@@ -141,13 +163,22 @@ semantic_evidence.analysis_usage=record_only 且 key_point_candidate=false 的�
 semantic_evidence.low_confidence_source、source_conflict 或 unsupported_strong_fact_types 命中的片段，只能作为低置信背景；不得把 unsupported_strong_fact 片段改写成“客户叫某某”“客户自报姓名”“客户公司是某某”等确定事实。
 semantic_evidence.new_question_or_intent=true 的客户跳话题问题、conversation_control_intent=true 的继续/结束/稍后联系意图应保留为客户问题或关注点；semantic_evidence.weak_feedback=true 且 key_point_candidate=false 的弱反馈只能记录为弱反馈，不能扩写成强意向或业务事实。
 speaker_type=human_agent 且 transcript_quality.low_confidence_source=true 的人工坐席轮次只可作为低置信坐席上下文或音频污染风险，不能反推为客户事实，也不能作为客户诉求、异议或承诺。
-必须只返回五字段 JSON 对象，不输出 Markdown、解释或额外字段。
+必须只返回六字段 JSON 对象，不输出 Markdown、解释或额外字段。
 JSON 字段固定为：
 - summary: 字符串，本通电话摘要，重点描述客户侧表达。
 - feedback_type: 字符串，只能是 正向、负向、中性。
 - key_points: 字符串数组，客户表达的事实、诉求、异议、承诺、风险点或约束条件。
 - time_hint: 对象，包含 time_text、time_value、original_texts。
-- tags: 字符串数组，开放中文标签。"""
+- tags: 字符串数组，开放中文标签。
+- follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 仅表示客户侧存在后续联系需求；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺联系不能作为客户同意证据。"""
+
+FOLLOW_UP_CONSENTS = {"explicit", "missing", "refused"}
+FOLLOW_UP_CONFIDENCES = {"high", "medium", "low"}
+CUSTOMER_INTENT_BY_FEEDBACK = {
+    "正向": "positive",
+    "中性": "neutral",
+    "负向": "negative",
+}
 
 
 class SemanticAnalyzerProtocol(Protocol):
@@ -157,7 +188,7 @@ class SemanticAnalyzerProtocol(Protocol):
         transcript_snapshot: dict[str, Any],
         reference_date: str | None = None,
     ) -> dict[str, Any]:
-        """Return raw five-field semantic analysis result."""
+        """Return raw structured semantic analysis and post-call result."""
 
 
 class OpenAICompatibleSemanticAnalyzer:
@@ -609,7 +640,10 @@ class SemanticTranscriptBuilder:
             cls._row_key(offline_row): [
                 realtime_row
                 for realtime_row in reliable_realtime_rows
-                if cls._time_ranges_overlap(realtime_row, offline_row)
+                if cls._same_cross_source_customer_utterance(
+                    realtime_row,
+                    offline_row,
+                )
             ]
             for offline_row in offline_rows
         }
@@ -619,7 +653,10 @@ class SemanticTranscriptBuilder:
             low_quality_overlaps: list[AiCallDialogueSegmentModel] = []
             fallback_reason: str | None = None
             for offline_row in offline_rows:
-                if not cls._time_ranges_overlap(realtime_row, offline_row):
+                if not cls._same_cross_source_customer_utterance(
+                    realtime_row,
+                    offline_row,
+                ):
                     continue
                 issue = cls._offline_realtime_quality_issue(
                     offline_row=offline_row,
@@ -657,6 +694,23 @@ class SemanticTranscriptBuilder:
         realtime_row: AiCallDialogueSegmentModel,
         overlapping_realtime_rows: list[AiCallDialogueSegmentModel],
     ) -> str | None:
+        has_nearby_conflict = is_cross_source_customer_transcript_conflict(
+            source=offline_row.source,
+            speaker_type=offline_row.speaker_type,
+            text=cls._text(offline_row),
+            started_at=offline_row.started_at,
+            ended_at=offline_row.ended_at,
+            candidate_source=realtime_row.source,
+            candidate_speaker_type=realtime_row.speaker_type,
+            candidate_text=cls._text(realtime_row),
+            candidate_started_at=realtime_row.started_at,
+            candidate_ended_at=realtime_row.ended_at,
+        )
+        if has_nearby_conflict and not cls._time_ranges_overlap(
+            offline_row,
+            realtime_row,
+        ):
+            return OFFLINE_NEARBY_TRANSCRIPT_CONFLICT
         direct_issue = cls._offline_customer_quality_issue(offline_row)
         if direct_issue is not None:
             return direct_issue
@@ -686,6 +740,27 @@ class SemanticTranscriptBuilder:
         ):
             return OFFLINE_SHADOWED_BY_RICHER_REALTIME
         return None
+
+    @classmethod
+    def _same_cross_source_customer_utterance(
+        cls,
+        left: AiCallDialogueSegmentModel,
+        right: AiCallDialogueSegmentModel,
+    ) -> bool:
+        return cls._time_ranges_overlap(left, right) or (
+            is_cross_source_customer_transcript_conflict(
+                source=left.source,
+                speaker_type=left.speaker_type,
+                text=cls._text(left),
+                started_at=left.started_at,
+                ended_at=left.ended_at,
+                candidate_source=right.source,
+                candidate_speaker_type=right.speaker_type,
+                candidate_text=cls._text(right),
+                candidate_started_at=right.started_at,
+                candidate_ended_at=right.ended_at,
+            )
+        )
 
     @classmethod
     def _offline_customer_quality_issue(
@@ -1187,6 +1262,12 @@ class SemanticTranscriptBuilder:
             supported_fact_types.append("time")
         if cls._supports_commitment_fact(text, previous_ai_text):
             supported_fact_types.append("commitment")
+        follow_up_consent = cls._supports_follow_up_consent_fact(
+            text,
+            previous_ai_text,
+        )
+        if follow_up_consent:
+            supported_fact_types.append("follow_up_consent")
         if business_detail and cls._has_requirement_conclusion(text):
             supported_fact_types.append("requirement_conclusion")
 
@@ -1194,6 +1275,7 @@ class SemanticTranscriptBuilder:
             new_question_or_intent
             or business_detail
             or conversation_control_intent
+            or follow_up_consent
             or (responds_to_previous_ai and normalized in SHORT_ANSWER_TEXTS)
         )
         analysis_usage = (
@@ -1367,6 +1449,21 @@ class SemanticTranscriptBuilder:
             and not cls._is_user_question_or_intent(text)
             and COMMITMENT_PATTERN.search(text)
             and (TIME_HINT_PATTERN.search(text) or cls._assistant_asks_question(previous_ai_text))
+        )
+
+    @classmethod
+    def _supports_follow_up_consent_fact(
+        cls,
+        text: str,
+        previous_ai_text: str,
+    ) -> bool:
+        if not text or FOLLOW_UP_REFUSAL_PATTERN.search(text):
+            return False
+        if FOLLOW_UP_CONTACT_PATTERN.search(text):
+            return True
+        return bool(
+            cls._normalized_text_value(text) in SHORT_ANSWER_TEXTS
+            and FOLLOW_UP_CONTACT_OFFER_PATTERN.search(previous_ai_text)
         )
 
     @staticmethod
@@ -1603,9 +1700,11 @@ class AiCallSemanticAnalysisService:
             analysis_result=result,
             transcript_snapshot_json=snapshot_json,
             transcript_hash=snapshot_hash,
+            **post_call_materialized_fields(result),
             now=now,
         )
         if succeeded is not None:
+            await AiCallPostCallFollowUpService(self.repository).apply(succeeded)
             return succeeded
         return claimed
 
@@ -1656,6 +1755,7 @@ def normalize_analysis_result(value: dict[str, Any] | None) -> dict[str, Any]:
         "key_points": _string_list(raw.get("key_points")),
         "time_hint": _normalize_time_hint(raw.get("time_hint")),
         "tags": _string_list(raw.get("tags")),
+        "follow_up": _normalize_follow_up(raw.get("follow_up")),
     }
 
 
@@ -1679,6 +1779,7 @@ def enforce_semantic_evidence_on_result(
     normalized = _remove_record_only_time_hints(normalized, snapshot)
     normalized = _remove_transcript_listing_summary(normalized)
     normalized = _append_transcript_quality_risk_tags(normalized, snapshot)
+    normalized = _enforce_follow_up_evidence(normalized, snapshot)
     if _snapshot_supports_strong_fact(snapshot, "identity"):
         return normalized
     unsupported_identity_texts = _snapshot_unsupported_strong_fact_texts(snapshot, "identity")
@@ -2034,6 +2135,111 @@ def _normalize_time_hint(value: Any) -> dict[str, Any]:
         "time_value": _string_value(raw.get("time_value")),
         "original_texts": _string_list(raw.get("original_texts")),
     }
+
+
+def _normalize_follow_up(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    consent = _string_value(raw.get("consent"))
+    confidence = _string_value(raw.get("confidence"))
+    return {
+        "required": raw.get("required") is True,
+        "consent": consent if consent in FOLLOW_UP_CONSENTS else "missing",
+        "reason": _string_value(raw.get("reason")),
+        "preferred_time": _string_value(raw.get("preferred_time")) or None,
+        "confidence": (
+            confidence if confidence in FOLLOW_UP_CONFIDENCES else "low"
+        ),
+    }
+
+
+def post_call_materialized_fields(result: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_analysis_result(result)
+    follow_up = normalized["follow_up"]
+    return {
+        "customer_intent": CUSTOMER_INTENT_BY_FEEDBACK[normalized["feedback_type"]],
+        "follow_up_suggested": (
+            follow_up["required"] is True
+            and follow_up["consent"] != "refused"
+        ),
+        "follow_up_consent": follow_up["consent"],
+        "follow_up_reason": follow_up["reason"] or None,
+        "follow_up_preferred_at": _parse_rfc3339_or_none(
+            follow_up["preferred_time"]
+        ),
+        "follow_up_confidence": follow_up["confidence"],
+    }
+
+
+def _parse_rfc3339_or_none(value: Any) -> datetime | None:
+    text = _string_value(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _enforce_follow_up_evidence(
+    result: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    follow_up = result["follow_up"]
+    supports_consent = _snapshot_supports_follow_up_consent(snapshot)
+    if (
+        follow_up["required"] is True
+        and follow_up["consent"] == "missing"
+        and supports_consent
+    ):
+        return {
+            **result,
+            "follow_up": {
+                **follow_up,
+                "consent": "explicit",
+                "reason": "客户明确同意后续电话联系",
+                "confidence": "high",
+            },
+        }
+    if follow_up["consent"] != "explicit" and follow_up["confidence"] != "high":
+        return result
+    if supports_consent:
+        return result
+    return {
+        **result,
+        "follow_up": {
+            **follow_up,
+            "consent": "missing",
+            "confidence": "low",
+        },
+    }
+
+
+def _snapshot_supports_follow_up_consent(snapshot: dict[str, Any]) -> bool:
+    turns = snapshot.get("turns")
+    if not isinstance(turns, list):
+        return False
+    for turn in turns:
+        if not isinstance(turn, dict) or turn.get("role") != ROLE_USER:
+            continue
+        evidence = turn.get("semantic_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if (
+            evidence.get("analysis_usage") == "record_only"
+            or evidence.get("low_confidence_source")
+            or evidence.get("source_conflict")
+            or not evidence.get("supports_strong_fact")
+        ):
+            continue
+        supported_types = evidence.get("supported_strong_fact_types")
+        if not isinstance(supported_types, list):
+            continue
+        if "follow_up_consent" in supported_types:
+            return True
+    return False
 
 
 def _string_list(value: Any) -> list[str]:

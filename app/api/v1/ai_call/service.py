@@ -779,6 +779,8 @@ class AiCallService:
         phone_number: str | None = None,
         customer_name: str | None = None,
         call_result: str | None = None,
+        customer_intent: str | None = None,
+        follow_up_status: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -797,6 +799,8 @@ class AiCallService:
             phone_number=phone_number,
             customer_name=customer_name,
             call_result=call_result,
+            customer_intent=customer_intent,
+            follow_up_status=follow_up_status,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -817,9 +821,11 @@ class AiCallService:
         if record is None:
             raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
         last_event = await self.record_service.get_last_event(call_id)
+        execution_config = await self.record_service.get_execution_config(record)
         return {
             "record": self.record_service.record_to_dict(record),
             "lastEvent": self.record_service.event_to_dict(last_event) if last_event else None,
+            "executionConfig": execution_config,
         }
 
     async def list_record_events(

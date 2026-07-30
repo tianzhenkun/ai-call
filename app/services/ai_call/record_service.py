@@ -147,6 +147,11 @@ PERSISTED_EVENT_TYPES = frozenset({
 })
 
 
+def _optional_text(value: Any) -> str | None:
+    normalized = str(value).strip() if value is not None else ""
+    return normalized or None
+
+
 class AiCallRecordService:
     """B1 通话记录和关键事件持久化服务。"""
 
@@ -219,6 +224,37 @@ class AiCallRecordService:
             callee_phone_number_hash=callee_phone_number_hash,
             active_statuses=active_statuses,
         )
+
+    async def get_execution_config(
+        self,
+        record: AiCallRecordModel,
+    ) -> dict[str, str | None] | None:
+        if record.business_type != "outbound_task" or not record.business_id:
+            return None
+        try:
+            task_id = int(record.business_id)
+        except (TypeError, ValueError):
+            return None
+        snapshot_json = await self.repository.get_outbound_task_config_snapshot(task_id)
+        try:
+            snapshot = json.loads(snapshot_json or "")
+            prompt = snapshot["prompt"]
+            voice = snapshot["voice"]
+            rule = snapshot["rule"]
+            if not all(isinstance(item, dict) for item in (prompt, voice, rule)):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        result = {
+            "promptProfileId": _optional_text(prompt.get("id")),
+            "promptName": _optional_text(prompt.get("name")),
+            "sceneCode": _optional_text(prompt.get("sceneCode")),
+            "voice": _optional_text(voice.get("voice")),
+            "voiceName": _optional_text(voice.get("displayName")),
+            "ruleName": _optional_text(rule.get("ruleName")),
+        }
+        return result if any(result.values()) else None
 
     async def mark_status(
         self,
@@ -331,6 +367,8 @@ class AiCallRecordService:
         phone_number: str | None = None,
         customer_name: str | None = None,
         call_result: str | None = None,
+        customer_intent: str | None = None,
+        follow_up_status: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -348,6 +386,8 @@ class AiCallRecordService:
             phone_number=phone_number,
             customer_name=customer_name,
             call_result=call_result,
+            customer_intent=customer_intent,
+            follow_up_status=follow_up_status,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -380,6 +420,19 @@ class AiCallRecordService:
 
     def record_to_dict(self, record: AiCallRecordModel) -> dict[str, Any]:
         outbound_context = getattr(record, "_outbound_context", {})
+        semantic_context = getattr(record, "_semantic_analysis_context", {})
+        follow_up_context = getattr(record, "_follow_up_context", {})
+        semantic_summary = None
+        semantic_analysis_result = getattr(record, "_semantic_analysis_result", None)
+        if semantic_analysis_result:
+            try:
+                parsed_analysis = json.loads(semantic_analysis_result)
+            except (TypeError, ValueError):
+                parsed_analysis = None
+            if isinstance(parsed_analysis, dict):
+                raw_summary = parsed_analysis.get("summary")
+                if isinstance(raw_summary, str) and raw_summary.strip():
+                    semantic_summary = raw_summary.strip()
         return {
             "id": str(record.id),
             "callId": record.call_id,
@@ -390,6 +443,14 @@ class AiCallRecordService:
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
             "callResult": outbound_context.get("callResult"),
+            "summary": semantic_summary,
+            "analysisStatus": semantic_context.get("analysisStatus"),
+            "customerIntent": semantic_context.get("customerIntent"),
+            "followUpSuggested": bool(
+                semantic_context.get("followUpSuggested", False)
+            ),
+            "followUpId": follow_up_context.get("followUpId"),
+            "followUpStatus": follow_up_context.get("followUpStatus"),
             "businessType": record.business_type,
             "businessId": record.business_id,
             "sceneCode": record.scene_code,

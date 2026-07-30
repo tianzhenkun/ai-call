@@ -90,6 +90,7 @@ FollowUpAttemptResult = Literal[
 FollowUpClosedReason = Literal[
     "customer_refused",
     "invalid_contact",
+    "created_by_error",
     "no_longer_needed",
     "other",
 ]
@@ -155,8 +156,11 @@ class FollowUpCloseIn(BaseModel):
 
     @model_validator(mode="after")
     def validate_other_reason(self):
-        if self.closed_reason == "other" and not self.closed_remark:
-            raise ValueError("选择其他关闭原因时必须填写说明")
+        if (
+            self.closed_reason in {"created_by_error", "no_longer_needed", "other"}
+            and not self.closed_remark
+        ):
+            raise ValueError("当前关闭原因必须填写说明")
         return self
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -120,9 +120,9 @@ async def _seed_agent(
     return console_session_id
 
 
-async def _seed_completed_handoff(session_factory) -> None:
+async def _seed_completed_handoff(session_factory) -> str:
     now = datetime.now(timezone.utc)
-    await _seed_agent(
+    console_session_id = await _seed_agent(
         session_factory,
         user_id=20,
         agent_identity="agent-20",
@@ -167,6 +167,7 @@ async def _seed_completed_handoff(session_factory) -> None:
                 ended_at=now,
             )
         )
+    return console_session_id
 
 
 async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> None:
@@ -177,6 +178,7 @@ async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> 
                 id=task_id,
                 tenant_id="tenant-a",
                 source_type="handoff_unanswered",
+                source_key=f"handoff:handoff-unanswered-{task_id}",
                 source_call_id="call-unanswered",
                 source_handoff_id=f"handoff-unanswered-{task_id}",
                 scene_code="intro_contract",
@@ -189,6 +191,37 @@ async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> 
                 follow_up_reason="首次人工接通等待超时",
                 customer_callback_at=None,
                 summary=None,
+                closed_reason=None,
+                closed_remark=None,
+                completed_at=None,
+                closed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+async def _seed_ai_post_call_follow_up(session_factory, *, task_id: int = 102) -> None:
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallFollowUpTaskModel(
+                id=task_id,
+                tenant_id="tenant-a",
+                source_type="ai_post_call",
+                source_key=f"call:call-ai-post-{task_id}",
+                source_call_id=f"call-ai-post-{task_id}",
+                source_handoff_id=None,
+                scene_code="intro_contract",
+                business_type="lead",
+                business_id="lead-ai",
+                contact_ref=f"call:call-ai-post-{task_id}",
+                masked_contact="137****0000",
+                owner_agent_identity=None,
+                status="pending",
+                follow_up_reason="客户明确要求顾问回访",
+                customer_callback_at=None,
+                summary="客户希望顾问后续联系。",
                 closed_reason=None,
                 closed_remark=None,
                 completed_at=None,
@@ -280,7 +313,16 @@ async def test_owned_handoff_completion_enters_quick_wrap_up(session_factory) ->
 
 @pytest.mark.anyio
 async def test_submit_acw_creates_one_owned_follow_up_and_releases_agent(session_factory) -> None:
-    await _seed_completed_handoff(session_factory)
+    console_session_id = await _seed_completed_handoff(session_factory)
+    async with session_factory() as db, db.begin():
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        presence.last_seen_at = datetime.now(timezone.utc) - timedelta(minutes=2)
 
     async with session_factory() as db:
         service = AiCallFollowUpService(db)
@@ -310,6 +352,13 @@ async def test_submit_acw_creates_one_owned_follow_up_and_releases_agent(session
         assert presence.status == "available"
         assert presence.active_handoff_id is None
         assert presence.active_call_id is None
+        assert presence.last_seen_at == presence.status_updated_at
+
+        _, available_presence = await service.agent_service.require_available_presence(
+            auth,
+            console_session_id=console_session_id,
+        )
+        assert available_presence.status == "available"
 
 
 @pytest.mark.anyio
@@ -358,6 +407,7 @@ async def test_unanswered_follow_up_claim_is_atomic_and_owner_is_fixed(session_f
                     _auth(db, user_id=user_id),
                     follow_up_id=100,
                 )
+                await db.commit()
                 return task.owner_agent_identity
             except CustomException as exc:
                 return _error_code(exc)
@@ -377,6 +427,45 @@ async def test_unanswered_follow_up_claim_is_atomic_and_owner_is_fixed(session_f
                 follow_up_id=100,
             )
         assert _error_code(conflict.value) == "FOLLOW_UP_ALREADY_CLAIMED"
+
+
+@pytest.mark.anyio
+async def test_claim_keeps_request_owned_transaction_valid(session_factory) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        async with db.begin():
+            task = await AiCallFollowUpService(db).claim_follow_up(
+                _auth(db, user_id=20),
+                follow_up_id=100,
+            )
+            assert task.owner_agent_identity == "agent-20"
+
+    async with session_factory() as db:
+        persisted = await db.get(AiCallFollowUpTaskModel, 100)
+        assert persisted is not None
+        assert persisted.owner_agent_identity == "agent-20"
+        assert persisted.status == "processing"
+
+
+@pytest.mark.anyio
+async def test_ai_post_call_follow_up_can_be_claimed_by_scoped_agent(
+    session_factory,
+) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_ai_post_call_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+
+        rows = await service.list_follow_ups(auth)
+        task = await service.claim_follow_up(auth, follow_up_id=102)
+
+        assert [row.id for row in rows] == [102]
+        assert task.owner_agent_identity == "agent-20"
+        assert task.status == "processing"
 
 
 @pytest.mark.anyio
@@ -402,6 +491,20 @@ async def test_owner_can_append_attempt_complete_or_close_with_rules(session_fac
         assert attempt.customer_callback_at is None
         assert task.status == "pending"
 
+        with pytest.raises(CustomException, match="请先登记已联系结果"):
+            await service.complete_follow_up(auth, follow_up_id=100)
+
+        connected_attempt = await service.append_attempt(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpAttemptIn(
+                contact_channel="wechat",
+                attempt_result="connected",
+                remark="客户已确认问题解决",
+            ),
+        )
+        assert connected_attempt.attempt_result == "connected"
+
         completed = await service.complete_follow_up(auth, follow_up_id=100)
         assert completed.status == "completed"
         assert completed.owner_agent_identity == "agent-20"
@@ -417,11 +520,55 @@ async def test_owner_can_append_attempt_complete_or_close_with_rules(session_fac
             .scalars()
             .all()
         )
-        assert len(attempts) == 1
+        assert len(attempts) == 2
 
     with pytest.raises(ValidationError):
         FollowUpCloseIn(closed_reason="other")
     assert FollowUpCloseIn(closed_reason="customer_refused").closed_remark is None
+    with pytest.raises(ValidationError):
+        FollowUpCloseIn(closed_reason="created_by_error")
+    assert (
+        FollowUpCloseIn(
+            closed_reason="created_by_error",
+            closed_remark="本地验收夹具重复创建",
+        ).closed_reason
+        == "created_by_error"
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_follow_up_payload_exposes_latest_contact_attempt(
+    session_factory,
+) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        await service.append_attempt(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpAttemptIn(
+                contact_channel="manual_phone",
+                attempt_result="no_answer",
+            ),
+        )
+        await service.append_attempt(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpAttemptIn(
+                contact_channel="wechat",
+                attempt_result="connected",
+            ),
+        )
+
+        rows = await service.list_follow_ups(auth)
+        payload = service.follow_up_payload(rows[0])
+
+        assert payload["latest_attempt"]["contact_channel"] == "wechat"
+        assert payload["latest_attempt"]["attempt_result"] == "connected"
 
 
 @pytest.mark.anyio
@@ -834,6 +981,7 @@ async def test_concurrent_callbacks_allow_only_one_active_call(session_factory) 
     async with session_factory() as db:
         service = AiCallFollowUpService(db)
         await service.claim_follow_up(_auth(db, user_id=20), follow_up_id=100)
+        await db.commit()
 
     callback_factory = _FakeCallbackFactory()
 

@@ -32,7 +32,8 @@ from app.api.v1.ai_call.model import (
     AiCallRecordModel,
     AiCallVoiceProfileModel,
 )
-from app.api.v1.ai_call.schema import HandoffListOut
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
+from app.api.v1.ai_call.schema import HandoffListOut, RecordDetailOut
 from app.api.v1.ai_call.service import AiCallService, configure_ai_call_offline_asr
 from app.api.v1.system.oss.service import OssService
 from app.config.setting import Settings
@@ -1235,11 +1236,131 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert detail["record"]["businessId"] == "324800000000000002"
     assert detail["lastEvent"]["id"].isdigit()
     assert isinstance(detail["lastEvent"]["id"], str)
+    assert detail["executionConfig"] is None
 
     events = await service.list_record_events(result.call_id)
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+@pytest.mark.anyio
+async def test_outbound_record_detail_uses_frozen_task_execution_config(
+    b1_service,
+) -> None:
+    task_id = 324800000000000101
+    now = datetime(2026, 7, 30, 2, 0, tzinfo=timezone.utc)
+    frozen_snapshot = {
+        "prompt": {
+            "id": "prompt-frozen",
+            "name": "冻结提示词",
+            "sceneCode": "intro_frozen",
+        },
+        "voice": {
+            "voice": "Cherry",
+            "displayName": "芊悦",
+        },
+        "rule": {
+            "ruleName": "冻结规则",
+        },
+    }
+    async with b1_service.session_maker() as db:
+        db.add(
+            AiCallOutboundTaskModel(
+                id=task_id,
+                tenant_id="000000",
+                validation_id=324800000000000102,
+                idempotency_key="record-detail-frozen-config",
+                request_fingerprint="a" * 64,
+                task_name="正式外呼任务",
+                task_mode="single",
+                status="COMPLETED",
+                total_targets=1,
+                completed_targets=1,
+                connected_targets=1,
+                failed_targets=0,
+                execution_mode="immediate",
+                scheduled_at=None,
+                next_dispatch_at=None,
+                last_dispatched_at=now,
+                started_at=now,
+                ended_at=now,
+                prompt_profile_id="prompt-current",
+                prompt_name="不能使用的当前提示词",
+                scene_code="intro_current",
+                voice="Tina",
+                voice_name="不能使用的当前音色",
+                rule_id=324800000000000103,
+                rule_name="不能使用的当前规则",
+                rule_summary="当前规则摘要",
+                line_id=None,
+                line_name=None,
+                config_snapshot_json=json.dumps(frozen_snapshot, ensure_ascii=False),
+                error_message=None,
+                created_by=1,
+                created_by_name="管理员",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await db.commit()
+
+    await b1_service.record_service.create_sip_record(
+        call_id="call_outbound_frozen_config",
+        business_type="outbound_task",
+        business_id=str(task_id),
+        room_name="room-outbound-frozen-config",
+        participant_identity="sip-outbound-frozen-config",
+        started_at=now,
+    )
+
+    detail = await b1_service.service.get_record_detail(
+        "call_outbound_frozen_config"
+    )
+    response = RecordDetailOut.model_validate(detail).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+
+    assert response["executionConfig"] == {
+        "promptProfileId": "prompt-frozen",
+        "promptName": "冻结提示词",
+        "sceneCode": "intro_frozen",
+        "voice": "Cherry",
+        "voiceName": "芊悦",
+        "ruleName": "冻结规则",
+    }
+
+
+@pytest.mark.anyio
+async def test_record_list_includes_successful_semantic_summary(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    repository = record_service.repository
+    await repository.ensure_semantic_analysis_record(
+        call_id=result.call_id,
+        scene_code="intro_geo",
+    )
+    await repository.update_semantic_analysis_success(
+        call_id=result.call_id,
+        analysis_result={
+            "summary": "客户希望进一步了解服务效果。",
+            "feedback_type": "中性",
+            "key_points": [],
+            "time_hint": {},
+            "tags": [],
+        },
+        transcript_snapshot_json="{}",
+        transcript_hash="hash-1",
+    )
+
+    page = await service.list_records(tenant_id="000000")
+
+    assert page["rows"][0]["summary"] == "客户希望进一步了解服务效果。"
 
 
 @pytest.mark.anyio

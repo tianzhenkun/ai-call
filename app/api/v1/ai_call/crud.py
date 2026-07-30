@@ -87,6 +87,103 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def list_records_by_call_ids(
+        self,
+        call_ids: list[str],
+    ) -> list[AiCallRecordModel]:
+        if not call_ids:
+            return []
+        result = await self.db.execute(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id.in_(call_ids))
+        )
+        return list(result.scalars().all())
+
+    async def list_dialogue_segments_by_call_ids(
+        self,
+        call_ids: list[str],
+    ) -> list[AiCallDialogueSegmentModel]:
+        if not call_ids:
+            return []
+        ranked_segments = (
+            select(
+                AiCallDialogueSegmentModel.id.label("segment_id"),
+                func.row_number()
+                .over(
+                    partition_by=AiCallDialogueSegmentModel.call_id,
+                    order_by=AiCallDialogueSegmentModel.segment_no.desc(),
+                )
+                .label("row_number"),
+            )
+            .where(
+                AiCallDialogueSegmentModel.call_id.in_(call_ids),
+                AiCallDialogueSegmentModel.segment_status == "final",
+                AiCallDialogueSegmentModel.speaker_type.in_(
+                    {"customer", "ai", "human_agent"}
+                ),
+                func.length(func.trim(AiCallDialogueSegmentModel.segment_text)) > 0,
+            )
+            .subquery()
+        )
+        result = await self.db.execute(
+            select(AiCallDialogueSegmentModel)
+            .join(
+                ranked_segments,
+                ranked_segments.c.segment_id == AiCallDialogueSegmentModel.id,
+            )
+            .where(ranked_segments.c.row_number <= 6)
+            .order_by(
+                asc(AiCallDialogueSegmentModel.call_id),
+                asc(AiCallDialogueSegmentModel.segment_no),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def outbound_customer_names_by_call_ids(
+        self,
+        *,
+        tenant_id: str,
+        call_ids: list[str],
+    ) -> dict[str, str | None]:
+        if not call_ids:
+            return {}
+        result = await self.db.execute(
+            select(
+                AiCallOutboundAttemptModel.call_id,
+                AiCallOutboundTargetModel.customer_name,
+            )
+            .join(
+                AiCallOutboundTargetModel,
+                and_(
+                    AiCallOutboundTargetModel.id == AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundTargetModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                ),
+            )
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.call_id.in_(call_ids),
+            )
+        )
+        return dict(result.all())
+
+    async def get_outbound_task_config_snapshot(self, task_id: int) -> str | None:
+        return await self.db.scalar(
+            select(AiCallOutboundTaskModel.config_snapshot_json).where(
+                AiCallOutboundTaskModel.id == task_id
+            )
+        )
+
+    async def get_outbound_attempt_by_call_id(
+        self,
+        call_id: str,
+    ) -> AiCallOutboundAttemptModel | None:
+        result = await self.db.execute(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == call_id
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def get_active_sip_record_by_callee_hash(
         self,
         *,
@@ -129,6 +226,8 @@ class AiCallRecordRepository:
         phone_number: str | None = None,
         customer_name: str | None = None,
         call_result: str | None = None,
+        customer_intent: str | None = None,
+        follow_up_status: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -147,6 +246,8 @@ class AiCallRecordRepository:
             phone_number=phone_number,
             customer_name=customer_name,
             call_result=call_result,
+            customer_intent=customer_intent,
+            follow_up_status=follow_up_status,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -163,6 +264,8 @@ class AiCallRecordRepository:
             phone_number=phone_number,
             customer_name=customer_name,
             call_result=call_result,
+            customer_intent=customer_intent,
+            follow_up_status=follow_up_status,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -181,7 +284,102 @@ class AiCallRecordRepository:
         )
         rows = (await self.db.execute(stmt)).scalars().all()
         await self._attach_outbound_context(rows, tenant_id=tenant_id)
+        await self._attach_semantic_analysis(rows)
+        await self._attach_follow_up_context(rows, tenant_id=tenant_id)
         return list(rows), total
+
+    async def _attach_semantic_analysis(
+        self,
+        records: list[AiCallRecordModel],
+    ) -> None:
+        call_ids = [record.call_id for record in records]
+        if not call_ids:
+            return
+        analysis_rows = (
+            await self.db.execute(
+                select(
+                    AiCallSemanticAnalysisModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_status,
+                    AiCallSemanticAnalysisModel.analysis_result,
+                    AiCallSemanticAnalysisModel.customer_intent,
+                    AiCallSemanticAnalysisModel.follow_up_suggested,
+                ).where(
+                    AiCallSemanticAnalysisModel.call_id.in_(call_ids),
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                )
+            )
+        ).all()
+        analysis_by_call_id = {
+            row.call_id: {
+                "analysisStatus": row.analysis_status,
+                "analysisResult": row.analysis_result,
+                "customerIntent": row.customer_intent,
+                "followUpSuggested": bool(row.follow_up_suggested),
+            }
+            for row in analysis_rows
+        }
+        for record in records:
+            context = analysis_by_call_id.get(record.call_id, {})
+            record._semantic_analysis_context = context
+            record._semantic_analysis_result = context.get("analysisResult")
+
+    async def _attach_follow_up_context(
+        self,
+        records: list[AiCallRecordModel],
+        *,
+        tenant_id: str | None,
+    ) -> None:
+        call_ids = [record.call_id for record in records]
+        follow_up_ids = [
+            record.follow_up_id
+            for record in records
+            if record.follow_up_id is not None
+        ]
+        if not tenant_id or (not call_ids and not follow_up_ids):
+            return
+        result = await self.db.execute(
+            select(AiCallFollowUpTaskModel).where(
+                AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                or_(
+                    AiCallFollowUpTaskModel.source_call_id.in_(call_ids),
+                    AiCallFollowUpTaskModel.id.in_(follow_up_ids),
+                ),
+            )
+        )
+        tasks = list(result.scalars().all())
+        tasks_by_id = {task.id: task for task in tasks}
+        tasks_by_call_id: dict[str, list[AiCallFollowUpTaskModel]] = {}
+        for task in tasks:
+            tasks_by_call_id.setdefault(task.source_call_id, []).append(task)
+
+        for record in records:
+            selected = (
+                tasks_by_id.get(record.follow_up_id)
+                if record.follow_up_id is not None
+                else None
+            )
+            if selected is None:
+                candidates = tasks_by_call_id.get(record.call_id, [])
+                active = [
+                    task
+                    for task in candidates
+                    if task.status not in {"completed", "closed"}
+                ]
+                pool = active or candidates
+                if pool:
+                    selected = max(
+                        pool,
+                        key=lambda task: (task.updated_at, task.id),
+                    )
+            record._follow_up_context = (
+                {
+                    "followUpId": str(selected.id),
+                    "followUpStatus": selected.status,
+                }
+                if selected is not None
+                else {}
+            )
 
     async def _attach_outbound_context(
         self,
@@ -780,6 +978,7 @@ class AiCallRecordRepository:
         analysis.analysis_started_at = now
         analysis.analysis_finished_at = None
         analysis.analysis_error = None
+        self._clear_semantic_post_call_fields(analysis)
         analysis.updated_at = now
         await self.db.flush()
         await self.db.refresh(analysis)
@@ -792,6 +991,12 @@ class AiCallRecordRepository:
         analysis_result: dict,
         transcript_snapshot_json: str,
         transcript_hash: str,
+        customer_intent: str | None = None,
+        follow_up_suggested: bool = False,
+        follow_up_consent: str | None = None,
+        follow_up_reason: str | None = None,
+        follow_up_preferred_at: datetime | None = None,
+        follow_up_confidence: str | None = None,
         analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
         now: datetime | None = None,
     ) -> AiCallSemanticAnalysisModel | None:
@@ -804,6 +1009,12 @@ class AiCallRecordRepository:
         now = now or datetime.now(timezone.utc)
         analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
         analysis.analysis_result = json.dumps(analysis_result, ensure_ascii=False)
+        analysis.customer_intent = customer_intent
+        analysis.follow_up_suggested = follow_up_suggested
+        analysis.follow_up_consent = follow_up_consent
+        analysis.follow_up_reason = follow_up_reason
+        analysis.follow_up_preferred_at = follow_up_preferred_at
+        analysis.follow_up_confidence = follow_up_confidence
         analysis.analysis_error = None
         analysis.analysis_finished_at = now
         analysis.transcript_snapshot_json = transcript_snapshot_json
@@ -832,6 +1043,7 @@ class AiCallRecordRepository:
         now = now or datetime.now(timezone.utc)
         analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_FAILED
         analysis.analysis_error = analysis_error
+        self._clear_semantic_post_call_fields(analysis)
         analysis.analysis_retry_count = int(analysis.analysis_retry_count or 0) + 1
         analysis.analysis_finished_at = now
         if transcript_snapshot_json is not None:
@@ -862,6 +1074,7 @@ class AiCallRecordRepository:
         now = now or datetime.now(timezone.utc)
         analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT
         analysis.analysis_error = analysis_error
+        self._clear_semantic_post_call_fields(analysis)
         analysis.analysis_finished_at = now
         analysis.transcript_snapshot_json = transcript_snapshot_json
         analysis.transcript_hash = transcript_hash
@@ -869,6 +1082,17 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(analysis)
         return analysis
+
+    @staticmethod
+    def _clear_semantic_post_call_fields(
+        analysis: AiCallSemanticAnalysisModel,
+    ) -> None:
+        analysis.customer_intent = None
+        analysis.follow_up_suggested = False
+        analysis.follow_up_consent = None
+        analysis.follow_up_reason = None
+        analysis.follow_up_preferred_at = None
+        analysis.follow_up_confidence = None
 
     async def create_prompt_profile(self, **values) -> AiCallPromptProfileModel:
         now = datetime.now(timezone.utc)
@@ -1242,6 +1466,12 @@ class AiCallRecordRepository:
         return result.rowcount == 1
 
     async def create_unanswered_follow_up_if_missing(self, values: dict) -> None:
+        await self.create_follow_up_if_missing(values)
+
+    async def create_follow_up_if_missing(
+        self,
+        values: dict,
+    ) -> AiCallFollowUpTaskModel:
         table = AiCallFollowUpTaskModel.__table__
         dialect_name = self._dialect_name()
         if dialect_name == "postgresql":
@@ -1249,7 +1479,11 @@ class AiCallRecordRepository:
                 postgresql_insert(table)
                 .values(**values)
                 .on_conflict_do_nothing(
-                    index_elements=[table.c.tenant_id, table.c.source_handoff_id]
+                    index_elements=[
+                        table.c.tenant_id,
+                        table.c.source_type,
+                        table.c.source_key,
+                    ]
                 )
             )
         elif dialect_name == "sqlite":
@@ -1257,26 +1491,56 @@ class AiCallRecordRepository:
                 sqlite_insert(table)
                 .values(**values)
                 .on_conflict_do_nothing(
-                    index_elements=[table.c.tenant_id, table.c.source_handoff_id]
+                    index_elements=[
+                        table.c.tenant_id,
+                        table.c.source_type,
+                        table.c.source_key,
+                    ]
                 )
             )
         elif dialect_name == "mysql":
             insert_stmt = mysql_insert(table).values(**values)
             stmt = insert_stmt.on_duplicate_key_update(
-                source_handoff_id=insert_stmt.inserted.source_handoff_id
+                source_key=insert_stmt.inserted.source_key
             )
         else:
             existing = await self.db.execute(
                 select(AiCallFollowUpTaskModel.id).where(
                     AiCallFollowUpTaskModel.tenant_id == values["tenant_id"],
-                    AiCallFollowUpTaskModel.source_handoff_id
-                    == values["source_handoff_id"],
+                    AiCallFollowUpTaskModel.source_type == values["source_type"],
+                    AiCallFollowUpTaskModel.source_key == values["source_key"],
                 )
             )
             if existing.scalar_one_or_none() is None:
                 self.db.add(AiCallFollowUpTaskModel(**values))
-            return
-        await self.db.execute(stmt)
+                await self.db.flush()
+        if dialect_name in {"postgresql", "sqlite", "mysql"}:
+            await self.db.execute(stmt)
+            await self.db.flush()
+        return await self.get_follow_up_by_source(
+            tenant_id=values["tenant_id"],
+            source_type=values["source_type"],
+            source_key=values["source_key"],
+        )
+
+    async def get_follow_up_by_source(
+        self,
+        *,
+        tenant_id: str,
+        source_type: str,
+        source_key: str,
+    ) -> AiCallFollowUpTaskModel:
+        result = await self.db.execute(
+            select(AiCallFollowUpTaskModel).where(
+                AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                AiCallFollowUpTaskModel.source_type == source_type,
+                AiCallFollowUpTaskModel.source_key == source_key,
+            )
+        )
+        task = result.scalar_one_or_none()
+        if task is None:
+            raise RuntimeError("跟进任务幂等写入后未找到记录")
+        return task
 
     async def update_handoff(
         self,
@@ -1361,6 +1625,12 @@ class AiCallRecordRepository:
         phone_number = str(filters.get("phone_number") or "").strip() or None
         customer_name = str(filters.get("customer_name") or "").strip() or None
         call_result = str(filters.get("call_result") or "").strip() or None
+        customer_intent = (
+            str(filters.get("customer_intent") or "").strip() or None
+        )
+        follow_up_status = (
+            str(filters.get("follow_up_status") or "").strip() or None
+        )
         has_outbound_filters = any(
             (
                 filters.get("task_id"),
@@ -1446,6 +1716,126 @@ class AiCallRecordRepository:
             stmt = stmt.where(AiCallRecordModel.status == filters["status"])
         if filters.get("entry_type"):
             stmt = stmt.where(AiCallRecordModel.entry_type == filters["entry_type"])
+        if customer_intent in {"positive", "neutral", "negative"}:
+            stmt = stmt.where(
+                select(AiCallSemanticAnalysisModel.id)
+                .where(
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.customer_intent
+                    == customer_intent,
+                )
+                .exists()
+            )
+        elif customer_intent == "pending":
+            stmt = stmt.where(
+                select(AiCallSemanticAnalysisModel.id)
+                .where(
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.analysis_status.in_(
+                        {
+                            SEMANTIC_ANALYSIS_STATUS_PENDING,
+                            SEMANTIC_ANALYSIS_STATUS_RUNNING,
+                        }
+                    ),
+                )
+                .exists()
+            )
+        elif customer_intent == "failed":
+            stmt = stmt.where(
+                select(AiCallSemanticAnalysisModel.id)
+                .where(
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.analysis_status
+                    == SEMANTIC_ANALYSIS_STATUS_FAILED,
+                )
+                .exists()
+            )
+        if follow_up_status:
+            exact_task_status = (
+                select(AiCallFollowUpTaskModel.status)
+                .where(
+                    AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                    AiCallFollowUpTaskModel.id == AiCallRecordModel.follow_up_id,
+                )
+                .correlate(AiCallRecordModel)
+                .limit(1)
+                .scalar_subquery()
+            )
+            active_task_status = (
+                select(AiCallFollowUpTaskModel.status)
+                .where(
+                    AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                    AiCallFollowUpTaskModel.source_call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallFollowUpTaskModel.status.not_in(
+                        {"completed", "closed"}
+                    ),
+                )
+                .order_by(
+                    AiCallFollowUpTaskModel.updated_at.desc(),
+                    AiCallFollowUpTaskModel.id.desc(),
+                )
+                .correlate(AiCallRecordModel)
+                .limit(1)
+                .scalar_subquery()
+            )
+            latest_task_status = (
+                select(AiCallFollowUpTaskModel.status)
+                .where(
+                    AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                    AiCallFollowUpTaskModel.source_call_id
+                    == AiCallRecordModel.call_id,
+                )
+                .order_by(
+                    AiCallFollowUpTaskModel.updated_at.desc(),
+                    AiCallFollowUpTaskModel.id.desc(),
+                )
+                .correlate(AiCallRecordModel)
+                .limit(1)
+                .scalar_subquery()
+            )
+            selected_task_status = func.coalesce(
+                exact_task_status,
+                active_task_status,
+                latest_task_status,
+            )
+            if follow_up_status in {
+                "pending",
+                "processing",
+                "completed",
+                "closed",
+            }:
+                stmt = stmt.where(selected_task_status == follow_up_status)
+            elif follow_up_status in {"suggested", "none"}:
+                suggested = follow_up_status == "suggested"
+                semantic_conditions = [
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.follow_up_suggested
+                    == suggested,
+                ]
+                if follow_up_status == "none":
+                    semantic_conditions.append(
+                        AiCallSemanticAnalysisModel.analysis_status
+                        == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+                    )
+                stmt = stmt.where(
+                    select(AiCallSemanticAnalysisModel.id)
+                    .where(*semantic_conditions)
+                    .exists(),
+                    selected_task_status.is_(None),
+                )
         if filters.get("started_at_begin"):
             stmt = stmt.where(AiCallRecordModel.started_at >= filters["started_at_begin"])
         if filters.get("started_at_end"):

@@ -72,6 +72,7 @@ def test_agent_console_models_match_tenant_scoped_contract() -> None:
         AiCallFollowUpTaskModel: {
             "tenant_id",
             "source_type",
+            "source_key",
             "source_call_id",
             "source_handoff_id",
             "scene_code",
@@ -144,6 +145,9 @@ def test_new_models_define_required_unique_constraints_and_indexes() -> None:
         ("tenant_id", "handoff_id"),
     } <= _unique_columns(AiCallAfterCallWorkModel)
     assert ("tenant_id", "source_handoff_id") in _unique_columns(AiCallFollowUpTaskModel)
+    assert ("tenant_id", "source_type", "source_key") in _unique_columns(
+        AiCallFollowUpTaskModel
+    )
     assert {
         ("tenant_id", "follow_up_id", "contacted_at"),
         ("tenant_id", "related_call_id"),

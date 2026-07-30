@@ -545,6 +545,16 @@ class AiCallSemanticAnalysisModel(MappedBase):
         Index("idx_ai_call_semantic_call_id", "call_id"),
         Index("idx_ai_call_semantic_status_updated", "analysis_status", "updated_at"),
         Index("idx_ai_call_semantic_scene_status", "scene_code", "analysis_status"),
+        Index(
+            "idx_ai_call_semantic_scene_intent",
+            "analysis_scene_code",
+            "customer_intent",
+        ),
+        Index(
+            "idx_ai_call_semantic_scene_follow_up",
+            "analysis_scene_code",
+            "follow_up_suggested",
+        ),
         {"comment": "AI Call 通话后语义分析记录表"},
     )
     __permission_strategy__ = None
@@ -574,7 +584,38 @@ class AiCallSemanticAnalysisModel(MappedBase):
     analysis_result: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
-        comment="五字段语义分析 JSON",
+        comment="结构化语义分析与话后结果 JSON",
+    )
+    customer_intent: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="物化客户意向：positive/neutral/negative",
+    )
+    follow_up_suggested: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="是否建议后续人工跟进",
+    )
+    follow_up_consent: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="跟进同意状态：explicit/missing/refused",
+    )
+    follow_up_reason: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="结构化跟进原因",
+    )
+    follow_up_preferred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="客户期望跟进时间",
+    )
+    follow_up_confidence: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="跟进证据置信度：high/medium/low",
     )
     analysis_error: Mapped[str | None] = mapped_column(
         String(1000),
@@ -880,6 +921,12 @@ class AiCallFollowUpTaskModel(MappedBase):
         UniqueConstraint(
             "tenant_id", "source_handoff_id", name="uk_ai_call_follow_up_source_handoff"
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "source_type",
+            "source_key",
+            name="uk_ai_call_follow_up_source_key",
+        ),
         Index(
             "idx_ai_call_follow_up_owner_status",
             "tenant_id",
@@ -894,8 +941,9 @@ class AiCallFollowUpTaskModel(MappedBase):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(160), nullable=False)
     source_call_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    source_handoff_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_handoff_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scene_code: Mapped[str] = mapped_column(String(64), nullable=False)
     business_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     business_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

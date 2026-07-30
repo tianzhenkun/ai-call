@@ -26,6 +26,7 @@ class AiCallHandoffUnansweredService:
                 "id": generate_snowflake_id(),
                 "tenant_id": handoff.tenant_id,
                 "source_type": "handoff_unanswered",
+                "source_key": f"handoff:{handoff.handoff_id}",
                 "source_call_id": handoff.call_id,
                 "source_handoff_id": handoff.handoff_id,
                 "scene_code": handoff.scene_code,

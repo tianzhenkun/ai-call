@@ -12,7 +12,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallFollowUpTaskModel,
+    AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
+)
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -58,6 +62,8 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
             "phoneNumber": "13800138011",
             "customerName": "客户甲",
             "callResult": "no_answer",
+            "customerIntent": "positive",
+            "followUpStatus": "suggested",
         },
     )
 
@@ -70,6 +76,8 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
         "phone_number": "13800138011",
         "customer_name": "客户甲",
         "call_result": "no_answer",
+        "customer_intent": "positive",
+        "follow_up_status": "suggested",
         "business_type": None,
         "business_id": None,
         "status": None,
@@ -79,6 +87,24 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
         "page_num": 1,
         "page_size": 10,
     }
+
+
+def test_record_list_controller_rejects_unknown_post_call_filters() -> None:
+    service = _ListRecordsService()
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
+
+    response = TestClient(app).get(
+        "/ai-call/records",
+        params={"customerIntent": "very_positive"},
+    )
+
+    assert response.status_code == 422
+    assert service.query is None
 
 
 def test_outbound_attempt_model_has_no_physical_foreign_keys() -> None:
@@ -403,5 +429,237 @@ async def test_record_list_is_tenant_scoped_and_rejects_inconsistent_target_task
         )
         assert legacy_total == 1
         assert [row.call_id for row in legacy_rows] == ["call-legacy-default-tenant"]
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    call_cases = [
+        ("call-positive-none", "positive", False, "2"),
+        ("call-positive-suggested", "positive", True, "2"),
+        ("call-pending-task", "neutral", True, "2"),
+        ("call-completed-task", "negative", True, "2"),
+        ("call-analysis-running", None, False, "1"),
+        ("call-analysis-pending", None, False, "0"),
+        ("call-analysis-failed", None, False, "3"),
+        ("call-no-user-input", None, False, "4"),
+    ]
+
+    async with session_maker() as session:
+        session.add(
+            AiCallOutboundTaskModel(
+                id=501,
+                tenant_id="tenant-a",
+                validation_id=501,
+                idempotency_key="post-call-list",
+                request_fingerprint="post-call-list-fingerprint",
+                task_name="话后结果筛选",
+                task_mode="batch",
+                status="COMPLETED",
+                total_targets=len(call_cases),
+                completed_targets=len(call_cases),
+                connected_targets=len(call_cases),
+                failed_targets=0,
+                execution_mode="immediate",
+                prompt_name="GEO 产品介绍",
+                scene_code="intro_geo",
+                voice="Tina",
+                rule_id=1,
+                rule_name="工作日规则",
+                rule_summary="09:00–12:00",
+                config_snapshot_json="{}",
+                created_by=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        for offset, (
+            call_id,
+            customer_intent,
+            follow_up_suggested,
+            analysis_status,
+        ) in enumerate(call_cases, start=1):
+            target_id = 600 + offset
+            session.add_all(
+                [
+                    AiCallOutboundTargetModel(
+                        id=target_id,
+                        tenant_id="tenant-a",
+                        task_id=501,
+                        validation_id=501,
+                        source_validation_row_id=target_id,
+                        source_row_number=offset + 1,
+                        phone_number=f"19900001{offset:03d}",
+                        customer_name=f"客户{offset}",
+                        status="COMPLETED",
+                        attempt_count=1,
+                        latest_result="connected",
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRecordModel(
+                        id=700 + offset,
+                        call_id=call_id,
+                        business_type="outbound_task",
+                        business_id="501",
+                        scene_code="intro_geo",
+                        entry_type="sip_outbound",
+                        room_name=f"room-{call_id}",
+                        participant_identity=f"sip-{offset}",
+                        status="completed",
+                        started_at=now,
+                        ended_at=now,
+                        follow_up_id=(
+                            1002 if call_id == "call-completed-task" else None
+                        ),
+                    ),
+                    AiCallOutboundAttemptModel(
+                        id=800 + offset,
+                        tenant_id="tenant-a",
+                        task_id=501,
+                        target_id=target_id,
+                        attempt_no=1,
+                        call_id=call_id,
+                        dialer_type="sip",
+                        status="COMPLETED",
+                        call_result="connected",
+                        started_at=now,
+                        ended_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallSemanticAnalysisModel(
+                        id=900 + offset,
+                        call_id=call_id,
+                        scene_code="intro_geo",
+                        analysis_scene_code="ai_call_semantic_analysis",
+                        analysis_status=analysis_status,
+                        analysis_result='{"summary":"结构化摘要"}',
+                        customer_intent=customer_intent,
+                        follow_up_suggested=follow_up_suggested,
+                        follow_up_consent=(
+                            "explicit" if follow_up_suggested else "missing"
+                        ),
+                        follow_up_reason=(
+                            "客户要求回访" if follow_up_suggested else None
+                        ),
+                        follow_up_confidence=(
+                            "high" if follow_up_suggested else "low"
+                        ),
+                        analysis_retry_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                ]
+            )
+        session.add_all(
+            [
+                AiCallFollowUpTaskModel(
+                    id=1001,
+                    tenant_id="tenant-a",
+                    source_type="ai_post_call",
+                    source_key="call:call-pending-task",
+                    source_call_id="call-pending-task",
+                    source_handoff_id=None,
+                    scene_code="intro_geo",
+                    contact_ref="call:call-pending-task",
+                    masked_contact="199****1003",
+                    status="pending",
+                    follow_up_reason="客户要求回访",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallFollowUpTaskModel(
+                    id=1002,
+                    tenant_id="tenant-a",
+                    source_type="ai_post_call",
+                    source_key="call:call-completed-task",
+                    source_call_id="call-completed-task",
+                    source_handoff_id=None,
+                    scene_code="intro_geo",
+                    contact_ref="call:call-completed-task",
+                    masked_contact="199****1004",
+                    status="completed",
+                    follow_up_reason="客户要求回访",
+                    completed_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallFollowUpTaskModel(
+                    id=1003,
+                    tenant_id="tenant-a",
+                    source_type="ai_post_call",
+                    source_key="call:call-completed-task:second",
+                    source_call_id="call-completed-task",
+                    source_handoff_id=None,
+                    scene_code="intro_geo",
+                    contact_ref="call:call-completed-task",
+                    masked_contact="199****1004",
+                    status="pending",
+                    follow_up_reason="新一轮跟进建议",
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+        service = AiCallRecordService(AiCallRecordRepository(session))
+        rows, total = await service.list_records(
+            tenant_id="tenant-a",
+            page_size=10,
+        )
+        payloads = {
+            row.call_id: service.record_to_dict(row)
+            for row in rows
+        }
+
+        assert total == 8
+        assert payloads["call-pending-task"] | {
+            "analysisStatus": "2",
+            "customerIntent": "neutral",
+            "followUpSuggested": True,
+            "followUpId": "1001",
+            "followUpStatus": "pending",
+        } == payloads["call-pending-task"]
+        assert payloads["call-completed-task"]["followUpStatus"] == "completed"
+        assert payloads["call-analysis-running"]["analysisStatus"] == "1"
+
+        positive_rows, positive_total = await service.list_records(
+            tenant_id="tenant-a",
+            customer_intent="positive",
+        )
+        suggested_rows, suggested_total = await service.list_records(
+            tenant_id="tenant-a",
+            follow_up_status="suggested",
+        )
+        pending_rows, pending_total = await service.list_records(
+            tenant_id="tenant-a",
+            follow_up_status="pending",
+        )
+        none_rows, none_total = await service.list_records(
+            tenant_id="tenant-a",
+            follow_up_status="none",
+        )
+
+        assert positive_total == 2
+        assert {row.call_id for row in positive_rows} == {
+            "call-positive-none",
+            "call-positive-suggested",
+        }
+        assert suggested_total == 1
+        assert [row.call_id for row in suggested_rows] == [
+            "call-positive-suggested"
+        ]
+        assert pending_total == 1
+        assert [row.call_id for row in pending_rows] == ["call-pending-task"]
+        assert none_total == 1
+        assert [row.call_id for row in none_rows] == ["call-positive-none"]
 
     await engine.dispose()

@@ -1009,6 +1009,32 @@ def test_semantic_evidence_keeps_short_answer_to_previous_question() -> None:
     assert _semantic_module().SemanticTranscriptBuilder().has_effective_user_input(snapshot)
 
 
+def test_semantic_evidence_marks_direct_future_call_instruction_as_consent() -> None:
+    snapshot = _build_snapshot([
+        _segment(
+            segment_no=1,
+            speaker_type="ai",
+            text="方便留一个邮箱或微信号吗？",
+            started_offset_seconds=0,
+            ended_offset_seconds=2,
+        ),
+        _segment(
+            segment_no=2,
+            speaker_type="customer",
+            text="你到时候打一个电话就行。",
+            source="qwen_realtime",
+            started_offset_seconds=3,
+            ended_offset_seconds=5,
+        ),
+    ])
+
+    evidence = _user_turns(snapshot)[0]["semantic_evidence"]
+
+    assert evidence["analysis_usage"] == "use_as_customer_signal"
+    assert evidence["supports_strong_fact"] is True
+    assert "follow_up_consent" in evidence["supported_strong_fact_types"]
+
+
 def test_semantic_evidence_marks_weak_feedback_without_business_fact() -> None:
     snapshot = _build_snapshot([
         _segment(
@@ -2120,7 +2146,7 @@ def test_semantic_transcript_rejects_short_offline_question_diverging_from_realt
     } == {"offline_asr_short_question_realtime_divergence"}
 
 
-def test_semantic_analysis_result_is_normalized_to_fixed_five_fields() -> None:
+def test_semantic_analysis_result_is_normalized_to_fixed_six_fields() -> None:
     module = _semantic_module()
 
     result = module.normalize_analysis_result({
@@ -2138,6 +2164,7 @@ def test_semantic_analysis_result_is_normalized_to_fixed_five_fields() -> None:
         "key_points",
         "time_hint",
         "tags",
+        "follow_up",
     ]
     assert result["summary"] == "123"
     assert result["feedback_type"] == "中性"
@@ -2148,6 +2175,13 @@ def test_semantic_analysis_result_is_normalized_to_fixed_five_fields() -> None:
         "original_texts": ["下午再联系"],
     }
     assert result["tags"] == ["跟进", "7"]
+    assert result["follow_up"] == {
+        "required": False,
+        "consent": "missing",
+        "reason": "",
+        "preferred_time": None,
+        "confidence": "low",
+    }
 
 
 @pytest.mark.anyio
@@ -2562,7 +2596,7 @@ async def test_openai_compatible_semantic_analyzer_posts_json_chat_completion() 
         assert request.headers["authorization"] == "Bearer test-key"
         assert payload["model"] == "qwen-plus"
         assert payload["response_format"] == {"type": "json_object"}
-        assert "五字段 JSON" in payload["messages"][0]["content"]
+        assert "六字段 JSON" in payload["messages"][0]["content"]
         assert user_payload["reference_date"] == "2026-07-02"
         assert user_payload["transcript_json"]["call_id"] == "call_semantic_llm"
 

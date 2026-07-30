@@ -282,9 +282,19 @@ class RecordEventOut(AiCallBaseSchema):
     payload: dict
 
 
+class RecordExecutionConfigOut(AiCallBaseSchema):
+    prompt_profile_id: str | None = None
+    prompt_name: str | None = None
+    scene_code: str | None = None
+    voice: str | None = None
+    voice_name: str | None = None
+    rule_name: str | None = None
+
+
 class RecordDetailOut(AiCallBaseSchema):
     record: RecordOut
     last_event: RecordEventOut | None = None
+    execution_config: RecordExecutionConfigOut | None = None
 
 
 class RecordEventListOut(AiCallBaseSchema):
