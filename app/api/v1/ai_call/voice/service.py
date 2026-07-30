@@ -51,6 +51,7 @@ CLEANUP_PERSISTENCE_LOG = "音色样本清理补偿持久化失败，需人工�
 VOICE_PREVIEW_OPENING_MESSAGE = "您好，我是您的智能语音助手，很高兴为您服务。"
 VOICE_PREVIEW_INSTRUCTIONS = "你是智能语音助手，请自然地与用户进行简短试听对话。"
 VOICE_PREVIEW_TIMEOUT_SECONDS = 30
+VOICE_PREVIEW_CLEANUP_RETRY_DELAYS = (0.5, 1.0, 2.0)
 SAMPLE_EXTENSION_BY_CONTENT_TYPE = {
     "audio/wav": ".wav",
     "audio/mpeg": ".mp3",
@@ -94,8 +95,13 @@ class _VoicePreviewSession:
     user_id: int
     call_id: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    create_task: asyncio.Task[CreateSessionResult] | None = None
     ready_task: asyncio.Task[BrowserEventReportResult] | None = None
     cleanup_task: asyncio.Task[EndSessionResult] | None = None
+    resource_generation: int = 0
+    cleanup_task_generation: int = -1
+    cleanup_failures: int = 0
+    last_cleanup_error_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +121,7 @@ class VoicePreviewService:
         orchestrator: VoicePreviewOrchestrator,
         target_model: str,
         timeout_seconds: float = VOICE_PREVIEW_TIMEOUT_SECONDS,
+        cleanup_retry_delays: tuple[float, ...] = VOICE_PREVIEW_CLEANUP_RETRY_DELAYS,
         tombstone_ttl_seconds: float = 60,
         tombstone_capacity: int = 1024,
         monotonic: Callable[[], float] = time.monotonic,
@@ -124,6 +131,7 @@ class VoicePreviewService:
         self.orchestrator = orchestrator
         self.target_model = target_model
         self.timeout_seconds = max(0.001, timeout_seconds)
+        self.cleanup_retry_delays = tuple(max(0.0, delay) for delay in cleanup_retry_delays)
         self.tombstone_ttl_seconds = max(0.001, tombstone_ttl_seconds)
         self.tombstone_capacity = max(1, tombstone_capacity)
         self.monotonic = monotonic
@@ -133,12 +141,28 @@ class VoicePreviewService:
         self._sessions: dict[str, _VoicePreviewSession] = {}
         self._tombstones: OrderedDict[str, _VoicePreviewTombstone] = OrderedDict()
         self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
+        self._cleanup_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
 
     @property
     def pending_timeout_count(self) -> int:
         return sum(not task.done() for task in self._timeout_tasks.values())
+
+    @property
+    def pending_create_count(self) -> int:
+        return sum(
+            session.create_task is not None and not session.create_task.done()
+            for session in self._sessions.values()
+        )
+
+    @property
+    def pending_cleanup_retry_count(self) -> int:
+        return sum(not task.done() for task in self._cleanup_retry_tasks.values())
+
+    @property
+    def failed_cleanup_count(self) -> int:
+        return sum(session.cleanup_failures > 0 for session in self._sessions.values())
 
     @property
     def active_session_count(self) -> int:
@@ -180,36 +204,55 @@ class VoicePreviewService:
                 call_id=call_id,
             )
             self._sessions[call_id] = session
-        preview_config = self._preview_config()
-        try:
-            result = await self.orchestrator.create_web_session(
-                voice=resolved_voice,
-                prompt=None,
-                call_id=call_id,
-                prompt_effective_config=preview_config,
+            preview_config = self._preview_config()
+            create_task = asyncio.create_task(
+                self.orchestrator.create_web_session(
+                    voice=resolved_voice,
+                    prompt=None,
+                    call_id=call_id,
+                    prompt_effective_config=preview_config,
+                ),
+                name=f"ai-call-voice-preview-create-{call_id}",
             )
+            session.create_task = create_task
+        try:
+            result = await asyncio.shield(create_task)
         except asyncio.CancelledError:
+            await self._cancel_create_task(session)
             await self._compensate_create_failure(session)
             raise
         except Exception as exc:
             await self._compensate_create_failure(session)
             self._raise_runtime_error("create", exc)
+        finally:
+            session.resource_generation += 1
 
-        try:
-            timeout_task = asyncio.create_task(
-                self._release_after_timeout(session),
-                name=f"ai-call-voice-preview-timeout-{call_id}",
-            )
-        except Exception as exc:
+        async with self._lifecycle_lock:
+            if not self._accepting or self._sessions.get(call_id) is not session:
+                should_abort = True
+            else:
+                should_abort = False
+                try:
+                    timeout_task = asyncio.create_task(
+                        self._release_after_timeout(session),
+                        name=f"ai-call-voice-preview-timeout-{call_id}",
+                    )
+                except Exception as exc:
+                    await self._compensate_create_failure(session)
+                    self._raise_runtime_error("schedule_timeout", exc)
+                self._timeout_tasks[call_id] = timeout_task
+                timeout_task.add_done_callback(
+                    lambda completed, preview_call_id=call_id: self._consume_timeout_task(
+                        preview_call_id,
+                        completed,
+                    )
+                )
+        if should_abort:
             await self._compensate_create_failure(session)
-            self._raise_runtime_error("schedule_timeout", exc)
-        self._timeout_tasks[call_id] = timeout_task
-        timeout_task.add_done_callback(
-            lambda completed, preview_call_id=call_id: self._consume_timeout_task(
-                preview_call_id,
-                completed,
+            raise CustomException(
+                msg="音色试听服务正在停止，请稍后重试",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        )
         return result
 
     async def ready_preview_session(
@@ -322,15 +365,21 @@ class VoicePreviewService:
         self,
         session: _VoicePreviewSession,
     ) -> None:
+        should_retry = False
         try:
             await asyncio.sleep(self.timeout_seconds)
+            current_task = asyncio.current_task()
+            if self._timeout_tasks.get(session.call_id) is current_task:
+                self._timeout_tasks.pop(session.call_id, None)
             await self._release(
                 session,
                 end_reason="voice_preview_timeout",
+                schedule_retry=False,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            should_retry = True
             log.warning(
                 "音色试听超时释放失败: callId={}, errorType={}",
                 session.call_id,
@@ -340,21 +389,32 @@ class VoicePreviewService:
             current_task = asyncio.current_task()
             if self._timeout_tasks.get(session.call_id) is current_task:
                 self._timeout_tasks.pop(session.call_id, None)
+        if should_retry:
+            self._schedule_cleanup_retry(
+                session,
+                end_reason="voice_preview_timeout",
+            )
 
     async def _release(
         self,
         session: _VoicePreviewSession,
         *,
         end_reason: str,
+        schedule_retry: bool = True,
     ) -> EndSessionResult:
         async with session.lock:
             cleanup_task = session.cleanup_task
-            if cleanup_task is None or self._task_failed(cleanup_task):
+            if (
+                cleanup_task is None
+                or self._task_failed(cleanup_task)
+                or session.cleanup_task_generation != session.resource_generation
+            ):
                 cleanup_task = asyncio.create_task(
                     self._run_cleanup(session, end_reason=end_reason),
                     name=f"ai-call-voice-preview-cleanup-{session.call_id}",
                 )
                 session.cleanup_task = cleanup_task
+                session.cleanup_task_generation = session.resource_generation
                 cleanup_task.add_done_callback(
                     lambda completed, preview_session=session: self._consume_cleanup_task(
                         preview_session, completed
@@ -365,6 +425,10 @@ class VoicePreviewService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            session.cleanup_failures += 1
+            session.last_cleanup_error_type = type(exc).__name__
+            if schedule_retry:
+                self._schedule_cleanup_retry(session, end_reason=end_reason)
             self._raise_runtime_error("end", exc)
 
     async def _run_cleanup(
@@ -395,6 +459,14 @@ class VoicePreviewService:
         self._sessions.pop(session.call_id, None)
         self._add_tombstone(session, result)
         return result
+
+    async def _cancel_create_task(self, session: _VoicePreviewSession) -> None:
+        create_task = session.create_task
+        if create_task is None:
+            return
+        if not create_task.done():
+            create_task.cancel()
+        await asyncio.gather(create_task, return_exceptions=True)
 
     async def _cancel_timeout_task(self, call_id: str) -> None:
         timeout_task = self._timeout_tasks.pop(call_id, None)
@@ -429,6 +501,57 @@ class VoicePreviewService:
             )
             return
         self._tombstones.pop(session.call_id, None)
+
+    def _schedule_cleanup_retry(
+        self,
+        session: _VoicePreviewSession,
+        *,
+        end_reason: str,
+    ) -> None:
+        if not self._accepting or not self.cleanup_retry_delays:
+            return
+        existing = self._cleanup_retry_tasks.get(session.call_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._retry_cleanup(session, end_reason=end_reason),
+            name=f"ai-call-voice-preview-cleanup-retry-{session.call_id}",
+        )
+        self._cleanup_retry_tasks[session.call_id] = task
+        task.add_done_callback(
+            lambda completed, call_id=session.call_id: self._consume_cleanup_retry_task(
+                call_id,
+                completed,
+            )
+        )
+
+    async def _retry_cleanup(
+        self,
+        session: _VoicePreviewSession,
+        *,
+        end_reason: str,
+    ) -> None:
+        for delay in self.cleanup_retry_delays:
+            await asyncio.sleep(delay)
+            if self._sessions.get(session.call_id) is not session:
+                return
+            try:
+                await self._release(
+                    session,
+                    end_reason=end_reason,
+                    schedule_retry=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except CustomException:
+                continue
+            return
+        log.warning(
+            "音色试听后台清理重试耗尽: callId={}, attempts={}, errorType={}",
+            session.call_id,
+            session.cleanup_failures,
+            session.last_cleanup_error_type or "Unknown",
+        )
 
     def _owned_session(
         self,
@@ -522,6 +645,22 @@ class VoicePreviewService:
                 self._tombstones.clear()
                 return
             self._accepting = False
+            sessions = tuple(self._sessions.values())
+        create_tasks = [
+            session.create_task
+            for session in sessions
+            if session.create_task is not None and not session.create_task.done()
+        ]
+        for create_task in create_tasks:
+            create_task.cancel()
+        if create_tasks:
+            await asyncio.gather(*create_tasks, return_exceptions=True)
+        retry_tasks = tuple(self._cleanup_retry_tasks.values())
+        for retry_task in retry_tasks:
+            retry_task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+        self._cleanup_retry_tasks.clear()
         for timeout_task in tuple(self._timeout_tasks.values()):
             timeout_task.cancel()
         for session in tuple(self._sessions.values()):
@@ -529,7 +668,13 @@ class VoicePreviewService:
             if ready_task is not None:
                 ready_task.cancel()
         cleanup_tasks = [
-            asyncio.create_task(self._release(session, end_reason="voice_preview_shutdown"))
+            asyncio.create_task(
+                self._release(
+                    session,
+                    end_reason="voice_preview_shutdown",
+                    schedule_retry=False,
+                )
+            )
             for session in tuple(self._sessions.values())
         ]
         if cleanup_tasks:
@@ -537,7 +682,11 @@ class VoicePreviewService:
         remaining = tuple(self._sessions.values())
         for session in remaining:
             with suppress(Exception):
-                await self._release(session, end_reason="voice_preview_shutdown_retry")
+                await self._release(
+                    session,
+                    end_reason="voice_preview_shutdown_retry",
+                    schedule_retry=False,
+                )
         for timeout_task in tuple(self._timeout_tasks.values()):
             timeout_task.cancel()
         if self._timeout_tasks:
@@ -548,7 +697,6 @@ class VoicePreviewService:
         self._timeout_tasks.clear()
         with suppress(Exception):
             await self.orchestrator.shutdown()
-        self._sessions.clear()
         self._tombstones.clear()
 
     def _preview_config(self) -> PromptEffectiveConfig:
@@ -601,6 +749,16 @@ class VoicePreviewService:
     ) -> None:
         if self._timeout_tasks.get(call_id) is task:
             self._timeout_tasks.pop(call_id, None)
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    def _consume_cleanup_retry_task(
+        self,
+        call_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._cleanup_retry_tasks.get(call_id) is task:
+            self._cleanup_retry_tasks.pop(call_id, None)
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 

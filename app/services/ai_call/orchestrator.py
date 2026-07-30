@@ -345,6 +345,8 @@ class AiCallOrchestrator:
         self._browser_ready_timeout_tasks: set[asyncio.Task[None]] = set()
         self._room_create_attempts: set[str] = set()
         self._agent_start_attempts: set[str] = set()
+        self._resource_generations: dict[str, dict[str, int]] = {}
+        self._cleanup_generations: dict[str, dict[str, int]] = {}
         self.agent_runner = agent_runner or self._build_default_agent_runner()
 
     @classmethod
@@ -468,18 +470,16 @@ class AiCallOrchestrator:
         self.registry.transition(call_id, CallSessionStatus.PREPARING)
         self._append_event(call_id, "session_preparing", "orchestrator")
         self._room_create_attempts.add(call_id)
+        self._advance_resource_generation(call_id, "delete_room")
 
         try:
             await self.livekit_room_manager.create_room(room_name)
         except AiCallError as exc:
-            self._append_event(
+            await self._fail_create_session(
                 call_id,
-                "session_create_failed",
-                "orchestrator",
-                {
-                    "errorId": "room_create_failed",
-                    "failureStage": "room_create",
-                },
+                error_id="room_create_failed",
+                failure_stage="room_create",
+                failure_message="LiveKit Room 创建失败",
             )
             raise AiCallError(
                 error_id="room_create_failed",
@@ -487,20 +487,18 @@ class AiCallOrchestrator:
                 status_code=exc.status_code,
             ) from None
         except Exception:
-            self._append_event(
+            await self._fail_create_session(
                 call_id,
-                "session_create_failed",
-                "orchestrator",
-                {
-                    "errorId": "room_create_failed",
-                    "failureStage": "room_create",
-                },
+                error_id="room_create_failed",
+                failure_stage="room_create",
+                failure_message="LiveKit Room 创建失败",
             )
             raise AiCallError(
                 error_id="room_create_failed",
                 msg="LiveKit Room 创建失败",
                 status_code=status.HTTP_502_BAD_GATEWAY,
             ) from None
+        self._advance_resource_generation(call_id, "delete_room")
         self._append_event(call_id, "room_created", "livekit", {"roomName": room_name})
 
         try:
@@ -509,14 +507,11 @@ class AiCallOrchestrator:
                 participant_identity,
             )
         except Exception:
-            self._append_event(
+            await self._fail_create_session(
                 call_id,
-                "session_create_failed",
-                "orchestrator",
-                {
-                    "errorId": "browser_token_issue_failed",
-                    "failureStage": "browser_token",
-                },
+                error_id="browser_token_issue_failed",
+                failure_stage="browser_token",
+                failure_message="浏览器连接凭证签发失败",
             )
             raise AiCallError(
                 error_id="browser_token_issue_failed",
@@ -534,10 +529,12 @@ class AiCallOrchestrator:
         )
 
         self._agent_start_attempts.add(call_id)
+        self._advance_resource_generation(call_id, "agent_stop")
         try:
             await self.agent_runner.start(session)
         except Exception as exc:
             await self._handle_agent_start_failed(call_id, room_name, exc)
+        self._advance_resource_generation(call_id, "agent_stop")
         self._append_event(
             call_id,
             "agent_started",
@@ -600,18 +597,16 @@ class AiCallOrchestrator:
         self.registry.transition(call_id, CallSessionStatus.PREPARING)
         self._append_event(call_id, "session_preparing", "orchestrator")
         self._room_create_attempts.add(call_id)
+        self._advance_resource_generation(call_id, "delete_room")
 
         try:
             await self.livekit_room_manager.create_room(room_name)
         except AiCallError as exc:
-            self._append_event(
+            await self._fail_create_session(
                 call_id,
-                "session_create_failed",
-                "orchestrator",
-                {
-                    "errorId": "room_create_failed",
-                    "failureStage": "room_create",
-                },
+                error_id="room_create_failed",
+                failure_stage="room_create",
+                failure_message="LiveKit Room 创建失败",
             )
             raise AiCallError(
                 error_id="room_create_failed",
@@ -619,27 +614,27 @@ class AiCallOrchestrator:
                 status_code=exc.status_code,
             ) from None
         except Exception:
-            self._append_event(
+            await self._fail_create_session(
                 call_id,
-                "session_create_failed",
-                "orchestrator",
-                {
-                    "errorId": "room_create_failed",
-                    "failureStage": "room_create",
-                },
+                error_id="room_create_failed",
+                failure_stage="room_create",
+                failure_message="LiveKit Room 创建失败",
             )
             raise AiCallError(
                 error_id="room_create_failed",
                 msg="LiveKit Room 创建失败",
                 status_code=status.HTTP_502_BAD_GATEWAY,
             ) from None
+        self._advance_resource_generation(call_id, "delete_room")
         self._append_event(call_id, "room_created", "livekit", {"roomName": room_name})
 
         self._agent_start_attempts.add(call_id)
+        self._advance_resource_generation(call_id, "agent_stop")
         try:
             await self.agent_runner.start(session)
         except Exception as exc:
             await self._handle_agent_start_failed(call_id, room_name, exc)
+        self._advance_resource_generation(call_id, "agent_stop")
         self._append_event(
             call_id,
             "agent_started",
@@ -681,6 +676,12 @@ class AiCallOrchestrator:
             "agent",
             error_payload,
         )
+        self._append_failed_terminal_event(
+            call_id,
+            end_reason="agent_start_failed",
+            failure_stage="agent_start",
+            failure_message="Agent 启动失败",
+        )
         try:
             await self._run_end_cleanup_step(
                 call_id,
@@ -695,22 +696,50 @@ class AiCallOrchestrator:
                 record_success=False,
             )
         except AiCallError:
-            raise AiCallError(
-                error_id="agent_start_failed",
-                msg="Agent 启动失败",
-                status_code=status.HTTP_502_BAD_GATEWAY,
-            ) from None
-        self._append_failed_terminal_event(
-            call_id,
-            end_reason="agent_start_failed",
-            failure_stage="agent_start",
-            failure_message="Agent 启动失败",
-        )
+            pass
         raise AiCallError(
             error_id="agent_start_failed",
             msg="Agent 启动失败",
             status_code=status.HTTP_502_BAD_GATEWAY,
         ) from None
+
+    async def _fail_create_session(
+        self,
+        call_id: str,
+        *,
+        error_id: str,
+        failure_stage: str,
+        failure_message: str,
+    ) -> None:
+        self._append_event(
+            call_id,
+            "session_create_failed",
+            "orchestrator",
+            {
+                "errorId": error_id,
+                "failureStage": failure_stage,
+            },
+        )
+        self._append_failed_terminal_event(
+            call_id,
+            end_reason=error_id,
+            failure_stage=failure_stage,
+            failure_message=failure_message,
+        )
+        with suppress(AiCallError):
+            await self.abort_session(
+                call_id,
+                end_reason=error_id,
+            )
+
+    def _advance_resource_generation(self, call_id: str, step: str) -> None:
+        generations = self._resource_generations.setdefault(call_id, {})
+        generations[step] = generations.get(step, 0) + 1
+
+    def _is_resource_clean(self, call_id: str, step: str) -> bool:
+        resource_generation = self._resource_generations.get(call_id, {}).get(step, 0)
+        cleanup_generation = self._cleanup_generations.get(call_id, {}).get(step, -1)
+        return resource_generation > 0 and cleanup_generation == resource_generation
 
     async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
         session = self.registry.get(call_id)
@@ -945,23 +974,17 @@ class AiCallOrchestrator:
         should_delete_room = bool(
             call_id in self._room_create_attempts or "room_created" in event_types
         )
-        completed_steps = {
-            event.payload.get("step")
-            for event in events
-            if event.type == "session_cleanup_completed"
-        }
-
         if session.status in RUNNING_STATUSES and session.status != CallSessionStatus.ENDING:
             self.registry.transition(call_id, CallSessionStatus.ENDING)
             self._append_event(call_id, "session_ending", "orchestrator")
 
-        if should_stop_agent and "agent_stop" not in completed_steps:
+        if should_stop_agent and not self._is_resource_clean(call_id, "agent_stop"):
             await self._run_end_cleanup_step(
                 call_id,
                 step="agent_stop",
                 awaitable=self.agent_runner.stop(call_id),
             )
-        if should_delete_room and "delete_room" not in completed_steps:
+        if should_delete_room and not self._is_resource_clean(call_id, "delete_room"):
             await self._run_end_cleanup_step(
                 call_id,
                 step="delete_room",
@@ -1053,12 +1076,17 @@ class AiCallOrchestrator:
                 "orchestrator",
                 {"step": step},
             )
+        self._cleanup_generations.setdefault(call_id, {})[step] = (
+            self._resource_generations.get(call_id, {}).get(step, 0)
+        )
 
     def dispose_session(self, call_id: str) -> None:
         self._cancel_browser_ready_watchdog(call_id)
         self.registry._sessions.pop(call_id, None)
         self._room_create_attempts.discard(call_id)
         self._agent_start_attempts.discard(call_id)
+        self._resource_generations.pop(call_id, None)
+        self._cleanup_generations.pop(call_id, None)
         self.event_store._events = [
             event for event in self.event_store._events if event.call_id != call_id
         ]
@@ -1076,11 +1104,13 @@ class AiCallOrchestrator:
         self._browser_ready_timeout_tasks.clear()
         self._auto_end_tasks.clear()
         for call_id in tuple(self.registry._sessions):
-            with suppress(Exception):
+            try:
                 await self.abort_session(
                     call_id,
                     end_reason="orchestrator_shutdown",
                 )
+            except Exception:
+                continue
             self.dispose_session(call_id)
 
     def _schedule_browser_ready_watchdog(self, call_id: str) -> None:

@@ -161,6 +161,30 @@ class BlockingCreateRoomManager(FakeLiveKitRoomManager):
         await asyncio.Event().wait()
 
 
+class LateCompletingCreateRoomManager(FakeLiveKitRoomManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_started = asyncio.Event()
+        self.release_create = asyncio.Event()
+        self.external_rooms: set[str] = set()
+        self.operations: list[str] = []
+
+    async def create_room(self, room_name: str) -> None:
+        self.create_started.set()
+        try:
+            await self.release_create.wait()
+        except asyncio.CancelledError:
+            self.operations.append("create_cancelled")
+        self.created_rooms.append(room_name)
+        self.external_rooms.add(room_name)
+        self.operations.append("create_completed")
+
+    async def delete_room(self, room_name: str) -> None:
+        self.deleted_rooms.append(room_name)
+        self.external_rooms.discard(room_name)
+        self.operations.append("delete_completed")
+
+
 class FailingTokenRoomManager(FakeLiveKitRoomManager):
     def issue_browser_token(
         self,
@@ -173,6 +197,47 @@ class FailingTokenRoomManager(FakeLiveKitRoomManager):
 class FailingCleanupRoomManager(FakeLiveKitRoomManager):
     async def delete_room(self, room_name: str) -> None:
         raise RuntimeError("delete failed api-key=secret-value object=private/sample.wav")
+
+
+class FlakyCleanupRoomManager(FakeLiveKitRoomManager):
+    def __init__(
+        self,
+        *,
+        delete_failures: int,
+        token_failure: bool = False,
+    ) -> None:
+        super().__init__()
+        self.delete_failures = delete_failures
+        self.token_failure = token_failure
+        self.delete_attempts = 0
+        self.external_rooms: set[str] = set()
+
+    async def create_room(self, room_name: str) -> None:
+        await super().create_room(room_name)
+        self.external_rooms.add(room_name)
+
+    def issue_browser_token(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> BrowserRoomToken:
+        if self.token_failure:
+            raise RuntimeError("token failed api-key=secret-value object=private/sample.wav")
+        return super().issue_browser_token(room_name, participant_identity)
+
+    async def delete_room(self, room_name: str) -> None:
+        self.delete_attempts += 1
+        if self.delete_attempts <= self.delete_failures:
+            raise RuntimeError("delete failed api-key=secret-value object=private/sample.wav")
+        await super().delete_room(room_name)
+        self.external_rooms.discard(room_name)
+
+
+class PartialCreateFailureRoomManager(FlakyCleanupRoomManager):
+    async def create_room(self, room_name: str) -> None:
+        self.created_rooms.append(room_name)
+        self.external_rooms.add(room_name)
+        raise RuntimeError("create failed api-key=secret-value object=private/sample.wav")
 
 
 class FailingAgentRunner(FakeAgentRunner):
@@ -252,6 +317,14 @@ class FakeDefaultPreviewService:
             call_id=values["call_id"],
             status=CallSessionStatus.COMPLETED,
         )
+
+
+async def _wait_until(predicate, *, attempts: int = 100) -> None:
+    for _attempt in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition was not met")
 
 
 def _runtime_config() -> AiCallRuntimeConfig:
@@ -942,6 +1015,167 @@ async def test_cancelled_create_shields_abort_and_preserves_cancellation(
 
 
 @pytest.mark.anyio
+async def test_shutdown_waits_for_inflight_create_before_cleanup(
+    preview_database,
+) -> None:
+    room_manager = LateCompletingCreateRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(211),
+    )
+    async with preview_database() as db:
+        create_request = asyncio.create_task(
+            service.create_preview_session(
+                db,
+                tenant_id="tenant-a",
+                user_id=7,
+                voice="Tina",
+            )
+        )
+        await asyncio.wait_for(room_manager.create_started.wait(), timeout=1)
+        shutdown_task = asyncio.create_task(service.shutdown())
+        await asyncio.sleep(0.01)
+        room_manager.release_create.set()
+        await asyncio.wait_for(shutdown_task, timeout=1)
+        await asyncio.gather(create_request, return_exceptions=True)
+
+    assert room_manager.operations.index("create_completed") < room_manager.operations.index(
+        "delete_completed"
+    )
+    assert room_manager.external_rooms == set()
+    assert service.active_session_count == 0
+    assert service.pending_create_count == 0
+    assert service.pending_cleanup_retry_count == 0
+    with pytest.raises(AiCallError):
+        orchestrator.registry.get("preview_211")
+
+
+@pytest.mark.anyio
+async def test_create_failure_retries_hidden_cleanup_until_runtime_is_gone(
+    preview_database,
+) -> None:
+    room_manager = FlakyCleanupRoomManager(
+        delete_failures=2,
+        token_failure=True,
+    )
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        cleanup_retry_delays=(0, 0.01),
+        id_generator=SequenceIds(212),
+    )
+
+    async with preview_database() as db:
+        with pytest.raises(CustomException) as create_error:
+            await service.create_preview_session(
+                db,
+                tenant_id="tenant-a",
+                user_id=7,
+                voice="Tina",
+            )
+
+    assert "preview_212" not in create_error.value.msg
+    await _wait_until(lambda: service.active_session_count == 0)
+    assert room_manager.delete_attempts == 3
+    assert room_manager.external_rooms == set()
+    assert service.pending_cleanup_retry_count == 0
+    with pytest.raises(AiCallError):
+        orchestrator.registry.get("preview_212")
+
+
+@pytest.mark.anyio
+async def test_timeout_cleanup_failure_is_retried_in_background(
+    preview_database,
+) -> None:
+    room_manager = FlakyCleanupRoomManager(delete_failures=1)
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        timeout_seconds=0.01,
+        cleanup_retry_delays=(0,),
+        id_generator=SequenceIds(213),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    await _wait_until(lambda: service.active_session_count == 0)
+    assert room_manager.delete_attempts == 2
+    assert room_manager.external_rooms == set()
+    assert service.pending_timeout_count == 0
+    assert service.pending_cleanup_retry_count == 0
+    with pytest.raises(AiCallError):
+        orchestrator.registry.get(preview.call_id)
+
+
+@pytest.mark.anyio
+async def test_exhausted_cleanup_remains_observable_and_shutdown_retries(
+    preview_database,
+) -> None:
+    room_manager = FlakyCleanupRoomManager(delete_failures=2)
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        cleanup_retry_delays=(0,),
+        id_generator=SequenceIds(214),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+        with pytest.raises(CustomException):
+            await service.close_preview_session(
+                tenant_id="tenant-a",
+                user_id=7,
+                call_id=preview.call_id,
+            )
+
+    await _wait_until(lambda: service.pending_cleanup_retry_count == 0)
+    assert service.active_session_count == 1
+    assert service.failed_cleanup_count == 1
+    assert room_manager.external_rooms == {preview.room_name}
+
+    await service.shutdown()
+
+    assert service.active_session_count == 0
+    assert service.failed_cleanup_count == 0
+    assert room_manager.delete_attempts == 3
+    assert room_manager.external_rooms == set()
+
+
+@pytest.mark.anyio
 async def test_orchestrator_abort_cleans_preparing_session_and_redacts_secrets() -> None:
     room_manager = FailingTokenRoomManager()
     orchestrator = AiCallOrchestrator(
@@ -975,10 +1209,80 @@ async def test_orchestrator_abort_cleans_preparing_session_and_redacts_secrets()
 
 
 @pytest.mark.anyio
+async def test_web_room_create_and_cleanup_failure_is_failed_and_redacted() -> None:
+    room_manager = PartialCreateFailureRoomManager(delete_failures=1)
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+
+    with patch("app.services.ai_call.orchestrator.log.error") as error_log:
+        with pytest.raises(AiCallError) as create_error:
+            await orchestrator.create_web_session(
+                voice="Tina",
+                prompt=None,
+                call_id="formal_web_create_failed",
+            )
+
+    session = orchestrator.registry.get("formal_web_create_failed")
+    serialized_events = json.dumps([
+        {"type": event.type, "payload": event.payload}
+        for event in orchestrator.event_store.list_all("formal_web_create_failed")
+    ])
+    assert session.status == CallSessionStatus.FAILED
+    assert "session_cleanup_failed" in serialized_events
+    assert "secret-value" not in create_error.value.msg
+    assert "secret-value" not in serialized_events
+    assert "private/sample.wav" not in serialized_events
+    assert "secret-value" not in repr(error_log.call_args_list)
+
+    await orchestrator.abort_session("formal_web_create_failed")
+    assert room_manager.external_rooms == set()
+
+
+@pytest.mark.anyio
+async def test_sip_agent_start_and_cleanup_failure_is_failed_and_redacted() -> None:
+    room_manager = FlakyCleanupRoomManager(delete_failures=1)
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FailingAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+
+    with patch("app.services.ai_call.orchestrator.log.error") as error_log:
+        with pytest.raises(AiCallError) as create_error:
+            await orchestrator.create_sip_session(
+                voice="Tina",
+                prompt=None,
+                call_id="formal_sip_agent_failed",
+            )
+
+    session = orchestrator.registry.get("formal_sip_agent_failed")
+    serialized_events = json.dumps([
+        {"type": event.type, "payload": event.payload}
+        for event in orchestrator.event_store.list_all("formal_sip_agent_failed")
+    ])
+    serialized_logs = repr(error_log.call_args_list)
+    assert session.status == CallSessionStatus.FAILED
+    assert "session_cleanup_failed" in serialized_events
+    assert "secret-value" not in create_error.value.msg
+    assert "secret-value" not in serialized_events
+    assert "private/sample.wav" not in serialized_events
+    assert "secret-value" not in serialized_logs
+    assert "private/sample.wav" not in serialized_logs
+
+    await orchestrator.abort_session("formal_sip_agent_failed")
+    assert room_manager.external_rooms == set()
+
+
+@pytest.mark.anyio
 async def test_cleanup_failure_is_redacted_and_retryable(
     preview_database,
 ) -> None:
-    room_manager = FailingCleanupRoomManager()
+    room_manager = FlakyCleanupRoomManager(delete_failures=2)
     orchestrator = AiCallOrchestrator(
         config=_runtime_config(),
         livekit_room_manager=room_manager,
@@ -988,6 +1292,7 @@ async def test_cleanup_failure_is_redacted_and_retryable(
     service = VoicePreviewService(
         orchestrator=orchestrator,
         target_model=TARGET_MODEL,
+        cleanup_retry_delays=(),
         id_generator=SequenceIds(208),
     )
     async with preview_database() as db:
@@ -1015,6 +1320,9 @@ async def test_cleanup_failure_is_redacted_and_retryable(
     assert "secret-value" not in serialized_events
     assert "private/sample.wav" not in serialized_events
     assert service.active_session_count == 1
+
+    await service.shutdown()
+    assert service.active_session_count == 0
 
 
 @pytest.mark.anyio
