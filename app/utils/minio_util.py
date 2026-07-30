@@ -210,3 +210,125 @@ class MinioUtil:
         if not content_length:
             return None
         return int(content_length)
+
+    @classmethod
+    async def get_object(
+        cls,
+        config: dict,
+        object_name: str,
+        *,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> bytes:
+        """读取私有对象，只向 MinIO 发送服务端 SigV4 凭据。"""
+        try:
+            response = await cls._signed_empty_body_request(
+                "GET",
+                config,
+                object_name,
+                timeout=timeout,
+                transport=transport,
+            )
+        except httpx.HTTPStatusError as error:
+            failure_message = f"MinIO读取对象失败: HTTP {error.response.status_code}"
+        except httpx.HTTPError:
+            failure_message = "MinIO读取对象失败: 网络请求异常"
+        else:
+            return response.content
+        raise CustomException(msg=failure_message, code=RET.SERVERERR.code)
+
+    @classmethod
+    async def delete_object(
+        cls,
+        config: dict,
+        object_name: str,
+        *,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        """删除私有对象。MinIO 的任意 2xx 响应都视为成功。"""
+        try:
+            await cls._signed_empty_body_request(
+                "DELETE",
+                config,
+                object_name,
+                timeout=timeout,
+                transport=transport,
+            )
+        except httpx.HTTPStatusError as error:
+            failure_message = f"MinIO删除对象失败: HTTP {error.response.status_code}"
+        except httpx.HTTPError:
+            failure_message = "MinIO删除对象失败: 网络请求异常"
+        else:
+            return
+        raise CustomException(msg=failure_message, code=RET.SERVERERR.code)
+
+    @classmethod
+    async def _signed_empty_body_request(
+        cls,
+        method: str,
+        config: dict,
+        object_name: str,
+        *,
+        timeout: float,
+        transport: httpx.AsyncBaseTransport | None,
+    ) -> httpx.Response:
+        endpoint_base, host = cls._endpoint_base_and_host(config)
+        bucket = str(config["bucket_name"]).strip("/")
+        object_path = object_name.lstrip("/")
+        access_key = config["access_key"]
+        secret_key = config["secret_key"]
+        region = (config.get("region") or "").strip() or "us-east-1"
+
+        now = datetime.now(timezone.utc)
+        date_stamp = now.strftime("%Y%m%d")
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        payload_hash = hashlib.sha256(b"").hexdigest()
+        signed_headers = {
+            "host": host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        canonical_headers = "".join(
+            f"{name}:{value}\n" for name, value in sorted(signed_headers.items())
+        )
+        signed_header_names = ";".join(sorted(signed_headers))
+        canonical_uri = f"/{bucket}/{quote(object_path, safe='/')}"
+        canonical_request = "\n".join(
+            [
+                method,
+                canonical_uri,
+                "",
+                canonical_headers,
+                signed_header_names,
+                payload_hash,
+            ]
+        )
+        credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                credential_scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signature = hmac.new(
+            _signing_key(secret_key, date_stamp, region),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        authorization = (
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+            f"SignedHeaders={signed_header_names}, Signature={signature}"
+        )
+        request_headers = {
+            "Authorization": authorization,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        url = f"{endpoint_base}{canonical_uri}"
+        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+            response = await client.request(method, url, headers=request_headers)
+            response.raise_for_status()
+        return response
