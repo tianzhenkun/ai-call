@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,7 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_reconciler import (
     AiCallAgentConsoleReconciler,
     agent_console_event_broker,
+    agent_console_stream_registry,
     publish_agent_console_event,
 )
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
@@ -96,6 +98,54 @@ async def _publish(auth: AuthSchema, event_type: str, payload: dict) -> None:
     await publish_agent_console_event(_tenant_id(auth), event_type, payload)
 
 
+async def _agent_console_event_stream(
+    request: Request,
+    *,
+    tenant_id: str,
+    agent_identity: str,
+    after_sequence: int,
+    broker=agent_console_event_broker,
+    registry=agent_console_stream_registry,
+):
+    lease = registry.replace(tenant_id, agent_identity)
+    sequence = after_sequence
+    try:
+        while registry.is_current(lease):
+            if await request.is_disconnected():
+                return
+            event_wait = asyncio.create_task(
+                broker.wait_for_events(tenant_id, sequence)
+            )
+            replacement_wait = asyncio.create_task(lease.replaced.wait())
+            try:
+                completed, pending = await asyncio.wait(
+                    {event_wait, replacement_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for task in (event_wait, replacement_wait):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    event_wait,
+                    replacement_wait,
+                    return_exceptions=True,
+                )
+            if replacement_wait in completed or not registry.is_current(lease):
+                return
+            events = event_wait.result()
+            if await request.is_disconnected():
+                return
+            if not events:
+                yield ": heartbeat\n\n"
+                continue
+            for event in events:
+                sequence = event.sequence
+                yield _sse_event(event)
+    finally:
+        registry.release(lease)
+
+
 def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
     if not handoff.human_agent_identity:
         raise CustomException(msg="认领结果缺少坐席身份", status_code=500)
@@ -142,27 +192,23 @@ async def bootstrap_controller(
 
 @AgentConsoleRouter.get("/events", summary="订阅坐席中心状态变化")
 async def agent_console_events_controller(
+    request: Request,
     auth: AuthenticatedUser,
     after_sequence: Annotated[int, Query(ge=0)] = 0,
 ):
     tenant_id = _tenant_id(auth)
-    await AiCallAgentConsoleService(auth.db).require_current_agent(auth)
+    profile = await AiCallAgentConsoleService(auth.db).require_current_agent(auth)
+    agent_identity = profile.agent_identity
     # SSE 不再读取数据库，提前释放认证查询占用的连接，避免长连接耗尽连接池。
     await auth.db.close()
 
-    async def stream():
-        sequence = after_sequence
-        while True:
-            events = await agent_console_event_broker.wait_for_events(tenant_id, sequence)
-            if not events:
-                yield ": heartbeat\n\n"
-                continue
-            for event in events:
-                sequence = event.sequence
-                yield _sse_event(event)
-
     return StreamingResponse(
-        stream(),
+        _agent_console_event_stream(
+            request,
+            tenant_id=tenant_id,
+            agent_identity=agent_identity,
+            after_sequence=after_sequence,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -243,7 +289,7 @@ async def pending_handoffs_controller(
         limit=limit,
     )
     return TableResponse(
-        rows=[service.handoff_payload(handoff) for handoff in rows],
+        rows=await service.handoff_payloads(rows),
         total=len(rows),
     )
 
@@ -267,7 +313,7 @@ async def claim_handoff_controller(
     )
     return SuccessResponse(
         data={
-            "handoff": service.handoff_payload(handoff),
+            "handoff": await service.handoff_payload(handoff),
             "seat_token": _issue_handoff_token(auth, handoff),
         }
     )
@@ -294,12 +340,35 @@ async def media_ready_controller(
             handoff_status=handoff.status,
             reason="media_ready",
         )
+        ai_call_service.handoff_exception_manager.stop_waiting_tone(
+            handoff.handoff_id,
+            call_id=handoff.call_id,
+            handoff_status=handoff.status,
+            reason="media_ready",
+        )
+    if ai_call_service.recording_service is not None:
+        await ai_call_service.recording_service.start_human_agent_recording(
+            call_id=handoff.call_id,
+            room_name=handoff.room_name,
+            handoff_id=handoff.handoff_id,
+            participant_identity=payload.participant_identity,
+        )
+    try:
+        ai_call_service.orchestrator.record_handoff_event(
+            call_id=handoff.call_id,
+            event_type="handoff_connected",
+            handoff_id=handoff.handoff_id,
+            handoff_status=handoff.status,
+            payload={"participantIdentity": payload.participant_identity},
+        )
+    except AiCallError:
+        pass
     await _publish(
         auth,
         "handoff.changed",
         {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
     )
-    return SuccessResponse(data=service.handoff_payload(handoff))
+    return SuccessResponse(data=await service.handoff_payload(handoff))
 
 
 @AgentConsoleRouter.post(
@@ -324,7 +393,7 @@ async def reconnect_token_controller(
     )
     return SuccessResponse(
         data={
-            "handoff": service.handoff_payload(handoff),
+            "handoff": await service.handoff_payload(handoff),
             "seat_token": _issue_handoff_token(auth, handoff),
         }
     )
@@ -342,12 +411,17 @@ async def complete_agent_handoff_controller(
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
+    ai_call_service = get_default_ai_call_service(auth.db)
+    await ai_call_service.end_running_session_after_handoff(
+        handoff.call_id,
+        handoff.end_reason,
+    )
     await _publish(
         auth,
         "handoff.changed",
         {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
     )
-    return SuccessResponse(data=service.handoff_payload(handoff))
+    return SuccessResponse(data=await service.handoff_payload(handoff))
 
 
 @AgentConsoleRouter.put("/calls/{call_id}/after-call-work", summary="提交快速话后确认")

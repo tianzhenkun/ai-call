@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+import jwt
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -13,10 +14,15 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
+    AiCallDialogueSegmentModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -174,6 +180,16 @@ async def test_livekit_media_ready_requires_unmuted_microphone_track() -> None:
     assert await manager.has_published_microphone("room-1", "human-agent-1") is False
 
 
+def test_livekit_participant_lookup_admin_token_is_scoped_to_room() -> None:
+    manager = LiveKitRoomManager("ws://livekit.test", "key", "secret", 60)
+
+    token = manager._issue_room_admin_token(room_name="room-1")
+    payload = jwt.decode(token, "secret", algorithms=["HS256"])
+
+    assert payload["video"]["roomAdmin"] is True
+    assert payload["video"]["room"] == "room-1"
+
+
 @pytest.mark.anyio
 async def test_livekit_room_lookup_uses_exact_room_name() -> None:
     manager = LiveKitRoomManager("ws://livekit.test", "key", "secret", 60)
@@ -264,6 +280,55 @@ async def test_presence_requires_preflight_and_enforces_console_session(session_
 
 
 @pytest.mark.anyio
+async def test_bootstrap_restores_completed_handoff_during_quick_wrap_up(
+    session_factory,
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+        status="wrap_up_quick",
+    )
+    await _seed_handoff(
+        session_factory,
+        row_id=1,
+        handoff_id="wrap-up",
+        status="completed",
+    )
+    async with session_factory() as db, db.begin():
+        presence_row = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        presence_row.active_handoff_id = "wrap-up"
+        presence_row.active_call_id = "call-wrap-up"
+        handoff_row = (
+            await db.execute(
+                select(AiCallHandoffModel).where(
+                    AiCallHandoffModel.handoff_id == "wrap-up"
+                )
+            )
+        ).scalar_one()
+        handoff_row.human_agent_identity = "agent-20"
+        handoff_row.accepted_console_session_id = console_session_id
+
+    async with session_factory() as db:
+        payload = await AiCallAgentConsoleService(db).bootstrap_payload(
+            _auth(db, user_id=20)
+        )
+
+    assert payload["presence"]["status"] == "wrap_up_quick"
+    assert payload["current_handoff"]["handoff_id"] == "wrap-up"
+    assert payload["current_handoff"]["call_id"] == "call-wrap-up"
+    assert payload["current_handoff"]["status"] == "completed"
+
+
+@pytest.mark.anyio
 async def test_stale_available_presence_is_persisted_as_offline(session_factory) -> None:
     console_session_id = str(uuid4())
     await _seed_agent(
@@ -344,6 +409,121 @@ async def test_pending_pool_filters_tenant_status_expiry_and_scene_scope(session
         )
 
     assert [row.handoff_id for row in rows] == ["visible"]
+
+
+@pytest.mark.anyio
+async def test_handoff_payloads_include_batched_business_context_and_recent_dialogue(
+    session_factory,
+) -> None:
+    now = datetime.now(timezone.utc)
+    call_id = "call-visible"
+    dialogue = [
+        ("ai", "较早的开场内容"),
+        ("customer", "我想确认合同到期时间"),
+        ("ai", "合同将在本月底到期"),
+        ("customer", "续约价格有没有变化"),
+        ("ai", "具体价格需要人工进一步确认"),
+        ("human_agent", "我来协助您确认"),
+        ("customer", "请帮我确认下周是否可以续约"),
+    ]
+    await _seed_handoff(session_factory, row_id=1, handoff_id="visible")
+    async with session_factory() as db, db.begin():
+        db.add_all(
+            [
+                AiCallRecordModel(
+                    id=100,
+                    call_id=call_id,
+                    business_type="lead",
+                    business_id="lead-100",
+                    scene_code="intro_contract",
+                    entry_type="sip_outbound",
+                    room_name="room-visible",
+                    participant_identity="sip-visible",
+                    callee_phone_number_hash="hash-visible",
+                    callee_phone_number_masked="138****0000",
+                    status="running",
+                    started_at=now,
+                ),
+                AiCallOutboundTargetModel(
+                    id=200,
+                    tenant_id="tenant-a",
+                    task_id=300,
+                    validation_id=400,
+                    source_validation_row_id=500,
+                    source_row_number=1,
+                    phone_number="encrypted-phone",
+                    customer_name="张先生",
+                    status="calling",
+                    attempt_count=1,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=201,
+                    tenant_id="tenant-a",
+                    task_id=300,
+                    target_id=200,
+                    attempt_no=1,
+                    call_id=call_id,
+                    dialer_type="sip_outbound",
+                    status="connected",
+                    started_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                *[
+                    AiCallDialogueSegmentModel(
+                        id=600 + segment_no,
+                        call_id=call_id,
+                        segment_no=segment_no,
+                        speaker_type=speaker_type,
+                        source="test",
+                        source_segment_id=f"segment-{segment_no}",
+                        segment_text=segment_text,
+                        segment_status="final",
+                        started_at=now + timedelta(seconds=segment_no),
+                    )
+                    for segment_no, (speaker_type, segment_text) in enumerate(
+                        dialogue,
+                        start=1,
+                    )
+                ],
+            ]
+        )
+
+    async with session_factory() as db:
+        handoffs = await AiCallRecordRepository(db).list_console_pending_handoffs(
+            tenant_id="tenant-a",
+            scene_codes=["intro_contract"],
+            now=now,
+            limit=50,
+        )
+        payloads = await AiCallAgentConsoleService(db).handoff_payloads(handoffs)
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["masked_customer_name"] == "张先生"
+    assert payload["masked_contact"] == "138****0000"
+    assert payload["business_type"] == "lead"
+    assert payload["business_id"] == "lead-100"
+    assert [turn["speaker_type"] for turn in payload["recent_dialogue"]] == [
+        "customer",
+        "ai",
+        "customer",
+        "ai",
+        "human_agent",
+        "customer",
+    ]
+    assert payload["handoff_summary"] == (
+        "请转人工；客户最近表示：“请帮我确认下周是否可以续约”"
+    )
+    assert payload["pending_items"] == [
+        {"text": "请转人工", "evidence": "转人工请求"},
+        {
+            "text": "请帮我确认下周是否可以续约",
+            "evidence": "客户最近表达",
+        },
+    ]
 
 
 async def _claim(

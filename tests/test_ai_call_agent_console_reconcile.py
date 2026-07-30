@@ -20,12 +20,13 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
-from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.agent_console_reconciler import (
     AgentConsoleEventBroker,
+    AgentConsoleStreamRegistry,
     AiCallAgentConsoleReconciler,
     publish_agent_console_event,
 )
+from app.services.ai_call.exceptions import AiCallError
 
 
 def _auth(db, *, user_id: int = 1, tenant_id: str = "tenant-a") -> AuthSchema:
@@ -105,6 +106,7 @@ async def _seed_management_rows(session_factory) -> None:
                 business_type="lead",
                 business_id="lead-1",
                 scene_code="intro_contract",
+                prompt_source_key="intro_contract",
                 entry_type="sip_outbound",
                 room_name="room-1",
                 participant_identity="sip-call-1",
@@ -134,6 +136,7 @@ async def _seed_management_rows(session_factory) -> None:
                 id=300,
                 tenant_id="tenant-a",
                 source_type="after_call_work",
+                source_key="handoff:handoff-1",
                 source_call_id="call-1",
                 source_handoff_id="handoff-1",
                 scene_code="intro_contract",
@@ -186,6 +189,7 @@ async def test_admin_queries_return_metrics_details_and_string_ids(session_facto
         assert handoffs["rows"][0]["id"] == "200"
         detail = await service.get_handoff_detail(auth, "handoff-1")
         assert detail["handoff"]["call_id"] == "call-1"
+        assert detail["record"]["prompt_source_key"] == "intro_contract"
         assert detail["follow_up"]["id"] == "300"
 
         follow_ups = await service.list_follow_ups(auth)
@@ -406,6 +410,23 @@ async def test_event_broker_orders_events_and_supports_sequence_resume() -> None
     resumed = broker.events_after("tenant-a", first.sequence)
     assert [event.event_type for event in resumed] == ["presence.changed"]
     assert resumed[0].payload == {"status": "available"}
+
+
+@pytest.mark.anyio
+async def test_event_stream_registry_replaces_the_previous_agent_connection() -> None:
+    registry = AgentConsoleStreamRegistry()
+    first = registry.replace("tenant-a", "agent-20")
+    second = registry.replace("tenant-a", "agent-20")
+
+    assert first.replaced.is_set()
+    assert not second.replaced.is_set()
+    assert not registry.is_current(first)
+    assert registry.is_current(second)
+
+    registry.release(first)
+    assert registry.is_current(second)
+    registry.release(second)
+    assert not registry.is_current(second)
 
 
 @pytest.mark.anyio

@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call import AiCallRouter, agent_console_controller
 from app.api.v1.ai_call.agent_console_controller import (
     get_agent_console_reconciler,
     get_agent_console_service,
 )
-from app.api.v1.ai_call.agent_console_schema import AgentProfileCreateIn, AgentSceneScopesIn
+from app.api.v1.ai_call.agent_console_schema import (
+    AgentHandoffClaimIn,
+    AgentMediaReadyIn,
+    AgentPresenceSessionIn,
+    AgentProfileCreateIn,
+    AgentSceneScopesIn,
+)
 from app.api.v1.ai_call.model import AiCallAgentProfileModel, AiCallAgentSceneScopeModel
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -72,6 +81,185 @@ def test_task7_management_and_sse_routes_are_registered() -> None:
 
 
 @pytest.mark.anyio
+async def test_pending_handoffs_awaits_batched_rich_payload(db_session) -> None:
+    handoff = SimpleNamespace(handoff_id="handoff-1")
+    console_service = SimpleNamespace(
+        list_pending_handoffs=AsyncMock(return_value=[handoff]),
+        handoff_payloads=AsyncMock(
+            return_value=[{"handoff_id": "handoff-1", "handoff_summary": "请转人工"}]
+        ),
+    )
+    console_session_id = uuid4()
+
+    await agent_console_controller.pending_handoffs_controller(
+        _auth(db_session),
+        console_service,
+        console_session_id,
+        50,
+    )
+
+    console_service.handoff_payloads.assert_awaited_once_with([handoff])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("controller_name", "service_method", "payload_type"),
+    [
+        ("claim_handoff_controller", "claim_handoff", AgentHandoffClaimIn),
+        ("reconnect_token_controller", "begin_reconnect", AgentPresenceSessionIn),
+    ],
+)
+async def test_token_handoff_endpoints_await_rich_payload(
+    db_session,
+    monkeypatch,
+    controller_name,
+    service_method,
+    payload_type,
+) -> None:
+    handoff = SimpleNamespace(
+        handoff_id="handoff-1",
+        call_id="call-1",
+        status="accepted",
+    )
+    rich_payload = {"handoff_id": "handoff-1", "handoff_summary": "请转人工"}
+    console_service = SimpleNamespace(
+        **{
+            service_method: AsyncMock(return_value=handoff),
+            "handoff_payload": AsyncMock(return_value=rich_payload),
+        }
+    )
+    monkeypatch.setattr(
+        agent_console_controller,
+        "_issue_handoff_token",
+        lambda _auth, _handoff: {"participant_token": "test-token"},
+    )
+    monkeypatch.setattr(agent_console_controller, "_publish", AsyncMock())
+
+    await getattr(agent_console_controller, controller_name)(
+        "handoff-1",
+        payload_type(console_session_id=uuid4()),
+        _auth(db_session),
+        console_service,
+    )
+
+    console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+
+@pytest.mark.anyio
+async def test_media_ready_stops_waiting_tone_and_starts_human_recording(
+    db_session,
+    monkeypatch,
+) -> None:
+    handoff = SimpleNamespace(
+        handoff_id="handoff-1",
+        call_id="call-1",
+        room_name="room-1",
+        status="connected",
+    )
+    console_service = SimpleNamespace(
+        media_ready=AsyncMock(return_value=handoff),
+        handoff_payload=AsyncMock(return_value={"handoff_id": "handoff-1"}),
+    )
+    manager = SimpleNamespace(
+        cancel_timeout=Mock(),
+        stop_waiting_tone=Mock(),
+    )
+    recording_service = SimpleNamespace(
+        start_human_agent_recording=AsyncMock(),
+    )
+    orchestrator = SimpleNamespace(record_handoff_event=Mock())
+    ai_call_service = SimpleNamespace(
+        handoff_exception_manager=manager,
+        recording_service=recording_service,
+        orchestrator=orchestrator,
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(
+        agent_console_controller,
+        "get_default_ai_call_service",
+        lambda _db: ai_call_service,
+    )
+    monkeypatch.setattr(agent_console_controller, "_publish", publish)
+
+    await agent_console_controller.media_ready_controller(
+        "handoff-1",
+        AgentMediaReadyIn(
+            console_session_id=uuid4(),
+            participant_identity="human-agent-handoff-1",
+        ),
+        _auth(db_session),
+        console_service,
+    )
+
+    manager.cancel_timeout.assert_called_once_with(
+        "handoff-1",
+        call_id="call-1",
+        handoff_status="connected",
+        reason="media_ready",
+    )
+    manager.stop_waiting_tone.assert_called_once_with(
+        "handoff-1",
+        call_id="call-1",
+        handoff_status="connected",
+        reason="media_ready",
+    )
+    recording_service.start_human_agent_recording.assert_awaited_once_with(
+        call_id="call-1",
+        room_name="room-1",
+        handoff_id="handoff-1",
+        participant_identity="human-agent-handoff-1",
+    )
+    orchestrator.record_handoff_event.assert_called_once_with(
+        call_id="call-1",
+        event_type="handoff_connected",
+        handoff_id="handoff-1",
+        handoff_status="connected",
+        payload={"participantIdentity": "human-agent-handoff-1"},
+    )
+    console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+
+@pytest.mark.anyio
+async def test_complete_handoff_ends_running_customer_session(
+    db_session,
+    monkeypatch,
+) -> None:
+    handoff = SimpleNamespace(
+        handoff_id="handoff-1",
+        call_id="call-1",
+        status="completed",
+        end_reason="agent_completed",
+    )
+    console_service = SimpleNamespace(
+        complete_handoff=AsyncMock(return_value=handoff),
+        handoff_payload=AsyncMock(return_value={"handoff_id": "handoff-1"}),
+    )
+    ai_call_service = SimpleNamespace(
+        end_running_session_after_handoff=AsyncMock(),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(
+        agent_console_controller,
+        "get_default_ai_call_service",
+        lambda _db: ai_call_service,
+    )
+    monkeypatch.setattr(agent_console_controller, "_publish", publish)
+
+    await agent_console_controller.complete_agent_handoff_controller(
+        "handoff-1",
+        AgentPresenceSessionIn(console_session_id=uuid4()),
+        _auth(db_session),
+        console_service,
+    )
+
+    ai_call_service.end_running_session_after_handoff.assert_awaited_once_with(
+        "call-1",
+        "agent_completed",
+    )
+    console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+
+@pytest.mark.anyio
 async def test_agent_console_requires_login_and_enabled_profile(db_session) -> None:
     service = AiCallAgentConsoleService(db_session)
 
@@ -103,6 +291,31 @@ async def test_agent_console_requires_login_and_enabled_profile(db_session) -> N
     with _client(authenticated, service) as client:
         response = client.get("/ai-call/agent-console/bootstrap")
         assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_event_stream_stops_before_waiting_after_browser_disconnect() -> None:
+    request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
+    broker = SimpleNamespace(wait_for_events=AsyncMock())
+    registry = SimpleNamespace(
+        replace=Mock(return_value=object()),
+        is_current=Mock(return_value=True),
+        release=Mock(),
+    )
+
+    stream = agent_console_controller._agent_console_event_stream(
+        request,
+        tenant_id="tenant-a",
+        agent_identity="agent-20",
+        after_sequence=0,
+        broker=broker,
+        registry=registry,
+    )
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+    broker.wait_for_events.assert_not_awaited()
+    registry.release.assert_called_once()
 
 
 @pytest.mark.anyio

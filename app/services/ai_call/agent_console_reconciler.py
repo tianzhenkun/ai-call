@@ -107,7 +107,43 @@ class AgentConsoleEventBroker:
         return self.events_after(tenant_id, sequence)
 
 
+@dataclass(frozen=True, slots=True)
+class AgentConsoleStreamLease:
+    tenant_id: str
+    agent_identity: str
+    replaced: asyncio.Event
+
+
+class AgentConsoleStreamRegistry:
+    """同一进程内每个坐席只保留最新的 SSE 连接。"""
+
+    def __init__(self) -> None:
+        self._current: dict[tuple[str, str], AgentConsoleStreamLease] = {}
+
+    def replace(self, tenant_id: str, agent_identity: str) -> AgentConsoleStreamLease:
+        key = (tenant_id, agent_identity)
+        previous = self._current.get(key)
+        if previous is not None:
+            previous.replaced.set()
+        lease = AgentConsoleStreamLease(
+            tenant_id=tenant_id,
+            agent_identity=agent_identity,
+            replaced=asyncio.Event(),
+        )
+        self._current[key] = lease
+        return lease
+
+    def is_current(self, lease: AgentConsoleStreamLease) -> bool:
+        return self._current.get((lease.tenant_id, lease.agent_identity)) is lease
+
+    def release(self, lease: AgentConsoleStreamLease) -> None:
+        key = (lease.tenant_id, lease.agent_identity)
+        if self._current.get(key) is lease:
+            self._current.pop(key, None)
+
+
 agent_console_event_broker = AgentConsoleEventBroker()
+agent_console_stream_registry = AgentConsoleStreamRegistry()
 
 
 async def publish_agent_console_event(
@@ -791,6 +827,7 @@ class AiCallAgentConsoleReconciler:
             "business_type": record.business_type,
             "business_id": record.business_id,
             "scene_code": record.scene_code,
+            "prompt_source_key": record.prompt_source_key,
             "entry_type": record.entry_type,
             "masked_contact": record.callee_phone_number_masked,
             "status": record.status,

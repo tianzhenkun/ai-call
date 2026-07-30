@@ -546,9 +546,21 @@ class AiCallAgentConsoleService:
     async def bootstrap_payload(self, auth: AuthSchema) -> dict:
         profile = await self.require_current_agent(auth)
         presence = await self._presence(profile)
+        current_handoff = None
+        if presence is not None and presence.active_handoff_id:
+            handoff = await self.repository.get_console_handoff_for_claim(
+                tenant_id=profile.tenant_id,
+                handoff_id=presence.active_handoff_id,
+            )
+            if (
+                handoff is not None
+                and handoff.human_agent_identity == profile.agent_identity
+            ):
+                current_handoff = await self.handoff_payload(handoff)
         return {
             "profile": await self.profile_payload(profile),
             "presence": self.presence_payload(presence, profile.agent_identity),
+            "current_handoff": current_handoff,
         }
 
     @classmethod
@@ -581,8 +593,102 @@ class AiCallAgentConsoleService:
             "status_updated_at": cls._api_datetime(presence.status_updated_at),
         }
 
+    async def handoff_payload(self, handoff: AiCallHandoffModel) -> dict:
+        payloads = await self.handoff_payloads([handoff])
+        return payloads[0]
+
+    async def handoff_payloads(
+        self,
+        handoffs: list[AiCallHandoffModel],
+    ) -> list[dict]:
+        if not handoffs:
+            return []
+
+        call_ids = list(dict.fromkeys(handoff.call_id for handoff in handoffs))
+        records = await self.repository.list_records_by_call_ids(call_ids)
+        dialogue_segments = await self.repository.list_dialogue_segments_by_call_ids(call_ids)
+        records_by_call_id = {record.call_id: record for record in records}
+
+        customer_names_by_call_id: dict[str, str | None] = {}
+        for tenant_id in dict.fromkeys(handoff.tenant_id for handoff in handoffs):
+            tenant_call_ids = [
+                handoff.call_id
+                for handoff in handoffs
+                if handoff.tenant_id == tenant_id
+            ]
+            customer_names_by_call_id.update(
+                await self.repository.outbound_customer_names_by_call_ids(
+                    tenant_id=tenant_id,
+                    call_ids=tenant_call_ids,
+                )
+            )
+
+        dialogue_by_call_id: dict[str, list[dict]] = {}
+        for segment in dialogue_segments:
+            text = segment.segment_text.strip()
+            if (
+                segment.segment_status != "final"
+                or segment.speaker_type not in {"customer", "ai", "human_agent"}
+                or not text
+            ):
+                continue
+            dialogue_by_call_id.setdefault(segment.call_id, []).append(
+                {
+                    "id": str(segment.id),
+                    "speaker_type": segment.speaker_type,
+                    "text": text,
+                    "occurred_at": self._api_datetime(
+                        segment.started_at or segment.ended_at
+                    ),
+                }
+            )
+
+        payloads: list[dict] = []
+        for handoff in handoffs:
+            recent_dialogue = dialogue_by_call_id.get(handoff.call_id, [])[-6:]
+            request_text = self._handoff_request_text(handoff)
+            latest_customer_text = next(
+                (
+                    turn["text"]
+                    for turn in reversed(recent_dialogue)
+                    if turn["speaker_type"] == "customer"
+                ),
+                None,
+            )
+            handoff_summary = request_text
+            pending_items = [{"text": request_text, "evidence": "转人工请求"}]
+            if latest_customer_text and latest_customer_text not in request_text:
+                handoff_summary = (
+                    f"{request_text}；客户最近表示：“{latest_customer_text}”"
+                )
+                pending_items.append(
+                    {
+                        "text": latest_customer_text,
+                        "evidence": "客户最近表达",
+                    }
+                )
+
+            record = records_by_call_id.get(handoff.call_id)
+            payloads.append(
+                {
+                    **self._base_handoff_payload(handoff),
+                    "masked_customer_name": customer_names_by_call_id.get(
+                        handoff.call_id
+                    ),
+                    "masked_contact": (
+                        record.callee_phone_number_masked if record else None
+                    ),
+                    "business_type": record.business_type if record else None,
+                    "business_id": record.business_id if record else None,
+                    "handoff_summary": handoff_summary,
+                    "pending_items": pending_items,
+                    "recent_dialogue": recent_dialogue,
+                }
+            )
+        return payloads
+
     @classmethod
-    def handoff_payload(cls, handoff: AiCallHandoffModel) -> dict:
+    def _base_handoff_payload(cls, handoff: AiCallHandoffModel) -> dict:
         return {
             "id": str(handoff.id),
             "handoff_id": handoff.handoff_id,
@@ -597,9 +703,25 @@ class AiCallAgentConsoleService:
             "accepted_console_session_id": handoff.accepted_console_session_id,
             "requested_at": cls._api_datetime(handoff.requested_at),
             "accepted_at": cls._api_datetime(handoff.accepted_at),
+            "connected_at": cls._api_datetime(handoff.connected_at),
+            "ended_at": cls._api_datetime(handoff.ended_at),
             "expires_at": cls._api_datetime(handoff.expires_at),
             "claim_expires_at": cls._api_datetime(handoff.claim_expires_at),
+            "reconnect_expires_at": cls._api_datetime(handoff.reconnect_expires_at),
+            "end_reason": handoff.end_reason,
+            "failure_stage": handoff.failure_stage,
+            "failure_message": handoff.failure_message,
         }
+
+    @staticmethod
+    def _handoff_request_text(handoff: AiCallHandoffModel) -> str:
+        if handoff.request_message and handoff.request_message.strip():
+            return handoff.request_message.strip()
+        if handoff.request_reason == "customer_requested_human":
+            return "客户请求转人工"
+        if handoff.request_reason and handoff.request_reason.strip():
+            return handoff.request_reason.strip()
+        return "客户请求转人工"
 
     async def _require_owned_handoff(
         self,

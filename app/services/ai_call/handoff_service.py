@@ -524,6 +524,20 @@ class AiCallHandoffService:
         if agent is None or agent.active_handoff_id != handoff.handoff_id:
             return
         now = utc_now()
+        if (
+            agent.console_session_id
+            and agent.active_call_id == handoff.call_id
+            and handoff.status in {HANDOFF_STATUS_COMPLETED, HANDOFF_STATUS_FAILED}
+        ):
+            await self.repository.upsert_handoff_agent(
+                agent_identity=agent.agent_identity,
+                skill_group=agent.skill_group,
+                status="wrap_up_quick",
+                active_handoff_id=handoff.handoff_id,
+                last_seen_at=now,
+                status_updated_at=now,
+            )
+            return
         await self.repository.upsert_handoff_agent(
             agent_identity=agent.agent_identity,
             skill_group=agent.skill_group,
