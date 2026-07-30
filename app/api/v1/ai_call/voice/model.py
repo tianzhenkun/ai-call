@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, DateTime, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -86,7 +86,12 @@ class AiCallVoiceEnrollmentModel(MappedBase):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_voice: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provider_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -127,11 +132,21 @@ class AiCallVoiceDeletionModel(MappedBase):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    historical_task_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    historical_task_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     requested_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
