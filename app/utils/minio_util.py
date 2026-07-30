@@ -3,7 +3,7 @@ import hmac
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
@@ -58,6 +58,71 @@ class MinioUtil:
             parsed = urlparse(endpoint)
             return endpoint, parsed.netloc
         return f"{protocol}://{endpoint}", endpoint
+
+    @classmethod
+    def presigned_get_url(
+        cls,
+        config: dict,
+        object_name: str,
+        *,
+        expires_seconds: int = 900,
+        now: datetime | None = None,
+    ) -> str:
+        """生成私有对象的短时 GET 地址，不向调用方暴露 MinIO 密钥。"""
+        if not 1 <= expires_seconds <= 604800:
+            raise ValueError("expires_seconds must be between 1 and 604800")
+
+        endpoint_base, host = cls._endpoint_base_and_host(config)
+        bucket = str(config["bucket_name"]).strip("/")
+        object_path = object_name.lstrip("/")
+        access_key = config["access_key"]
+        secret_key = config["secret_key"]
+        region = (config.get("region") or "").strip() or "us-east-1"
+
+        signed_at = now or datetime.now(timezone.utc)
+        date_stamp = signed_at.strftime("%Y%m%d")
+        amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
+        credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+        canonical_uri = f"/{bucket}/{quote(object_path, safe='/')}"
+        query_params = {
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential": f"{access_key}/{credential_scope}",
+            "X-Amz-Date": amz_date,
+            "X-Amz-Expires": str(expires_seconds),
+            "X-Amz-SignedHeaders": "host",
+        }
+        canonical_query = urlencode(
+            sorted(query_params.items()),
+            quote_via=quote,
+            safe="-_.~",
+        )
+        canonical_request = "\n".join(
+            [
+                "GET",
+                canonical_uri,
+                canonical_query,
+                f"host:{host}\n",
+                "host",
+                "UNSIGNED-PAYLOAD",
+            ]
+        )
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                credential_scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signature = hmac.new(
+            _signing_key(secret_key, date_stamp, region),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return (
+            f"{endpoint_base}{canonical_uri}?{canonical_query}"
+            f"&X-Amz-Signature={signature}"
+        )
 
     @classmethod
     def upload(

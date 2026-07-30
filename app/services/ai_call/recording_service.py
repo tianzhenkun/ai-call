@@ -15,7 +15,6 @@ from app.api.v1.ai_call.model import (
     AiCallRecordingTrackModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
-from app.api.v1.system.oss.crud import OssCRUD
 from app.api.v1.system.oss.service import OssService
 from app.core.logger import log
 from app.services.ai_call.livekit_egress import (
@@ -901,11 +900,7 @@ class AiCallRecordingService:
         if oss_id is None:
             return None
         auth = AuthSchema(user=None, check_data_scope=False, db=self.repository.db)
-        row = await OssCRUD(auth).get_url_by_oss_id_crud(oss_id=oss_id)
-        if not row:
-            return None
-        url = row.get("url")
-        return str(url) if url else None
+        return await OssService.get_presigned_url_by_oss_id_service(auth, oss_id)
 
     async def _register_recording_object(self, object_name: str, file_size: int | None) -> int:
         return await OssService.register_existing_object_service(

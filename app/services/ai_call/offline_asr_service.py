@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallDialogueSegmentModel, AiCallRecordingTrackModel
 from app.api.v1.system.auth.schema import AuthSchema
-from app.api.v1.system.oss.crud import OssCRUD
+from app.api.v1.system.oss.service import OssService
 from app.core.logger import log
 from app.services.ai_call.dialogue_merge import (
     CUSTOMER_SPEAKER_TYPE,
@@ -528,11 +528,7 @@ class AiCallOfflineAsrService:
 
     async def _play_url(self, oss_id: int) -> str | None:
         auth = AuthSchema(user=None, check_data_scope=False, db=self.repository.db)
-        row = await OssCRUD(auth).get_url_by_oss_id_crud(oss_id=oss_id)
-        if not row:
-            return None
-        url = row.get("url")
-        return str(url) if url else None
+        return await OssService.get_presigned_url_by_oss_id_service(auth, oss_id)
 
     async def _checkpoint(self) -> None:
         if self.commit_between_steps:

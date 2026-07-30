@@ -77,6 +77,30 @@ class OssService:
         return OssUrlOutSchema.model_validate(oss_obj).model_dump(by_alias=True)
 
     @classmethod
+    async def get_presigned_url_by_oss_id_service(
+        cls,
+        auth: AuthSchema,
+        oss_id: int,
+        *,
+        expires_seconds: int = 900,
+    ) -> str | None:
+        """返回可短时访问的对象地址，供浏览器播放和外部任务拉取。"""
+        oss_obj = await OssCRUD(auth).get_by_oss_id_crud(oss_id=oss_id)
+        if not oss_obj:
+            return None
+        if oss_obj.get("service") != "minio":
+            return str(oss_obj.get("url") or "") or None
+        config = cls._active_config
+        object_name = str(oss_obj.get("file_name") or "").strip()
+        if not config or not object_name:
+            return str(oss_obj.get("url") or "") or None
+        return MinioUtil.presigned_get_url(
+            config,
+            object_name,
+            expires_seconds=expires_seconds,
+        )
+
+    @classmethod
     async def get_list_by_oss_ids_service(cls, auth: AuthSchema, oss_ids: list[int]) -> list[dict]:
         """
         根据oss_id列表批量获取OSS对象完整信息

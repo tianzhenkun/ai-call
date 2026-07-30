@@ -1,6 +1,8 @@
 import datetime as dt
 import hashlib
 import hmac
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -63,6 +65,35 @@ def test_oss_service_build_object_url_matches_upload_url_rule():
     )
 
     assert url == "https://oss.lingchen-ai.com/recov/ai-call/recordings/call_325209354604376064.mp4"
+
+
+def test_presigned_get_url_allows_private_object_download_without_exposing_secret():
+    config = {
+        "is_https": "Y",
+        "endpoint": "minio.example.com",
+        "bucket_name": "recov",
+        "access_key": "public-key",
+        "secret_key": "private-secret",
+        "region": "us-east-1",
+    }
+
+    url = MinioUtil.presigned_get_url(
+        config,
+        "ai-call/recordings/call-1.mp3",
+        expires_seconds=900,
+        now=datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc),
+    )
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "minio.example.com"
+    assert parsed.path == "/recov/ai-call/recordings/call-1.mp3"
+    assert query["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
+    assert query["X-Amz-Expires"] == ["900"]
+    assert query["X-Amz-SignedHeaders"] == ["host"]
+    assert len(query["X-Amz-Signature"][0]) == 64
+    assert "private-secret" not in url
 
 
 def _private_object_config() -> dict:
