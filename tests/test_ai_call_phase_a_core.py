@@ -9765,6 +9765,56 @@ async def test_realtime_agent_runner_waits_for_stable_user_turn_before_response(
 
 
 @pytest.mark.anyio
+async def test_realtime_agent_runner_requests_sip_response_before_observed_followup_gap() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider([])
+    call_id = "call_sip_response_before_followup_gap"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"sip-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+    stability_delay_seconds = float(
+        Settings.model_fields["AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS"].default
+    )
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        user_turn_stability_delay_seconds=stability_delay_seconds,
+    )
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        stopped_at = datetime.now(timezone.utc)
+        await runner._handle_user_speech_started(call_id, provider, stopped_at)
+        await runner._handle_user_transcript(
+            call_id,
+            provider,
+            ProviderEvent(type="user_transcript_done", payload={"transcript": "方便。"}),
+            stopped_at,
+        )
+        await runner._handle_user_speech_stopped(call_id, provider, stopped_at)
+
+        await asyncio.sleep(0.25)
+
+        assert provider.created_responses == [None]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_keeps_inflight_audio_for_browser_candidate() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
