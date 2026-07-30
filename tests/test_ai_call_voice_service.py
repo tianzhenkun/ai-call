@@ -1,22 +1,146 @@
 from __future__ import annotations
 
+import io
+import wave
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from fastapi import UploadFile
 from pydantic import ValidationError
-from sqlalchemy import event
+from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.datastructures import Headers
 
 from app.api.v1.ai_call.model import AiCallVoiceProfileModel
-from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+from app.api.v1.ai_call.voice.model import (
+    AiCallTenantVoiceProfileModel,
+    AiCallVoiceEnrollmentModel,
+)
 from app.api.v1.ai_call.voice.repository import VoiceRepository
-from app.api.v1.ai_call.voice.schema import VoiceProfileOut
+from app.api.v1.ai_call.voice.schema import (
+    VoiceEnrollmentAcceptedOut,
+    VoiceEnrollmentRequest,
+    VoiceProfileOut,
+)
+from app.api.v1.ai_call.voice.service import VoiceEnrollmentService
 from app.core.base_model import MappedBase
+from app.core.exceptions import CustomException
 
 TARGET_MODEL = "qwen3.5-omni-plus-realtime"
 OTHER_MODEL = "qwen-omni-turbo-realtime"
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+
+
+class FakeVoiceSampleStorage:
+    def __init__(
+        self,
+        *,
+        put_error: Exception | None = None,
+        delete_error: Exception | None = None,
+    ) -> None:
+        self.put_error = put_error
+        self.delete_error = delete_error
+        self.put_calls: list[dict[str, object]] = []
+        self.delete_calls: list[str] = []
+
+    async def put(self, *, data: bytes, filename: str, content_type: str) -> str:
+        self.put_calls.append({
+            "data": data,
+            "filename": filename,
+            "content_type": content_type,
+        })
+        if self.put_error is not None:
+            raise self.put_error
+        return f"private/sample-{len(self.put_calls)}"
+
+    async def get(self, object_key: str) -> bytes:
+        raise NotImplementedError
+
+    async def delete(self, object_key: str) -> None:
+        self.delete_calls.append(object_key)
+        if self.delete_error is not None:
+            raise self.delete_error
+
+
+class SequenceIds:
+    def __init__(self, *values: int) -> None:
+        self._values = iter(values)
+
+    def __call__(self) -> int:
+        return next(self._values)
+
+
+def _valid_wav(*, seconds: int = 3) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24_000)
+        wav_file.writeframes(b"\x00\x00" * 24_000 * seconds)
+    return output.getvalue()
+
+
+def _upload(
+    data: bytes | None = None,
+    *,
+    filename: str = "sample.wav",
+    content_type: str = "audio/wav",
+) -> UploadFile:
+    return UploadFile(
+        io.BytesIO(data if data is not None else _valid_wav()),
+        filename=filename,
+        headers=Headers({"content-type": content_type}),
+    )
+
+
+def _enrollment_request(**overrides: object) -> VoiceEnrollmentRequest:
+    values: dict[str, object] = {
+        "display_name": " 客服小林 ",
+        "gender": "女声",
+        "language": "zh",
+        "transcript": " 您好 ",
+        "consent_confirmed": True,
+    }
+    values.update(overrides)
+    return VoiceEnrollmentRequest(**values)
+
+
+@pytest.fixture
+async def enrollment_database(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'voice-enrollment.db'}",
+    )
+    tables = [
+        AiCallTenantVoiceProfileModel.__table__,
+        AiCallVoiceEnrollmentModel.__table__,
+    ]
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            lambda sync_connection: MappedBase.metadata.create_all(
+                sync_connection,
+                tables=tables,
+            )
+        )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield engine, factory
+    finally:
+        await engine.dispose()
+
+
+def _voice_service(
+    storage: FakeVoiceSampleStorage,
+    *,
+    ids: tuple[int, ...] = (101, 102),
+) -> VoiceEnrollmentService:
+    return VoiceEnrollmentService(
+        storage=storage,
+        target_model=TARGET_MODEL,
+        now=lambda: NOW,
+        id_generator=SequenceIds(*ids),
+    )
 
 
 @pytest.fixture
@@ -584,3 +708,620 @@ async def _all_profiles(factory: async_sessionmaker) -> list[VoiceProfileOut]:
             page_size=100,
         )
         return rows
+
+
+def test_enrollment_request_normalizes_fields_and_forbids_server_owned_values() -> None:
+    request = _enrollment_request(transcript="   ")
+
+    assert request.display_name == "客服小林"
+    assert request.transcript is None
+    assert request.model_dump(by_alias=True) == {
+        "displayName": "客服小林",
+        "gender": "女声",
+        "language": "zh",
+        "transcript": None,
+        "consentConfirmed": True,
+    }
+
+    with pytest.raises(ValidationError):
+        VoiceEnrollmentRequest.model_validate({
+            **request.model_dump(by_alias=True),
+            "tenantId": "tenant-from-browser",
+        })
+    with pytest.raises(ValidationError):
+        VoiceEnrollmentRequest.model_validate({
+            **request.model_dump(by_alias=True),
+            "targetModel": "browser-model",
+        })
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"display_name": "  "},
+        {"display_name": "a" * 101},
+        {"gender": "其他"},
+        {"language": "en"},
+        {"transcript": "a" * 2001},
+        {"consent_confirmed": "true"},
+    ],
+)
+def test_enrollment_request_rejects_invalid_business_fields(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        _enrollment_request(**payload)
+
+
+def test_enrollment_accepted_output_stringifies_ids() -> None:
+    output = VoiceEnrollmentAcceptedOut(
+        voice_profile_id=9_007_199_254_740_993,
+        enrollment_id=9_007_199_254_740_994,
+        status="CREATING",
+        display_name="客服小林",
+    )
+
+    assert output.voice_profile_id == "9007199254740993"
+    assert output.enrollment_id == "9007199254740994"
+    assert output.model_dump(by_alias=True)["voiceProfileId"] == "9007199254740993"
+
+
+@pytest.mark.anyio
+async def test_create_persists_normalized_profile_and_enrollment(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(123456789012345678, 223456789012345678))
+    sample = _upload()
+    await sample.read(7)
+
+    async with factory() as database:
+        accepted = await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key=" key-1 ",
+            request=_enrollment_request(),
+            sample=sample,
+        )
+
+    async with factory() as database:
+        profile = await database.scalar(select(AiCallTenantVoiceProfileModel))
+        enrollment = await database.scalar(select(AiCallVoiceEnrollmentModel))
+
+    assert accepted.model_dump(by_alias=True) == {
+        "voiceProfileId": "123456789012345678",
+        "enrollmentId": "223456789012345678",
+        "status": "CREATING",
+        "displayName": "客服小林",
+    }
+    assert profile is not None
+    assert enrollment is not None
+    assert profile.tenant_id == "tenant-a"
+    assert profile.display_name == "客服小林"
+    assert profile.voice is None
+    assert profile.voice_type == "自定义复刻"
+    assert profile.provider == "aliyun_qwen"
+    assert profile.target_model == TARGET_MODEL
+    assert profile.status == "CREATING"
+    assert profile.latest_enrollment_id == enrollment.id
+    assert profile.created_by == 7
+    assert profile.created_at.replace(tzinfo=timezone.utc) == NOW
+    assert enrollment.idempotency_key == "key-1"
+    assert enrollment.preferred_name == "3456789012345678"
+    assert enrollment.status == "PENDING"
+    assert enrollment.provider_voice is None
+    assert enrollment.attempt_count == 0
+    assert enrollment.consent_user_id == 7
+    assert enrollment.consent_at.replace(tzinfo=timezone.utc) == NOW
+    assert enrollment.created_at.replace(tzinfo=timezone.utc) == NOW
+    assert enrollment.request_hash
+    assert enrollment.sample_sha256
+    assert enrollment.sample_object_key == "private/sample-1"
+    assert storage.put_calls[0]["content_type"] == "audio/wav"
+
+
+@pytest.mark.anyio
+async def test_create_reuses_same_tenant_key_and_canonical_hash_without_upload(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(101, 102))
+
+    async with factory() as database:
+        first = await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key=" key-1 ",
+            request=_enrollment_request(),
+            sample=_upload(),
+        )
+        second = await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=8,
+            idempotency_key="key-1",
+            request=_enrollment_request(
+                display_name="客服小林",
+                transcript="您好",
+            ),
+            sample=_upload(),
+        )
+
+    assert second == first
+    assert len(storage.put_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_create_rejects_same_tenant_key_with_different_payload(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(101, 102))
+
+    async with factory() as database:
+        await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key="key-1",
+            request=_enrollment_request(),
+            sample=_upload(),
+        )
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(display_name="另一个音色"),
+                sample=_upload(),
+            )
+
+    assert caught.value.status_code == 409
+    assert len(storage.put_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_create_scopes_same_idempotency_key_by_tenant(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(101, 102, 201, 202))
+    max_length_key = "k" * 128
+
+    async with factory() as database:
+        first = await service.create(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key=max_length_key,
+            request=_enrollment_request(),
+            sample=_upload(),
+        )
+        second = await service.create(
+            database,
+            tenant_id="tenant-b",
+            user_id=8,
+            idempotency_key=max_length_key,
+            request=_enrollment_request(),
+            sample=_upload(),
+        )
+
+    assert second.voice_profile_id != first.voice_profile_id
+    assert len(storage.put_calls) == 2
+
+
+@pytest.mark.anyio
+async def test_create_rejects_missing_consent_before_reading_or_uploading(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage)
+
+    class UnreadableSample:
+        filename = "secret.wav"
+        content_type = "audio/wav"
+
+        async def seek(self, _offset: int) -> None:
+            raise AssertionError("consent failure must happen before seek")
+
+        async def read(self, _size: int) -> bytes:
+            raise AssertionError("consent failure must happen before read")
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(consent_confirmed=False),
+                sample=UnreadableSample(),  # type: ignore[arg-type]
+            )
+
+    assert caught.value.status_code == 422
+    assert storage.put_calls == []
+
+
+@pytest.mark.parametrize("key", ["", " ", "x" * 129])
+@pytest.mark.anyio
+async def test_create_rejects_invalid_idempotency_key(
+    enrollment_database,
+    key: str,
+) -> None:
+    _engine, factory = enrollment_database
+    service = _voice_service(FakeVoiceSampleStorage())
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key=key,
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    assert caught.value.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_create_reads_from_start_with_hard_size_limit(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    service = _voice_service(FakeVoiceSampleStorage())
+
+    class OversizedSample:
+        filename = "sample.wav"
+        content_type = "audio/wav"
+
+        def __init__(self) -> None:
+            self.seek_calls: list[int] = []
+            self.read_sizes: list[int] = []
+
+        async def seek(self, offset: int) -> None:
+            self.seek_calls.append(offset)
+
+        async def read(self, size: int) -> bytes:
+            self.read_sizes.append(size)
+            return b"x" * size
+
+    sample = OversizedSample()
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=sample,  # type: ignore[arg-type]
+            )
+
+    assert caught.value.status_code == 413
+    assert sample.seek_calls == [0]
+    assert sample.read_sizes == [10 * 1024 * 1024 + 1]
+
+
+@pytest.mark.anyio
+async def test_create_upload_failure_leaves_database_empty(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage(put_error=RuntimeError("secret storage credential"))
+    service = _voice_service(storage)
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    async with factory() as database:
+        assert await database.scalar(select(AiCallTenantVoiceProfileModel)) is None
+        assert await database.scalar(select(AiCallVoiceEnrollmentModel)) is None
+    assert caught.value.status_code == 502
+    assert "secret" not in str(caught.value).lower()
+
+
+@pytest.mark.anyio
+async def test_create_commit_failure_rolls_back_and_deletes_uploaded_sample(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage)
+
+    async with factory() as database:
+
+        async def fail_commit() -> None:
+            raise RuntimeError("database secret")
+
+        monkeypatch.setattr(database, "commit", fail_commit)
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    async with factory() as database:
+        assert await database.scalar(select(AiCallTenantVoiceProfileModel)) is None
+        assert await database.scalar(select(AiCallVoiceEnrollmentModel)) is None
+    assert caught.value.status_code == 500
+    assert storage.delete_calls == ["private/sample-1"]
+    assert "secret" not in str(caught.value).lower()
+
+
+@pytest.mark.anyio
+async def test_create_post_upload_setup_failure_deletes_uploaded_sample(
+    enrollment_database,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+
+    def fail_id_generation() -> int:
+        raise RuntimeError("database setup secret")
+
+    service = VoiceEnrollmentService(
+        storage=storage,
+        target_model=TARGET_MODEL,
+        now=lambda: NOW,
+        id_generator=fail_id_generation,
+    )
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="key-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    assert caught.value.status_code == 500
+    assert storage.delete_calls == ["private/sample-1"]
+    assert "secret" not in str(caught.value).lower()
+
+
+@pytest.mark.anyio
+async def test_create_cleanup_failure_is_redacted(
+    enrollment_database,
+    monkeypatch,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage(delete_error=RuntimeError("secret sample and key"))
+    service = _voice_service(storage)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "app.api.v1.ai_call.voice.service.log.warning",
+        lambda message: warnings.append(str(message)),
+    )
+
+    async with factory() as database:
+
+        async def fail_commit() -> None:
+            raise RuntimeError("database secret")
+
+        monkeypatch.setattr(database, "commit", fail_commit)
+        with pytest.raises(CustomException) as caught:
+            await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="sensitive-idempotency-key",
+                request=_enrollment_request(),
+                sample=_upload(filename="sensitive-sample.wav"),
+            )
+
+    rendered = " ".join(warnings + [str(caught.value)])
+    assert "secret" not in rendered.lower()
+    assert "sensitive" not in rendered.lower()
+    assert "private/sample-1" not in rendered
+
+
+@pytest.mark.parametrize("winner_hash_matches", [True, False])
+@pytest.mark.anyio
+async def test_create_recovers_unique_race_from_persisted_winner(
+    enrollment_database,
+    monkeypatch,
+    winner_hash_matches: bool,
+) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(101, 102))
+
+    async with factory() as database:
+        real_flush = database.flush
+        raced = False
+
+        async def race_flush(*args, **kwargs) -> None:
+            nonlocal raced
+            if raced:
+                await real_flush(*args, **kwargs)
+                return
+            raced = True
+            pending_profile = next(
+                row for row in database.new if isinstance(row, AiCallTenantVoiceProfileModel)
+            )
+            pending_enrollment = next(
+                row for row in database.new if isinstance(row, AiCallVoiceEnrollmentModel)
+            )
+            winner_profile = _tenant_voice(
+                profile_id=901,
+                tenant_id=pending_profile.tenant_id,
+                voice=None,
+                display_name=pending_profile.display_name,
+                status="CREATING",
+            )
+            winner_profile.latest_enrollment_id = 902
+            winner_enrollment = AiCallVoiceEnrollmentModel(
+                id=902,
+                tenant_id=pending_enrollment.tenant_id,
+                voice_profile_id=901,
+                idempotency_key=pending_enrollment.idempotency_key,
+                request_hash=(pending_enrollment.request_hash if winner_hash_matches else "0" * 64),
+                preferred_name="vc901",
+                language=pending_enrollment.language,
+                transcript=pending_enrollment.transcript,
+                sample_object_key="winner/sample",
+                sample_sha256=pending_enrollment.sample_sha256,
+                status="PENDING",
+                provider_voice=None,
+                provider_request_id=None,
+                attempt_count=0,
+                next_retry_at=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                error_message=None,
+                cleanup_error_message=None,
+                consent_user_id=7,
+                consent_at=NOW,
+                started_at=None,
+                finished_at=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            await database.rollback()
+            async with factory() as winner_db:
+                winner_db.add_all([winner_profile, winner_enrollment])
+                await winner_db.commit()
+            raise IntegrityError("insert", {}, RuntimeError("unique"))
+
+        monkeypatch.setattr(database, "flush", race_flush)
+        if winner_hash_matches:
+            accepted = await service.create(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                idempotency_key="race-key",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+            assert accepted.voice_profile_id == "901"
+            assert accepted.enrollment_id == "902"
+        else:
+            with pytest.raises(CustomException) as caught:
+                await service.create(
+                    database,
+                    tenant_id="tenant-a",
+                    user_id=7,
+                    idempotency_key="race-key",
+                    request=_enrollment_request(),
+                    sample=_upload(),
+                )
+            assert caught.value.status_code == 409
+
+    assert storage.delete_calls == ["private/sample-1"]
+
+
+@pytest.mark.anyio
+async def test_reenroll_requires_current_tenant_failed_profile(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(201, 202))
+    async with factory() as database:
+        database.add_all([
+            _tenant_voice(
+                profile_id=101,
+                tenant_id="tenant-a",
+                voice=None,
+                status="ENABLED",
+            ),
+            _tenant_voice(
+                profile_id=102,
+                tenant_id="tenant-b",
+                voice=None,
+                status="CREATE_FAILED",
+            ),
+        ])
+        await database.commit()
+
+        with pytest.raises(CustomException) as wrong_state:
+            await service.reenroll(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=101,
+                idempotency_key="retry-1",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+        with pytest.raises(CustomException) as other_tenant:
+            await service.reenroll(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=102,
+                idempotency_key="retry-2",
+                request=_enrollment_request(),
+                sample=_upload(),
+            )
+
+    assert wrong_state.value.status_code == 409
+    assert other_tenant.value.status_code == 404
+    assert storage.put_calls == []
+
+
+@pytest.mark.anyio
+async def test_reenroll_updates_failed_profile_and_is_idempotent(enrollment_database) -> None:
+    _engine, factory = enrollment_database
+    storage = FakeVoiceSampleStorage()
+    service = _voice_service(storage, ids=(202,))
+    async with factory() as database:
+        profile = _tenant_voice(
+            profile_id=101,
+            tenant_id="tenant-a",
+            voice=None,
+            display_name="旧名称",
+            status="CREATE_FAILED",
+            error_message="旧错误",
+        )
+        database.add(profile)
+        await database.commit()
+
+        first = await service.reenroll(
+            database,
+            tenant_id="tenant-a",
+            user_id=9,
+            profile_id=101,
+            idempotency_key="retry-key",
+            request=_enrollment_request(display_name=" 新名称 ", gender="男声"),
+            sample=_upload(),
+        )
+        second = await service.reenroll(
+            database,
+            tenant_id="tenant-a",
+            user_id=9,
+            profile_id=101,
+            idempotency_key="retry-key",
+            request=_enrollment_request(display_name="新名称", gender="男声"),
+            sample=_upload(),
+        )
+
+    async with factory() as database:
+        saved_profile = await database.get(AiCallTenantVoiceProfileModel, 101)
+        enrollments = (await database.execute(select(AiCallVoiceEnrollmentModel))).scalars().all()
+
+    assert first == second
+    assert first.voice_profile_id == "101"
+    assert first.enrollment_id == "202"
+    assert first.display_name == "新名称"
+    assert saved_profile is not None
+    assert saved_profile.status == "CREATING"
+    assert saved_profile.latest_enrollment_id == 202
+    assert saved_profile.error_message is None
+    assert saved_profile.display_name == "新名称"
+    assert saved_profile.gender == "男声"
+    assert len(enrollments) == 1
+    assert len(storage.put_calls) == 1
