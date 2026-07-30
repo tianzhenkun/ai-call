@@ -150,3 +150,34 @@ comment on column ai_call_voice_deletion.started_at is '开始处理时间';
 comment on column ai_call_voice_deletion.finished_at is '完成处理时间';
 comment on column ai_call_voice_deletion.created_at is '创建时间';
 comment on column ai_call_voice_deletion.updated_at is '更新时间';
+
+create table if not exists ai_call_voice_sample_cleanup (
+    id bigint primary key,
+    tenant_id varchar(64) not null,
+    object_key varchar(500) not null,
+    status varchar(32) not null,
+    attempt_count integer not null default 0,
+    next_retry_at timestamptz null,
+    lease_owner varchar(128) null,
+    lease_expires_at timestamptz null,
+    error_message varchar(1000) null,
+    created_at timestamptz not null,
+    updated_at timestamptz not null,
+    constraint uk_voice_sample_cleanup_object_key unique (object_key)
+);
+
+create index if not exists idx_voice_sample_cleanup_claim
+    on ai_call_voice_sample_cleanup (status, next_retry_at, id);
+
+comment on table ai_call_voice_sample_cleanup is 'AI Call 孤儿声音样本清理任务';
+comment on column ai_call_voice_sample_cleanup.id is '雪花主键';
+comment on column ai_call_voice_sample_cleanup.tenant_id is '租户ID';
+comment on column ai_call_voice_sample_cleanup.object_key is '待删除私有对象键';
+comment on column ai_call_voice_sample_cleanup.status is '清理状态';
+comment on column ai_call_voice_sample_cleanup.attempt_count is '清理尝试次数';
+comment on column ai_call_voice_sample_cleanup.next_retry_at is '下次重试时间';
+comment on column ai_call_voice_sample_cleanup.lease_owner is '处理租约持有者';
+comment on column ai_call_voice_sample_cleanup.lease_expires_at is '处理租约过期时间';
+comment on column ai_call_voice_sample_cleanup.error_message is '脱敏后的清理失败原因';
+comment on column ai_call_voice_sample_cleanup.created_at is '创建时间';
+comment on column ai_call_voice_sample_cleanup.updated_at is '更新时间';

@@ -20,6 +20,7 @@ from app.api.v1.ai_call.voice.model import (
     AiCallTenantVoiceProfileModel,
     AiCallVoiceDeletionModel,
     AiCallVoiceEnrollmentModel,
+    AiCallVoiceSampleCleanupModel,
 )
 
 SQL_PATH = (
@@ -94,6 +95,19 @@ MODEL_COLUMNS: dict[str, dict[str, tuple[type[object], bool, int | None]]] = {
         "created_at": (DateTime, False, None),
         "updated_at": (DateTime, False, None),
     },
+    "ai_call_voice_sample_cleanup": {
+        "id": (BigInteger, False, None),
+        "tenant_id": (String, False, 64),
+        "object_key": (String, False, 500),
+        "status": (String, False, 32),
+        "attempt_count": (Integer, False, None),
+        "next_retry_at": (DateTime, True, None),
+        "lease_owner": (String, True, 128),
+        "lease_expires_at": (DateTime, True, None),
+        "error_message": (String, True, 1000),
+        "created_at": (DateTime, False, None),
+        "updated_at": (DateTime, False, None),
+    },
 }
 
 SQL_TABLE_CONTRACTS: dict[str, dict[str, tuple[str, bool, int | None]]] = {
@@ -163,6 +177,19 @@ SQL_TABLE_CONTRACTS: dict[str, dict[str, tuple[str, bool, int | None]]] = {
         "created_at": ("timestamptz", False, None),
         "updated_at": ("timestamptz", False, None),
     },
+    "ai_call_voice_sample_cleanup": {
+        "id": ("bigint", False, None),
+        "tenant_id": ("varchar(64)", False, None),
+        "object_key": ("varchar(500)", False, None),
+        "status": ("varchar(32)", False, None),
+        "attempt_count": ("integer", False, 0),
+        "next_retry_at": ("timestamptz", True, None),
+        "lease_owner": ("varchar(128)", True, None),
+        "lease_expires_at": ("timestamptz", True, None),
+        "error_message": ("varchar(1000)", True, None),
+        "created_at": ("timestamptz", False, None),
+        "updated_at": ("timestamptz", False, None),
+    },
 }
 
 UNIQUE_CONTRACTS = {
@@ -177,6 +204,10 @@ UNIQUE_CONTRACTS = {
     "uk_voice_deletion_tenant_key": (
         "ai_call_voice_deletion",
         ("tenant_id", "idempotency_key"),
+    ),
+    "uk_voice_sample_cleanup_object_key": (
+        "ai_call_voice_sample_cleanup",
+        ("object_key",),
     ),
 }
 
@@ -204,6 +235,10 @@ INDEX_CONTRACTS = {
     "idx_voice_deletion_profile": (
         "ai_call_voice_deletion",
         ("tenant_id", "voice_profile_id", "created_at"),
+    ),
+    "idx_voice_sample_cleanup_claim": (
+        "ai_call_voice_sample_cleanup",
+        ("status", "next_retry_at", "id"),
     ),
 }
 
@@ -279,8 +314,7 @@ def _parse_sql_tables(sql: str) -> dict[str, dict[str, object]]:
             unique_match = unique_pattern.match(definition)
             if unique_match:
                 unique_constraints[unique_match.group("name").lower()] = tuple(
-                    column.strip().lower()
-                    for column in unique_match.group("columns").split(",")
+                    column.strip().lower() for column in unique_match.group("columns").split(",")
                 )
                 continue
             column_match = column_pattern.match(definition)
@@ -359,16 +393,30 @@ def test_voice_deletion_model_matches_contract() -> None:
     }
 
 
+def test_voice_sample_cleanup_model_matches_contract() -> None:
+    _assert_model_columns(AiCallVoiceSampleCleanupModel)
+    assert AiCallVoiceSampleCleanupModel.__table__.columns.id.autoincrement is False
+    _assert_counter_defaults(AiCallVoiceSampleCleanupModel, "attempt_count")
+    assert _unique_constraints(AiCallVoiceSampleCleanupModel) == {
+        "uk_voice_sample_cleanup_object_key": ("object_key",),
+    }
+    assert _indexes(AiCallVoiceSampleCleanupModel) == {
+        "idx_voice_sample_cleanup_claim": ("status", "next_retry_at", "id"),
+    }
+
+
 def test_counter_server_defaults_are_reflected_by_sqlite() -> None:
     engine = create_engine("sqlite://")
     try:
         for model, column_names in (
             (AiCallVoiceEnrollmentModel, ("attempt_count",)),
             (AiCallVoiceDeletionModel, ("attempt_count", "historical_task_count")),
+            (AiCallVoiceSampleCleanupModel, ("attempt_count",)),
         ):
             model.__table__.create(engine)
             reflected_columns = {
-                column["name"]: column for column in sa_inspect(engine).get_columns(model.__tablename__)
+                column["name"]: column
+                for column in sa_inspect(engine).get_columns(model.__tablename__)
             }
             for column_name in column_names:
                 assert reflected_columns[column_name]["default"] == "0"

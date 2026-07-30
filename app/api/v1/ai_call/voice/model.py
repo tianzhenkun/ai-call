@@ -94,7 +94,9 @@ class AiCallVoiceEnrollmentModel(MappedBase):
     )
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     cleanup_error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     consent_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -140,7 +142,9 @@ class AiCallVoiceDeletionModel(MappedBase):
     )
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     historical_task_count: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -151,5 +155,44 @@ class AiCallVoiceDeletionModel(MappedBase):
     requested_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallVoiceSampleCleanupModel(MappedBase):
+    """数据库回滚后遗留的私有声音样本清理任务。"""
+
+    __tablename__ = "ai_call_voice_sample_cleanup"
+    __table_args__ = (
+        UniqueConstraint(
+            "object_key",
+            name="uk_voice_sample_cleanup_object_key",
+        ),
+        Index(
+            "idx_voice_sample_cleanup_claim",
+            "status",
+            "next_retry_at",
+            "id",
+        ),
+        {"comment": "AI Call 孤儿声音样本清理任务"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
