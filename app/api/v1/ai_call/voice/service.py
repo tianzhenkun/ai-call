@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
 from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Never
+from typing import Any, Never, Protocol
 
 from fastapi import UploadFile, status
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.model import AiCallVoiceProfileModel
 from app.core.exceptions import CustomException
 from app.core.logger import log
+from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.orchestrator import (
+    AiCallOrchestrator,
+    BrowserEventReportResult,
+    CreateSessionResult,
+    EndSessionResult,
+)
+from app.services.ai_call.prompt_config import PromptEffectiveConfig
 from app.services.ai_call.voice_sample import (
     VoiceSampleMetadata,
     VoiceSampleStorage,
@@ -35,11 +45,364 @@ MAX_SAMPLE_BYTES = 10 * 1024 * 1024
 PROVIDER = "aliyun_qwen"
 CLEANUP_ERROR_MESSAGE = "即时删除声音样本失败，等待后台重试"
 CLEANUP_PERSISTENCE_LOG = "音色样本清理补偿持久化失败，需人工检查后台回收"
+VOICE_PREVIEW_OPENING_MESSAGE = "您好，我是您的智能语音助手，很高兴为您服务。"
+VOICE_PREVIEW_INSTRUCTIONS = "你是智能语音助手，请自然地与用户进行简短试听对话。"
+VOICE_PREVIEW_TIMEOUT_SECONDS = 30
 SAMPLE_EXTENSION_BY_CONTENT_TYPE = {
     "audio/wav": ".wav",
     "audio/mpeg": ".mp3",
     "audio/mp4": ".m4a",
 }
+
+
+class VoicePreviewOrchestrator(Protocol):
+    async def create_web_session(
+        self,
+        *,
+        voice: str | None,
+        prompt: str | None,
+        call_id: str | None = None,
+        prompt_effective_config: PromptEffectiveConfig | None = None,
+    ) -> CreateSessionResult: ...
+
+    async def report_browser_event(
+        self,
+        call_id: str,
+        event_type: str,
+        timestamp: datetime | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> BrowserEventReportResult: ...
+
+    async def end_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str = "web_user_end",
+    ) -> EndSessionResult: ...
+
+
+@dataclass(slots=True)
+class _VoicePreviewSession:
+    tenant_id: str
+    user_id: int
+    call_id: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    released: bool = False
+    end_result: EndSessionResult | None = None
+    end_error: CustomException | None = None
+
+
+class VoicePreviewService:
+    """创建不落正式业务记录的隔离 Realtime 音色试听会话。"""
+
+    def __init__(
+        self,
+        *,
+        orchestrator: VoicePreviewOrchestrator,
+        target_model: str,
+        timeout_seconds: float = VOICE_PREVIEW_TIMEOUT_SECONDS,
+        id_generator: Callable[[], int] = generate_snowflake_id,
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.target_model = target_model
+        self.timeout_seconds = max(0.001, timeout_seconds)
+        self.id_generator = id_generator
+        self._sessions: dict[str, _VoicePreviewSession] = {}
+        self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
+
+    @property
+    def pending_timeout_count(self) -> int:
+        return sum(not task.done() for task in self._timeout_tasks.values())
+
+    async def create_preview_session(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        user_id: int,
+        voice: str,
+    ) -> CreateSessionResult:
+        resolved_voice = await self._resolve_voice(
+            db,
+            tenant_id=tenant_id,
+            voice=voice,
+        )
+        call_id = self._new_call_id()
+        preview_config = self._preview_config()
+        try:
+            result = await self.orchestrator.create_web_session(
+                voice=resolved_voice,
+                prompt=None,
+                call_id=call_id,
+                prompt_effective_config=preview_config,
+            )
+        except Exception as exc:
+            await self._cleanup_unregistered(call_id)
+            self._raise_runtime_error("create", exc)
+
+        session = _VoicePreviewSession(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            call_id=call_id,
+        )
+        self._sessions[call_id] = session
+        try:
+            timeout_task = asyncio.create_task(
+                self._release_after_timeout(session),
+                name=f"ai-call-voice-preview-timeout-{call_id}",
+            )
+        except Exception as exc:
+            self._sessions.pop(call_id, None)
+            await self._cleanup_unregistered(call_id)
+            self._raise_runtime_error("schedule_timeout", exc)
+        self._timeout_tasks[call_id] = timeout_task
+        timeout_task.add_done_callback(
+            lambda completed, preview_call_id=call_id: self._consume_timeout_task(
+                preview_call_id,
+                completed,
+            )
+        )
+        return result
+
+    async def ready_preview_session(
+        self,
+        *,
+        tenant_id: str,
+        user_id: int,
+        call_id: str,
+    ) -> BrowserEventReportResult:
+        session = self._owned_session(tenant_id=tenant_id, call_id=call_id)
+        async with session.lock:
+            if session.released:
+                self._raise_not_found()
+            try:
+                return await self.orchestrator.report_browser_event(
+                    call_id=call_id,
+                    event_type="browser_ready",
+                    timestamp=None,
+                    payload=None,
+                )
+            except Exception as exc:
+                self._raise_runtime_error("ready", exc)
+
+    async def close_preview_session(
+        self,
+        *,
+        tenant_id: str,
+        user_id: int,
+        call_id: str,
+    ) -> EndSessionResult:
+        session = self._owned_session(tenant_id=tenant_id, call_id=call_id)
+        return await self._release(session, end_reason="voice_preview_user_end")
+
+    async def _resolve_voice(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        voice: str,
+    ) -> str:
+        normalized_tenant_id = str(tenant_id or "").strip()
+        normalized_voice = str(voice or "").strip()
+        if not normalized_tenant_id or not normalized_voice:
+            self._raise_not_found()
+        try:
+            builtin_voice = await db.scalar(
+                select(AiCallVoiceProfileModel.voice)
+                .where(
+                    AiCallVoiceProfileModel.voice == normalized_voice,
+                    AiCallVoiceProfileModel.voice_type == "内置",
+                    AiCallVoiceProfileModel.target_model == self.target_model,
+                )
+                .limit(1)
+            )
+            if builtin_voice is not None:
+                return str(builtin_voice)
+            tenant_voice = await db.scalar(
+                select(AiCallTenantVoiceProfileModel.voice)
+                .where(
+                    AiCallTenantVoiceProfileModel.tenant_id == normalized_tenant_id,
+                    AiCallTenantVoiceProfileModel.voice == normalized_voice,
+                    AiCallTenantVoiceProfileModel.status == "ENABLED",
+                    AiCallTenantVoiceProfileModel.target_model == self.target_model,
+                )
+                .limit(1)
+            )
+        except Exception as exc:
+            log.warning(
+                "音色试听资产查询失败: errorType={}",
+                type(exc).__name__,
+            )
+            raise CustomException(
+                msg="音色查询失败，请稍后重试",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            ) from None
+        if tenant_voice is None:
+            self._raise_not_found()
+        return str(tenant_voice)
+
+    async def _release_after_timeout(
+        self,
+        session: _VoicePreviewSession,
+    ) -> None:
+        try:
+            await asyncio.sleep(self.timeout_seconds)
+            await self._release(
+                session,
+                end_reason="voice_preview_timeout",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "音色试听超时释放失败: callId={}, errorType={}",
+                session.call_id,
+                type(exc).__name__,
+            )
+        finally:
+            current_task = asyncio.current_task()
+            if self._timeout_tasks.get(session.call_id) is current_task:
+                self._timeout_tasks.pop(session.call_id, None)
+
+    async def _release(
+        self,
+        session: _VoicePreviewSession,
+        *,
+        end_reason: str,
+    ) -> EndSessionResult:
+        async with session.lock:
+            if session.released:
+                if session.end_error is not None:
+                    raise session.end_error
+                if session.end_result is None:
+                    raise CustomException(
+                        msg="音色试听服务暂不可用，请稍后重试",
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                    )
+                return session.end_result
+            session.released = True
+            await self._cancel_timeout_task(session.call_id)
+            try:
+                session.end_result = await self.orchestrator.end_session(
+                    session.call_id,
+                    end_reason=end_reason,
+                )
+            except Exception as exc:
+                error = self._runtime_error("end", exc)
+                session.end_error = error
+                raise error from None
+            return session.end_result
+
+    async def _cancel_timeout_task(self, call_id: str) -> None:
+        timeout_task = self._timeout_tasks.pop(call_id, None)
+        if timeout_task is None or timeout_task is asyncio.current_task():
+            return
+        timeout_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await timeout_task
+
+    async def _cleanup_unregistered(self, call_id: str) -> None:
+        try:
+            await self.orchestrator.end_session(
+                call_id,
+                end_reason="voice_preview_create_failed",
+            )
+        except Exception:
+            return
+
+    def _owned_session(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> _VoicePreviewSession:
+        session = self._sessions.get(call_id)
+        if session is None or session.tenant_id != str(tenant_id or "").strip():
+            self._raise_not_found()
+        return session
+
+    def _new_call_id(self) -> str:
+        try:
+            call_id = f"preview_{self.id_generator()}"
+        except Exception:
+            raise CustomException(
+                msg="音色试听会话创建失败，请稍后重试",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            ) from None
+        if call_id in self._sessions:
+            raise CustomException(
+                msg="音色试听会话创建失败，请稍后重试",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return call_id
+
+    def _preview_config(self) -> PromptEffectiveConfig:
+        return PromptEffectiveConfig(
+            instructions=VOICE_PREVIEW_INSTRUCTIONS,
+            prompt_hash=hashlib.sha256(VOICE_PREVIEW_INSTRUCTIONS.encode()).hexdigest(),
+            opening_message=VOICE_PREVIEW_OPENING_MESSAGE,
+            opening_message_hash=hashlib.sha256(VOICE_PREVIEW_OPENING_MESSAGE.encode()).hexdigest(),
+            prompt_source_key="voice_preview",
+        )
+
+    @staticmethod
+    def _raise_not_found() -> Never:
+        raise CustomException(
+            msg="音色不可用",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    @classmethod
+    def _runtime_error(
+        cls,
+        stage: str,
+        exc: Exception,
+    ) -> CustomException:
+        log.warning(
+            "音色试听运行失败: stage={}, errorType={}",
+            stage,
+            type(exc).__name__,
+        )
+        status_code = status.HTTP_502_BAD_GATEWAY
+        if isinstance(exc, AiCallError) and exc.status_code == 503:
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return CustomException(
+            msg="音色试听服务暂不可用，请稍后重试",
+            status_code=status_code,
+        )
+
+    @classmethod
+    def _raise_runtime_error(
+        cls,
+        stage: str,
+        exc: Exception,
+    ) -> Never:
+        raise cls._runtime_error(stage, exc) from None
+
+    def _consume_timeout_task(
+        self,
+        call_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._timeout_tasks.get(call_id) is task:
+            self._timeout_tasks.pop(call_id, None)
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+
+_default_voice_preview_service: VoicePreviewService | None = None
+
+
+def get_default_voice_preview_service() -> VoicePreviewService:
+    global _default_voice_preview_service
+    if _default_voice_preview_service is None:
+        from app.config.setting import settings
+
+        _default_voice_preview_service = VoicePreviewService(
+            orchestrator=AiCallOrchestrator.from_settings(settings),
+            target_model=settings.QWEN_REALTIME_MODEL,
+        )
+    return _default_voice_preview_service
 
 
 def _utc_now() -> datetime:
