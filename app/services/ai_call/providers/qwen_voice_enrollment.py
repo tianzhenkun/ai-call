@@ -122,10 +122,14 @@ class QwenVoiceEnrollmentProvider:
         return result
 
     async def delete(self, *, voice: str) -> str | None:
-        _, request_id = await self._request(
-            {"action": "delete", "voice": voice},
-            result_unknown_on_timeout=True,
-        )
+        try:
+            _, request_id = await self._request(
+                {"action": "delete", "voice": voice},
+                result_unknown_on_timeout=True,
+                result_unknown_on_ambiguous_response=True,
+            )
+        except VoiceProviderProtocolError:
+            raise VoiceProviderResultUnknownError("Qwen 删除请求执行结果未知") from None
         return request_id
 
     async def _request(
@@ -133,6 +137,7 @@ class QwenVoiceEnrollmentProvider:
         input_values: dict[str, Any],
         *,
         result_unknown_on_timeout: bool = False,
+        result_unknown_on_ambiguous_response: bool = False,
     ) -> tuple[dict[str, Any], str | None]:
         network_error: VoiceProviderError | None = None
         try:
@@ -152,7 +157,10 @@ class QwenVoiceEnrollmentProvider:
                     },
                 )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
-            network_error = VoiceProviderRetryableError("Qwen 请求发送前连接失败")
+            if result_unknown_on_ambiguous_response:
+                network_error = VoiceProviderResultUnknownError("Qwen 请求执行结果未知")
+            else:
+                network_error = VoiceProviderRetryableError("Qwen 请求发送前连接失败")
         except httpx.RequestError:
             if result_unknown_on_timeout:
                 network_error = VoiceProviderResultUnknownError("Qwen 请求执行结果未知")
@@ -161,18 +169,16 @@ class QwenVoiceEnrollmentProvider:
         if network_error is not None:
             raise network_error
 
-        if response.status_code == 429 or response.status_code >= 500:
-            raise VoiceProviderRetryableError(
-                f"Qwen 返回可重试 HTTP 状态 {response.status_code}"
-            )
+        if response.status_code == 429:
+            raise VoiceProviderRetryableError(f"Qwen 返回可重试 HTTP 状态 {response.status_code}")
+        if response.status_code >= 500:
+            if result_unknown_on_ambiguous_response:
+                raise VoiceProviderResultUnknownError("Qwen 请求执行结果未知")
+            raise VoiceProviderRetryableError(f"Qwen 返回可重试 HTTP 状态 {response.status_code}")
         if 400 <= response.status_code < 500:
-            raise VoiceProviderRejectedError(
-                f"Qwen 拒绝请求，HTTP 状态 {response.status_code}"
-            )
+            raise VoiceProviderRejectedError(f"Qwen 拒绝请求，HTTP 状态 {response.status_code}")
         if not 200 <= response.status_code < 300:
-            raise VoiceProviderProtocolError(
-                f"Qwen 返回非预期 HTTP 状态 {response.status_code}"
-            )
+            raise VoiceProviderProtocolError(f"Qwen 返回非预期 HTTP 状态 {response.status_code}")
 
         try:
             body = response.json()
@@ -181,8 +187,12 @@ class QwenVoiceEnrollmentProvider:
         else:
             protocol_error = None
         if protocol_error is not None:
+            if result_unknown_on_ambiguous_response:
+                raise VoiceProviderResultUnknownError("Qwen 请求执行结果未知") from None
             raise protocol_error
         if not isinstance(body, dict):
+            if result_unknown_on_ambiguous_response:
+                raise VoiceProviderResultUnknownError("Qwen 请求执行结果未知")
             raise VoiceProviderProtocolError("Qwen 响应不是 JSON 对象")
         return body, _request_id(body)
 

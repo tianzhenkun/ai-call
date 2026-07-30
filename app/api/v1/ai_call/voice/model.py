@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, UniqueConstraint, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -117,6 +126,10 @@ class AiCallVoiceDeletionModel(MappedBase):
             "idempotency_key",
             name="uk_voice_deletion_tenant_key",
         ),
+        CheckConstraint(
+            "status in ('PENDING','PROCESSING','RECONCILING','RETRY_WAIT','SUCCEEDED','FAILED')",
+            name="ck_voice_deletion_status",
+        ),
         Index("idx_voice_deletion_claim", "status", "next_retry_at", "id"),
         Index(
             "idx_voice_deletion_profile",
@@ -146,6 +159,12 @@ class AiCallVoiceDeletionModel(MappedBase):
         DateTime(timezone=True), nullable=True
     )
     historical_task_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    reconcile_absent_count: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,

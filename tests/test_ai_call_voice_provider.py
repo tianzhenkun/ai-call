@@ -230,6 +230,69 @@ async def test_delete_errors_after_possible_send_have_unknown_result(
 @pytest.mark.parametrize(
     "error_factory",
     [
+        lambda request: httpx.ConnectError("connection failed", request=request),
+        lambda request: httpx.ConnectTimeout("connection timed out", request=request),
+        lambda request: httpx.PoolTimeout("pool timed out", request=request),
+    ],
+)
+async def test_delete_connection_outcome_is_unknown(
+    error_factory: Callable[[httpx.Request], httpx.RequestError],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_factory(request)
+
+    with pytest.raises(VoiceProviderResultUnknownError):
+        await _provider(handler).delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [500, 502, 503])
+async def test_delete_server_error_has_unknown_result(status_code: int) -> None:
+    provider = _provider(
+        lambda _: httpx.Response(status_code, json={"message": "ambiguous failure"})
+    )
+
+    with pytest.raises(VoiceProviderResultUnknownError):
+        await provider.delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+async def test_delete_rate_limit_is_retryable() -> None:
+    provider = _provider(lambda _: httpx.Response(429, json={"message": "rate limited"}))
+
+    with pytest.raises(VoiceProviderRetryableError):
+        await provider.delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+async def test_delete_explicit_client_error_is_rejected(status_code: int) -> None:
+    provider = _provider(lambda _: httpx.Response(status_code, json={"message": "invalid request"}))
+
+    with pytest.raises(VoiceProviderRejectedError):
+        await provider.delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "response_factory",
+    [
+        lambda: httpx.Response(200, text="not-json"),
+        lambda: httpx.Response(200, json=[]),
+        lambda: httpx.Response(200, json={"requestId": {"unexpected": True}}),
+    ],
+)
+async def test_delete_ambiguous_2xx_protocol_error_has_unknown_result(
+    response_factory: Callable[[], httpx.Response],
+) -> None:
+    with pytest.raises(VoiceProviderResultUnknownError):
+        await _provider(lambda _: response_factory()).delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error_factory",
+    [
         lambda request: httpx.ReadError("read failed", request=request),
         lambda request: httpx.WriteError("write failed", request=request),
         lambda request: httpx.RemoteProtocolError("protocol failed", request=request),
@@ -381,15 +444,13 @@ async def test_list_optional_fields_must_be_string_or_none(
 @pytest.mark.anyio
 @pytest.mark.parametrize("field", ["request_id", "requestId"])
 @pytest.mark.parametrize("request_id", [1, True, {}, []])
-async def test_request_id_must_be_string_or_none(
+async def test_delete_invalid_request_id_has_unknown_result(
     field: str,
     request_id: object,
 ) -> None:
-    provider = _provider(
-        lambda _: httpx.Response(200, json={field: request_id})
-    )
+    provider = _provider(lambda _: httpx.Response(200, json={field: request_id}))
 
-    with pytest.raises(VoiceProviderProtocolError, match=field):
+    with pytest.raises(VoiceProviderResultUnknownError):
         await provider.delete(voice="qwen-omni-vc-one")
 
 

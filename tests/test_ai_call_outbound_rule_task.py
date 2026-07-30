@@ -28,8 +28,11 @@ from app.api.v1.ai_call.outbound.rule_task_schema import (
 from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
+from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+from app.api.v1.ai_call.voice.service import VoiceDeletionService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
+from app.services.ai_call.voice_profile import QWEN_OMNI_REALTIME_TARGET_MODEL
 from app.utils.id_util import generate_snowflake_id
 
 
@@ -59,13 +62,14 @@ def _validation_config(
     task_name: str = "合同审查客户回访",
     phone_number: str | None = None,
     customer_name: str | None = None,
+    voice: str = "Tina",
 ) -> dict:
     result = {
         "taskName": task_name,
         "taskMode": task_mode,
         "promptProfileId": str(prompt_id),
         "sceneCode": "intro_contract",
-        "voice": "Tina",
+        "voice": voice,
         "ruleId": str(rule_id),
         "executionMode": "immediate",
         "scheduledAt": None,
@@ -185,6 +189,42 @@ async def _seed_references(database) -> tuple[int, int]:
     return prompt_id, voice_id
 
 
+async def _seed_tenant_voice(
+    database,
+    *,
+    tenant_id: str = "tenant-a",
+    voice: str = "qwen-omni-vc-tenant",
+    status: str = "ENABLED",
+) -> int:
+    profile_id = generate_snowflake_id()
+    async with database() as session:
+        now = _now()
+        session.add(
+            AiCallTenantVoiceProfileModel(
+                id=profile_id,
+                tenant_id=tenant_id,
+                display_name="租户客服音色",
+                voice=voice,
+                voice_type="自定义复刻",
+                gender="女声",
+                language="zh",
+                target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+                provider="qwen",
+                status=status,
+                latest_enrollment_id=None,
+                provider_created_at=now,
+                error_message=None,
+                created_by=10,
+                deleted_by=None,
+                deleted_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+    return profile_id
+
+
 async def _seed_passed_validation(
     database,
     *,
@@ -238,6 +278,301 @@ async def _seed_passed_validation(
         ])
         await session.commit()
     return validation_id
+
+
+@pytest.mark.anyio
+async def test_formal_task_tenant_voice_lookup_uses_profile_row_lock() -> None:
+    marker = AiCallTenantVoiceProfileModel(
+        id=1,
+        tenant_id="tenant-a",
+        display_name="租户音色",
+        voice="tenant-voice",
+        voice_type="自定义复刻",
+        gender="女声",
+        language="zh",
+        target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+        provider="qwen",
+        status="ENABLED",
+        latest_enrollment_id=None,
+        provider_created_at=None,
+        error_message=None,
+        created_by=10,
+        deleted_by=None,
+        deleted_at=None,
+        created_at=_now(),
+        updated_at=_now(),
+    )
+
+    class CapturingSession:
+        statement = None
+
+        async def scalar(self, statement):
+            self.statement = statement
+            return marker
+
+    session = CapturingSession()
+    service = OutboundRuleTaskService(lambda: None)
+
+    resolved = await service._resolve_voice(
+        session,
+        tenant_id="tenant-a",
+        voice="tenant-voice",
+        lock_tenant_voice=True,
+    )
+
+    assert resolved is marker
+    assert session.statement is not None
+    assert session.statement._for_update_arg is not None
+
+
+@pytest.mark.anyio
+async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-tenant",
+        phone_number="19900001111",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001111", None)],
+    )
+
+    async with database() as session:
+        task, created = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-tenant-voice",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+
+    assert created is True
+    snapshot = json.loads(task.config_snapshot_json)
+    assert snapshot["voice"] == {
+        "id": str(profile_id),
+        "voice": "qwen-omni-vc-tenant",
+        "displayName": "租户客服音色",
+        "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
+    }
+
+
+@pytest.mark.anyio
+async def test_formal_task_rejects_non_enabled_tenant_voice(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    await _seed_tenant_voice(
+        database,
+        voice="qwen-omni-vc-deleting",
+        status="DELETING",
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-deleting",
+        phone_number="19900001112",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001112", None)],
+    )
+
+    async with database() as session:
+        with pytest.raises(CustomException) as exc_info:
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-deleting-voice",
+                _create_task_request(config, validation_id),
+            )
+
+    assert exc_info.value.status_code == 409
+    assert "不可用" in exc_info.value.msg
+
+
+@pytest.mark.anyio
+async def test_formal_task_builtin_voice_is_scoped_by_target_model(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    async with database() as session:
+        now = _now()
+        session.add(
+            AiCallVoiceProfileModel(
+                id=generate_snowflake_id(),
+                voice="Tina",
+                display_name="错误模型 Tina",
+                voice_type="内置",
+                gender="女声",
+                target_model="other-model",
+                description=None,
+                sort_order=0,
+                remark=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        phone_number="19900001113",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001113", None)],
+    )
+
+    async with database() as session:
+        task, _ = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-built-in-model",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+
+    snapshot = json.loads(task.config_snapshot_json)
+    assert snapshot["voice"]["targetModel"] == QWEN_OMNI_REALTIME_TARGET_MODEL
+    assert snapshot["voice"]["displayName"] == "甜甜 Tina"
+
+
+@pytest.mark.anyio
+async def test_delete_commits_deleting_before_task_create_rejects_insert(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(database)
+    task_service = OutboundRuleTaskService(database)
+    deletion_service = VoiceDeletionService(session_factory=database)
+    async with database() as session:
+        rule = await task_service.create_rule(
+            session,
+            "tenant-a",
+            10,
+            _rule_payload(),
+        )
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-tenant",
+        phone_number="19900001114",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001114", None)],
+    )
+    async with database() as session:
+        await deletion_service.request_deletion(
+            session,
+            tenant_id="tenant-a",
+            user_id=10,
+            profile_id=profile_id,
+            idempotency_key="delete-before-task",
+        )
+
+    async with database() as session:
+        with pytest.raises(CustomException) as exc_info:
+            await task_service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "task-after-delete",
+                _create_task_request(config, validation_id),
+            )
+        task = await session.scalar(
+            select(AiCallOutboundTaskModel).where(
+                AiCallOutboundTaskModel.idempotency_key == "task-after-delete"
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert task is None
+
+
+@pytest.mark.anyio
+async def test_task_commit_before_delete_recheck_returns_blocking_reference(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    profile_id = await _seed_tenant_voice(database)
+    task_service = OutboundRuleTaskService(database)
+    deletion_service = VoiceDeletionService(session_factory=database)
+    async with database() as session:
+        rule = await task_service.create_rule(
+            session,
+            "tenant-a",
+            10,
+            _rule_payload(),
+        )
+        await session.commit()
+    config = _validation_config(
+        task_mode="single",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+        voice="qwen-omni-vc-tenant",
+        phone_number="19900001115",
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("19900001115", None)],
+    )
+    async with database() as session:
+        task, _ = await task_service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "task-before-delete",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+
+    async with database() as session:
+        with pytest.raises(CustomException) as exc_info:
+            await deletion_service.request_deletion(
+                session,
+                tenant_id="tenant-a",
+                user_id=10,
+                profile_id=profile_id,
+                idempotency_key="delete-after-task",
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.data == {
+        "blockingTaskCount": 1,
+        "historicalTaskCount": 0,
+        "blockingTaskIds": [str(task.id)],
+    }
 
 
 def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:

@@ -159,6 +159,16 @@ class FakeLifecycleService:
                 msg="音色资产不存在",
                 status_code=status.HTTP_404_NOT_FOUND,
             )
+        if profile_id == 9003:
+            raise CustomException(
+                msg="音色正在被外呼任务使用，暂不可删除",
+                status_code=status.HTTP_409_CONFLICT,
+                data={
+                    "blockingTaskCount": 2,
+                    "historicalTaskCount": 3,
+                    "blockingTaskIds": ["101", "102"],
+                },
+            )
         return {
             "voiceProfileId": str(profile_id),
             "deletionId": str(BIG_ENROLLMENT_ID),
@@ -416,6 +426,28 @@ def test_cross_tenant_resource_operations_do_not_expose_resources(
     assert preview.status_code in {403, 404}
     assert deletion_check.status_code in {403, 404}
     assert delete.status_code in {403, 404}
+
+
+def test_delete_conflict_returns_structured_task_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    client, _repository, _service, _lifecycle = _client(
+        monkeypatch,
+        permissions=frozenset({"ai_call:voice:manage"}),
+    )
+
+    response = client.delete(
+        "/ai-call/tenant-voice-profiles/9003",
+        headers={"Idempotency-Key": "delete-key-blocked"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["data"] == {
+        "blockingTaskCount": 2,
+        "historicalTaskCount": 3,
+        "blockingTaskIds": ["101", "102"],
+    }
 
 
 def test_default_deletion_routes_delegate_to_real_service_dependency(

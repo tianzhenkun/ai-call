@@ -9,7 +9,9 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallPromptProfileModel, AiCallVoiceProfileModel
+from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.core.exceptions import CustomException
+from app.services.ai_call.voice_profile import QWEN_OMNI_REALTIME_TARGET_MODEL
 from app.utils.id_util import generate_snowflake_id
 
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
@@ -346,7 +348,12 @@ class OutboundRuleTaskService:
                 msg="任务参数与校验固化配置不一致",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        rule, prompt, voice = await self._resolve_references(db, tenant_id, request)
+        rule, prompt, voice = await self._resolve_references(
+            db,
+            tenant_id,
+            request,
+            lock_tenant_voice=True,
+        )
         now = _now()
         scheduled_at = (
             self._parse_datetime(request.scheduled_at)
@@ -747,7 +754,13 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         tenant_id: str,
         request: SingleValidationRequest | CreateTaskRequest,
-    ) -> tuple[AiCallOutboundRuleModel, AiCallPromptProfileModel, AiCallVoiceProfileModel]:
+        *,
+        lock_tenant_voice: bool = False,
+    ) -> tuple[
+        AiCallOutboundRuleModel,
+        AiCallPromptProfileModel,
+        AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel,
+    ]:
         rule_id = self._business_id(request.rule_id, "ruleId")
         rule = await db.scalar(
             select(AiCallOutboundRuleModel).where(
@@ -779,18 +792,52 @@ class OutboundRuleTaskService:
                 msg="提示词不存在或与场景不匹配",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        voice = await db.scalar(
+        voice = await self._resolve_voice(
+            db,
+            tenant_id=tenant_id,
+            voice=request.voice,
+            lock_tenant_voice=lock_tenant_voice,
+        )
+        return rule, prompt, voice
+
+    @staticmethod
+    async def _resolve_voice(
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        voice: str,
+        lock_tenant_voice: bool,
+    ) -> AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel:
+        tenant_statement = select(AiCallTenantVoiceProfileModel).where(
+            AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+            AiCallTenantVoiceProfileModel.voice == voice,
+        )
+        if lock_tenant_voice:
+            tenant_statement = tenant_statement.with_for_update()
+        tenant_voice = await db.scalar(tenant_statement)
+        if tenant_voice is not None:
+            if tenant_voice.status != "ENABLED":
+                raise CustomException(
+                    msg="租户音色当前不可用",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            return tenant_voice
+
+        builtin_voice = await db.scalar(
             select(AiCallVoiceProfileModel)
-            .where(AiCallVoiceProfileModel.voice == request.voice)
+            .where(
+                AiCallVoiceProfileModel.target_model == QWEN_OMNI_REALTIME_TARGET_MODEL,
+                AiCallVoiceProfileModel.voice == voice,
+            )
             .order_by(AiCallVoiceProfileModel.sort_order, AiCallVoiceProfileModel.id)
             .limit(1)
         )
-        if voice is None:
+        if builtin_voice is None:
             raise CustomException(
                 msg="音色不存在",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        return rule, prompt, voice
+        return builtin_voice
 
     @staticmethod
     async def _get_rule(

@@ -6,6 +6,7 @@ from pathlib import Path
 from sqlalchemy import (
     JSON,
     BigInteger,
+    CheckConstraint,
     DateTime,
     Integer,
     String,
@@ -26,6 +27,10 @@ from app.api.v1.ai_call.voice.model import (
 SQL_PATH = (
     Path(__file__).resolve().parents[1]
     / "docs/livekit-ai-outbound/sql/phase-h6-voice-enrollment-postgres.sql"
+)
+DELETION_RECONCILIATION_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs/livekit-ai-outbound/sql/phase-h6-voice-deletion-reconciliation-migration.sql"
 )
 
 MODEL_COLUMNS: dict[str, dict[str, tuple[type[object], bool, int | None]]] = {
@@ -88,6 +93,7 @@ MODEL_COLUMNS: dict[str, dict[str, tuple[type[object], bool, int | None]]] = {
         "lease_owner": (String, True, 128),
         "lease_expires_at": (DateTime, True, None),
         "historical_task_count": (Integer, False, None),
+        "reconcile_absent_count": (Integer, False, None),
         "error_message": (String, True, 1000),
         "requested_by": (BigInteger, False, None),
         "started_at": (DateTime, True, None),
@@ -170,6 +176,7 @@ SQL_TABLE_CONTRACTS: dict[str, dict[str, tuple[str, bool, int | None]]] = {
         "lease_owner": ("varchar(128)", True, None),
         "lease_expires_at": ("timestamptz", True, None),
         "historical_task_count": ("integer", False, 0),
+        "reconcile_absent_count": ("integer", False, 0),
         "error_message": ("varchar(1000)", True, None),
         "requested_by": ("bigint", False, None),
         "started_at": ("timestamptz", True, None),
@@ -255,6 +262,14 @@ def _indexes(model: type) -> dict[str, tuple[str, ...]]:
     return {
         index.name: tuple(column.name for column in index.columns)
         for index in model.__table__.indexes
+    }
+
+
+def _check_constraints(model: type) -> dict[str, str]:
+    return {
+        constraint.name: str(constraint.sqltext)
+        for constraint in model.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
     }
 
 
@@ -383,6 +398,7 @@ def test_voice_deletion_model_matches_contract() -> None:
         AiCallVoiceDeletionModel,
         "attempt_count",
         "historical_task_count",
+        "reconcile_absent_count",
     )
     assert _unique_constraints(AiCallVoiceDeletionModel) == {
         "uk_voice_deletion_tenant_key": ("tenant_id", "idempotency_key"),
@@ -390,6 +406,11 @@ def test_voice_deletion_model_matches_contract() -> None:
     assert _indexes(AiCallVoiceDeletionModel) == {
         "idx_voice_deletion_claim": ("status", "next_retry_at", "id"),
         "idx_voice_deletion_profile": ("tenant_id", "voice_profile_id", "created_at"),
+    }
+    assert _check_constraints(AiCallVoiceDeletionModel) == {
+        "ck_voice_deletion_status": (
+            "status in ('PENDING','PROCESSING','RECONCILING','RETRY_WAIT','SUCCEEDED','FAILED')"
+        ),
     }
 
 
@@ -410,7 +431,14 @@ def test_counter_server_defaults_are_reflected_by_sqlite() -> None:
     try:
         for model, column_names in (
             (AiCallVoiceEnrollmentModel, ("attempt_count",)),
-            (AiCallVoiceDeletionModel, ("attempt_count", "historical_task_count")),
+            (
+                AiCallVoiceDeletionModel,
+                (
+                    "attempt_count",
+                    "historical_task_count",
+                    "reconcile_absent_count",
+                ),
+            ),
             (AiCallVoiceSampleCleanupModel, ("attempt_count",)),
         ):
             model.__table__.create(engine)
@@ -452,3 +480,18 @@ def test_phase_h6_sql_matches_explicit_contract() -> None:
     assert not re.search(r"\bjsonb?\b", sql, re.IGNORECASE)
     assert not re.search(r"\breferences\b", sql, re.IGNORECASE)
     assert not re.search(r"\bforeign\s+key\b", sql, re.IGNORECASE)
+    assert (
+        "constraint ck_voice_deletion_status check "
+        "(status in ('PENDING','PROCESSING','RECONCILING',"
+        "'RETRY_WAIT','SUCCEEDED','FAILED'))"
+    ) in sql
+
+
+def test_deletion_reconciliation_migration_converts_legacy_statuses_and_adds_guard() -> None:
+    sql = DELETION_RECONCILIATION_MIGRATION_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(sql.split())
+
+    assert "when 'DELETED' then 'SUCCEEDED'" in normalized
+    assert "when 'DELETE_FAILED' then 'FAILED'" in normalized
+    assert "add column if not exists reconcile_absent_count" in normalized
+    assert "add constraint ck_voice_deletion_status check" in normalized

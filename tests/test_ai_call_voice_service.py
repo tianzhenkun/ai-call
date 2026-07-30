@@ -987,6 +987,11 @@ async def test_delete_rechecks_references_after_preflight_and_rejects_cross_tena
             )
 
     assert blocked.value.status_code == 409
+    assert blocked.value.data == {
+        "blockingTaskCount": 1,
+        "historicalTaskCount": 0,
+        "blockingTaskIds": ["301"],
+    }
     assert cross_tenant.value.status_code == 404
     async with factory() as database:
         profile = await database.get(AiCallTenantVoiceProfileModel, 703)
@@ -1054,7 +1059,7 @@ async def test_delete_is_idempotent_and_failed_delete_requires_new_key(
         profile = await database.get(AiCallTenantVoiceProfileModel, 705)
         assert deletion is not None
         assert profile is not None
-        deletion.status = "DELETE_FAILED"
+        deletion.status = "FAILED"
         profile.status = "DELETE_FAILED"
         await database.commit()
 
@@ -1107,6 +1112,87 @@ async def test_concurrent_same_key_delete_returns_single_task(
         rows = (await database.scalars(select(AiCallVoiceDeletionModel))).all()
     assert len(rows) == 1
     assert rows[0].status == "PENDING"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("winner_profile_id", "expected_status"),
+    [(709, None), (710, 409)],
+)
+async def test_delete_rechecks_idempotency_after_profile_lock_wait(
+    winner_profile_id: int,
+    expected_status: int | None,
+) -> None:
+    profile = _tenant_voice(
+        profile_id=709,
+        voice="vc-lock-wait",
+        status="DELETING",
+    )
+    winner = AiCallVoiceDeletionModel(
+        id=841,
+        tenant_id="tenant-a",
+        voice_profile_id=winner_profile_id,
+        idempotency_key="same-key-after-lock",
+        status="PENDING",
+        provider_request_id=None,
+        attempt_count=0,
+        next_retry_at=None,
+        lease_owner=None,
+        lease_expires_at=None,
+        historical_task_count=0,
+        reconcile_absent_count=0,
+        error_message=None,
+        requested_by=7,
+        started_at=None,
+        finished_at=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    class LockWaitSession:
+        def __init__(self) -> None:
+            self.scalar_calls = 0
+            self.profile_statement = None
+            self.rollback_calls = 0
+
+        async def scalar(self, statement):
+            self.scalar_calls += 1
+            if self.scalar_calls == 1:
+                return None
+            if self.scalar_calls == 2:
+                self.profile_statement = statement
+                return profile
+            return winner
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    database = LockWaitSession()
+    service = VoiceDeletionService(session_factory=lambda: None)
+
+    if expected_status is None:
+        result = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=709,
+            idempotency_key="same-key-after-lock",
+        )
+        assert result["deletionId"] == "841"
+    else:
+        with pytest.raises(CustomException) as exc_info:
+            await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=709,
+                idempotency_key="same-key-after-lock",
+            )
+        assert exc_info.value.status_code == expected_status
+
+    assert database.scalar_calls == 3
+    assert database.profile_statement._for_update_arg is not None
+    assert database.rollback_calls >= 2
 
 
 @pytest.mark.anyio

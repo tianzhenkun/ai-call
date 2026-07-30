@@ -37,6 +37,8 @@ from app.services.ai_call.voice_sample import VoiceSampleStorage
 RETRY_DELAYS = (5, 30, 120)
 MAX_BATCH_SIZE = 100
 DEFAULT_LIST_PAGE_SIZE = 1000
+MAX_RECONCILIATION_PAGES = 100
+REQUIRED_ABSENT_RECONCILIATIONS = 2
 ENROLLMENT_FAILURE_MESSAGE = "音色创建失败，请重新上传声音样本"
 ENROLLMENT_RETRY_MESSAGE = "音色创建暂时失败，等待自动重试"
 SAMPLE_CLEANUP_ERROR_MESSAGE = "声音样本清理失败，等待后台重试"
@@ -106,6 +108,7 @@ class DeletionWorkItem:
     target_model: str
     status: str
     attempt_count: int
+    reconcile_absent_count: int
     lease_owner: str
     lease_expires_at: datetime
 
@@ -663,23 +666,24 @@ class VoiceEnrollmentWorker:
             target_model=target_model,
             status=row.status,
             attempt_count=row.attempt_count,
+            reconcile_absent_count=row.reconcile_absent_count,
             lease_owner=row.lease_owner or "",
             lease_expires_at=_as_utc(row.lease_expires_at),
         )
 
     async def _process_deletion(self, item: DeletionWorkItem) -> None:
+        if not item.voice:
+            await self._fail_deletion(item)
+            return
+        if item.status == "RECONCILING":
+            await self._reconcile_deletion(item)
+            return
         blocking_count, historical_count = await self._deletion_reference_counts(item)
         if blocking_count:
             await self._block_deletion(
                 item,
                 historical_task_count=historical_count,
             )
-            return
-        if not item.voice:
-            await self._fail_deletion(item)
-            return
-        if item.status == "RECONCILING":
-            await self._reconcile_deletion(item)
             return
         try:
             request_id = await self.provider.delete(voice=item.voice)
@@ -699,17 +703,54 @@ class VoiceEnrollmentWorker:
 
     async def _reconcile_deletion(self, item: DeletionWorkItem) -> None:
         try:
-            voices = await self.provider.list(
-                page_index=0,
-                page_size=DEFAULT_LIST_PAGE_SIZE,
-            )
+            provider_state = await self._provider_deletion_state(item)
         except Exception:
             await self._schedule_deletion_reconciliation(item)
             return
-        if any(voice.voice == item.voice for voice in voices):
-            await self._retry_or_fail_deletion(item)
+        if provider_state == "INCOMPLETE":
+            await self._schedule_deletion_reconciliation(item)
             return
-        await self._complete_deletion(item, request_id=None)
+        if provider_state == "ABSENT":
+            absent_count = item.reconcile_absent_count + 1
+            if absent_count >= REQUIRED_ABSENT_RECONCILIATIONS:
+                await self._complete_deletion(
+                    item,
+                    request_id=None,
+                    reconcile_absent_count=absent_count,
+                )
+                return
+            await self._schedule_deletion_reconciliation(
+                item,
+                reconcile_absent_count=absent_count,
+            )
+            return
+
+        blocking_count, historical_count = await self._deletion_reference_counts(item)
+        if blocking_count:
+            await self._block_deletion(
+                item,
+                historical_task_count=historical_count,
+            )
+            return
+        await self._schedule_deletion_reconciliation(
+            item,
+            reconcile_absent_count=0,
+        )
+
+    async def _provider_deletion_state(
+        self,
+        item: DeletionWorkItem,
+    ) -> str:
+        for page_index in range(MAX_RECONCILIATION_PAGES):
+            voices = await self.provider.list(
+                page_index=page_index,
+                page_size=DEFAULT_LIST_PAGE_SIZE,
+            )
+            if any(voice.voice == item.voice for voice in voices):
+                return "FOUND"
+            if len(voices) < DEFAULT_LIST_PAGE_SIZE:
+                return "ABSENT"
+        return "INCOMPLETE"
 
     async def _deletion_reference_counts(
         self,
@@ -765,22 +806,25 @@ class VoiceEnrollmentWorker:
     async def _schedule_deletion_reconciliation(
         self,
         item: DeletionWorkItem,
+        *,
+        reconcile_absent_count: int | None = None,
     ) -> None:
         now = self.now()
         delay = RETRY_DELAYS[min(item.attempt_count - 1, len(RETRY_DELAYS) - 1)]
         retry_at = now + timedelta(seconds=delay)
+        values: dict[str, object] = {
+            "status": "RECONCILING",
+            "next_retry_at": retry_at,
+            "lease_owner": None,
+            "lease_expires_at": retry_at,
+            "error_message": DELETION_RECONCILING_MESSAGE,
+            "updated_at": now,
+        }
+        if reconcile_absent_count is not None:
+            values["reconcile_absent_count"] = reconcile_absent_count
         async with self.session_factory() as database:
             await database.execute(
-                update(AiCallVoiceDeletionModel)
-                .where(self._owned_deletion(item))
-                .values(
-                    status="RECONCILING",
-                    next_retry_at=retry_at,
-                    lease_owner=None,
-                    lease_expires_at=retry_at,
-                    error_message=DELETION_RECONCILING_MESSAGE,
-                    updated_at=now,
-                )
+                update(AiCallVoiceDeletionModel).where(self._owned_deletion(item)).values(**values)
             )
             await database.commit()
 
@@ -789,22 +833,26 @@ class VoiceEnrollmentWorker:
         item: DeletionWorkItem,
         *,
         request_id: str | None,
+        reconcile_absent_count: int | None = None,
     ) -> None:
         now = self.now()
+        deletion_values: dict[str, object] = {
+            "status": "SUCCEEDED",
+            "provider_request_id": request_id,
+            "next_retry_at": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "error_message": None,
+            "finished_at": now,
+            "updated_at": now,
+        }
+        if reconcile_absent_count is not None:
+            deletion_values["reconcile_absent_count"] = reconcile_absent_count
         async with self.session_factory() as database:
             result = await database.execute(
                 update(AiCallVoiceDeletionModel)
                 .where(self._owned_deletion(item))
-                .values(
-                    status="DELETED",
-                    provider_request_id=request_id,
-                    next_retry_at=None,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    error_message=None,
-                    finished_at=now,
-                    updated_at=now,
-                )
+                .values(**deletion_values)
             )
             if result.rowcount != 1:
                 await database.rollback()
@@ -858,7 +906,7 @@ class VoiceEnrollmentWorker:
     ) -> None:
         now = self.now()
         values: dict[str, object] = {
-            "status": "DELETE_FAILED",
+            "status": "FAILED",
             "next_retry_at": None,
             "lease_owner": None,
             "lease_expires_at": None,

@@ -111,13 +111,14 @@ create table if not exists ai_call_voice_deletion (
     tenant_id varchar(64) not null,
     voice_profile_id bigint not null,
     idempotency_key varchar(128) not null,
-    status varchar(32) not null,
+    status varchar(32) not null constraint ck_voice_deletion_status check (status in ('PENDING','PROCESSING','RECONCILING','RETRY_WAIT','SUCCEEDED','FAILED')),
     provider_request_id varchar(128) null,
     attempt_count integer not null default 0,
     next_retry_at timestamptz null,
     lease_owner varchar(128) null,
     lease_expires_at timestamptz null,
     historical_task_count integer not null default 0,
+    reconcile_absent_count integer not null default 0,
     error_message varchar(1000) null,
     requested_by bigint not null,
     started_at timestamptz null,
@@ -144,6 +145,7 @@ comment on column ai_call_voice_deletion.next_retry_at is '下次重试时间';
 comment on column ai_call_voice_deletion.lease_owner is '处理租约持有者';
 comment on column ai_call_voice_deletion.lease_expires_at is '处理租约过期时间';
 comment on column ai_call_voice_deletion.historical_task_count is '关联历史任务数';
+comment on column ai_call_voice_deletion.reconcile_absent_count is '连续完整确认音色不存在次数';
 comment on column ai_call_voice_deletion.error_message is '失败原因';
 comment on column ai_call_voice_deletion.requested_by is '请求用户ID';
 comment on column ai_call_voice_deletion.started_at is '开始处理时间';

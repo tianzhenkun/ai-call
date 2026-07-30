@@ -16,6 +16,7 @@ from app.api.v1.ai_call.voice.model import (
     AiCallVoiceSampleCleanupModel,
 )
 from app.core.base_model import MappedBase
+from app.services.ai_call import voice_enrollment_worker as worker_module
 from app.services.ai_call.providers.qwen_voice_enrollment import (
     VoiceCreateResult,
     VoiceListItem,
@@ -57,6 +58,7 @@ class FakeProvider:
         )
         self.create_error: Exception | None = None
         self.list_result: list[VoiceListItem] = []
+        self.list_results_by_page: dict[int, list[VoiceListItem]] = {}
         self.list_error: Exception | None = None
         self.delete_result: str | None = "req-delete"
         self.delete_error: Exception | None = None
@@ -94,6 +96,8 @@ class FakeProvider:
         })
         if self.list_error is not None:
             raise self.list_error
+        if page_index in self.list_results_by_page:
+            return list(self.list_results_by_page[page_index])
         return list(self.list_result)
 
     async def delete(self, *, voice: str) -> str | None:
@@ -230,6 +234,7 @@ class WorkerHarness:
         lease_owner: str | None = None,
         lease_expires_at: datetime | None = None,
         attempt_count: int = 0,
+        reconcile_absent_count: int = 0,
         tenant_id: str = "tenant-a",
     ) -> AiCallVoiceDeletionModel:
         deletion_id = 20_000 + self.next_id
@@ -254,6 +259,7 @@ class WorkerHarness:
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
             historical_task_count=0,
+            reconcile_absent_count=reconcile_absent_count,
             error_message=None,
             requested_by=7,
             started_at=None,
@@ -675,7 +681,7 @@ async def test_worker_deletes_provider_voice_and_marks_profile_deleted(harness) 
     deletion = await harness.deletion(task.id)
     profile = await harness.profile(task.voice_profile_id)
     assert harness.provider.delete_calls == ["qwen-omni-vc-delete"]
-    assert deletion.status == "DELETED"
+    assert deletion.status == "SUCCEEDED"
     assert deletion.provider_request_id == "req-delete"
     assert deletion.lease_owner is None
     assert profile.status == "DELETED"
@@ -714,7 +720,7 @@ async def test_sqlite_workers_do_not_delete_same_voice_twice(worker_database) ->
     await asyncio.gather(first.worker.run_once(), second.run_once())
 
     assert first.provider.delete_calls == ["qwen-omni-vc-delete"]
-    assert (await first.deletion(task.id)).status == "DELETED"
+    assert (await first.deletion(task.id)).status == "SUCCEEDED"
 
 
 @pytest.mark.anyio
@@ -744,7 +750,7 @@ async def test_worker_rechecks_blocking_reference_without_calling_provider(
     deletion = await harness.deletion(task.id)
     profile = await harness.profile(task.voice_profile_id)
     assert harness.provider.delete_calls == []
-    assert deletion.status == "DELETE_FAILED"
+    assert deletion.status == "FAILED"
     assert deletion.error_message == DELETION_BLOCKED_MESSAGE
     assert deletion.historical_task_count == 1
     assert profile.status == "ENABLED"
@@ -763,7 +769,7 @@ async def test_worker_does_not_load_profile_from_another_tenant(harness) -> None
     await harness.worker.run_once()
 
     assert harness.provider.delete_calls == []
-    assert (await harness.deletion(task.id)).status == "DELETE_FAILED"
+    assert (await harness.deletion(task.id)).status == "FAILED"
     assert (await harness.profile(task.voice_profile_id)).status == "DELETING"
 
 
@@ -790,7 +796,7 @@ async def test_retryable_delete_uses_backoff_and_eventually_fails_safely(
 
     deletion = await harness.deletion(task.id)
     profile = await harness.profile(task.voice_profile_id)
-    assert deletion.status == "DELETE_FAILED"
+    assert deletion.status == "FAILED"
     assert deletion.error_message == DELETION_FAILURE_MESSAGE
     assert profile.status == "DELETE_FAILED"
     assert "secret" not in (deletion.error_message or "")
@@ -814,14 +820,22 @@ async def test_unknown_delete_result_reconciles_absence_without_second_delete(
     harness.provider.list_result = []
     await harness.worker.run_once()
 
-    assert (await harness.deletion(task.id)).status == "DELETED"
+    first_absence = await harness.deletion(task.id)
+    assert first_absence.status == "RECONCILING"
+    assert first_absence.reconcile_absent_count == 1
+    harness.clock.advance(RETRY_DELAYS[1] + 1)
+    await harness.worker.run_once()
+
+    completed = await harness.deletion(task.id)
+    assert completed.status == "SUCCEEDED"
+    assert completed.reconcile_absent_count == 2
     assert (await harness.profile(task.voice_profile_id)).status == "DELETED"
     assert len(harness.provider.delete_calls) == 1
-    assert len(harness.provider.list_calls) == 1
+    assert len(harness.provider.list_calls) == 2
 
 
 @pytest.mark.anyio
-async def test_unknown_delete_reconciles_presence_before_retrying_delete(
+async def test_unknown_delete_reconciles_presence_without_retrying_delete(
     harness,
 ) -> None:
     task = await harness.seed_deletion()
@@ -841,16 +855,129 @@ async def test_unknown_delete_reconciles_presence_before_retrying_delete(
     await harness.worker.run_once()
 
     reconciled = await harness.deletion(task.id)
-    assert reconciled.status == "RETRY_WAIT"
+    assert reconciled.status == "RECONCILING"
+    assert reconciled.reconcile_absent_count == 0
     assert len(harness.provider.delete_calls) == 1
     assert len(harness.provider.list_calls) == 1
 
-    harness.clock.advance(RETRY_DELAYS[1])
+    harness.clock.advance(RETRY_DELAYS[1] + 1)
     harness.provider.list_result = []
     await harness.worker.run_once()
+    assert (await harness.deletion(task.id)).status == "RECONCILING"
+    harness.clock.advance(RETRY_DELAYS[2] + 1)
+    await harness.worker.run_once()
 
-    assert (await harness.deletion(task.id)).status == "DELETED"
-    assert len(harness.provider.delete_calls) == 2
+    assert (await harness.deletion(task.id)).status == "SUCCEEDED"
+    assert len(harness.provider.delete_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_reconciliation_absence_wins_over_new_blocking_reference(harness) -> None:
+    task = await harness.seed_deletion()
+    harness.provider.delete_error = VoiceProviderResultUnknownError("secret timeout")
+    await harness.worker.run_once()
+    await harness.seed_outbound_task(
+        task_id=94,
+        voice="qwen-omni-vc-delete",
+        status="RUNNING",
+    )
+    harness.provider.delete_error = None
+    harness.provider.list_result = []
+
+    harness.clock.advance(RETRY_DELAYS[0] + 1)
+    await harness.worker.run_once()
+    harness.clock.advance(RETRY_DELAYS[1] + 1)
+    await harness.worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "SUCCEEDED"
+    assert (await harness.profile(task.voice_profile_id)).status == "DELETED"
+    assert harness.provider.delete_calls == ["qwen-omni-vc-delete"]
+
+
+@pytest.mark.anyio
+async def test_reconciliation_found_then_blocking_reference_restores_profile(harness) -> None:
+    task = await harness.seed_deletion()
+    harness.provider.delete_error = VoiceProviderResultUnknownError("secret timeout")
+    await harness.worker.run_once()
+    await harness.seed_outbound_task(
+        task_id=95,
+        voice="qwen-omni-vc-delete",
+        status="RUNNING",
+    )
+    harness.provider.delete_error = None
+    harness.provider.list_result = [
+        VoiceListItem(
+            voice="qwen-omni-vc-delete",
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    harness.clock.advance(RETRY_DELAYS[0] + 1)
+    await harness.worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "FAILED"
+    assert (await harness.profile(task.voice_profile_id)).status == "ENABLED"
+    assert harness.provider.delete_calls == ["qwen-omni-vc-delete"]
+
+
+@pytest.mark.anyio
+async def test_reconciliation_scans_pages_without_accumulating_full_list(
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "DEFAULT_LIST_PAGE_SIZE", 2)
+    task = await harness.seed_deletion(
+        status="RECONCILING",
+        lease_owner="dead-worker",
+        lease_expires_at=NOW - timedelta(seconds=1),
+    )
+    harness.provider.list_results_by_page = {
+        0: [
+            VoiceListItem(voice="other-1", target_model=TARGET_MODEL, gmt_create=None),
+            VoiceListItem(voice="other-2", target_model=TARGET_MODEL, gmt_create=None),
+        ],
+        1: [
+            VoiceListItem(
+                voice="qwen-omni-vc-delete",
+                target_model=TARGET_MODEL,
+                gmt_create=None,
+            )
+        ],
+    }
+
+    await harness.worker.run_once()
+
+    assert [call["page_index"] for call in harness.provider.list_calls] == [0, 1]
+    assert (await harness.deletion(task.id)).status == "RECONCILING"
+    assert (await harness.deletion(task.id)).reconcile_absent_count == 0
+    assert harness.provider.delete_calls == []
+
+
+@pytest.mark.anyio
+async def test_full_page_cap_never_proves_voice_absent(
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "DEFAULT_LIST_PAGE_SIZE", 2)
+    monkeypatch.setattr(worker_module, "MAX_RECONCILIATION_PAGES", 2)
+    task = await harness.seed_deletion(
+        status="RECONCILING",
+        lease_owner="dead-worker",
+        lease_expires_at=NOW - timedelta(seconds=1),
+    )
+    full_page = [
+        VoiceListItem(voice="other-1", target_model=TARGET_MODEL, gmt_create=None),
+        VoiceListItem(voice="other-2", target_model=TARGET_MODEL, gmt_create=None),
+    ]
+    harness.provider.list_results_by_page = {0: full_page, 1: full_page}
+
+    await harness.worker.run_once()
+
+    deletion = await harness.deletion(task.id)
+    assert [call["page_index"] for call in harness.provider.list_calls] == [0, 1]
+    assert deletion.status == "RECONCILING"
+    assert deletion.reconcile_absent_count == 0
 
 
 @pytest.mark.anyio
@@ -871,7 +998,7 @@ async def test_same_owner_stale_delete_attempt_cannot_publish_after_reclaim(
     assert (await harness.deletion(task.id)).status == "RECONCILING"
 
     await harness.worker._complete_deletion(second_claim, request_id=None)
-    assert (await harness.deletion(task.id)).status == "DELETED"
+    assert (await harness.deletion(task.id)).status == "SUCCEEDED"
 
 
 @pytest.mark.anyio
@@ -902,10 +1029,12 @@ async def test_delete_publish_failure_recovers_by_list_without_second_delete(
     harness.clock.advance(61)
     harness.provider.list_result = []
     await second_worker.run_once()
+    harness.clock.advance(RETRY_DELAYS[1] + 1)
+    await second_worker.run_once()
 
-    assert (await harness.deletion(task.id)).status == "DELETED"
+    assert (await harness.deletion(task.id)).status == "SUCCEEDED"
     assert len(harness.provider.delete_calls) == 1
-    assert len(harness.provider.list_calls) == 1
+    assert len(harness.provider.list_calls) == 2
 
 
 @pytest.mark.anyio

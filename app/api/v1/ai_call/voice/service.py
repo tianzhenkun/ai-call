@@ -43,7 +43,7 @@ from .model import (
     AiCallVoiceEnrollmentModel,
     AiCallVoiceSampleCleanupModel,
 )
-from .repository import VoiceRepository
+from .repository import VoiceRepository, VoiceTaskReferenceSummary
 from .schema import VoiceEnrollmentAcceptedOut, VoiceEnrollmentRequest
 
 MAX_SAMPLE_BYTES = 10 * 1024 * 1024
@@ -903,6 +903,16 @@ class VoiceDeletionService:
         if profile is None or profile.status == "DELETED":
             await self._safe_rollback(db)
             self._raise_not_found()
+        locked_existing = await self._find_deletion(db, tenant_id, command_key)
+        if locked_existing is not None:
+            try:
+                result = self._resolve_idempotent(
+                    locked_existing,
+                    profile_id=profile_id,
+                )
+            finally:
+                await self._safe_rollback(db)
+            return result
         if profile.status not in {"ENABLED", "DELETE_FAILED"} or not profile.voice:
             await self._safe_rollback(db)
             raise CustomException(
@@ -918,6 +928,7 @@ class VoiceDeletionService:
             raise CustomException(
                 msg="音色正在被外呼任务使用，暂不可删除",
                 status_code=status.HTTP_409_CONFLICT,
+                data=self._reference_summary_out(references),
             )
         try:
             deletion_id = self.id_generator()
@@ -965,6 +976,7 @@ class VoiceDeletionService:
                 lease_owner=None,
                 lease_expires_at=None,
                 historical_task_count=references.historical_task_count,
+                reconcile_absent_count=0,
                 error_message=None,
                 requested_by=user_id,
                 started_at=None,
@@ -1028,6 +1040,12 @@ class VoiceDeletionService:
             tenant_id=tenant_id,
             voice=voice,
         )
+        return VoiceDeletionService._reference_summary_out(summary)
+
+    @staticmethod
+    def _reference_summary_out(
+        summary: VoiceTaskReferenceSummary,
+    ) -> dict[str, object]:
         return {
             "blockingTaskCount": summary.blocking_task_count,
             "historicalTaskCount": summary.historical_task_count,
@@ -1087,10 +1105,14 @@ class VoiceDeletionService:
     @staticmethod
     def _accepted(deletion: AiCallVoiceDeletionModel) -> dict[str, object]:
         deleting_statuses = {"PENDING", "PROCESSING", "RETRY_WAIT", "RECONCILING"}
+        profile_status = {
+            "SUCCEEDED": "DELETED",
+            "FAILED": "DELETE_FAILED",
+        }.get(deletion.status, deletion.status)
         return {
             "voiceProfileId": str(deletion.voice_profile_id),
             "deletionId": str(deletion.id),
-            "status": ("DELETING" if deletion.status in deleting_statuses else deletion.status),
+            "status": ("DELETING" if deletion.status in deleting_statuses else profile_status),
         }
 
     @staticmethod
