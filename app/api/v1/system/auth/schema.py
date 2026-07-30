@@ -12,6 +12,10 @@ class AuthSchema(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     user: UserModel | None = Field(default=None, description="用户信息")
+    permissions: frozenset[str] = Field(
+        default_factory=frozenset,
+        description="当前用户权限标识集合",
+    )
     check_data_scope: bool = Field(default=True, description="是否检查数据权限")
     db: AsyncSession = Field(description="数据库会话")
 

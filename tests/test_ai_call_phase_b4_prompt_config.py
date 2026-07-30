@@ -1234,43 +1234,6 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "total": 1,
             }
 
-        async def list_voice_profiles(self, **kwargs):
-            _ = kwargs
-            return {
-                "rows": [
-                    {
-                        "id": "1",
-                        "voice": "Tina",
-                        "displayName": "甜甜 Tina",
-                        "voiceType": "内置",
-                        "gender": "女声",
-                        "targetModel": "qwen3.5-omni-plus-realtime",
-                        "description": "默认音色",
-                        "sortOrder": 1,
-                        "remark": "",
-                        "createdAt": "2026-06-18T00:00:00Z",
-                        "updatedAt": "2026-06-18T00:00:00Z",
-                    }
-                ],
-                "total": 1,
-            }
-
-        async def create_voice_profile(self, values):
-            _ = values
-            return {
-                "id": "2",
-                "voice": "custom_voice_001",
-                "displayName": "张总自定义音色",
-                "voiceType": "自定义复刻",
-                "gender": "未知",
-                "targetModel": "qwen3.5-omni-plus-realtime",
-                "description": None,
-                "sortOrder": 1000,
-                "remark": "百炼复刻音色",
-                "createdAt": "2026-06-18T00:00:00Z",
-                "updatedAt": "2026-06-18T00:00:00Z",
-            }
-
         async def preview_prompt_profile(self, **kwargs):
             _ = kwargs
             return {
@@ -1288,15 +1251,6 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     with TestClient(app) as client:
         profiles = client.get("/ai-call/prompt-profiles").json()
         components = client.get("/ai-call/prompt-components").json()
-        voices = client.get("/ai-call/voice-profiles").json()
-        custom_voice = client.post(
-            "/ai-call/voice-profiles",
-            json={
-                "voice": "custom_voice_001",
-                "displayName": "张总自定义音色",
-                "remark": "百炼复刻音色",
-            },
-        ).json()
         preview = client.post(
             "/ai-call/prompt-profiles/preview",
             json={
@@ -1308,8 +1262,4 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert profiles["code"] == 200
     assert profiles["rows"][0]["sceneCode"] == "debt_promise_repay_reminder"
     assert components["rows"][0]["componentKey"] == "platform_constraints"
-    assert voices["rows"][0]["voice"] == "Tina"
-    assert voices["rows"][0]["gender"] == "女声"
-    assert custom_voice["data"]["voice"] == "custom_voice_001"
-    assert custom_voice["data"]["voiceType"] == "自定义复刻"
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"

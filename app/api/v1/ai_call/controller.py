@@ -46,8 +46,6 @@ from .schema import (
     SemanticAnalysisOut,
     SessionStatusOut,
     TokenOut,
-    VoiceProfileCreateRequest,
-    VoiceProfileOut,
 )
 from .service import (
     AiCallService,
@@ -173,42 +171,6 @@ async def _commit_ai_call_record_audit(service: AiCallService) -> None:
     db = getattr(repository, "db", None)
     if db is not None:
         await db.commit()
-
-
-@AiCallRouter.get(
-    "/voice-profiles",
-    summary="查询端到端音色配置列表",
-)
-async def list_voice_profiles_controller(
-    service: Annotated[AiCallService, Depends(get_ai_call_service)],
-    voice_type: Annotated[str | None, Query(alias="voiceType")] = None,
-    gender: Annotated[str | None, Query()] = None,
-    target_model: Annotated[str | None, Query(alias="targetModel")] = None,
-    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
-    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 200,
-) -> JSONResponse:
-    result = await service.list_voice_profiles(
-        voice_type=voice_type,
-        gender=gender,
-        target_model=target_model,
-        page_num=page_num,
-        page_size=page_size,
-    )
-    rows = [VoiceProfileOut.model_validate(row) for row in result["rows"]]
-    return TableResponse(rows=rows, total=result["total"], msg="查询成功")
-
-
-@AiCallRouter.post(
-    "/voice-profiles",
-    summary="登记自定义复刻音色",
-    response_model=ResponseSchema[VoiceProfileOut],
-)
-async def create_voice_profile_controller(
-    request: VoiceProfileCreateRequest,
-    service: Annotated[AiCallService, Depends(get_ai_call_service)],
-) -> JSONResponse:
-    result = await service.create_voice_profile(request.model_dump())
-    return SuccessResponse(data=VoiceProfileOut.model_validate(result), msg="创建成功")
 
 
 @AiCallRouter.get(

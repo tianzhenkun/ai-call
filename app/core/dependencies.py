@@ -14,6 +14,17 @@ from app.core.exceptions import CustomException
 from app.core.security import OAuth2Schema, decode_access_token
 
 
+def _subject_permissions(user_info: dict) -> frozenset[str]:
+    raw_permissions = user_info.get("permissions")
+    if not isinstance(raw_permissions, list):
+        return frozenset()
+    return frozenset(
+        permission.strip()
+        for permission in raw_permissions
+        if isinstance(permission, str) and permission.strip()
+    )
+
+
 async def db_getter() -> AsyncGenerator[AsyncSession, None]:
     """获取数据库会话连接
 
@@ -117,7 +128,11 @@ async def get_current_user(
     request.scope["dept_id"] = dept_id
 
     # 创建认证对象
-    auth = AuthSchema(db=db, check_data_scope=False)
+    auth = AuthSchema(
+        db=db,
+        check_data_scope=False,
+        permissions=_subject_permissions(user_info),
+    )
     auth.user = user
     return auth
 
@@ -199,8 +214,24 @@ async def _verify_token(
     user.tenant_id = tenant_id
     user.dept_id = dept_id
 
-    auth = AuthSchema(db=db, check_data_scope=False)
+    auth = AuthSchema(
+        db=db,
+        check_data_scope=False,
+        permissions=_subject_permissions(user_info),
+    )
     auth.user = user
+    return auth
+
+
+async def get_voice_manager(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if settings.JWT_ENABLE and "ai_call:voice:manage" not in auth.permissions:
+        raise CustomException(
+            msg="无权限操作",
+            code=10403,
+            status_code=403,
+        )
     return auth
 
 
