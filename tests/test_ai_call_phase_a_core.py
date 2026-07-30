@@ -2073,7 +2073,7 @@ async def test_create_session_cleans_up_room_and_marks_failed_when_agent_start_f
         "session_failed",
     ]
     assert events.rows[-2].payload["errorType"] == "RuntimeError"
-    assert events.rows[-2].payload["errorMessage"] == "agent boom"
+    assert events.rows[-2].payload == {"errorType": "RuntimeError"}
 
 
 @pytest.mark.anyio

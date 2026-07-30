@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +18,7 @@ from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.service import (
     VOICE_PREVIEW_OPENING_MESSAGE,
     VoicePreviewService,
+    get_app_voice_preview_service,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -110,11 +114,70 @@ class BlockingEndOrchestrator(AiCallOrchestrator):
         self.end_started = asyncio.Event()
         self.release_end = asyncio.Event()
 
-    async def end_session(self, call_id: str, *, end_reason: str = "web_user_end"):
+    async def abort_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str = "session_aborted",
+    ):
         self.end_calls.append(call_id)
         self.end_started.set()
         await self.release_end.wait()
-        return await super().end_session(call_id, end_reason=end_reason)
+        return await super().abort_session(call_id, end_reason=end_reason)
+
+
+class BlockingReadyOrchestrator(AiCallOrchestrator):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ready_started = asyncio.Event()
+        self.release_ready = asyncio.Event()
+        self.ready_calls = 0
+        self.abort_calls: list[str] = []
+
+    async def report_browser_event(self, *args, **kwargs):
+        self.ready_calls += 1
+        self.ready_started.set()
+        await self.release_ready.wait()
+        return await super().report_browser_event(*args, **kwargs)
+
+    async def abort_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str = "session_aborted",
+    ):
+        self.abort_calls.append(call_id)
+        return await super().abort_session(call_id, end_reason=end_reason)
+
+
+class BlockingCreateRoomManager(FakeLiveKitRoomManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_started = asyncio.Event()
+
+    async def create_room(self, room_name: str) -> None:
+        self.created_rooms.append(room_name)
+        self.create_started.set()
+        await asyncio.Event().wait()
+
+
+class FailingTokenRoomManager(FakeLiveKitRoomManager):
+    def issue_browser_token(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> BrowserRoomToken:
+        raise RuntimeError("token failed api-key=secret-value object=private/sample.wav")
+
+
+class FailingCleanupRoomManager(FakeLiveKitRoomManager):
+    async def delete_room(self, room_name: str) -> None:
+        raise RuntimeError("delete failed api-key=secret-value object=private/sample.wav")
+
+
+class FailingAgentRunner(FakeAgentRunner):
+    async def start(self, session: CallSession) -> None:
+        raise RuntimeError("agent failed api-key=secret-value object=private/sample.wav")
 
 
 class FailingCreateOrchestrator:
@@ -126,8 +189,18 @@ class FailingCreateOrchestrator:
         self.created_call_ids.append(call_id)
         raise RuntimeError("provider failed with api-key=secret-value")
 
-    async def end_session(self, call_id: str, *, end_reason: str):
+    async def abort_session(self, call_id: str, *, end_reason: str):
         self.ended_call_ids.append(call_id)
+        return EndSessionResult(
+            call_id=call_id,
+            status=CallSessionStatus.FAILED,
+        )
+
+    def dispose_session(self, call_id: str) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
 
 
 class FakeDefaultPreviewService:
@@ -210,6 +283,22 @@ def _orchestrator(
     agent_runner = FakeAgentRunner()
     orchestrator_type = BlockingEndOrchestrator if blocking_end else AiCallOrchestrator
     orchestrator = orchestrator_type(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=agent_runner,
+        browser_ready_timeout_seconds=60,
+    )
+    return orchestrator, room_manager, agent_runner
+
+
+def _blocking_ready_orchestrator() -> tuple[
+    BlockingReadyOrchestrator,
+    FakeLiveKitRoomManager,
+    FakeAgentRunner,
+]:
+    room_manager = FakeLiveKitRoomManager()
+    agent_runner = FakeAgentRunner()
+    orchestrator = BlockingReadyOrchestrator(
         config=_runtime_config(),
         livekit_room_manager=room_manager,
         agent_runner=agent_runner,
@@ -551,9 +640,8 @@ def test_http_preview_routes_use_default_isolated_service(
     preview_service = FakeDefaultPreviewService()
     monkeypatch.setattr(
         voice_controller,
-        "get_default_voice_preview_service",
-        lambda: preview_service,
-        raising=False,
+        "get_app_voice_preview_service",
+        lambda _app: preview_service,
     )
     user = UserModel(
         user_id=7,
@@ -596,3 +684,498 @@ def test_http_preview_routes_use_default_isolated_service(
         "user_id": 7,
         "voice": "Tina",
     }
+
+
+@pytest.mark.anyio
+async def test_blocked_ready_does_not_block_timeout_cleanup(
+    preview_database,
+) -> None:
+    orchestrator, rooms, runner = _blocking_ready_orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        timeout_seconds=0.01,
+        id_generator=SequenceIds(201),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    ready_request = asyncio.create_task(
+        service.ready_preview_session(
+            tenant_id="tenant-a",
+            user_id=7,
+            call_id=preview.call_id,
+        )
+    )
+    await asyncio.wait_for(orchestrator.ready_started.wait(), timeout=1)
+    await asyncio.sleep(0.03)
+
+    assert orchestrator.abort_calls == [preview.call_id]
+    assert rooms.deleted_rooms == [preview.room_name]
+    assert runner.stopped_call_ids == [preview.call_id]
+    assert service.pending_timeout_count == 0
+    ready_request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await ready_request
+
+
+@pytest.mark.anyio
+async def test_cancelled_delete_keeps_shared_cleanup_alive_and_retryable(
+    preview_database,
+) -> None:
+    orchestrator, rooms, _runner = _orchestrator(blocking_end=True)
+    assert isinstance(orchestrator, BlockingEndOrchestrator)
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(202),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    first_delete = asyncio.create_task(
+        service.close_preview_session(
+            tenant_id="tenant-a",
+            user_id=7,
+            call_id=preview.call_id,
+        )
+    )
+    await asyncio.wait_for(orchestrator.end_started.wait(), timeout=1)
+    first_delete.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_delete
+    orchestrator.release_end.set()
+
+    result = await asyncio.wait_for(
+        service.close_preview_session(
+            tenant_id="tenant-a",
+            user_id=7,
+            call_id=preview.call_id,
+        ),
+        timeout=1,
+    )
+
+    assert result.call_id == preview.call_id
+    assert orchestrator.end_calls == [preview.call_id]
+    assert rooms.deleted_rooms == [preview.room_name]
+
+
+@pytest.mark.anyio
+async def test_cancelled_ready_request_does_not_cancel_shared_ready_task(
+    preview_database,
+) -> None:
+    orchestrator, _rooms, _runner = _blocking_ready_orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(210),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    first_request = asyncio.create_task(
+        service.ready_preview_session(
+            tenant_id="tenant-a",
+            user_id=7,
+            call_id=preview.call_id,
+        )
+    )
+    await asyncio.wait_for(orchestrator.ready_started.wait(), timeout=1)
+    first_request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_request
+
+    orchestrator.release_ready.set()
+    result = await service.ready_preview_session(
+        tenant_id="tenant-a",
+        user_id=7,
+        call_id=preview.call_id,
+    )
+
+    assert result.type == "browser_ready"
+    assert orchestrator.ready_calls == 1
+    await service.close_preview_session(
+        tenant_id="tenant-a",
+        user_id=7,
+        call_id=preview.call_id,
+    )
+
+
+@pytest.mark.anyio
+async def test_same_tenant_different_user_cannot_access_preview(
+    preview_database,
+) -> None:
+    orchestrator, _rooms, _runner = _orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(203),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    with pytest.raises(CustomException) as error:
+        await service.ready_preview_session(
+            tenant_id="tenant-a",
+            user_id=8,
+            call_id=preview.call_id,
+        )
+
+    assert error.value.status_code == 404
+    await service.close_preview_session(
+        tenant_id="tenant-a",
+        user_id=7,
+        call_id=preview.call_id,
+    )
+
+
+@pytest.mark.anyio
+async def test_successful_cleanup_disposes_runtime_and_uses_bounded_tombstones(
+    preview_database,
+) -> None:
+    clock = [100.0]
+    orchestrator, _rooms, _runner = _orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        tombstone_ttl_seconds=5,
+        tombstone_capacity=2,
+        monotonic=lambda: clock[0],
+        id_generator=SequenceIds(204, 205, 206),
+    )
+    call_ids: list[str] = []
+    async with preview_database() as db:
+        for _index in range(3):
+            preview = await service.create_preview_session(
+                db,
+                tenant_id="tenant-a",
+                user_id=7,
+                voice="Tina",
+            )
+            call_ids.append(preview.call_id)
+            await service.close_preview_session(
+                tenant_id="tenant-a",
+                user_id=7,
+                call_id=preview.call_id,
+            )
+
+    assert service.active_session_count == 0
+    assert service.tombstone_count == 2
+    assert orchestrator.metrics_by_call_id == {}
+    assert orchestrator.event_store.list_all(call_ids[-1]) == []
+    with pytest.raises(AiCallError):
+        orchestrator.registry.get(call_ids[-1])
+
+    repeated = await service.close_preview_session(
+        tenant_id="tenant-a",
+        user_id=7,
+        call_id=call_ids[-1],
+    )
+    assert repeated.call_id == call_ids[-1]
+
+    clock[0] += 6
+    with pytest.raises(CustomException) as expired:
+        await service.close_preview_session(
+            tenant_id="tenant-a",
+            user_id=7,
+            call_id=call_ids[-1],
+        )
+    assert expired.value.status_code == 404
+    assert service.tombstone_count == 0
+
+
+@pytest.mark.anyio
+async def test_cancelled_create_shields_abort_and_preserves_cancellation(
+    preview_database,
+) -> None:
+    room_manager = BlockingCreateRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(207),
+    )
+    async with preview_database() as db:
+        create_task = asyncio.create_task(
+            service.create_preview_session(
+                db,
+                tenant_id="tenant-a",
+                user_id=7,
+                voice="Tina",
+            )
+        )
+        await asyncio.wait_for(room_manager.create_started.wait(), timeout=1)
+        create_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+    await asyncio.sleep(0)
+    assert room_manager.deleted_rooms == ["ai-call-preview_207"]
+    assert service.active_session_count == 0
+    with pytest.raises(AiCallError):
+        orchestrator.registry.get("preview_207")
+
+
+@pytest.mark.anyio
+async def test_orchestrator_abort_cleans_preparing_session_and_redacts_secrets() -> None:
+    room_manager = FailingTokenRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+
+    with pytest.raises(AiCallError) as create_error:
+        await orchestrator.create_web_session(
+            voice="Tina",
+            prompt=None,
+            call_id="preview_abort",
+        )
+    assert "secret-value" not in create_error.value.msg
+
+    result = await orchestrator.abort_session(
+        "preview_abort",
+        end_reason="voice_preview_create_failed",
+    )
+    serialized_events = json.dumps([
+        {"type": event.type, "payload": event.payload}
+        for event in orchestrator.event_store.list_all("preview_abort")
+    ])
+
+    assert result.call_id == "preview_abort"
+    assert room_manager.deleted_rooms == ["ai-call-preview_abort"]
+    assert "secret-value" not in serialized_events
+    assert "private/sample.wav" not in serialized_events
+
+
+@pytest.mark.anyio
+async def test_cleanup_failure_is_redacted_and_retryable(
+    preview_database,
+) -> None:
+    room_manager = FailingCleanupRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FakeAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(208),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    for _attempt in range(2):
+        with pytest.raises(CustomException) as cleanup_error:
+            await service.close_preview_session(
+                tenant_id="tenant-a",
+                user_id=7,
+                call_id=preview.call_id,
+            )
+        assert cleanup_error.value.status_code == 502
+        assert "secret-value" not in cleanup_error.value.msg
+
+    serialized_events = json.dumps([
+        {"type": event.type, "payload": event.payload}
+        for event in orchestrator.event_store.list_all(preview.call_id)
+    ])
+    assert "secret-value" not in serialized_events
+    assert "private/sample.wav" not in serialized_events
+    assert service.active_session_count == 1
+
+
+@pytest.mark.anyio
+async def test_shutdown_releases_active_sessions_and_rejects_new_creation(
+    preview_database,
+) -> None:
+    orchestrator, rooms, runner = _orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(209),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+        await service.shutdown()
+        with pytest.raises(CustomException) as stopped:
+            await service.create_preview_session(
+                db,
+                tenant_id="tenant-a",
+                user_id=7,
+                voice="Tina",
+            )
+
+    assert stopped.value.status_code == 503
+    assert rooms.deleted_rooms == [preview.room_name]
+    assert runner.stopped_call_ids == [preview.call_id]
+    assert service.active_session_count == 0
+    assert service.pending_timeout_count == 0
+    assert service.tombstone_count == 0
+
+
+def test_default_preview_ids_are_high_entropy_and_not_sequential() -> None:
+    orchestrator, _rooms, _runner = _orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+    )
+
+    first = service._new_call_id()
+    second = service._new_call_id()
+
+    assert first.startswith("preview_")
+    assert second.startswith("preview_")
+    assert first != second
+    assert len(first.removeprefix("preview_")) >= 32
+    assert len(second.removeprefix("preview_")) >= 32
+
+
+def test_preview_service_is_scoped_to_each_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = [object(), object()]
+    monkeypatch.setattr(
+        "app.api.v1.ai_call.voice.service.build_default_voice_preview_service",
+        lambda: services.pop(0),
+    )
+    first_app = FastAPI()
+    second_app = FastAPI()
+
+    first = get_app_voice_preview_service(first_app)
+    repeated = get_app_voice_preview_service(first_app)
+    second = get_app_voice_preview_service(second_app)
+
+    assert first is repeated
+    assert first is not second
+
+
+@pytest.mark.anyio
+async def test_app_lifespan_starts_and_stops_preview_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_init = importlib.import_module("app.plugin.init_app")
+
+    class ShutdownTrackingService:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    preview_service = ShutdownTrackingService()
+    monkeypatch.setattr(settings, "AI_CALL_STANDALONE_ENABLE", True)
+    monkeypatch.setattr(
+        "app.api.v1.ai_call.voice.service.build_default_voice_preview_service",
+        lambda: preview_service,
+    )
+    start_names = [
+        "_start_ai_call_event_worker",
+        "_start_ai_call_dialogue_worker",
+        "_start_ai_call_semantic_analysis_worker",
+        "_start_ai_call_offline_asr_worker",
+        "_start_ai_call_recording_reconcile_worker",
+        "_start_ai_call_handoff_trigger_worker",
+        "_start_ai_call_outbound_task_worker",
+        "_start_ai_call_linphone_test_worker",
+    ]
+    stop_names = [
+        "_stop_ai_call_event_worker",
+        "_stop_ai_call_dialogue_worker",
+        "_stop_ai_call_semantic_analysis_worker",
+        "_stop_ai_call_offline_asr_worker",
+        "_stop_ai_call_recording_reconcile_worker",
+        "_stop_ai_call_handoff_trigger_worker",
+        "_stop_ai_call_outbound_task_worker",
+        "_stop_ai_call_linphone_test_worker",
+    ]
+    for name in start_names:
+        monkeypatch.setattr(app_init, name, AsyncMock(return_value=None))
+    for name in stop_names:
+        monkeypatch.setattr(app_init, name, AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        app_init,
+        "_recover_ai_call_outbound_validations",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        app_init,
+        "_init_ai_call_standalone_oss_config",
+        AsyncMock(return_value=None),
+    )
+    app = FastAPI()
+
+    async with app_init.lifespan(app):
+        assert app.state.voice_preview_service is preview_service
+        assert preview_service.shutdown_calls == 0
+
+    assert not hasattr(app.state, "voice_preview_service")
+    assert preview_service.shutdown_calls == 1
+
+
+@pytest.mark.anyio
+async def test_agent_start_failure_redacts_response_events_and_logs() -> None:
+    room_manager = FakeLiveKitRoomManager()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=FailingAgentRunner(),
+        browser_ready_timeout_seconds=60,
+    )
+
+    with patch("app.services.ai_call.orchestrator.log.error") as error_log:
+        with pytest.raises(AiCallError) as create_error:
+            await orchestrator.create_web_session(
+                voice="Tina",
+                prompt=None,
+                call_id="preview_secret_log",
+            )
+
+    serialized_events = json.dumps([
+        {"type": event.type, "payload": event.payload}
+        for event in orchestrator.event_store.list_all("preview_secret_log")
+    ])
+    serialized_logs = repr(error_log.call_args_list)
+    assert "secret-value" not in create_error.value.msg
+    assert "private/sample.wav" not in create_error.value.msg
+    assert "secret-value" not in serialized_events
+    assert "private/sample.wav" not in serialized_events
+    assert "secret-value" not in serialized_logs
+    assert "private/sample.wav" not in serialized_logs

@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     await _recover_ai_call_outbound_validations()
     ai_call_outbound_task_worker = await _start_ai_call_outbound_task_worker()
     ai_call_linphone_test_worker = await _start_ai_call_linphone_test_worker()
+    _start_ai_call_voice_preview_service(app)
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             await _init_ai_call_standalone_oss_config()
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
             yield
             log.info("✅ AI Call standalone 模式关闭")
         finally:
+            await _stop_ai_call_voice_preview_service(app)
             await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
             await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
             await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
@@ -80,6 +82,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         )
 
     except Exception as e:
+        await _stop_ai_call_voice_preview_service(app)
         await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
@@ -94,6 +97,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     try:
         yield
     finally:
+        await _stop_ai_call_voice_preview_service(app)
         await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
         await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
         await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
@@ -122,6 +126,21 @@ async def _init_ai_call_standalone_oss_config() -> None:
     from app.api.v1.system.oss.service import OssService
 
     await OssService.init_active_config()
+
+
+def _start_ai_call_voice_preview_service(app: FastAPI) -> None:
+    from app.api.v1.ai_call.voice.service import get_app_voice_preview_service
+
+    get_app_voice_preview_service(app)
+
+
+async def _stop_ai_call_voice_preview_service(app: FastAPI) -> None:
+    service = getattr(app.state, "voice_preview_service", None)
+    if service is None:
+        return
+    del app.state.voice_preview_service
+    await service.shutdown()
+    log.info("✅ AI Call 音色试听服务已关闭")
 
 
 async def _start_ai_call_outbound_task_worker():

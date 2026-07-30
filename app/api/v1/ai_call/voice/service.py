@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import secrets
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ from app.services.ai_call.orchestrator import (
     EndSessionResult,
 )
 from app.services.ai_call.prompt_config import PromptEffectiveConfig
+from app.services.ai_call.session_registry import CallSessionStatus
 from app.services.ai_call.voice_sample import (
     VoiceSampleMetadata,
     VoiceSampleStorage,
@@ -73,12 +76,16 @@ class VoicePreviewOrchestrator(Protocol):
         payload: dict[str, Any] | None = None,
     ) -> BrowserEventReportResult: ...
 
-    async def end_session(
+    async def abort_session(
         self,
         call_id: str,
         *,
         end_reason: str = "web_user_end",
     ) -> EndSessionResult: ...
+
+    def dispose_session(self, call_id: str) -> None: ...
+
+    async def shutdown(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -87,9 +94,16 @@ class _VoicePreviewSession:
     user_id: int
     call_id: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    released: bool = False
-    end_result: EndSessionResult | None = None
-    end_error: CustomException | None = None
+    ready_task: asyncio.Task[BrowserEventReportResult] | None = None
+    cleanup_task: asyncio.Task[EndSessionResult] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _VoicePreviewTombstone:
+    tenant_id: str
+    user_id: int
+    result: EndSessionResult
+    expires_at: float
 
 
 class VoicePreviewService:
@@ -101,18 +115,39 @@ class VoicePreviewService:
         orchestrator: VoicePreviewOrchestrator,
         target_model: str,
         timeout_seconds: float = VOICE_PREVIEW_TIMEOUT_SECONDS,
-        id_generator: Callable[[], int] = generate_snowflake_id,
+        tombstone_ttl_seconds: float = 60,
+        tombstone_capacity: int = 1024,
+        monotonic: Callable[[], float] = time.monotonic,
+        token_generator: Callable[[], str] = lambda: secrets.token_urlsafe(24),
+        id_generator: Callable[[], int] | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.target_model = target_model
         self.timeout_seconds = max(0.001, timeout_seconds)
+        self.tombstone_ttl_seconds = max(0.001, tombstone_ttl_seconds)
+        self.tombstone_capacity = max(1, tombstone_capacity)
+        self.monotonic = monotonic
+        self.token_generator = token_generator
+        # 仅保留给既有测试的确定性注入；生产默认始终使用高熵随机 token。
         self.id_generator = id_generator
         self._sessions: dict[str, _VoicePreviewSession] = {}
+        self._tombstones: OrderedDict[str, _VoicePreviewTombstone] = OrderedDict()
         self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
+        self._lifecycle_lock = asyncio.Lock()
+        self._accepting = True
 
     @property
     def pending_timeout_count(self) -> int:
         return sum(not task.done() for task in self._timeout_tasks.values())
+
+    @property
+    def active_session_count(self) -> int:
+        return len(self._sessions)
+
+    @property
+    def tombstone_count(self) -> int:
+        self._prune_tombstones()
+        return len(self._tombstones)
 
     async def create_preview_session(
         self,
@@ -122,12 +157,29 @@ class VoicePreviewService:
         user_id: int,
         voice: str,
     ) -> CreateSessionResult:
+        if not self._accepting:
+            raise CustomException(
+                msg="音色试听服务正在停止，请稍后重试",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         resolved_voice = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
             voice=voice,
         )
-        call_id = self._new_call_id()
+        async with self._lifecycle_lock:
+            if not self._accepting:
+                raise CustomException(
+                    msg="音色试听服务正在停止，请稍后重试",
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            call_id = self._new_call_id()
+            session = _VoicePreviewSession(
+                tenant_id=str(tenant_id or "").strip(),
+                user_id=user_id,
+                call_id=call_id,
+            )
+            self._sessions[call_id] = session
         preview_config = self._preview_config()
         try:
             result = await self.orchestrator.create_web_session(
@@ -136,24 +188,20 @@ class VoicePreviewService:
                 call_id=call_id,
                 prompt_effective_config=preview_config,
             )
+        except asyncio.CancelledError:
+            await self._compensate_create_failure(session)
+            raise
         except Exception as exc:
-            await self._cleanup_unregistered(call_id)
+            await self._compensate_create_failure(session)
             self._raise_runtime_error("create", exc)
 
-        session = _VoicePreviewSession(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            call_id=call_id,
-        )
-        self._sessions[call_id] = session
         try:
             timeout_task = asyncio.create_task(
                 self._release_after_timeout(session),
                 name=f"ai-call-voice-preview-timeout-{call_id}",
             )
         except Exception as exc:
-            self._sessions.pop(call_id, None)
-            await self._cleanup_unregistered(call_id)
+            await self._compensate_create_failure(session)
             self._raise_runtime_error("schedule_timeout", exc)
         self._timeout_tasks[call_id] = timeout_task
         timeout_task.add_done_callback(
@@ -171,19 +219,40 @@ class VoicePreviewService:
         user_id: int,
         call_id: str,
     ) -> BrowserEventReportResult:
-        session = self._owned_session(tenant_id=tenant_id, call_id=call_id)
+        session = self._owned_session(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            call_id=call_id,
+        )
         async with session.lock:
-            if session.released:
+            if session.cleanup_task is not None:
                 self._raise_not_found()
-            try:
-                return await self.orchestrator.report_browser_event(
-                    call_id=call_id,
-                    event_type="browser_ready",
-                    timestamp=None,
-                    payload=None,
+            ready_task = session.ready_task
+            if ready_task is None or self._task_failed(ready_task):
+                ready_task = asyncio.create_task(
+                    self.orchestrator.report_browser_event(
+                        call_id=call_id,
+                        event_type="browser_ready",
+                        timestamp=None,
+                        payload=None,
+                    ),
+                    name=f"ai-call-voice-preview-ready-{call_id}",
                 )
-            except Exception as exc:
-                self._raise_runtime_error("ready", exc)
+                session.ready_task = ready_task
+                ready_task.add_done_callback(
+                    lambda completed, preview_session=session: self._consume_ready_task(
+                        preview_session, completed
+                    )
+                )
+        try:
+            return await asyncio.shield(ready_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            async with session.lock:
+                if session.ready_task is ready_task:
+                    session.ready_task = None
+            self._raise_runtime_error("ready", exc)
 
     async def close_preview_session(
         self,
@@ -192,7 +261,15 @@ class VoicePreviewService:
         user_id: int,
         call_id: str,
     ) -> EndSessionResult:
-        session = self._owned_session(tenant_id=tenant_id, call_id=call_id)
+        session = self._sessions.get(call_id)
+        if session is None:
+            tombstone = self._owned_tombstone(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                call_id=call_id,
+            )
+            return tombstone.result
+        self._assert_owner(session, tenant_id=tenant_id, user_id=user_id)
         return await self._release(session, end_reason="voice_preview_user_end")
 
     async def _resolve_voice(
@@ -271,27 +348,53 @@ class VoicePreviewService:
         end_reason: str,
     ) -> EndSessionResult:
         async with session.lock:
-            if session.released:
-                if session.end_error is not None:
-                    raise session.end_error
-                if session.end_result is None:
-                    raise CustomException(
-                        msg="音色试听服务暂不可用，请稍后重试",
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                    )
-                return session.end_result
-            session.released = True
-            await self._cancel_timeout_task(session.call_id)
-            try:
-                session.end_result = await self.orchestrator.end_session(
-                    session.call_id,
-                    end_reason=end_reason,
+            cleanup_task = session.cleanup_task
+            if cleanup_task is None or self._task_failed(cleanup_task):
+                cleanup_task = asyncio.create_task(
+                    self._run_cleanup(session, end_reason=end_reason),
+                    name=f"ai-call-voice-preview-cleanup-{session.call_id}",
                 )
-            except Exception as exc:
-                error = self._runtime_error("end", exc)
-                session.end_error = error
-                raise error from None
-            return session.end_result
+                session.cleanup_task = cleanup_task
+                cleanup_task.add_done_callback(
+                    lambda completed, preview_session=session: self._consume_cleanup_task(
+                        preview_session, completed
+                    )
+                )
+        try:
+            return await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._raise_runtime_error("end", exc)
+
+    async def _run_cleanup(
+        self,
+        session: _VoicePreviewSession,
+        *,
+        end_reason: str,
+    ) -> EndSessionResult:
+        await self._cancel_timeout_task(session.call_id)
+        ready_task = session.ready_task
+        if ready_task is not None and not ready_task.done():
+            ready_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await ready_task
+        try:
+            result = await self.orchestrator.abort_session(
+                session.call_id,
+                end_reason=end_reason,
+            )
+        except AiCallError as exc:
+            if exc.error_id != "session_not_found":
+                raise
+            result = EndSessionResult(
+                call_id=session.call_id,
+                status=CallSessionStatus.FAILED,
+            )
+        self.orchestrator.dispose_session(session.call_id)
+        self._sessions.pop(session.call_id, None)
+        self._add_tombstone(session, result)
+        return result
 
     async def _cancel_timeout_task(self, call_id: str) -> None:
         timeout_task = self._timeout_tasks.pop(call_id, None)
@@ -301,40 +404,152 @@ class VoicePreviewService:
         with suppress(asyncio.CancelledError):
             await timeout_task
 
-    async def _cleanup_unregistered(self, call_id: str) -> None:
+    async def _compensate_create_failure(
+        self,
+        session: _VoicePreviewSession,
+    ) -> None:
         try:
-            await self.orchestrator.end_session(
-                call_id,
-                end_reason="voice_preview_create_failed",
+            await asyncio.shield(
+                self._release(
+                    session,
+                    end_reason="voice_preview_create_failed",
+                )
             )
-        except Exception:
+        except asyncio.CancelledError:
+            # 外层请求已取消时，补偿任务仍由 shield 保持运行。
+            cleanup_task = session.cleanup_task
+            if cleanup_task is not None:
+                with suppress(Exception):
+                    await asyncio.shield(cleanup_task)
+        except Exception as exc:
+            log.warning(
+                "音色试听创建补偿失败: callId={}, errorType={}",
+                session.call_id,
+                type(exc).__name__,
+            )
             return
+        self._tombstones.pop(session.call_id, None)
 
     def _owned_session(
         self,
         *,
         tenant_id: str,
+        user_id: int,
         call_id: str,
     ) -> _VoicePreviewSession:
         session = self._sessions.get(call_id)
-        if session is None or session.tenant_id != str(tenant_id or "").strip():
+        if session is None:
             self._raise_not_found()
+        self._assert_owner(session, tenant_id=tenant_id, user_id=user_id)
         return session
 
+    @classmethod
+    def _assert_owner(
+        cls,
+        session: _VoicePreviewSession,
+        *,
+        tenant_id: str,
+        user_id: int,
+    ) -> None:
+        if session.tenant_id != str(tenant_id or "").strip() or session.user_id != user_id:
+            cls._raise_not_found()
+
+    def _owned_tombstone(
+        self,
+        *,
+        tenant_id: str,
+        user_id: int,
+        call_id: str,
+    ) -> _VoicePreviewTombstone:
+        self._prune_tombstones()
+        tombstone = self._tombstones.get(call_id)
+        if (
+            tombstone is None
+            or tombstone.tenant_id != str(tenant_id or "").strip()
+            or tombstone.user_id != user_id
+        ):
+            self._raise_not_found()
+        self._tombstones.move_to_end(call_id)
+        return tombstone
+
     def _new_call_id(self) -> str:
-        try:
-            call_id = f"preview_{self.id_generator()}"
-        except Exception:
-            raise CustomException(
-                msg="音色试听会话创建失败，请稍后重试",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            ) from None
-        if call_id in self._sessions:
-            raise CustomException(
-                msg="音色试听会话创建失败，请稍后重试",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        for _attempt in range(3):
+            try:
+                token = (
+                    str(self.id_generator())
+                    if self.id_generator is not None
+                    else self.token_generator()
+                )
+            except Exception:
+                break
+            call_id = f"preview_{token}"
+            if call_id not in self._sessions and call_id not in self._tombstones:
+                return call_id
+        raise CustomException(
+            msg="音色试听会话创建失败，请稍后重试",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ) from None
+
+    def _add_tombstone(
+        self,
+        session: _VoicePreviewSession,
+        result: EndSessionResult,
+    ) -> None:
+        self._prune_tombstones()
+        self._tombstones[session.call_id] = _VoicePreviewTombstone(
+            tenant_id=session.tenant_id,
+            user_id=session.user_id,
+            result=result,
+            expires_at=self.monotonic() + self.tombstone_ttl_seconds,
+        )
+        self._tombstones.move_to_end(session.call_id)
+        while len(self._tombstones) > self.tombstone_capacity:
+            self._tombstones.popitem(last=False)
+
+    def _prune_tombstones(self) -> None:
+        now = self.monotonic()
+        expired = [
+            call_id
+            for call_id, tombstone in self._tombstones.items()
+            if tombstone.expires_at <= now
+        ]
+        for call_id in expired:
+            self._tombstones.pop(call_id, None)
+
+    async def shutdown(self) -> None:
+        async with self._lifecycle_lock:
+            if not self._accepting and not self._sessions:
+                self._tombstones.clear()
+                return
+            self._accepting = False
+        for timeout_task in tuple(self._timeout_tasks.values()):
+            timeout_task.cancel()
+        for session in tuple(self._sessions.values()):
+            ready_task = session.ready_task
+            if ready_task is not None:
+                ready_task.cancel()
+        cleanup_tasks = [
+            asyncio.create_task(self._release(session, end_reason="voice_preview_shutdown"))
+            for session in tuple(self._sessions.values())
+        ]
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        remaining = tuple(self._sessions.values())
+        for session in remaining:
+            with suppress(Exception):
+                await self._release(session, end_reason="voice_preview_shutdown_retry")
+        for timeout_task in tuple(self._timeout_tasks.values()):
+            timeout_task.cancel()
+        if self._timeout_tasks:
+            await asyncio.gather(
+                *tuple(self._timeout_tasks.values()),
+                return_exceptions=True,
             )
-        return call_id
+        self._timeout_tasks.clear()
+        with suppress(Exception):
+            await self.orchestrator.shutdown()
+        self._sessions.clear()
+        self._tombstones.clear()
 
     def _preview_config(self) -> PromptEffectiveConfig:
         return PromptEffectiveConfig(
@@ -389,20 +604,54 @@ class VoicePreviewService:
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 
+    @staticmethod
+    def _consume_ready_task(
+        session: _VoicePreviewSession,
+        task: asyncio.Task[BrowserEventReportResult],
+    ) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+        if session.ready_task is task and task.cancelled():
+            session.ready_task = None
 
-_default_voice_preview_service: VoicePreviewService | None = None
+    @staticmethod
+    def _consume_cleanup_task(
+        session: _VoicePreviewSession,
+        task: asyncio.Task[EndSessionResult],
+    ) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+        failed = task.cancelled()
+        if not failed:
+            with suppress(Exception):
+                failed = task.exception() is not None
+        if session.cleanup_task is task and failed:
+            session.cleanup_task = None
+
+    @staticmethod
+    def _task_failed(task: asyncio.Task[Any]) -> bool:
+        if not task.done():
+            return False
+        if task.cancelled():
+            return True
+        return task.exception() is not None
 
 
-def get_default_voice_preview_service() -> VoicePreviewService:
-    global _default_voice_preview_service
-    if _default_voice_preview_service is None:
-        from app.config.setting import settings
+def build_default_voice_preview_service() -> VoicePreviewService:
+    from app.config.setting import settings
 
-        _default_voice_preview_service = VoicePreviewService(
-            orchestrator=AiCallOrchestrator.from_settings(settings),
-            target_model=settings.QWEN_REALTIME_MODEL,
-        )
-    return _default_voice_preview_service
+    return VoicePreviewService(
+        orchestrator=AiCallOrchestrator.from_settings(settings),
+        target_model=settings.QWEN_REALTIME_MODEL,
+    )
+
+
+def get_app_voice_preview_service(app: Any) -> VoicePreviewService:
+    service = getattr(app.state, "voice_preview_service", None)
+    if service is None:
+        service = build_default_voice_preview_service()
+        app.state.voice_preview_service = service
+    return service
 
 
 def _utc_now() -> datetime:

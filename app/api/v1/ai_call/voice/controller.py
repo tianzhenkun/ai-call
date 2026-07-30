@@ -41,7 +41,7 @@ from .schema import (
 from .service import (
     VoiceEnrollmentService,
     VoicePreviewService,
-    get_default_voice_preview_service,
+    get_app_voice_preview_service,
 )
 
 VoiceRouter = APIRouter(tags=["租户音色管理"])
@@ -195,6 +195,7 @@ def get_voice_lifecycle_service(
 
 
 def get_voice_preview_lifecycle_service(
+    request: Request,
     auth: Annotated[AuthSchema, Depends(get_voice_manager)],
     configured_service: Annotated[
         VoiceLifecycleService,
@@ -205,7 +206,7 @@ def get_voice_preview_lifecycle_service(
         return configured_service
     return _DefaultVoiceLifecycleService(
         db=auth.db,
-        preview_service=get_default_voice_preview_service(),
+        preview_service=get_app_voice_preview_service(request.app),
     )
 
 
