@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -22,6 +23,12 @@ from app.common.constant import RET
 from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.utils.id_util import generate_snowflake_id
+
+
+@dataclass(frozen=True)
+class HandoffClaimResult:
+    handoff: AiCallHandoffModel
+    payload: dict
 
 
 class AiCallAgentConsoleService:
@@ -147,6 +154,7 @@ class AiCallAgentConsoleService:
         *,
         handoff_id: str,
         console_session_id: str,
+        commit: bool = True,
     ) -> AiCallHandoffModel:
         profile = await self.require_current_agent(auth)
         session_id = self._console_session_id(console_session_id)
@@ -226,9 +234,26 @@ class AiCallAgentConsoleService:
         set_committed_value(handoff, "accepted_console_session_id", session_id)
         set_committed_value(handoff, "accepted_at", now)
         set_committed_value(handoff, "claim_expires_at", claim_expires_at)
-        # 认领事务先落库，控制器随后才能签发 LiveKit Token。
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
         return handoff
+
+    async def claim_handoff_with_payload(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+    ) -> HandoffClaimResult:
+        handoff = await self.claim_handoff(
+            auth,
+            handoff_id=handoff_id,
+            console_session_id=console_session_id,
+            commit=False,
+        )
+        payload = await self.handoff_payload(handoff)
+        await self.db.commit()
+        return HandoffClaimResult(handoff=handoff, payload=payload)
 
     async def media_ready(
         self,

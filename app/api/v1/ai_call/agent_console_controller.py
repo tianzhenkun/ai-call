@@ -301,11 +301,12 @@ async def claim_handoff_controller(
     auth: AuthenticatedUser,
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
 ):
-    handoff = await service.claim_handoff(
+    claim_result = await service.claim_handoff_with_payload(
         auth,
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
+    handoff = claim_result.handoff
     await _publish(
         auth,
         "handoff.changed",
@@ -313,7 +314,7 @@ async def claim_handoff_controller(
     )
     return SuccessResponse(
         data={
-            "handoff": await service.handoff_payload(handoff),
+            "handoff": claim_result.payload,
             "seat_token": _issue_handoff_token(auth, handoff),
         }
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -105,7 +106,6 @@ async def test_pending_handoffs_awaits_batched_rich_payload(db_session) -> None:
 @pytest.mark.parametrize(
     ("controller_name", "service_method", "payload_type"),
     [
-        ("claim_handoff_controller", "claim_handoff", AgentHandoffClaimIn),
         ("reconnect_token_controller", "begin_reconnect", AgentPresenceSessionIn),
     ],
 )
@@ -143,6 +143,43 @@ async def test_token_handoff_endpoints_await_rich_payload(
     )
 
     console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+
+@pytest.mark.anyio
+async def test_claim_handoff_uses_payload_built_before_transaction_commit(
+    db_session,
+    monkeypatch,
+) -> None:
+    handoff = SimpleNamespace(
+        handoff_id="handoff-1",
+        call_id="call-1",
+        status="accepted",
+    )
+    rich_payload = {"handoff_id": "handoff-1", "handoff_summary": "请转人工"}
+    console_service = SimpleNamespace(
+        claim_handoff_with_payload=AsyncMock(
+            return_value=SimpleNamespace(
+                handoff=handoff,
+                payload=rich_payload,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agent_console_controller,
+        "_issue_handoff_token",
+        lambda _auth, _handoff: {"participant_token": "test-token"},
+    )
+    monkeypatch.setattr(agent_console_controller, "_publish", AsyncMock())
+
+    response = await agent_console_controller.claim_handoff_controller(
+        "handoff-1",
+        AgentHandoffClaimIn(console_session_id=uuid4()),
+        _auth(db_session),
+        console_service,
+    )
+
+    console_service.claim_handoff_with_payload.assert_awaited_once()
+    assert json.loads(response.body)["data"]["handoff"] == rich_payload
 
 
 @pytest.mark.anyio

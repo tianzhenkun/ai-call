@@ -547,6 +547,32 @@ async def _claim(
 
 
 @pytest.mark.anyio
+async def test_claim_can_build_response_payload_before_leaving_request_transaction(
+    session_factory,
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+
+    async with session_factory() as db, db.begin():
+        service = AiCallAgentConsoleService(db)
+        claim_result = await service.claim_handoff_with_payload(
+            _auth(db, user_id=20),
+            handoff_id="handoff-1",
+            console_session_id=console_session_id,
+        )
+
+    assert claim_result.payload["handoff_id"] == "handoff-1"
+    assert claim_result.payload["status"] == "accepted"
+    assert claim_result.handoff.status == "accepted"
+
+
+@pytest.mark.anyio
 async def test_two_agents_claiming_same_handoff_only_one_succeeds(session_factory) -> None:
     first_session = str(uuid4())
     second_session = str(uuid4())
