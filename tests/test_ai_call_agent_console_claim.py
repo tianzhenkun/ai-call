@@ -526,6 +526,115 @@ async def test_handoff_payloads_include_batched_business_context_and_recent_dial
     ]
 
 
+@pytest.mark.anyio
+async def test_handoff_context_returns_all_final_ai_customer_dialogue_in_order(
+    session_factory,
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    now = datetime.now(timezone.utc)
+    valid_dialogue = [
+        ("ai", "AI 第 1 条"),
+        ("customer", "客户第 2 条"),
+        ("ai", "AI 第 3 条"),
+        ("customer", "客户第 4 条"),
+        ("ai", "AI 第 5 条"),
+        ("customer", "客户第 6 条"),
+        ("ai", "AI 第 7 条"),
+        ("customer", "客户第 8 条"),
+    ]
+    async with session_factory() as db, db.begin():
+        db.add_all(
+            [
+                AiCallDialogueSegmentModel(
+                    id=700 + segment_no,
+                    call_id="call-handoff-1",
+                    segment_no=segment_no,
+                    speaker_type=speaker_type,
+                    source="test",
+                    source_segment_id=f"valid-{segment_no}",
+                    segment_text=text,
+                    segment_status="final",
+                    started_at=now + timedelta(seconds=segment_no),
+                )
+                for segment_no, (speaker_type, text) in enumerate(
+                    valid_dialogue,
+                    start=1,
+                )
+            ]
+            + [
+                AiCallDialogueSegmentModel(
+                    id=709,
+                    call_id="call-handoff-1",
+                    segment_no=9,
+                    speaker_type="human_agent",
+                    source="test",
+                    source_segment_id="human-9",
+                    segment_text="人工坐席内容不属于转接前上下文",
+                    segment_status="final",
+                    started_at=now + timedelta(seconds=9),
+                ),
+                AiCallDialogueSegmentModel(
+                    id=710,
+                    call_id="call-handoff-1",
+                    segment_no=10,
+                    speaker_type="ai",
+                    source="test",
+                    source_segment_id="draft-10",
+                    segment_text="未完成内容",
+                    segment_status="draft",
+                    started_at=now + timedelta(seconds=10),
+                ),
+            ]
+        )
+
+    async with session_factory() as db:
+        payload = await AiCallAgentConsoleService(db).handoff_context_payload(
+            _auth(db, user_id=20),
+            handoff_id="handoff-1",
+            console_session_id=console_session_id,
+        )
+
+    assert [turn["text"] for turn in payload["dialogue"]] == [
+        text for _speaker, text in valid_dialogue
+    ]
+    assert [turn["speaker_type"] for turn in payload["dialogue"]] == [
+        speaker for speaker, _text in valid_dialogue
+    ]
+    assert "pending_items" not in payload
+    assert "recent_dialogue" not in payload
+
+
+@pytest.mark.anyio
+async def test_handoff_context_requires_current_console_session(
+    session_factory,
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+
+    async with session_factory() as db:
+        with pytest.raises(CustomException) as conflict:
+            await AiCallAgentConsoleService(db).handoff_context_payload(
+                _auth(db, user_id=20),
+                handoff_id="handoff-1",
+                console_session_id=str(uuid4()),
+            )
+
+    assert _error_code(conflict.value) == "CONSOLE_SESSION_CONFLICT"
+
+
 async def _claim(
     session_factory,
     *,

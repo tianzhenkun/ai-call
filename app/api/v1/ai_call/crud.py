@@ -138,6 +138,25 @@ class AiCallRecordRepository:
         )
         return list(result.scalars().all())
 
+    async def list_handoff_context_dialogue(
+        self,
+        call_id: str,
+    ) -> list[AiCallDialogueSegmentModel]:
+        result = await self.db.execute(
+            select(AiCallDialogueSegmentModel)
+            .where(
+                AiCallDialogueSegmentModel.call_id == call_id,
+                AiCallDialogueSegmentModel.segment_status == "final",
+                AiCallDialogueSegmentModel.speaker_type.in_({"ai", "customer"}),
+                func.length(func.trim(AiCallDialogueSegmentModel.segment_text)) > 0,
+            )
+            .order_by(
+                asc(AiCallDialogueSegmentModel.segment_no),
+                asc(AiCallDialogueSegmentModel.id),
+            )
+        )
+        return list(result.scalars().all())
+
     async def outbound_customer_names_by_call_ids(
         self,
         *,

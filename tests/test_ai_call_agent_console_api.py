@@ -71,6 +71,7 @@ def test_task7_management_and_sse_routes_are_registered() -> None:
     paths = {route.path for route in AiCallRouter.routes}
     assert {
         "/ai-call/agent-console/events",
+        "/ai-call/agent-console/handoffs/{handoff_id}/context",
         "/ai-call/admin/agents/{agent_id}/status",
         "/ai-call/admin/agents/{agent_id}/release-stale",
         "/ai-call/admin/handoffs",
@@ -79,6 +80,36 @@ def test_task7_management_and_sse_routes_are_registered() -> None:
         "/ai-call/admin/follow-ups",
         "/ai-call/admin/follow-ups/{follow_up_id}",
     } <= paths
+
+
+@pytest.mark.anyio
+async def test_handoff_context_controller_passes_console_session_to_service(
+    db_session,
+) -> None:
+    console_session_id = uuid4()
+    auth = _auth(db_session)
+    console_service = SimpleNamespace(
+        handoff_context_payload=AsyncMock(
+            return_value={
+                "handoff_id": "handoff-1",
+                "dialogue": [{"speaker_type": "ai", "text": "您好"}],
+            }
+        )
+    )
+
+    response = await agent_console_controller.handoff_context_controller(
+        "handoff-1",
+        auth,
+        console_service,
+        console_session_id,
+    )
+
+    console_service.handoff_context_payload.assert_awaited_once_with(
+        auth,
+        handoff_id="handoff-1",
+        console_session_id=str(console_session_id),
+    )
+    assert json.loads(response.body)["data"]["dialogue"][0]["text"] == "您好"
 
 
 @pytest.mark.anyio

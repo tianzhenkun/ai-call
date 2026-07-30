@@ -622,6 +622,57 @@ class AiCallAgentConsoleService:
         payloads = await self.handoff_payloads([handoff])
         return payloads[0]
 
+    async def handoff_context_payload(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+    ) -> dict:
+        profile = await self.require_current_agent(auth)
+        session_id = self._console_session_id(console_session_id)
+        await self._require_console_presence(profile, session_id)
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=profile.tenant_id,
+            handoff_id=handoff_id,
+        )
+        if handoff is None:
+            raise CustomException(msg="转人工任务不存在", status_code=404)
+        if handoff.scene_code not in await self._scene_codes(profile):
+            raise CustomException(
+                msg="当前坐席无权处理该业务场景",
+                code=RET.ERROR.code,
+                status_code=status.HTTP_403_FORBIDDEN,
+                data={"errorCode": "AGENT_SCOPE_MISMATCH"},
+            )
+        if handoff.status != "requested":
+            if handoff.human_agent_identity != profile.agent_identity:
+                self._raise_conflict("当前坐席不是任务负责人", "HANDOFF_ALREADY_CLAIMED")
+            if handoff.accepted_console_session_id != session_id:
+                self._raise_conflict(
+                    "当前标签页不拥有媒体控制权",
+                    "CONSOLE_SESSION_CONFLICT",
+                )
+
+        payload = await self.handoff_payload(handoff)
+        payload.pop("pending_items", None)
+        payload.pop("recent_dialogue", None)
+        dialogue_segments = await self.repository.list_handoff_context_dialogue(
+            handoff.call_id
+        )
+        payload["dialogue"] = [
+            {
+                "id": str(segment.id),
+                "speaker_type": segment.speaker_type,
+                "text": segment.segment_text.strip(),
+                "occurred_at": self._api_datetime(
+                    segment.started_at or segment.ended_at
+                ),
+            }
+            for segment in dialogue_segments
+        ]
+        return payload
+
     async def handoff_payloads(
         self,
         handoffs: list[AiCallHandoffModel],

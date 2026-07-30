@@ -294,6 +294,25 @@ async def pending_handoffs_controller(
     )
 
 
+@AgentConsoleRouter.get(
+    "/handoffs/{handoff_id}/context",
+    summary="获取单条转人工完整上下文",
+)
+async def handoff_context_controller(
+    handoff_id: str,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    console_session_id: Annotated[UUID, Query()],
+):
+    return SuccessResponse(
+        data=await service.handoff_context_payload(
+            auth,
+            handoff_id=handoff_id,
+            console_session_id=str(console_session_id),
+        )
+    )
+
+
 @AgentConsoleRouter.post("/handoffs/{handoff_id}/claim", summary="原子认领转人工任务")
 async def claim_handoff_controller(
     handoff_id: str,
