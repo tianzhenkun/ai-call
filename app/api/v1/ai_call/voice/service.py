@@ -39,9 +39,11 @@ from app.utils.id_util import generate_snowflake_id
 
 from .model import (
     AiCallTenantVoiceProfileModel,
+    AiCallVoiceDeletionModel,
     AiCallVoiceEnrollmentModel,
     AiCallVoiceSampleCleanupModel,
 )
+from .repository import VoiceRepository
 from .schema import VoiceEnrollmentAcceptedOut, VoiceEnrollmentRequest
 
 MAX_SAMPLE_BYTES = 10 * 1024 * 1024
@@ -825,6 +827,297 @@ class _Reconciliation:
     state: str
     accepted: VoiceEnrollmentAcceptedOut | None = None
     sample_object_key: str | None = None
+
+
+class VoiceDeletionService:
+    """检查正式任务引用并异步受理租户音色删除。"""
+
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[
+            [],
+            AbstractAsyncContextManager[AsyncSession],
+        ],
+        now: Callable[[], datetime] = _utc_now,
+        id_generator: Callable[[], int] = generate_snowflake_id,
+    ) -> None:
+        self.session_factory = session_factory
+        self.now = now
+        self.id_generator = id_generator
+
+    async def deletion_check(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> dict[str, object]:
+        profile = await VoiceRepository(db).get_tenant_profile(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+        )
+        if profile is None or profile.status == "DELETED":
+            self._raise_not_found()
+        summary = await self._reference_summary(
+            db,
+            tenant_id=tenant_id,
+            voice=profile.voice,
+        )
+        return {
+            "voiceProfileId": str(profile.id),
+            "deletable": (
+                profile.status in {"ENABLED", "DELETE_FAILED"}
+                and bool(profile.voice)
+                and summary["blockingTaskCount"] == 0
+            ),
+            **summary,
+        }
+
+    async def request_deletion(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        user_id: int,
+        profile_id: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        command_key = idempotency_key.strip()
+        if not command_key or len(command_key) > 128:
+            raise CustomException(
+                msg="Idempotency-Key 不合法",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        existing = await self._find_deletion(db, tenant_id, command_key)
+        if existing is not None:
+            return self._resolve_idempotent(existing, profile_id=profile_id)
+        await self._safe_rollback(db)
+
+        repository = VoiceRepository(db)
+        profile = await repository.get_tenant_profile(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            for_update=True,
+        )
+        if profile is None or profile.status == "DELETED":
+            await self._safe_rollback(db)
+            self._raise_not_found()
+        if profile.status not in {"ENABLED", "DELETE_FAILED"} or not profile.voice:
+            await self._safe_rollback(db)
+            raise CustomException(
+                msg="当前音色状态不允许删除",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        references = await repository.task_reference_summary(
+            tenant_id=tenant_id,
+            voice=profile.voice,
+        )
+        if references.blocking_task_count:
+            await self._safe_rollback(db)
+            raise CustomException(
+                msg="音色正在被外呼任务使用，暂不可删除",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        try:
+            deletion_id = self.id_generator()
+        except Exception:
+            await self._safe_rollback(db)
+            self._raise_persistence_failure()
+        now = self.now()
+        try:
+            reserved = await db.execute(
+                update(AiCallTenantVoiceProfileModel)
+                .where(
+                    AiCallTenantVoiceProfileModel.id == profile_id,
+                    AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                    AiCallTenantVoiceProfileModel.status == profile.status,
+                )
+                .values(
+                    status="DELETING",
+                    error_message=None,
+                    deleted_by=user_id,
+                    updated_at=now,
+                )
+            )
+            if reserved.rowcount != 1:
+                await self._safe_rollback(db)
+                reconciled = await self._reconcile_deletion(
+                    tenant_id=tenant_id,
+                    command_key=command_key,
+                    profile_id=profile_id,
+                )
+                if reconciled is not None:
+                    return reconciled
+                raise CustomException(
+                    msg="当前音色状态不允许删除",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            deletion = AiCallVoiceDeletionModel(
+                id=deletion_id,
+                tenant_id=tenant_id,
+                voice_profile_id=profile_id,
+                idempotency_key=command_key,
+                status="PENDING",
+                provider_request_id=None,
+                attempt_count=0,
+                next_retry_at=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                historical_task_count=references.historical_task_count,
+                error_message=None,
+                requested_by=user_id,
+                started_at=None,
+                finished_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(deletion)
+            await db.flush()
+        except IntegrityError:
+            await self._safe_rollback(db)
+            reconciled = await self._reconcile_deletion(
+                tenant_id=tenant_id,
+                command_key=command_key,
+                profile_id=profile_id,
+            )
+            if reconciled is not None:
+                return reconciled
+            self._raise_idempotency_conflict()
+        except CustomException:
+            raise
+        except Exception:
+            await self._safe_rollback(db)
+            reconciled = await self._reconcile_deletion(
+                tenant_id=tenant_id,
+                command_key=command_key,
+                profile_id=profile_id,
+            )
+            if reconciled is not None:
+                return reconciled
+            self._raise_persistence_failure()
+
+        try:
+            await db.commit()
+        except Exception:
+            await self._safe_rollback(db)
+            reconciled = await self._reconcile_deletion(
+                tenant_id=tenant_id,
+                command_key=command_key,
+                profile_id=profile_id,
+            )
+            if reconciled is not None:
+                return reconciled
+            self._raise_persistence_failure()
+        return self._accepted(deletion)
+
+    @staticmethod
+    async def _reference_summary(
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        voice: str | None,
+    ) -> dict[str, object]:
+        if not voice:
+            return {
+                "blockingTaskCount": 0,
+                "historicalTaskCount": 0,
+                "blockingTaskIds": [],
+            }
+        summary = await VoiceRepository(db).task_reference_summary(
+            tenant_id=tenant_id,
+            voice=voice,
+        )
+        return {
+            "blockingTaskCount": summary.blocking_task_count,
+            "historicalTaskCount": summary.historical_task_count,
+            "blockingTaskIds": [str(task_id) for task_id in summary.blocking_task_ids],
+        }
+
+    async def _reconcile_deletion(
+        self,
+        *,
+        tenant_id: str,
+        command_key: str,
+        profile_id: int,
+    ) -> dict[str, object] | None:
+        try:
+            async with self.session_factory() as database:
+                deletion = await self._find_deletion(
+                    database,
+                    tenant_id,
+                    command_key,
+                )
+                if deletion is None:
+                    result = None
+                else:
+                    result = self._resolve_idempotent(
+                        deletion,
+                        profile_id=profile_id,
+                    )
+                await database.rollback()
+        except Exception:
+            return None
+        return result
+
+    @staticmethod
+    async def _find_deletion(
+        db: AsyncSession,
+        tenant_id: str,
+        command_key: str,
+    ) -> AiCallVoiceDeletionModel | None:
+        return await db.scalar(
+            select(AiCallVoiceDeletionModel).where(
+                AiCallVoiceDeletionModel.tenant_id == tenant_id,
+                AiCallVoiceDeletionModel.idempotency_key == command_key,
+            )
+        )
+
+    @classmethod
+    def _resolve_idempotent(
+        cls,
+        deletion: AiCallVoiceDeletionModel,
+        *,
+        profile_id: int,
+    ) -> dict[str, object]:
+        if deletion.voice_profile_id != profile_id:
+            cls._raise_idempotency_conflict()
+        return cls._accepted(deletion)
+
+    @staticmethod
+    def _accepted(deletion: AiCallVoiceDeletionModel) -> dict[str, object]:
+        deleting_statuses = {"PENDING", "PROCESSING", "RETRY_WAIT", "RECONCILING"}
+        return {
+            "voiceProfileId": str(deletion.voice_profile_id),
+            "deletionId": str(deletion.id),
+            "status": ("DELETING" if deletion.status in deleting_statuses else deletion.status),
+        }
+
+    @staticmethod
+    async def _safe_rollback(db: AsyncSession) -> None:
+        with suppress(Exception):
+            await db.rollback()
+
+    @staticmethod
+    def _raise_not_found() -> Never:
+        raise CustomException(
+            msg="音色资产不存在",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    @staticmethod
+    def _raise_idempotency_conflict() -> Never:
+        raise CustomException(
+            msg="Idempotency-Key 已用于不同请求",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    @staticmethod
+    def _raise_persistence_failure() -> Never:
+        raise CustomException(
+            msg="音色删除任务受理失败，请稍后重试",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ) from None
 
 
 class VoiceEnrollmentService:

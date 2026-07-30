@@ -8,8 +8,10 @@ import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import (
     AiCallTenantVoiceProfileModel,
+    AiCallVoiceDeletionModel,
     AiCallVoiceEnrollmentModel,
     AiCallVoiceSampleCleanupModel,
 )
@@ -22,6 +24,9 @@ from app.services.ai_call.providers.qwen_voice_enrollment import (
     VoiceProviderRetryableError,
 )
 from app.services.ai_call.voice_enrollment_worker import (
+    DELETION_BLOCKED_MESSAGE,
+    DELETION_FAILURE_MESSAGE,
+    DELETION_RETRY_MESSAGE,
     ENROLLMENT_FAILURE_MESSAGE,
     RETRY_DELAYS,
     SAMPLE_CLEANUP_ERROR_MESSAGE,
@@ -53,9 +58,13 @@ class FakeProvider:
         self.create_error: Exception | None = None
         self.list_result: list[VoiceListItem] = []
         self.list_error: Exception | None = None
+        self.delete_result: str | None = "req-delete"
+        self.delete_error: Exception | None = None
         self.create_calls: list[dict[str, str]] = []
         self.list_calls: list[dict[str, int]] = []
+        self.delete_calls: list[str] = []
         self.on_create: Callable[[], Awaitable[None]] | None = None
+        self.on_delete: Callable[[], Awaitable[None]] | None = None
 
     async def create(
         self,
@@ -86,6 +95,14 @@ class FakeProvider:
         if self.list_error is not None:
             raise self.list_error
         return list(self.list_result)
+
+    async def delete(self, *, voice: str) -> str | None:
+        self.delete_calls.append(voice)
+        if self.on_delete is not None:
+            await self.on_delete()
+        if self.delete_error is not None:
+            raise self.delete_error
+        return self.delete_result
 
 
 class FakeStorage:
@@ -203,6 +220,71 @@ class WorkerHarness:
         self.storage.objects[object_key] = b"orphan"
         return cleanup
 
+    async def seed_deletion(
+        self,
+        *,
+        status: str = "PENDING",
+        profile_status: str = "DELETING",
+        voice: str = "qwen-omni-vc-delete",
+        next_retry_at: datetime | None = None,
+        lease_owner: str | None = None,
+        lease_expires_at: datetime | None = None,
+        attempt_count: int = 0,
+        tenant_id: str = "tenant-a",
+    ) -> AiCallVoiceDeletionModel:
+        deletion_id = 20_000 + self.next_id
+        profile_id = 30_000 + self.next_id
+        self.next_id += 1
+        profile = _profile(
+            profile_id=profile_id,
+            latest_enrollment_id=1,
+            tenant_id=tenant_id,
+            voice=voice,
+            status=profile_status,
+        )
+        deletion = AiCallVoiceDeletionModel(
+            id=deletion_id,
+            tenant_id=tenant_id,
+            voice_profile_id=profile_id,
+            idempotency_key=f"delete-key-{deletion_id}",
+            status=status,
+            provider_request_id=None,
+            attempt_count=attempt_count,
+            next_retry_at=next_retry_at,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+            historical_task_count=0,
+            error_message=None,
+            requested_by=7,
+            started_at=None,
+            finished_at=None,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        async with self.factory() as database:
+            database.add_all([profile, deletion])
+            await database.commit()
+        return deletion
+
+    async def seed_outbound_task(
+        self,
+        *,
+        task_id: int,
+        voice: str,
+        status: str,
+        tenant_id: str = "tenant-a",
+    ) -> None:
+        async with self.factory() as database:
+            database.add(
+                _outbound_task(
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    voice=voice,
+                    status=status,
+                )
+            )
+            await database.commit()
+
     async def enrollment(self, enrollment_id: int) -> AiCallVoiceEnrollmentModel:
         async with self.factory() as database:
             row = await database.get(AiCallVoiceEnrollmentModel, enrollment_id)
@@ -221,6 +303,12 @@ class WorkerHarness:
             assert row is not None
             return row
 
+    async def deletion(self, deletion_id: int) -> AiCallVoiceDeletionModel:
+        async with self.factory() as database:
+            row = await database.get(AiCallVoiceDeletionModel, deletion_id)
+            assert row is not None
+            return row
+
 
 @pytest.fixture
 async def worker_database(tmp_path):
@@ -230,7 +318,9 @@ async def worker_database(tmp_path):
     tables = [
         AiCallTenantVoiceProfileModel.__table__,
         AiCallVoiceEnrollmentModel.__table__,
+        AiCallVoiceDeletionModel.__table__,
         AiCallVoiceSampleCleanupModel.__table__,
+        AiCallOutboundTaskModel.__table__,
     ]
     async with engine.begin() as connection:
         await connection.run_sync(
@@ -256,24 +346,72 @@ def _profile(
     *,
     profile_id: int,
     latest_enrollment_id: int,
+    tenant_id: str = "tenant-a",
+    voice: str | None = None,
+    status: str = "CREATING",
 ) -> AiCallTenantVoiceProfileModel:
     return AiCallTenantVoiceProfileModel(
         id=profile_id,
-        tenant_id="tenant-a",
+        tenant_id=tenant_id,
         display_name=f"音色-{profile_id}",
-        voice=None,
+        voice=voice,
         voice_type="自定义复刻",
         gender="女声",
         language="zh",
         target_model=TARGET_MODEL,
         provider="aliyun_qwen",
-        status="CREATING",
+        status=status,
         latest_enrollment_id=latest_enrollment_id,
         provider_created_at=None,
         error_message=None,
         created_by=7,
         deleted_by=None,
         deleted_at=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _outbound_task(
+    *,
+    task_id: int,
+    tenant_id: str,
+    voice: str,
+    status: str,
+) -> AiCallOutboundTaskModel:
+    return AiCallOutboundTaskModel(
+        id=task_id,
+        tenant_id=tenant_id,
+        validation_id=10_000 + task_id,
+        idempotency_key=f"task-key-{task_id}",
+        request_fingerprint=f"{task_id:064d}"[-64:],
+        task_name=f"任务-{task_id}",
+        task_mode="batch",
+        status=status,
+        total_targets=1,
+        completed_targets=0,
+        connected_targets=0,
+        failed_targets=0,
+        execution_mode="immediate",
+        scheduled_at=None,
+        next_dispatch_at=None,
+        last_dispatched_at=None,
+        started_at=None,
+        ended_at=None,
+        prompt_profile_id="prompt-1",
+        prompt_name="默认提示词",
+        scene_code="default",
+        voice=voice,
+        voice_name="客服音色",
+        rule_id=20_000 + task_id,
+        rule_name="默认规则",
+        rule_summary="默认规则摘要",
+        line_id=None,
+        line_name=None,
+        config_snapshot_json="{}",
+        error_message=None,
+        created_by=7,
+        created_by_name="测试用户",
         created_at=NOW,
         updated_at=NOW,
     )
@@ -467,6 +605,307 @@ async def test_sqlite_workers_do_not_claim_same_enrollment(worker_database) -> N
 
     claimed_ids = [item.id for item in first_claimed + second_claimed]
     assert claimed_ids == [1]
+
+
+@pytest.mark.anyio
+async def test_claims_due_and_expired_deletions_with_fencing(harness) -> None:
+    pending = await harness.seed_deletion(status="PENDING")
+    due_retry = await harness.seed_deletion(
+        status="RETRY_WAIT",
+        voice="qwen-omni-vc-delete-2",
+        next_retry_at=NOW,
+        attempt_count=1,
+    )
+    await harness.seed_deletion(
+        status="RETRY_WAIT",
+        voice="qwen-omni-vc-delete-3",
+        next_retry_at=NOW + timedelta(seconds=1),
+    )
+    expired_processing = await harness.seed_deletion(
+        status="PROCESSING",
+        voice="qwen-omni-vc-delete-4",
+        lease_owner="dead-worker",
+        lease_expires_at=NOW - timedelta(seconds=1),
+        attempt_count=2,
+    )
+    expired_reconciling = await harness.seed_deletion(
+        status="RECONCILING",
+        voice="qwen-omni-vc-delete-5",
+        lease_owner="dead-worker",
+        lease_expires_at=NOW - timedelta(seconds=1),
+        attempt_count=1,
+    )
+
+    claimed = await harness.worker._claim_deletions()
+
+    assert [item.id for item in claimed] == [
+        pending.id,
+        due_retry.id,
+        expired_processing.id,
+        expired_reconciling.id,
+    ]
+    assert [item.status for item in claimed] == [
+        "PROCESSING",
+        "PROCESSING",
+        "RECONCILING",
+        "RECONCILING",
+    ]
+    assert [item.attempt_count for item in claimed] == [1, 2, 3, 2]
+    assert all(item.lease_owner == "worker-a" for item in claimed)
+
+
+def test_postgres_deletion_claim_uses_for_update_skip_locked() -> None:
+    statement = VoiceEnrollmentWorker._deletion_claim_select(
+        now=NOW,
+        batch_size=10,
+    )
+
+    sql = str(statement.compile(dialect=postgresql.dialect())).lower()
+
+    assert "for update skip locked" in sql
+    assert "limit" in sql
+
+
+@pytest.mark.anyio
+async def test_worker_deletes_provider_voice_and_marks_profile_deleted(harness) -> None:
+    task = await harness.seed_deletion()
+
+    await harness.worker.run_once()
+
+    deletion = await harness.deletion(task.id)
+    profile = await harness.profile(task.voice_profile_id)
+    assert harness.provider.delete_calls == ["qwen-omni-vc-delete"]
+    assert deletion.status == "DELETED"
+    assert deletion.provider_request_id == "req-delete"
+    assert deletion.lease_owner is None
+    assert profile.status == "DELETED"
+    assert profile.deleted_at is not None
+
+
+@pytest.mark.anyio
+async def test_delete_provider_call_happens_after_claim_commit(harness) -> None:
+    task = await harness.seed_deletion()
+
+    async def assert_committed_claim() -> None:
+        current = await harness.deletion(task.id)
+        assert current.status == "PROCESSING"
+        assert current.lease_owner == "worker-a"
+
+    harness.provider.on_delete = assert_committed_claim
+
+    await harness.worker.run_once()
+
+
+@pytest.mark.anyio
+async def test_sqlite_workers_do_not_delete_same_voice_twice(worker_database) -> None:
+    _engine, factory = worker_database
+    first = WorkerHarness(factory, worker_id="worker-a")
+    task = await first.seed_deletion()
+    second = VoiceEnrollmentWorker(
+        session_factory=factory,
+        provider=first.provider,
+        storage=first.storage,
+        worker_id="worker-b",
+        now=first.clock,
+        batch_size=10,
+        lease_seconds=60,
+    )
+
+    await asyncio.gather(first.worker.run_once(), second.run_once())
+
+    assert first.provider.delete_calls == ["qwen-omni-vc-delete"]
+    assert (await first.deletion(task.id)).status == "DELETED"
+
+
+@pytest.mark.anyio
+async def test_worker_rechecks_blocking_reference_without_calling_provider(
+    harness,
+) -> None:
+    task = await harness.seed_deletion()
+    await harness.seed_outbound_task(
+        task_id=91,
+        voice="qwen-omni-vc-delete",
+        status="RUNNING",
+    )
+    await harness.seed_outbound_task(
+        task_id=92,
+        voice="qwen-omni-vc-delete",
+        status="COMPLETED",
+    )
+    await harness.seed_outbound_task(
+        task_id=93,
+        tenant_id="tenant-b",
+        voice="qwen-omni-vc-delete",
+        status="RUNNING",
+    )
+
+    await harness.worker.run_once()
+
+    deletion = await harness.deletion(task.id)
+    profile = await harness.profile(task.voice_profile_id)
+    assert harness.provider.delete_calls == []
+    assert deletion.status == "DELETE_FAILED"
+    assert deletion.error_message == DELETION_BLOCKED_MESSAGE
+    assert deletion.historical_task_count == 1
+    assert profile.status == "ENABLED"
+    assert profile.error_message is None
+
+
+@pytest.mark.anyio
+async def test_worker_does_not_load_profile_from_another_tenant(harness) -> None:
+    task = await harness.seed_deletion()
+    async with harness.factory() as database:
+        stored = await database.get(AiCallVoiceDeletionModel, task.id)
+        assert stored is not None
+        stored.tenant_id = "tenant-b"
+        await database.commit()
+
+    await harness.worker.run_once()
+
+    assert harness.provider.delete_calls == []
+    assert (await harness.deletion(task.id)).status == "DELETE_FAILED"
+    assert (await harness.profile(task.voice_profile_id)).status == "DELETING"
+
+
+@pytest.mark.anyio
+async def test_retryable_delete_uses_backoff_and_eventually_fails_safely(
+    harness,
+) -> None:
+    task = await harness.seed_deletion()
+    harness.provider.delete_error = VoiceProviderRetryableError(
+        "secret provider failure qwen-omni-vc-delete"
+    )
+
+    for expected_delay in RETRY_DELAYS:
+        await harness.worker.run_once()
+        deletion = await harness.deletion(task.id)
+        assert deletion.status == "RETRY_WAIT"
+        assert (_aware(deletion.next_retry_at) - harness.clock.value).total_seconds() == (
+            expected_delay
+        )
+        assert deletion.error_message == DELETION_RETRY_MESSAGE
+        harness.clock.advance(expected_delay)
+
+    await harness.worker.run_once()
+
+    deletion = await harness.deletion(task.id)
+    profile = await harness.profile(task.voice_profile_id)
+    assert deletion.status == "DELETE_FAILED"
+    assert deletion.error_message == DELETION_FAILURE_MESSAGE
+    assert profile.status == "DELETE_FAILED"
+    assert "secret" not in (deletion.error_message or "")
+
+
+@pytest.mark.anyio
+async def test_unknown_delete_result_reconciles_absence_without_second_delete(
+    harness,
+) -> None:
+    task = await harness.seed_deletion()
+    harness.provider.delete_error = VoiceProviderResultUnknownError("secret timeout")
+
+    await harness.worker.run_once()
+
+    awaiting_reconciliation = await harness.deletion(task.id)
+    assert awaiting_reconciliation.status == "RECONCILING"
+    assert len(harness.provider.delete_calls) == 1
+
+    harness.clock.advance(RETRY_DELAYS[0] + 1)
+    harness.provider.delete_error = None
+    harness.provider.list_result = []
+    await harness.worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "DELETED"
+    assert (await harness.profile(task.voice_profile_id)).status == "DELETED"
+    assert len(harness.provider.delete_calls) == 1
+    assert len(harness.provider.list_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_unknown_delete_reconciles_presence_before_retrying_delete(
+    harness,
+) -> None:
+    task = await harness.seed_deletion()
+    harness.provider.delete_error = VoiceProviderResultUnknownError("secret timeout")
+
+    await harness.worker.run_once()
+    harness.clock.advance(RETRY_DELAYS[0] + 1)
+    harness.provider.delete_error = None
+    harness.provider.list_result = [
+        VoiceListItem(
+            voice="qwen-omni-vc-delete",
+            target_model=TARGET_MODEL,
+            gmt_create=None,
+        )
+    ]
+
+    await harness.worker.run_once()
+
+    reconciled = await harness.deletion(task.id)
+    assert reconciled.status == "RETRY_WAIT"
+    assert len(harness.provider.delete_calls) == 1
+    assert len(harness.provider.list_calls) == 1
+
+    harness.clock.advance(RETRY_DELAYS[1])
+    harness.provider.list_result = []
+    await harness.worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "DELETED"
+    assert len(harness.provider.delete_calls) == 2
+
+
+@pytest.mark.anyio
+async def test_same_owner_stale_delete_attempt_cannot_publish_after_reclaim(
+    harness,
+) -> None:
+    task = await harness.seed_deletion(
+        status="RECONCILING",
+        lease_owner="worker-a",
+        lease_expires_at=NOW - timedelta(seconds=1),
+        attempt_count=1,
+    )
+    first_claim = (await harness.worker._claim_deletions())[0]
+    harness.clock.advance(61)
+    second_claim = (await harness.worker._claim_deletions())[0]
+
+    await harness.worker._complete_deletion(first_claim, request_id=None)
+    assert (await harness.deletion(task.id)).status == "RECONCILING"
+
+    await harness.worker._complete_deletion(second_claim, request_id=None)
+    assert (await harness.deletion(task.id)).status == "DELETED"
+
+
+@pytest.mark.anyio
+async def test_delete_publish_failure_recovers_by_list_without_second_delete(
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = await harness.seed_deletion()
+
+    async def fail_publish(*_args, **_kwargs) -> None:
+        raise RuntimeError("database publish failed")
+
+    monkeypatch.setattr(harness.worker, "_complete_deletion", fail_publish)
+    await harness.worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "PROCESSING"
+    assert len(harness.provider.delete_calls) == 1
+
+    second_worker = VoiceEnrollmentWorker(
+        session_factory=harness.factory,
+        provider=harness.provider,
+        storage=harness.storage,
+        worker_id="worker-a",
+        now=harness.clock,
+        batch_size=10,
+        lease_seconds=60,
+    )
+    harness.clock.advance(61)
+    harness.provider.list_result = []
+    await second_worker.run_once()
+
+    assert (await harness.deletion(task.id)).status == "DELETED"
+    assert len(harness.provider.delete_calls) == 1
+    assert len(harness.provider.list_calls) == 1
 
 
 @pytest.mark.anyio

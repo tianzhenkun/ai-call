@@ -122,7 +122,10 @@ class QwenVoiceEnrollmentProvider:
         return result
 
     async def delete(self, *, voice: str) -> str | None:
-        _, request_id = await self._request({"action": "delete", "voice": voice})
+        _, request_id = await self._request(
+            {"action": "delete", "voice": voice},
+            result_unknown_on_timeout=True,
+        )
         return request_id
 
     async def _request(
@@ -152,9 +155,7 @@ class QwenVoiceEnrollmentProvider:
             network_error = VoiceProviderRetryableError("Qwen 请求发送前连接失败")
         except httpx.RequestError:
             if result_unknown_on_timeout:
-                network_error = VoiceProviderResultUnknownError(
-                    "Qwen 创建请求执行结果未知"
-                )
+                network_error = VoiceProviderResultUnknownError("Qwen 请求执行结果未知")
             else:
                 network_error = VoiceProviderRetryableError("Qwen 请求网络异常")
         if network_error is not None:

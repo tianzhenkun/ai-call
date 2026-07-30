@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
+from app.core.database import async_db_session
 from app.core.dependencies import get_current_user, get_voice_manager
 from app.core.exceptions import CustomException
 from app.services.ai_call.orchestrator import (
@@ -39,6 +40,7 @@ from .schema import (
     VoiceStatus,
 )
 from .service import (
+    VoiceDeletionService,
     VoiceEnrollmentService,
     VoicePreviewService,
     get_app_voice_preview_service,
@@ -152,22 +154,40 @@ class _DefaultVoiceLifecycleService(_UnavailableVoiceLifecycleService):
         self,
         *,
         db: Any,
-        preview_service: VoicePreviewService,
+        preview_service: VoicePreviewService | None = None,
+        deletion_service: VoiceDeletionService | None = None,
     ) -> None:
         self.db = db
         self.preview_service = preview_service
+        self.deletion_service = deletion_service
 
     async def create_preview_session(self, **kwargs):
+        if self.preview_service is None:
+            self._raise_unavailable()
         return await self.preview_service.create_preview_session(
             self.db,
             **kwargs,
         )
 
     async def ready_preview_session(self, **kwargs):
+        if self.preview_service is None:
+            self._raise_unavailable()
         return await self.preview_service.ready_preview_session(**kwargs)
 
     async def close_preview_session(self, **kwargs):
+        if self.preview_service is None:
+            self._raise_unavailable()
         return await self.preview_service.close_preview_session(**kwargs)
+
+    async def deletion_check(self, **kwargs):
+        if self.deletion_service is None:
+            self._raise_unavailable()
+        return await self.deletion_service.deletion_check(self.db, **kwargs)
+
+    async def request_deletion(self, **kwargs):
+        if self.deletion_service is None:
+            self._raise_unavailable()
+        return await self.deletion_service.request_deletion(self.db, **kwargs)
 
 
 _unavailable_enrollment_service = _UnavailableVoiceEnrollmentService()
@@ -207,6 +227,21 @@ def get_voice_preview_lifecycle_service(
     return _DefaultVoiceLifecycleService(
         db=auth.db,
         preview_service=get_app_voice_preview_service(request.app),
+    )
+
+
+def get_voice_deletion_lifecycle_service(
+    auth: Annotated[AuthSchema, Depends(get_voice_manager)],
+    configured_service: Annotated[
+        VoiceLifecycleService,
+        Depends(get_voice_lifecycle_service),
+    ],
+) -> VoiceLifecycleService:
+    if configured_service is not _unavailable_lifecycle_service:
+        return configured_service
+    return _DefaultVoiceLifecycleService(
+        db=auth.db,
+        deletion_service=VoiceDeletionService(session_factory=async_db_session),
     )
 
 
@@ -437,7 +472,7 @@ async def check_voice_deletion_controller(
     auth: Annotated[AuthSchema, Depends(get_voice_manager)],
     service: Annotated[
         VoiceLifecycleService,
-        Depends(get_voice_lifecycle_service),
+        Depends(get_voice_deletion_lifecycle_service),
     ],
 ) -> JSONResponse:
     tenant_id, _user_id = _identity(auth)
@@ -459,7 +494,7 @@ async def delete_tenant_voice_controller(
     auth: Annotated[AuthSchema, Depends(get_voice_manager)],
     service: Annotated[
         VoiceLifecycleService,
-        Depends(get_voice_lifecycle_service),
+        Depends(get_voice_deletion_lifecycle_service),
     ],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)

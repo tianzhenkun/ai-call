@@ -13,10 +13,16 @@ from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import (
     AiCallTenantVoiceProfileModel,
+    AiCallVoiceDeletionModel,
     AiCallVoiceEnrollmentModel,
     AiCallVoiceSampleCleanupModel,
+)
+from app.api.v1.ai_call.voice.repository import (
+    BLOCKING_TASK_STATUSES,
+    HISTORICAL_TASK_STATUSES,
 )
 from app.services.ai_call.providers.qwen_voice_enrollment import (
     VoiceCreateResult,
@@ -34,6 +40,10 @@ DEFAULT_LIST_PAGE_SIZE = 1000
 ENROLLMENT_FAILURE_MESSAGE = "音色创建失败，请重新上传声音样本"
 ENROLLMENT_RETRY_MESSAGE = "音色创建暂时失败，等待自动重试"
 SAMPLE_CLEANUP_ERROR_MESSAGE = "声音样本清理失败，等待后台重试"
+DELETION_FAILURE_MESSAGE = "音色删除失败，请稍后重试"
+DELETION_RETRY_MESSAGE = "音色删除暂时失败，等待自动重试"
+DELETION_RECONCILING_MESSAGE = "音色删除结果确认中"
+DELETION_BLOCKED_MESSAGE = "音色已被外呼任务引用，删除已取消"
 
 _TERMINAL_ENROLLMENT_STATUSES = ("SUCCEEDED", "FAILED")
 _SAMPLE_CONTENT_TYPES = {
@@ -60,6 +70,9 @@ class VoiceEnrollmentProvider(Protocol):
     ) -> list[VoiceListItem]:
         raise NotImplementedError
 
+    async def delete(self, *, voice: str) -> str | None:
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, slots=True)
 class EnrollmentWorkItem:
@@ -82,6 +95,19 @@ class CleanupWorkItem:
     object_key: str
     attempt_count: int
     lease_owner: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionWorkItem:
+    id: int
+    tenant_id: str
+    voice_profile_id: int
+    voice: str
+    target_model: str
+    status: str
+    attempt_count: int
+    lease_owner: str
+    lease_expires_at: datetime
 
 
 class VoiceEnrollmentWorker:
@@ -112,6 +138,11 @@ class VoiceEnrollmentWorker:
         enrollments = await self._claim_enrollments()
         await asyncio.gather(
             *(self._process_enrollment(item) for item in enrollments),
+            return_exceptions=True,
+        )
+        deletions = await self._claim_deletions()
+        await asyncio.gather(
+            *(self._process_deletion(item) for item in deletions),
             return_exceptions=True,
         )
         cleanup_records = await self._claim_cleanup_records()
@@ -480,6 +511,392 @@ class VoiceEnrollmentWorker:
             AiCallVoiceEnrollmentModel.lease_owner == self.worker_id,
             AiCallVoiceEnrollmentModel.status == item.status,
             AiCallVoiceEnrollmentModel.attempt_count == item.attempt_count,
+        )
+
+    @staticmethod
+    def _deletion_claim_select(
+        *,
+        now: datetime,
+        batch_size: int,
+    ) -> Select:
+        return (
+            select(AiCallVoiceDeletionModel)
+            .where(VoiceEnrollmentWorker._deletion_is_claimable(now))
+            .order_by(AiCallVoiceDeletionModel.id)
+            .limit(min(MAX_BATCH_SIZE, max(1, batch_size)))
+            .with_for_update(skip_locked=True)
+        )
+
+    @staticmethod
+    def _deletion_is_claimable(now: datetime):
+        return or_(
+            AiCallVoiceDeletionModel.status == "PENDING",
+            and_(
+                AiCallVoiceDeletionModel.status == "RETRY_WAIT",
+                AiCallVoiceDeletionModel.next_retry_at <= now,
+            ),
+            and_(
+                AiCallVoiceDeletionModel.status.in_(("PROCESSING", "RECONCILING")),
+                AiCallVoiceDeletionModel.lease_expires_at < now,
+            ),
+        )
+
+    async def _claim_deletions(self) -> list[DeletionWorkItem]:
+        now = self.now()
+        lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+        async with self.session_factory() as database:
+            dialect_name = database.bind.dialect.name if database.bind else ""
+            if dialect_name == "postgresql":
+                rows = (
+                    await database.scalars(
+                        self._deletion_claim_select(
+                            now=now,
+                            batch_size=self.batch_size,
+                        )
+                    )
+                ).all()
+                for row in rows:
+                    self._claim_deletion_row(
+                        row,
+                        now=now,
+                        lease_expires_at=lease_expires_at,
+                    )
+            else:
+                candidate_ids = (
+                    select(AiCallVoiceDeletionModel.id)
+                    .where(self._deletion_is_claimable(now))
+                    .order_by(AiCallVoiceDeletionModel.id)
+                    .limit(self.batch_size)
+                )
+                rows = (
+                    await database.scalars(
+                        update(AiCallVoiceDeletionModel)
+                        .where(
+                            AiCallVoiceDeletionModel.id.in_(candidate_ids),
+                            self._deletion_is_claimable(now),
+                        )
+                        .values(
+                            status=case(
+                                (
+                                    AiCallVoiceDeletionModel.status.in_((
+                                        "PROCESSING",
+                                        "RECONCILING",
+                                    )),
+                                    "RECONCILING",
+                                ),
+                                else_="PROCESSING",
+                            ),
+                            attempt_count=(AiCallVoiceDeletionModel.attempt_count + 1),
+                            lease_owner=self.worker_id,
+                            lease_expires_at=lease_expires_at,
+                            started_at=func.coalesce(
+                                AiCallVoiceDeletionModel.started_at,
+                                now,
+                            ),
+                            next_retry_at=None,
+                            updated_at=now,
+                        )
+                        .returning(AiCallVoiceDeletionModel)
+                    )
+                ).all()
+            profiles: dict[tuple[str, int], tuple[str | None, str]] = {}
+            if rows:
+                profiles = {
+                    (tenant_id, profile_id): (voice, target_model)
+                    for tenant_id, profile_id, voice, target_model in (
+                        await database.execute(
+                            select(
+                                AiCallTenantVoiceProfileModel.tenant_id,
+                                AiCallTenantVoiceProfileModel.id,
+                                AiCallTenantVoiceProfileModel.voice,
+                                AiCallTenantVoiceProfileModel.target_model,
+                            ).where(
+                                AiCallTenantVoiceProfileModel.id.in_({
+                                    row.voice_profile_id for row in rows
+                                })
+                            )
+                        )
+                    ).all()
+                }
+            await database.commit()
+            return sorted(
+                (
+                    self._deletion_work_item(
+                        row,
+                        profile=profiles.get((row.tenant_id, row.voice_profile_id)),
+                    )
+                    for row in rows
+                ),
+                key=lambda item: item.id,
+            )
+
+    def _claim_deletion_row(
+        self,
+        row: AiCallVoiceDeletionModel,
+        *,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> None:
+        if row.status in ("PROCESSING", "RECONCILING"):
+            row.status = "RECONCILING"
+        else:
+            row.status = "PROCESSING"
+        row.attempt_count += 1
+        row.lease_owner = self.worker_id
+        row.lease_expires_at = lease_expires_at
+        row.started_at = row.started_at or now
+        row.next_retry_at = None
+        row.updated_at = now
+
+    @staticmethod
+    def _deletion_work_item(
+        row: AiCallVoiceDeletionModel,
+        *,
+        profile: tuple[str | None, str] | None,
+    ) -> DeletionWorkItem:
+        voice, target_model = profile or (None, "")
+        return DeletionWorkItem(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            voice_profile_id=row.voice_profile_id,
+            voice=voice or "",
+            target_model=target_model,
+            status=row.status,
+            attempt_count=row.attempt_count,
+            lease_owner=row.lease_owner or "",
+            lease_expires_at=_as_utc(row.lease_expires_at),
+        )
+
+    async def _process_deletion(self, item: DeletionWorkItem) -> None:
+        blocking_count, historical_count = await self._deletion_reference_counts(item)
+        if blocking_count:
+            await self._block_deletion(
+                item,
+                historical_task_count=historical_count,
+            )
+            return
+        if not item.voice:
+            await self._fail_deletion(item)
+            return
+        if item.status == "RECONCILING":
+            await self._reconcile_deletion(item)
+            return
+        try:
+            request_id = await self.provider.delete(voice=item.voice)
+        except VoiceProviderResultUnknownError:
+            await self._schedule_deletion_reconciliation(item)
+            return
+        except VoiceProviderRetryableError:
+            await self._retry_or_fail_deletion(item)
+            return
+        except (VoiceProviderRejectedError, VoiceProviderProtocolError):
+            await self._fail_deletion(item)
+            return
+        except Exception:
+            await self._retry_or_fail_deletion(item)
+            return
+        await self._complete_deletion(item, request_id=request_id)
+
+    async def _reconcile_deletion(self, item: DeletionWorkItem) -> None:
+        try:
+            voices = await self.provider.list(
+                page_index=0,
+                page_size=DEFAULT_LIST_PAGE_SIZE,
+            )
+        except Exception:
+            await self._schedule_deletion_reconciliation(item)
+            return
+        if any(voice.voice == item.voice for voice in voices):
+            await self._retry_or_fail_deletion(item)
+            return
+        await self._complete_deletion(item, request_id=None)
+
+    async def _deletion_reference_counts(
+        self,
+        item: DeletionWorkItem,
+    ) -> tuple[int, int]:
+        async with self.session_factory() as database:
+            base_filters = (
+                AiCallOutboundTaskModel.tenant_id == item.tenant_id,
+                AiCallOutboundTaskModel.voice == item.voice,
+            )
+            blocking_count = int(
+                await database.scalar(
+                    select(func.count(AiCallOutboundTaskModel.id)).where(
+                        *base_filters,
+                        AiCallOutboundTaskModel.status.in_(BLOCKING_TASK_STATUSES),
+                    )
+                )
+                or 0
+            )
+            historical_count = int(
+                await database.scalar(
+                    select(func.count(AiCallOutboundTaskModel.id)).where(
+                        *base_filters,
+                        AiCallOutboundTaskModel.status.in_(HISTORICAL_TASK_STATUSES),
+                    )
+                )
+                or 0
+            )
+            await database.rollback()
+        return blocking_count, historical_count
+
+    async def _retry_or_fail_deletion(self, item: DeletionWorkItem) -> None:
+        if item.attempt_count > len(RETRY_DELAYS):
+            await self._fail_deletion(item)
+            return
+        now = self.now()
+        delay = RETRY_DELAYS[min(item.attempt_count - 1, len(RETRY_DELAYS) - 1)]
+        async with self.session_factory() as database:
+            await database.execute(
+                update(AiCallVoiceDeletionModel)
+                .where(self._owned_deletion(item))
+                .values(
+                    status="RETRY_WAIT",
+                    next_retry_at=now + timedelta(seconds=delay),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    error_message=DELETION_RETRY_MESSAGE,
+                    updated_at=now,
+                )
+            )
+            await database.commit()
+
+    async def _schedule_deletion_reconciliation(
+        self,
+        item: DeletionWorkItem,
+    ) -> None:
+        now = self.now()
+        delay = RETRY_DELAYS[min(item.attempt_count - 1, len(RETRY_DELAYS) - 1)]
+        retry_at = now + timedelta(seconds=delay)
+        async with self.session_factory() as database:
+            await database.execute(
+                update(AiCallVoiceDeletionModel)
+                .where(self._owned_deletion(item))
+                .values(
+                    status="RECONCILING",
+                    next_retry_at=retry_at,
+                    lease_owner=None,
+                    lease_expires_at=retry_at,
+                    error_message=DELETION_RECONCILING_MESSAGE,
+                    updated_at=now,
+                )
+            )
+            await database.commit()
+
+    async def _complete_deletion(
+        self,
+        item: DeletionWorkItem,
+        *,
+        request_id: str | None,
+    ) -> None:
+        now = self.now()
+        async with self.session_factory() as database:
+            result = await database.execute(
+                update(AiCallVoiceDeletionModel)
+                .where(self._owned_deletion(item))
+                .values(
+                    status="DELETED",
+                    provider_request_id=request_id,
+                    next_retry_at=None,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    error_message=None,
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                await database.rollback()
+                return
+            await database.execute(
+                update(AiCallTenantVoiceProfileModel)
+                .where(
+                    AiCallTenantVoiceProfileModel.id == item.voice_profile_id,
+                    AiCallTenantVoiceProfileModel.tenant_id == item.tenant_id,
+                    AiCallTenantVoiceProfileModel.status == "DELETING",
+                )
+                .values(
+                    status="DELETED",
+                    error_message=None,
+                    deleted_at=now,
+                    updated_at=now,
+                )
+            )
+            await database.commit()
+
+    async def _fail_deletion(self, item: DeletionWorkItem) -> None:
+        await self._finish_failed_deletion(
+            item,
+            deletion_message=DELETION_FAILURE_MESSAGE,
+            profile_status="DELETE_FAILED",
+            profile_message=DELETION_FAILURE_MESSAGE,
+        )
+
+    async def _block_deletion(
+        self,
+        item: DeletionWorkItem,
+        *,
+        historical_task_count: int,
+    ) -> None:
+        await self._finish_failed_deletion(
+            item,
+            deletion_message=DELETION_BLOCKED_MESSAGE,
+            profile_status="ENABLED",
+            profile_message=None,
+            historical_task_count=historical_task_count,
+        )
+
+    async def _finish_failed_deletion(
+        self,
+        item: DeletionWorkItem,
+        *,
+        deletion_message: str,
+        profile_status: str,
+        profile_message: str | None,
+        historical_task_count: int | None = None,
+    ) -> None:
+        now = self.now()
+        values: dict[str, object] = {
+            "status": "DELETE_FAILED",
+            "next_retry_at": None,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "error_message": deletion_message,
+            "finished_at": now,
+            "updated_at": now,
+        }
+        if historical_task_count is not None:
+            values["historical_task_count"] = historical_task_count
+        async with self.session_factory() as database:
+            result = await database.execute(
+                update(AiCallVoiceDeletionModel).where(self._owned_deletion(item)).values(**values)
+            )
+            if result.rowcount != 1:
+                await database.rollback()
+                return
+            await database.execute(
+                update(AiCallTenantVoiceProfileModel)
+                .where(
+                    AiCallTenantVoiceProfileModel.id == item.voice_profile_id,
+                    AiCallTenantVoiceProfileModel.tenant_id == item.tenant_id,
+                    AiCallTenantVoiceProfileModel.status == "DELETING",
+                )
+                .values(
+                    status=profile_status,
+                    error_message=profile_message,
+                    updated_at=now,
+                )
+            )
+            await database.commit()
+
+    def _owned_deletion(self, item: DeletionWorkItem):
+        return and_(
+            AiCallVoiceDeletionModel.id == item.id,
+            AiCallVoiceDeletionModel.tenant_id == item.tenant_id,
+            AiCallVoiceDeletionModel.lease_owner == self.worker_id,
+            AiCallVoiceDeletionModel.status == item.status,
+            AiCallVoiceDeletionModel.attempt_count == item.attempt_count,
         )
 
     async def _cleanup_terminal_samples(self) -> None:

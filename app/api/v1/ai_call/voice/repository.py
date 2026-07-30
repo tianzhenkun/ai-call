@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallVoiceProfileModel
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.schema import VoiceProfileOut, VoiceStatus
+
+BLOCKING_TASK_STATUSES = ("SCHEDULED", "RUNNING", "PAUSING", "PAUSED", "STOPPING")
+HISTORICAL_TASK_STATUSES = ("STOPPED", "COMPLETED", "FAILED", "CANCELLED")
+MAX_BLOCKING_TASK_IDS = 100
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceTaskReferenceSummary:
+    blocking_task_count: int
+    historical_task_count: int
+    blocking_task_ids: tuple[int, ...]
 
 
 class VoiceRepository:
@@ -130,6 +144,70 @@ class VoiceRepository:
             rows.extend(self._global_profile(profile) for profile in global_profiles)
 
         return rows, tenant_total + global_total
+
+    async def get_tenant_profile(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        for_update: bool = False,
+    ) -> AiCallTenantVoiceProfileModel | None:
+        statement = select(AiCallTenantVoiceProfileModel).where(
+            AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+            AiCallTenantVoiceProfileModel.id == profile_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await self.db.scalar(statement)
+
+    async def task_reference_summary(
+        self,
+        *,
+        tenant_id: str,
+        voice: str,
+        blocking_id_limit: int = MAX_BLOCKING_TASK_IDS,
+    ) -> VoiceTaskReferenceSummary:
+        base_filters = (
+            AiCallOutboundTaskModel.tenant_id == tenant_id,
+            AiCallOutboundTaskModel.voice == voice,
+        )
+        blocking_count = int(
+            await self.db.scalar(
+                select(func.count(AiCallOutboundTaskModel.id)).where(
+                    *base_filters,
+                    AiCallOutboundTaskModel.status.in_(BLOCKING_TASK_STATUSES),
+                )
+            )
+            or 0
+        )
+        historical_count = int(
+            await self.db.scalar(
+                select(func.count(AiCallOutboundTaskModel.id)).where(
+                    *base_filters,
+                    AiCallOutboundTaskModel.status.in_(HISTORICAL_TASK_STATUSES),
+                )
+            )
+            or 0
+        )
+        safe_limit = max(1, min(blocking_id_limit, MAX_BLOCKING_TASK_IDS))
+        blocking_ids = tuple(
+            (
+                await self.db.scalars(
+                    select(AiCallOutboundTaskModel.id)
+                    .where(
+                        *base_filters,
+                        AiCallOutboundTaskModel.status.in_(BLOCKING_TASK_STATUSES),
+                    )
+                    .order_by(AiCallOutboundTaskModel.id)
+                    .limit(safe_limit)
+                )
+            ).all()
+        )
+        return VoiceTaskReferenceSummary(
+            blocking_task_count=blocking_count,
+            historical_task_count=historical_count,
+            blocking_task_ids=blocking_ids,
+        )
 
     @staticmethod
     def _global_profile(profile: AiCallVoiceProfileModel) -> VoiceProfileOut:

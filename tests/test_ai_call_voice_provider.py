@@ -211,6 +211,25 @@ async def test_create_read_or_write_timeout_has_unknown_result(
 @pytest.mark.parametrize(
     "error_factory",
     [
+        lambda request: httpx.ReadTimeout("read timed out", request=request),
+        lambda request: httpx.WriteTimeout("write timed out", request=request),
+        lambda request: httpx.RemoteProtocolError("protocol failed", request=request),
+    ],
+)
+async def test_delete_errors_after_possible_send_have_unknown_result(
+    error_factory: Callable[[httpx.Request], httpx.RequestError],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_factory(request)
+
+    with pytest.raises(VoiceProviderResultUnknownError):
+        await _provider(handler).delete(voice="qwen-omni-vc-one")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error_factory",
+    [
         lambda request: httpx.ReadError("read failed", request=request),
         lambda request: httpx.WriteError("write failed", request=request),
         lambda request: httpx.RemoteProtocolError("protocol failed", request=request),

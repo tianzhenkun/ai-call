@@ -17,8 +17,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.datastructures import Headers
 
 from app.api.v1.ai_call.model import AiCallVoiceProfileModel
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import (
     AiCallTenantVoiceProfileModel,
+    AiCallVoiceDeletionModel,
     AiCallVoiceEnrollmentModel,
     AiCallVoiceSampleCleanupModel,
 )
@@ -28,7 +30,7 @@ from app.api.v1.ai_call.voice.schema import (
     VoiceEnrollmentRequest,
     VoiceProfileOut,
 )
-from app.api.v1.ai_call.voice.service import VoiceEnrollmentService
+from app.api.v1.ai_call.voice.service import VoiceDeletionService, VoiceEnrollmentService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 
@@ -249,6 +251,30 @@ async def voice_database():
         await engine.dispose()
 
 
+@pytest.fixture
+async def deletion_database(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'voice-deletion.db'}",
+    )
+    tables = [
+        AiCallTenantVoiceProfileModel.__table__,
+        AiCallVoiceDeletionModel.__table__,
+        AiCallOutboundTaskModel.__table__,
+    ]
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            lambda sync_connection: MappedBase.metadata.create_all(
+                sync_connection,
+                tables=tables,
+            )
+        )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield engine, factory
+    finally:
+        await engine.dispose()
+
+
 def _global_voice(
     *,
     profile_id: int,
@@ -309,6 +335,63 @@ def _tenant_voice(
         deleted_at=NOW if status == "DELETED" else None,
         created_at=created_at,
         updated_at=updated_at,
+    )
+
+
+def _outbound_task(
+    *,
+    task_id: int,
+    tenant_id: str = "tenant-a",
+    voice: str = "vc-enabled",
+    status: str = "SCHEDULED",
+) -> AiCallOutboundTaskModel:
+    return AiCallOutboundTaskModel(
+        id=task_id,
+        tenant_id=tenant_id,
+        validation_id=10_000 + task_id,
+        idempotency_key=f"task-key-{task_id}",
+        request_fingerprint=f"{task_id:064d}"[-64:],
+        task_name=f"任务-{task_id}",
+        task_mode="batch",
+        status=status,
+        total_targets=1,
+        completed_targets=0,
+        connected_targets=0,
+        failed_targets=0,
+        execution_mode="immediate",
+        scheduled_at=None,
+        next_dispatch_at=None,
+        last_dispatched_at=None,
+        started_at=None,
+        ended_at=None,
+        prompt_profile_id="prompt-1",
+        prompt_name="默认提示词",
+        scene_code="default",
+        voice=voice,
+        voice_name="客服音色",
+        rule_id=20_000 + task_id,
+        rule_name="默认规则",
+        rule_summary="默认规则摘要",
+        line_id=None,
+        line_name=None,
+        config_snapshot_json="{}",
+        error_message=None,
+        created_by=7,
+        created_by_name="测试用户",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _deletion_service(
+    factory: async_sessionmaker,
+    *,
+    ids: tuple[int, ...] = (801, 802, 803),
+) -> VoiceDeletionService:
+    return VoiceDeletionService(
+        session_factory=factory,
+        now=lambda: NOW,
+        id_generator=SequenceIds(*ids),
     )
 
 
@@ -793,6 +876,266 @@ async def _all_profiles(factory: async_sessionmaker) -> list[VoiceProfileOut]:
             page_size=100,
         )
         return rows
+
+
+@pytest.mark.anyio
+async def test_deletion_check_classifies_task_states_and_isolates_tenant(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    blocking_statuses = ["SCHEDULED", "RUNNING", "PAUSING", "PAUSED", "STOPPING"]
+    historical_statuses = ["STOPPED", "COMPLETED", "FAILED", "CANCELLED"]
+    await _seed(
+        factory,
+        _tenant_voice(profile_id=701, voice="vc-enabled"),
+        *[
+            _outbound_task(task_id=index, status=task_status)
+            for index, task_status in enumerate(blocking_statuses, start=1)
+        ],
+        *[
+            _outbound_task(task_id=index, status=task_status)
+            for index, task_status in enumerate(historical_statuses, start=101)
+        ],
+        _outbound_task(task_id=201, tenant_id="tenant-b", status="RUNNING"),
+        _outbound_task(task_id=202, voice="other-voice", status="RUNNING"),
+    )
+    service = _deletion_service(factory)
+
+    async with factory() as database:
+        result = await service.deletion_check(
+            database,
+            tenant_id="tenant-a",
+            profile_id=701,
+        )
+
+    assert result == {
+        "voiceProfileId": "701",
+        "deletable": False,
+        "blockingTaskCount": 5,
+        "historicalTaskCount": 4,
+        "blockingTaskIds": ["1", "2", "3", "4", "5"],
+    }
+
+
+@pytest.mark.anyio
+async def test_deletion_check_bounds_blocking_task_id_page(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(
+        factory,
+        _tenant_voice(profile_id=702, voice="vc-enabled"),
+        *[_outbound_task(task_id=1_000 + index, status="SCHEDULED") for index in range(105)],
+    )
+
+    async with factory() as database:
+        result = await _deletion_service(factory).deletion_check(
+            database,
+            tenant_id="tenant-a",
+            profile_id=702,
+        )
+
+    assert result["blockingTaskCount"] == 105
+    assert len(result["blockingTaskIds"]) == 100
+    assert result["blockingTaskIds"][0] == "1000"
+    assert result["blockingTaskIds"][-1] == "1099"
+
+
+@pytest.mark.anyio
+async def test_delete_rechecks_references_after_preflight_and_rejects_cross_tenant(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(
+        factory,
+        _tenant_voice(profile_id=703, voice="vc-enabled"),
+        _tenant_voice(
+            profile_id=704,
+            tenant_id="tenant-b",
+            voice="tenant-b-voice",
+        ),
+    )
+    service = _deletion_service(factory)
+    async with factory() as database:
+        preflight = await service.deletion_check(
+            database,
+            tenant_id="tenant-a",
+            profile_id=703,
+        )
+    assert preflight["deletable"] is True
+
+    await _seed(
+        factory,
+        _outbound_task(task_id=301, voice="vc-enabled", status="RUNNING"),
+    )
+    async with factory() as database:
+        with pytest.raises(CustomException) as blocked:
+            await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=703,
+                idempotency_key="delete-key-1",
+            )
+        with pytest.raises(CustomException) as cross_tenant:
+            await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=704,
+                idempotency_key="delete-key-2",
+            )
+
+    assert blocked.value.status_code == 409
+    assert cross_tenant.value.status_code == 404
+    async with factory() as database:
+        profile = await database.get(AiCallTenantVoiceProfileModel, 703)
+        assert profile is not None
+        assert profile.status == "ENABLED"
+        assert await database.scalar(select(AiCallVoiceDeletionModel)) is None
+
+
+@pytest.mark.anyio
+async def test_delete_is_idempotent_and_failed_delete_requires_new_key(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(
+        factory,
+        _tenant_voice(profile_id=705, voice="vc-enabled"),
+        _tenant_voice(profile_id=706, voice="vc-other"),
+    )
+    service = _deletion_service(factory, ids=(811, 812))
+
+    async with factory() as database:
+        accepted = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=705,
+            idempotency_key="delete-key-1",
+        )
+    async with factory() as database:
+        repeated = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=705,
+            idempotency_key="delete-key-1",
+        )
+        with pytest.raises(CustomException) as reused_for_other_profile:
+            await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=706,
+                idempotency_key="delete-key-1",
+            )
+        with pytest.raises(CustomException) as new_key_while_deleting:
+            await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=705,
+                idempotency_key="delete-key-2",
+            )
+
+    assert accepted == repeated
+    assert accepted == {
+        "voiceProfileId": "705",
+        "deletionId": "811",
+        "status": "DELETING",
+    }
+    assert reused_for_other_profile.value.status_code == 409
+    assert new_key_while_deleting.value.status_code == 409
+
+    async with factory() as database:
+        deletion = await database.get(AiCallVoiceDeletionModel, 811)
+        profile = await database.get(AiCallTenantVoiceProfileModel, 705)
+        assert deletion is not None
+        assert profile is not None
+        deletion.status = "DELETE_FAILED"
+        profile.status = "DELETE_FAILED"
+        await database.commit()
+
+    async with factory() as database:
+        old_key = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=705,
+            idempotency_key="delete-key-1",
+        )
+        retried = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=705,
+            idempotency_key="delete-key-3",
+        )
+
+    assert old_key["status"] == "DELETE_FAILED"
+    assert retried == {
+        "voiceProfileId": "705",
+        "deletionId": "812",
+        "status": "DELETING",
+    }
+
+
+@pytest.mark.anyio
+async def test_concurrent_same_key_delete_returns_single_task(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(factory, _tenant_voice(profile_id=707, voice="vc-enabled"))
+    service = _deletion_service(factory, ids=(821, 822))
+
+    async def submit() -> dict[str, object]:
+        async with factory() as database:
+            return await service.request_deletion(
+                database,
+                tenant_id="tenant-a",
+                user_id=7,
+                profile_id=707,
+                idempotency_key="same-delete-key",
+            )
+
+    first, second = await asyncio.gather(submit(), submit())
+
+    assert first == second
+    async with factory() as database:
+        rows = (await database.scalars(select(AiCallVoiceDeletionModel))).all()
+    assert len(rows) == 1
+    assert rows[0].status == "PENDING"
+
+
+@pytest.mark.anyio
+async def test_delete_commit_then_raise_reconciles_persisted_task(
+    deletion_database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(factory, _tenant_voice(profile_id=708, voice="vc-enabled"))
+    service = _deletion_service(factory, ids=(831,))
+
+    async with factory() as database:
+        real_commit = database.commit
+
+        async def commit_then_raise() -> None:
+            await real_commit()
+            raise RuntimeError("secret connection lost after commit")
+
+        monkeypatch.setattr(database, "commit", commit_then_raise)
+        accepted = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=708,
+            idempotency_key="unknown-commit-key",
+        )
+
+    assert accepted["deletionId"] == "831"
+    assert "secret" not in str(accepted)
 
 
 def test_enrollment_request_normalizes_fields_and_forbids_server_owned_values() -> None:

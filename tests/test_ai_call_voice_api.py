@@ -166,6 +166,30 @@ class FakeLifecycleService:
         }
 
 
+class FakeDefaultDeletionService:
+    def __init__(self) -> None:
+        self.check_calls: list[tuple[AsyncSession, dict[str, object]]] = []
+        self.delete_calls: list[tuple[AsyncSession, dict[str, object]]] = []
+
+    async def deletion_check(self, db: AsyncSession, **values):
+        self.check_calls.append((db, values))
+        return {
+            "voiceProfileId": str(values["profile_id"]),
+            "deletable": True,
+            "blockingTaskCount": 0,
+            "historicalTaskCount": 0,
+            "blockingTaskIds": [],
+        }
+
+    async def request_deletion(self, db: AsyncSession, **values):
+        self.delete_calls.append((db, values))
+        return {
+            "voiceProfileId": str(values["profile_id"]),
+            "deletionId": str(BIG_ENROLLMENT_ID),
+            "status": "DELETING",
+        }
+
+
 def _auth(*, permissions: frozenset[str]) -> AuthSchema:
     user = UserModel(
         user_id=7,
@@ -392,3 +416,52 @@ def test_cross_tenant_resource_operations_do_not_expose_resources(
     assert preview.status_code in {403, 404}
     assert deletion_check.status_code in {403, 404}
     assert delete.status_code in {403, 404}
+
+
+def test_default_deletion_routes_delegate_to_real_service_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    deletion_service = FakeDefaultDeletionService()
+    monkeypatch.setattr(
+        voice_controller,
+        "VoiceDeletionService",
+        lambda *, session_factory: deletion_service,
+    )
+    auth = _auth(permissions=frozenset({"ai_call:voice:manage"}))
+    app = FastAPI()
+    handle_exception(app)
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_current_user] = lambda: auth
+    client = TestClient(app)
+
+    check = client.get(
+        f"/ai-call/tenant-voice-profiles/{BIG_PROFILE_ID}/deletion-check",
+    )
+    delete = client.delete(
+        f"/ai-call/tenant-voice-profiles/{BIG_PROFILE_ID}",
+        headers={"Idempotency-Key": "delete-key-default"},
+    )
+
+    assert check.status_code == 200
+    assert delete.status_code == 202
+    assert deletion_service.check_calls == [
+        (
+            auth.db,
+            {
+                "tenant_id": "tenant-a",
+                "profile_id": BIG_PROFILE_ID,
+            },
+        )
+    ]
+    assert deletion_service.delete_calls == [
+        (
+            auth.db,
+            {
+                "tenant_id": "tenant-a",
+                "user_id": 7,
+                "profile_id": BIG_PROFILE_ID,
+                "idempotency_key": "delete-key-default",
+            },
+        )
+    ]
