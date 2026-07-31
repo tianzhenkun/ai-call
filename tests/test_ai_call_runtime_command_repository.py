@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from app.services.ai_call.runtime_control.command_repository import (
+    CommandDecision,
+    EndCallIntent,
+    RuntimeCommandRepository,
+    StartCallIntent,
+    canonical_request_fingerprint,
+    end_call_request_fingerprint,
+    start_call_request_fingerprint,
+)
+from app.services.ai_call.runtime_control.types import CommandStatus
+
+
+def test_canonical_request_fingerprint_is_order_independent() -> None:
+    left = canonical_request_fingerprint(
+        {"tenant_id": "tenant-a", "payload": {"voice": "v1", "speed": 1}}
+    )
+    right = canonical_request_fingerprint(
+        {"payload": {"speed": 1, "voice": "v1"}, "tenant_id": "tenant-a"}
+    )
+
+    assert left == right
+    assert len(left) == 64
+
+
+def test_start_fingerprint_excludes_server_generated_identifiers() -> None:
+    request = StartCallIntent(
+        tenant_id="tenant-a",
+        entry_type="web",
+        idempotency_key="start:business-1",
+        payload={"business_id": "business-1", "voice": "v1"},
+    )
+
+    expected = canonical_request_fingerprint(
+        {
+            "command_type": "START_CALL",
+            "entry_type": "web",
+            "payload": {"business_id": "business-1", "voice": "v1"},
+            "tenant_id": "tenant-a",
+        }
+    )
+
+    assert start_call_request_fingerprint(request) == expected
+
+
+def test_end_fingerprint_ignores_source_reason_and_provider_event() -> None:
+    first = EndCallIntent(
+        tenant_id="tenant-a",
+        call_id="call-1",
+        source="customer_sip",
+        end_reason="customer_hangup",
+        dedupe_key="livekit:cluster-a:event-1",
+        provider="livekit",
+        provider_namespace="cluster-a",
+        provider_event_id="event-1",
+    )
+    second = EndCallIntent(
+        tenant_id="tenant-a",
+        call_id="call-1",
+        source="agent",
+        end_reason="agent_hangup",
+        dedupe_key="agent:call-1:hangup-1",
+    )
+
+    assert end_call_request_fingerprint(first) == end_call_request_fingerprint(second)
+    assert end_call_request_fingerprint(first) == canonical_request_fingerprint(
+        {
+            "call_id": "call-1",
+            "command_type": "END_CALL",
+            "tenant_id": "tenant-a",
+        }
+    )
+
+
+def test_command_claim_and_completion_api_is_explicit() -> None:
+    assert callable(RuntimeCommandRepository.claim_next_for_owner)
+    assert callable(RuntimeCommandRepository.claim_pending_end)
+    assert callable(RuntimeCommandRepository.complete)
+    assert CommandDecision(status=CommandStatus.SUCCEEDED).status == "SUCCEEDED"

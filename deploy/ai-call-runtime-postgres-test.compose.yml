@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ai_call_runtime_test
+      POSTGRES_USER: ai_call_runtime_test
+      POSTGRES_PASSWORD: ai_call_runtime_test
+    ports:
+      - "127.0.0.1:${AI_CALL_TEST_POSTGRES_PORT:-0}:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ai_call_runtime_test -d ai_call_runtime_test
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:

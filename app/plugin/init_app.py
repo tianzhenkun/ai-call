@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -15,116 +16,217 @@ from fastapi.staticfiles import StaticFiles
 from app.config.setting import settings
 from app.core.exceptions import handle_exception
 from app.core.logger import log
+from app.services.ai_call.runtime_control.roles import validate_runtime_role_settings
+from app.services.ai_call.runtime_control.types import ProcessRole
 from app.utils.common_util import import_module, import_modules_async
 from app.utils.console import console_close, console_run
 
 
+@dataclass(slots=True)
+class AiCallRoleWorkerHandles:
+    runtime_control: Any = None
+    dispatcher_control: Any = None
+    event_worker: Any = None
+    dialogue_worker: Any = None
+    semantic_analysis_worker: Any = None
+    offline_asr_worker: Any = None
+    recording_reconcile_worker: Any = None
+    handoff_trigger_worker: Any = None
+    outbound_task_worker: Any = None
+    linphone_test_worker: Any = None
+    voice_worker: Any = None
+    voice_preview_started: bool = False
+
+
+@dataclass(slots=True)
+class SystemServiceHandles:
+    events_loaded: bool = False
+    scheduler_started: bool = False
+    console_started: bool = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
-    """
-    自定义 FastAPI 应用生命周期。
-
-    参数:
-    - app (FastAPI): FastAPI 应用实例。
-
-    返回:
-    - AsyncGenerator[Any, Any]: 生命周期上下文生成器。
-    """
-    ai_call_event_worker = await _start_ai_call_event_worker()
-    ai_call_dialogue_worker = await _start_ai_call_dialogue_worker()
-    ai_call_semantic_analysis_worker = await _start_ai_call_semantic_analysis_worker()
-    ai_call_offline_asr_worker = await _start_ai_call_offline_asr_worker()
-    ai_call_recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
-    ai_call_handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
-    await _recover_ai_call_outbound_validations()
-    ai_call_outbound_task_worker = await _start_ai_call_outbound_task_worker()
-    ai_call_linphone_test_worker = await _start_ai_call_linphone_test_worker()
-    _start_ai_call_voice_preview_service(app)
+    roles = validate_runtime_role_settings(settings)
+    role_handles = await _start_ai_call_role_workers(app, roles, start_voice=False)
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
-            await _init_ai_call_standalone_oss_config()
-            await _start_ai_call_voice_worker(app)
+            if ProcessRole.JOBS in roles:
+                await _init_ai_call_standalone_oss_config()
+                role_handles.voice_worker = await _start_ai_call_voice_worker(app)
             log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
             yield
             log.info("✅ AI Call standalone 模式关闭")
         finally:
-            await _stop_ai_call_voice_worker(app)
-            await _stop_ai_call_voice_preview_service(app)
-            await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
-            await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
-            await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
-            await _stop_ai_call_event_worker(ai_call_event_worker)
-            await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
-            await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
-            await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
-            await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
+            await _stop_ai_call_role_workers(app, role_handles)
         return
 
-    from app.api.v1.system.dict.service import DictDataService
-    from app.api.v1.system.oss.service import OssService
-    from app.core.ap_scheduler import SchedulerUtil
-
+    system_handles = SystemServiceHandles()
     try:
-        await import_modules_async(
-            modules=settings.EVENT_LIST, desc="全局事件", app=app, status=True
-        )
-        log.info("✅ 全局事件模块加载完成")
-        await DictDataService().init_dict_service(redis=app.state.redis)
-        log.info("✅ Redis数据字典初始化完成")
-        await OssService.init_active_config()
-        await _start_ai_call_voice_worker(app)
-        await SchedulerUtil.init_scheduler(redis=app.state.redis)
-        log.info("✅ 定时任务调度器初始化完成")
-        from app.common.enums import EnvironmentEnum
-
-        console_run(
-            host=settings.SERVER_HOST,
-            port=settings.SERVER_PORT,
-            reload=settings.ENVIRONMENT in {EnvironmentEnum.LOCAL, EnvironmentEnum.DEV},
-            database_ready=True,
-            redis_ready=True,
-            scheduler_ready=SchedulerUtil.is_running(),
-        )
-
-    except Exception as e:
-        await _stop_ai_call_voice_worker(app)
-        await _stop_ai_call_voice_preview_service(app)
-        await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
-        await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
-        await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
-        await _stop_ai_call_event_worker(ai_call_event_worker)
-        await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
-        await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
-        await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
-        await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
-        log.error(f"❌ 应用初始化失败: {e!s}")
+        if ProcessRole.API in roles:
+            system_handles = await _start_system_services(app, roles, role_handles)
+        elif ProcessRole.JOBS in roles:
+            await _init_ai_call_standalone_oss_config()
+            role_handles.voice_worker = await _start_ai_call_voice_worker(app)
+    except Exception as exc:
+        await _stop_ai_call_role_workers(app, role_handles)
+        log.error(f"❌ 应用初始化失败: {exc!s}")
         raise SystemExit(1)
 
     try:
         yield
     finally:
-        await _stop_ai_call_voice_worker(app)
-        await _stop_ai_call_voice_preview_service(app)
-        await _stop_ai_call_linphone_test_worker(ai_call_linphone_test_worker)
-        await _stop_ai_call_outbound_task_worker(ai_call_outbound_task_worker)
-        await _stop_ai_call_handoff_trigger_worker(ai_call_handoff_trigger_worker)
-        await _stop_ai_call_event_worker(ai_call_event_worker)
-        await _stop_ai_call_recording_reconcile_worker(ai_call_recording_reconcile_worker)
-        await _stop_ai_call_offline_asr_worker(ai_call_offline_asr_worker)
-        await _stop_ai_call_semantic_analysis_worker(ai_call_semantic_analysis_worker)
-        await _stop_ai_call_dialogue_worker(ai_call_dialogue_worker)
+        await _stop_ai_call_role_workers(app, role_handles)
+        await _stop_system_services(app, system_handles)
 
+
+async def _start_ai_call_role_workers(
+    app: FastAPI,
+    roles: frozenset[ProcessRole],
+    *,
+    start_voice: bool = True,
+) -> AiCallRoleWorkerHandles:
+    handles = AiCallRoleWorkerHandles()
+    try:
+        if ProcessRole.RUNTIME in roles:
+            handles.runtime_control = await _start_ai_call_runtime_control()
+        if ProcessRole.DISPATCHER in roles:
+            handles.dispatcher_control = await _start_ai_call_dispatcher_control()
+        if ProcessRole.LEGACY_RUNTIME in roles:
+            handles.event_worker = await _start_ai_call_event_worker()
+            handles.dialogue_worker = await _start_ai_call_dialogue_worker()
+            _start_ai_call_voice_preview_service(app)
+            handles.voice_preview_started = True
+        if ProcessRole.OUTBOUND in roles:
+            await _recover_ai_call_outbound_validations()
+            handles.outbound_task_worker = await _start_ai_call_outbound_task_worker()
+            handles.linphone_test_worker = await _start_ai_call_linphone_test_worker()
+        if ProcessRole.JOBS in roles:
+            handles.semantic_analysis_worker = (
+                await _start_ai_call_semantic_analysis_worker()
+            )
+            handles.offline_asr_worker = await _start_ai_call_offline_asr_worker()
+            handles.recording_reconcile_worker = (
+                await _start_ai_call_recording_reconcile_worker()
+            )
+            handles.handoff_trigger_worker = (
+                await _start_ai_call_handoff_trigger_worker()
+            )
+            if start_voice:
+                handles.voice_worker = await _start_ai_call_voice_worker(app)
+    except Exception:
+        await _stop_ai_call_role_workers(app, handles)
+        raise
+    return handles
+
+
+async def _stop_ai_call_role_workers(
+    app: FastAPI,
+    handles: AiCallRoleWorkerHandles,
+) -> None:
+    if handles.dispatcher_control is not None:
+        await _stop_ai_call_dispatcher_control(handles.dispatcher_control)
+    if handles.runtime_control is not None:
+        await _stop_ai_call_runtime_control(handles.runtime_control)
+    if handles.voice_worker is not None:
+        await _stop_ai_call_voice_worker(app)
+    if handles.voice_preview_started:
+        await _stop_ai_call_voice_preview_service(app)
+    if handles.linphone_test_worker is not None:
+        await _stop_ai_call_linphone_test_worker(handles.linphone_test_worker)
+    if handles.outbound_task_worker is not None:
+        await _stop_ai_call_outbound_task_worker(handles.outbound_task_worker)
+    if handles.handoff_trigger_worker is not None:
+        await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
+    if handles.event_worker is not None:
+        await _stop_ai_call_event_worker(handles.event_worker)
+    if handles.recording_reconcile_worker is not None:
+        await _stop_ai_call_recording_reconcile_worker(
+            handles.recording_reconcile_worker
+        )
+    if handles.offline_asr_worker is not None:
+        await _stop_ai_call_offline_asr_worker(handles.offline_asr_worker)
+    if handles.semantic_analysis_worker is not None:
+        await _stop_ai_call_semantic_analysis_worker(
+            handles.semantic_analysis_worker
+        )
+    if handles.dialogue_worker is not None:
+        await _stop_ai_call_dialogue_worker(handles.dialogue_worker)
+
+
+async def _start_system_services(
+    app: FastAPI,
+    roles: frozenset[ProcessRole],
+    role_handles: AiCallRoleWorkerHandles,
+) -> SystemServiceHandles:
+    from app.api.v1.system.dict.service import DictDataService
+    from app.api.v1.system.oss.service import OssService
+    from app.common.enums import EnvironmentEnum
+    from app.core.ap_scheduler import SchedulerUtil
+
+    handles = SystemServiceHandles()
     try:
         await import_modules_async(
-            modules=settings.EVENT_LIST, desc="全局事件", app=app, status=False
+            modules=settings.EVENT_LIST,
+            desc="全局事件",
+            app=app,
+            status=True,
         )
-        log.info("✅ 全局事件模块卸载完成")
-        await SchedulerUtil.shutdown(wait=False)
-        log.info("✅ 定时任务调度器已关闭")
-        console_close()
+        handles.events_loaded = True
+        log.info("✅ 全局事件模块加载完成")
+        if settings.REDIS_ENABLE:
+            redis = getattr(app.state, "redis", None)
+            if redis is None:
+                raise RuntimeError("Redis 已启用，但 app.state.redis 未初始化")
+            await DictDataService().init_dict_service(redis=redis)
+            log.info("✅ Redis数据字典初始化完成")
+        await OssService.init_active_config()
+        if ProcessRole.JOBS in roles:
+            role_handles.voice_worker = await _start_ai_call_voice_worker(app)
+        if settings.REDIS_ENABLE:
+            await SchedulerUtil.init_scheduler(redis=app.state.redis)
+            handles.scheduler_started = True
+            log.info("✅ 定时任务调度器初始化完成")
+        console_run(
+            host=settings.SERVER_HOST,
+            port=settings.SERVER_PORT,
+            reload=settings.ENVIRONMENT
+            in {EnvironmentEnum.LOCAL, EnvironmentEnum.DEV},
+            database_ready=True,
+            redis_ready=settings.REDIS_ENABLE,
+            scheduler_ready=(
+                SchedulerUtil.is_running() if handles.scheduler_started else False
+            ),
+        )
+        handles.console_started = True
+    except Exception:
+        await _stop_system_services(app, handles)
+        raise
+    return handles
 
-    except Exception as e:
-        log.error(f"❌ 应用关闭过程中发生错误: {e!s}")
+
+async def _stop_system_services(
+    app: FastAPI,
+    handles: SystemServiceHandles,
+) -> None:
+    from app.core.ap_scheduler import SchedulerUtil
+
+    try:
+        if handles.events_loaded:
+            await import_modules_async(
+                modules=settings.EVENT_LIST,
+                desc="全局事件",
+                app=app,
+                status=False,
+            )
+            log.info("✅ 全局事件模块卸载完成")
+        if handles.scheduler_started:
+            await SchedulerUtil.shutdown(wait=False)
+            log.info("✅ 定时任务调度器已关闭")
+        if handles.console_started:
+            console_close()
+    except Exception as exc:
+        log.error(f"❌ 应用关闭过程中发生错误: {exc!s}")
 
 
 async def _init_ai_call_standalone_oss_config() -> None:
@@ -135,6 +237,38 @@ async def _init_ai_call_standalone_oss_config() -> None:
     from app.api.v1.system.oss.service import OssService
 
     await OssService.init_active_config()
+
+
+async def _start_ai_call_runtime_control():
+    from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.lifecycle import (
+        start_runtime_control_lifecycle,
+    )
+
+    service = await start_runtime_control_lifecycle(settings, async_db_session)
+    log.info(f"✅ AI Call DB-only Runtime 已启动: {service.worker_id}")
+    return service
+
+
+async def _stop_ai_call_runtime_control(service) -> None:
+    await service.stop()
+    log.info("✅ AI Call DB-only Runtime 已关闭")
+
+
+async def _start_ai_call_dispatcher_control():
+    from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.lifecycle import (
+        start_dispatcher_control_lifecycle,
+    )
+
+    service = await start_dispatcher_control_lifecycle(settings, async_db_session)
+    log.info("✅ AI Call DB-only Dispatcher 已启动")
+    return service
+
+
+async def _stop_ai_call_dispatcher_control(service) -> None:
+    await service.stop()
+    log.info("✅ AI Call DB-only Dispatcher 已关闭")
 
 
 def _start_ai_call_voice_preview_service(app: FastAPI) -> None:

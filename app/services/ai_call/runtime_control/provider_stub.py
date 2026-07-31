@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from collections import deque
+from collections.abc import Mapping, Sequence
+from enum import StrEnum
+
+from app.services.ai_call.runtime_control.effect_repository import (
+    EffectClaim,
+    ProviderObservation,
+    ProviderObservationKind,
+)
+
+
+class StubObservationKind(StrEnum):
+    RESOURCE_PRESENT = "RESOURCE_PRESENT"
+    NO_RESOURCE = "NO_RESOURCE"
+    DESTROY_CONFIRMED = "DESTROY_CONFIRMED"
+    REQUEST_ACCEPTED = "REQUEST_ACCEPTED"
+    RESULT_UNKNOWN = "RESULT_UNKNOWN"
+    RETRYABLE_NO_EFFECT = "RETRYABLE_NO_EFFECT"
+    PERMANENT_NO_EFFECT = "PERMANENT_NO_EFFECT"
+
+
+_OBSERVATION_MAPPING = {
+    StubObservationKind.RESOURCE_PRESENT: ProviderObservationKind.RESOURCE_PRESENT,
+    StubObservationKind.NO_RESOURCE: ProviderObservationKind.RESOURCE_ABSENT,
+    StubObservationKind.DESTROY_CONFIRMED: ProviderObservationKind.TERMINAL_CONFIRMED,
+    StubObservationKind.REQUEST_ACCEPTED: ProviderObservationKind.ACCEPTED,
+    StubObservationKind.RESULT_UNKNOWN: ProviderObservationKind.UNCERTAIN,
+    StubObservationKind.RETRYABLE_NO_EFFECT: ProviderObservationKind.RETRYABLE_FAILURE,
+    StubObservationKind.PERMANENT_NO_EFFECT: (
+        ProviderObservationKind.PERMANENT_NO_RESOURCE
+    ),
+}
+
+
+class ScriptedProviderStub:
+    """In-memory Provider fact source; never performs network or SDK calls."""
+
+    def __init__(
+        self,
+        script: Mapping[
+            str,
+            Sequence[StubObservationKind | ProviderObservation],
+        ],
+    ) -> None:
+        self._script = {key: deque(values) for key, values in script.items()}
+        self.calls: list[dict[str, str]] = []
+
+    async def apply(self, effect: EffectClaim) -> ProviderObservation:
+        self.calls.append(
+            {
+                "provider_namespace": effect.provider_namespace,
+                "effect_type": effect.effect_type,
+                "resource_key": effect.resource_key,
+            }
+        )
+        observations = self._script.get(effect.resource_key)
+        if not observations:
+            raise LookupError(
+                f"no scripted observation for resource key {effect.resource_key}"
+            )
+        scripted = observations.popleft()
+        if isinstance(scripted, ProviderObservation):
+            return scripted
+        return ProviderObservation(kind=_OBSERVATION_MAPPING[scripted])
