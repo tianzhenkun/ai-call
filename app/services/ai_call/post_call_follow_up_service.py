@@ -77,6 +77,9 @@ class AiCallPostCallFollowUpService:
         )
         if attempt is None or attempt.dialer_type != "sip":
             return None
+        handoffs = await self.repository.list_handoffs(analysis.call_id)
+        if handoffs:
+            return None
 
         now = datetime.now(timezone.utc)
         result = analysis.analysis_result_dict or {}

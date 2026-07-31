@@ -16,6 +16,7 @@ from app.api.v1.ai_call.model import (
     AiCallAgentSceneScopeModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
+    AiCallHandoffModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
@@ -506,6 +507,53 @@ async def test_post_call_follow_up_is_idempotent_for_same_formal_call(
             .where(AiCallFollowUpTaskModel.source_call_id == "call-formal-1")
         )
         assert count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("handoff_status", ["requested", "expired", "completed"])
+async def test_post_call_follow_up_skips_calls_with_any_handoff(
+    session_factory,
+    handoff_status: str,
+) -> None:
+    call_id = f"call-with-handoff-{handoff_status}"
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id=call_id,
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallHandoffModel(
+                id=500,
+                tenant_id="tenant-a",
+                handoff_id=f"handoff-{handoff_status}",
+                call_id=call_id,
+                room_name=f"room-{call_id}",
+                scene_code="intro_geo",
+                status=handoff_status,
+                request_source="ai",
+                requested_at=now,
+            )
+        )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(call_id=call_id)
+        assert analysis is not None
+
+        created = await post_call_follow_up_service.AiCallPostCallFollowUpService(
+            repository
+        ).apply(analysis)
+
+        assert created is None
+        count = await db.scalar(
+            select(func.count())
+            .select_from(AiCallFollowUpTaskModel)
+            .where(AiCallFollowUpTaskModel.source_call_id == call_id)
+        )
+        assert count == 0
 
 
 @pytest.mark.anyio
