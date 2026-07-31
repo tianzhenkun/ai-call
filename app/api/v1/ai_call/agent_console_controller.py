@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -713,8 +714,28 @@ async def list_admin_follow_ups_controller(
         AiCallAgentConsoleReconciler,
         Depends(get_agent_console_reconciler),
     ],
+    status: Annotated[str | None, Query()] = None,
+    source_started_at_begin: Annotated[
+        datetime | None,
+        Query(alias="sourceStartedAtBegin"),
+    ] = None,
+    source_started_at_end: Annotated[
+        datetime | None,
+        Query(alias="sourceStartedAtEnd"),
+    ] = None,
+    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
+    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 10,
 ):
-    return SuccessResponse(data=await service.list_follow_ups(auth))
+    return SuccessResponse(
+        data=await service.list_follow_ups(
+            auth,
+            status=status,
+            source_started_at_begin=source_started_at_begin,
+            source_started_at_end=source_started_at_end,
+            page_num=page_num,
+            page_size=page_size,
+        )
+    )
 
 
 @AgentAdminRouter.get("/follow-ups/{follow_up_id}", summary="查询跟进任务详情")

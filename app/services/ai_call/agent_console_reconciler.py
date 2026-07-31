@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import status
-from sqlalchemy import select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
@@ -493,20 +493,81 @@ class AiCallAgentConsoleReconciler:
         await self.db.flush()
         return self._handoff_payload(handoff)
 
-    async def list_follow_ups(self, auth: AuthSchema) -> dict:
+    async def list_follow_ups(
+        self,
+        auth: AuthSchema,
+        *,
+        status: str | None = None,
+        source_started_at_begin: datetime | None = None,
+        source_started_at_end: datetime | None = None,
+        page_num: int = 1,
+        page_size: int = 10,
+    ) -> dict:
         _, tenant_id = self._identity(auth)
+        normalized_status = (status or "").strip() or None
+        if normalized_status not in {
+            None,
+            "pending",
+            "processing",
+            "completed",
+            "closed",
+        }:
+            raise CustomException(msg="跟进状态不合法", status_code=400)
+        if (
+            source_started_at_begin is not None
+            and source_started_at_end is not None
+            and source_started_at_begin >= source_started_at_end
+        ):
+            raise CustomException(msg="来源通话开始时间必须早于结束时间", status_code=400)
+
+        filtered_stmt = select(AiCallFollowUpTaskModel).where(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id
+        )
+        if normalized_status:
+            filtered_stmt = filtered_stmt.where(AiCallFollowUpTaskModel.status == normalized_status)
+        if source_started_at_begin is not None or source_started_at_end is not None:
+            record_conditions = [
+                or_(
+                    AiCallRecordModel.follow_up_id == AiCallFollowUpTaskModel.id,
+                    AiCallRecordModel.call_id == AiCallFollowUpTaskModel.source_call_id,
+                )
+            ]
+            if source_started_at_begin is not None:
+                record_conditions.append(AiCallRecordModel.started_at >= source_started_at_begin)
+            if source_started_at_end is not None:
+                record_conditions.append(AiCallRecordModel.started_at < source_started_at_end)
+            filtered_stmt = filtered_stmt.where(
+                select(AiCallRecordModel.id).where(*record_conditions).exists()
+            )
+
+        total = int(
+            (
+                await self.db.execute(
+                    select(func.count()).select_from(filtered_stmt.order_by(None).subquery())
+                )
+            ).scalar_one()
+        )
+        safe_page_num = max(1, page_num)
+        safe_page_size = max(1, min(page_size, 100))
         tasks = list(
             (
                 await self.db.execute(
-                    select(AiCallFollowUpTaskModel)
-                    .where(AiCallFollowUpTaskModel.tenant_id == tenant_id)
-                    .order_by(AiCallFollowUpTaskModel.updated_at.desc())
+                    filtered_stmt
+                    .order_by(
+                        AiCallFollowUpTaskModel.updated_at.desc(),
+                        AiCallFollowUpTaskModel.id.desc(),
+                    )
+                    .offset((safe_page_num - 1) * safe_page_size)
+                    .limit(safe_page_size)
                 )
             )
             .scalars()
             .all()
         )
-        attempts = await self._latest_attempt_map(tenant_id)
+        attempts = await self._latest_attempt_map(
+            tenant_id,
+            [task.id for task in tasks],
+        )
         now = datetime.now(timezone.utc)
         rows = []
         for task in tasks:
@@ -516,28 +577,80 @@ class AiCallAgentConsoleReconciler:
                 self.follow_up_service.attempt_payload(latest) if latest else None
             )
             rows.append(row)
+        metrics_row = (
+            await self.db.execute(
+                select(
+                    func.coalesce(
+                        func.sum(case((AiCallFollowUpTaskModel.status == "pending", 1), else_=0)),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    AiCallFollowUpTaskModel.status.in_({"pending", "processing"})
+                                    & AiCallFollowUpTaskModel.customer_callback_at.is_not(None)
+                                    & (AiCallFollowUpTaskModel.customer_callback_at >= now),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    AiCallFollowUpTaskModel.status.in_({"pending", "processing"})
+                                    & AiCallFollowUpTaskModel.customer_callback_at.is_not(None)
+                                    & (AiCallFollowUpTaskModel.customer_callback_at < now),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    AiCallFollowUpTaskModel.source_type == "handoff_unanswered",
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (AiCallFollowUpTaskModel.status == "completed", 1),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(case((AiCallFollowUpTaskModel.status == "closed", 1), else_=0)),
+                        0,
+                    ),
+                ).where(AiCallFollowUpTaskModel.tenant_id == tenant_id)
+            )
+        ).one()
         return {
             "metrics": {
-                "pending": sum(task.status == "pending" for task in tasks),
-                "scheduled": sum(
-                    task.status in {"pending", "processing"}
-                    and task.customer_callback_at is not None
-                    and self._utc(task.customer_callback_at) >= now
-                    for task in tasks
-                ),
-                "overdue": sum(
-                    task.status in {"pending", "processing"}
-                    and task.customer_callback_at is not None
-                    and self._utc(task.customer_callback_at) < now
-                    for task in tasks
-                ),
-                "handoff_unanswered": sum(
-                    task.source_type == "handoff_unanswered" for task in tasks
-                ),
-                "completed": sum(task.status == "completed" for task in tasks),
-                "closed": sum(task.status == "closed" for task in tasks),
+                "pending": int(metrics_row[0]),
+                "scheduled": int(metrics_row[1]),
+                "overdue": int(metrics_row[2]),
+                "handoff_unanswered": int(metrics_row[3]),
+                "completed": int(metrics_row[4]),
+                "closed": int(metrics_row[5]),
             },
             "rows": rows,
+            "total": total,
         }
 
     async def get_follow_up_detail(self, auth: AuthSchema, follow_up_id: int) -> dict:
@@ -729,12 +842,18 @@ class AiCallAgentConsoleReconciler:
     async def _latest_attempt_map(
         self,
         tenant_id: str,
+        follow_up_ids: list[int],
     ) -> dict[int, AiCallFollowUpAttemptModel]:
+        if not follow_up_ids:
+            return {}
         attempts = list(
             (
                 await self.db.execute(
                     select(AiCallFollowUpAttemptModel)
-                    .where(AiCallFollowUpAttemptModel.tenant_id == tenant_id)
+                    .where(
+                        AiCallFollowUpAttemptModel.tenant_id == tenant_id,
+                        AiCallFollowUpAttemptModel.follow_up_id.in_(follow_up_ids),
+                    )
                     .order_by(AiCallFollowUpAttemptModel.contacted_at)
                 )
             )
