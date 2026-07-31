@@ -1858,7 +1858,7 @@ class AiCallRecordRepository:
         if filters.get("started_at_begin"):
             stmt = stmt.where(AiCallRecordModel.started_at >= filters["started_at_begin"])
         if filters.get("started_at_end"):
-            stmt = stmt.where(AiCallRecordModel.started_at <= filters["started_at_end"])
+            stmt = stmt.where(AiCallRecordModel.started_at < filters["started_at_end"])
         return stmt
 
     @staticmethod

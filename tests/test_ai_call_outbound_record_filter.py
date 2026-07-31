@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -663,3 +663,61 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
         assert [row.call_id for row in none_rows] == ["call-positive-none"]
 
     await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_record_list_uses_exclusive_started_at_end() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    begin = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    end = begin + timedelta(days=1)
+
+    async with session_maker() as session:
+        session.add_all(
+            [
+                AiCallRecordModel(
+                    id=9101,
+                    call_id="call-at-begin",
+                    entry_type="web",
+                    room_name="room-at-begin",
+                    participant_identity="browser-at-begin",
+                    status="completed",
+                    started_at=begin,
+                ),
+                AiCallRecordModel(
+                    id=9102,
+                    call_id="call-before-end",
+                    entry_type="web",
+                    room_name="room-before-end",
+                    participant_identity="browser-before-end",
+                    status="completed",
+                    started_at=end - timedelta(microseconds=1),
+                ),
+                AiCallRecordModel(
+                    id=9103,
+                    call_id="call-at-end",
+                    entry_type="web",
+                    room_name="room-at-end",
+                    participant_identity="browser-at-end",
+                    status="completed",
+                    started_at=end,
+                ),
+            ]
+        )
+        await session.commit()
+
+        rows, total = await AiCallRecordRepository(session).list_records(
+            started_at_begin=begin,
+            started_at_end=end,
+            page_size=10,
+        )
+
+    await engine.dispose()
+
+    assert total == 2
+    assert {row.call_id for row in rows} == {
+        "call-at-begin",
+        "call-before-end",
+    }
