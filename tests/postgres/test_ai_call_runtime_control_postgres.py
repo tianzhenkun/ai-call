@@ -54,6 +54,9 @@ from app.services.ai_call.runtime_control.provider_stub import (
     ScriptedProviderStub,
     StubObservationKind,
 )
+from app.services.ai_call.runtime_control.recovery_service import (
+    RecoveryControlService,
+)
 from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
     RuntimeRegistry,
@@ -711,6 +714,95 @@ async def test_owner_concurrent_dispatchers_only_consume_one_capacity_slot() -> 
             )
             assert tuple(record) == (worker.worker_id, 1, "active")
             assert active_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:recovery-race",
+                    payload={"phone_hash": "hash-recovery-race"},
+                )
+            )
+            old_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-recovery-old",
+                    startup_id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            old_lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert old_lease is not None
+            await commands.request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="recovery_test",
+                    end_reason="owner_lost",
+                    dedupe_key="recovery-test:owner-lost",
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where worker_id=:worker_id"
+                ).bindparams(worker_id=old_worker.worker_id)
+            )
+            new_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-recovery-new",
+                    startup_id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+                    capacity=0,
+                    cleanup_capacity=1,
+                )
+            )
+
+        first, second = await asyncio.gather(
+            RecoveryControlService(factory).run_once(),
+            RecoveryControlService(factory).run_once(),
+        )
+        assert first + second == 1
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (new_worker.worker_id, 2, "cleanup")
+            counts = (
+                await session.execute(
+                    text(
+                        "select worker_id, active_call_count, active_cleanup_count "
+                        "from ai_call_runtime_worker order by worker_id"
+                    )
+                )
+            ).all()
+            by_worker = {row.worker_id: row for row in counts}
+            assert by_worker[old_worker.worker_id].active_call_count == 0
+            assert by_worker[new_worker.worker_id].active_cleanup_count == 1
     finally:
         await engine.dispose()
 

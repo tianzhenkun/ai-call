@@ -26,6 +26,7 @@ from app.utils.console import console_close, console_run
 class AiCallRoleWorkerHandles:
     runtime_control: Any = None
     dispatcher_control: Any = None
+    recovery_control: Any = None
     event_worker: Any = None
     dialogue_worker: Any = None
     semantic_analysis_worker: Any = None
@@ -92,6 +93,7 @@ async def _start_ai_call_role_workers(
             handles.runtime_control = await _start_ai_call_runtime_control()
         if ProcessRole.DISPATCHER in roles:
             handles.dispatcher_control = await _start_ai_call_dispatcher_control()
+            handles.recovery_control = await _start_ai_call_recovery_control()
         if ProcessRole.LEGACY_RUNTIME in roles:
             handles.event_worker = await _start_ai_call_event_worker()
             handles.dialogue_worker = await _start_ai_call_dialogue_worker()
@@ -124,6 +126,8 @@ async def _stop_ai_call_role_workers(
     app: FastAPI,
     handles: AiCallRoleWorkerHandles,
 ) -> None:
+    if handles.recovery_control is not None:
+        await _stop_ai_call_recovery_control(handles.recovery_control)
     if handles.dispatcher_control is not None:
         await _stop_ai_call_dispatcher_control(handles.dispatcher_control)
     if handles.runtime_control is not None:
@@ -269,6 +273,22 @@ async def _start_ai_call_dispatcher_control():
 async def _stop_ai_call_dispatcher_control(service) -> None:
     await service.stop()
     log.info("✅ AI Call DB-only Dispatcher 已关闭")
+
+
+async def _start_ai_call_recovery_control():
+    from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.lifecycle import (
+        start_recovery_control_lifecycle,
+    )
+
+    service = await start_recovery_control_lifecycle(settings, async_db_session)
+    log.info("✅ AI Call DB-only Recovery 已启动")
+    return service
+
+
+async def _stop_ai_call_recovery_control(service) -> None:
+    await service.stop()
+    log.info("✅ AI Call DB-only Recovery 已关闭")
 
 
 def _start_ai_call_voice_preview_service(app: FastAPI) -> None:

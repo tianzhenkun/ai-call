@@ -13,6 +13,7 @@ from app.services.ai_call.runtime_control.dispatcher_service import (
 )
 from app.services.ai_call.runtime_control.owner_repository import build_worker_id
 from app.services.ai_call.runtime_control.provider_stub import ScriptedProviderStub
+from app.services.ai_call.runtime_control.recovery_service import RecoveryControlService
 from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
     RuntimeRegistry,
@@ -83,6 +84,19 @@ async def start_dispatcher_control_lifecycle(
         scan_interval_seconds=float(
             settings.AI_CALL_RUNTIME_COMMAND_SCAN_INTERVAL_SECONDS
         ),
+    )
+    await service.start()
+    return service
+
+
+async def start_recovery_control_lifecycle(
+    settings: Any,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> RecoveryControlService:
+    await validate_db_only_runtime_database(session_factory)
+    service = RecoveryControlService(
+        session_factory,
+        scan_interval_seconds=float(settings.AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS),
     )
     await service.start()
     return service

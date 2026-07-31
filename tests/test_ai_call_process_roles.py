@@ -145,6 +145,7 @@ def _patch_ai_call_workers(monkeypatch: pytest.MonkeyPatch):
         for name in (
             "_start_ai_call_runtime_control",
             "_start_ai_call_dispatcher_control",
+            "_start_ai_call_recovery_control",
             "_start_ai_call_event_worker",
             "_start_ai_call_dialogue_worker",
             "_start_ai_call_semantic_analysis_worker",
@@ -162,6 +163,7 @@ def _patch_ai_call_workers(monkeypatch: pytest.MonkeyPatch):
         for name in (
             "_stop_ai_call_runtime_control",
             "_stop_ai_call_dispatcher_control",
+            "_stop_ai_call_recovery_control",
             "_stop_ai_call_event_worker",
             "_stop_ai_call_dialogue_worker",
             "_stop_ai_call_semantic_analysis_worker",
@@ -242,7 +244,10 @@ async def test_api_role_does_not_start_ai_call_workers_or_require_redis(
         ),
         (
             "dispatcher",
-            {"_start_ai_call_dispatcher_control"},
+            {
+                "_start_ai_call_dispatcher_control",
+                "_start_ai_call_recovery_control",
+            },
             False,
         ),
         (
