@@ -2210,7 +2210,7 @@ async def test_runtime_effect_recovery_releases_owner_after_cleanup_converges() 
                     ).bindparams(call_id=start.call_id)
                 )
             ).one()
-            assert tuple(before) == ("completed", "reconciling", worker.worker_id)
+            assert tuple(before) == ("completed", "attention_required", None)
             await session.execute(
                 text(
                     "update ai_call_runtime_effect set "
@@ -2218,7 +2218,15 @@ async def test_runtime_effect_recovery_releases_owner_after_cleanup_converges() 
                     "where call_id=:call_id and status='RECONCILE_REQUIRED'"
                 ).bindparams(call_id=start.call_id)
             )
+            await session.execute(
+                text(
+                    "update ai_call_record set "
+                    "resource_cleanup_next_retry_at=clock_timestamp() - interval '1 second' "
+                    "where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
 
+        assert await RecoveryControlService(factory).run_once() == 1
         assert await runtime.run_once() == 1
 
         async with factory() as session:

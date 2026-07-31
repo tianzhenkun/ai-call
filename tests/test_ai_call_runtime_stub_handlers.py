@@ -134,6 +134,11 @@ class _FakeCommandRepository:
         return True
 
 
+class _FakeRecoveryOwnerRepository:
+    async def park_attention(self, lease, retry_after) -> bool:
+        return False
+
+
 class _AssertingProvider(ScriptedProviderStub):
     def __init__(self, factory: _FakeSessionFactory, script) -> None:
         super().__init__(script)
@@ -247,6 +252,7 @@ async def test_end_handler_separates_logical_end_from_cleanup_status() -> None:
         provider,
         effect_repository_factory=lambda session: effect_repository,
         command_repository_factory=lambda session: command_repository,
+        recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
     ).handle(_command_claim("END_CALL"), _owner_lease())
 
     assert result.logical_end_completed is True

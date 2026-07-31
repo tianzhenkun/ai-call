@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -17,7 +18,10 @@ from app.services.ai_call.runtime_control.effect_repository import (
     ProviderObservationKind,
     RuntimeEffectRepository,
 )
-from app.services.ai_call.runtime_control.owner_repository import OwnerLease
+from app.services.ai_call.runtime_control.owner_repository import (
+    OwnerLease,
+    RecoveryOwnerRepository,
+)
 from app.services.ai_call.runtime_control.provider_stub import ScriptedProviderStub
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
@@ -38,6 +42,7 @@ class EndHandlerResult:
 
 EffectRepositoryFactory = Callable[[AsyncSession], RuntimeEffectRepository]
 CommandRepositoryFactory = Callable[[AsyncSession], RuntimeCommandRepository]
+RecoveryOwnerRepositoryFactory = Callable[[AsyncSession], RecoveryOwnerRepository]
 
 
 class StartCallHandler:
@@ -111,13 +116,21 @@ class EndCallHandler:
         *,
         effect_repository_factory: EffectRepositoryFactory = RuntimeEffectRepository,
         command_repository_factory: CommandRepositoryFactory = RuntimeCommandRepository,
+        recovery_owner_repository_factory: RecoveryOwnerRepositoryFactory = (
+            RecoveryOwnerRepository
+        ),
         max_effect_attempts: int = 32,
+        attention_retry_after: timedelta = timedelta(seconds=30),
     ) -> None:
         self._session_factory = session_factory
         self._provider = provider
         self._effect_repository_factory = effect_repository_factory
         self._command_repository_factory = command_repository_factory
+        self._recovery_owner_repository_factory = recovery_owner_repository_factory
         self._max_effect_attempts = max_effect_attempts
+        if attention_retry_after.total_seconds() <= 0:
+            raise ValueError("attention_retry_after must be positive")
+        self._attention_retry_after = attention_retry_after
 
     async def handle(
         self,
@@ -170,8 +183,17 @@ class EndCallHandler:
                 if logical_completed
                 else False
             )
+        cleanup_status = "clean" if clean else "reconciling"
+        if logical_completed and not clean:
+            async with self._session_factory.begin() as session:
+                parked = await self._recovery_owner_repository_factory(session).park_attention(
+                    owner_lease,
+                    self._attention_retry_after,
+                )
+            if parked:
+                cleanup_status = "attention_required"
         return EndHandlerResult(
             logical_end_completed=logical_completed,
-            resource_cleanup_status="clean" if clean else "reconciling",
+            resource_cleanup_status=cleanup_status,
             processed_effect_count=processed_count,
         )

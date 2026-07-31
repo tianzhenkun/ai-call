@@ -265,7 +265,7 @@ class RuntimeControlService:
                 ).handle(end_claim, lease)
             except _OwnerFailClosed:
                 return False
-            if result.resource_cleanup_status == "clean":
+            if result.resource_cleanup_status in {"clean", "attention_required"}:
                 await self._clear_owner_tracking(lease.call_id)
             return True
 
