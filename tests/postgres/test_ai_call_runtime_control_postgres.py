@@ -61,6 +61,9 @@ from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
     RuntimeRegistry,
 )
+from app.services.ai_call.runtime_control.startup_recovery import (
+    StartupReconcileService,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
 
@@ -803,6 +806,308 @@ async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> 
             by_worker = {row.worker_id: row for row in counts}
             assert by_worker[old_worker.worker_id].active_call_count == 0
             assert by_worker[new_worker.worker_id].active_cleanup_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_startup_uncertain_deadline_marks_no_resource_failed_and_releases_owner() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:startup-uncertain-no-resource",
+                    payload={"business_id": "startup-uncertain-no-resource"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-startup-uncertain",
+                    startup_id=UUID("11111111-1111-4111-8111-111111111111"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            now = await read_database_time(session)
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=93001,
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    command_id=start.command_id,
+                    effect_type="CREATE_ROOM",
+                    idempotency_key="effect:startup-uncertain-no-resource",
+                    fencing_token=lease.fencing_token,
+                    status="FAILED",
+                    provider_namespace="stub:startup-uncertain",
+                    provider_idempotency_key="room:startup-uncertain",
+                    resource_key="room:startup-uncertain",
+                    resource_generation=lease.fencing_token,
+                    error_message="no_resource",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            await session.execute(
+                text(
+                    "update ai_call_record set "
+                    "startup_reconcile_deadline_at=clock_timestamp() - interval '1 second' "
+                    "where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+
+        assert await StartupReconcileService(factory).run_once() == 1
+
+        async with factory() as session:
+            command = (
+                await session.execute(
+                    text(
+                        "select status, error_message from ai_call_runtime_command "
+                        "where id=:command_id"
+                    ).bindparams(command_id=start.command_id)
+                )
+            ).one()
+            assert tuple(command) == ("DEAD", "START_NOT_CREATED")
+            record = (
+                await session.execute(
+                    text(
+                        "select status, failure_stage, failure_message, "
+                        "runtime_owner_id, runtime_capacity_class, "
+                        "resource_cleanup_status, resource_cleanup_completed_at "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (
+                "failed",
+                "startup_reconcile",
+                "START_NOT_CREATED",
+                None,
+                "none",
+                "clean",
+                record.resource_cleanup_completed_at,
+            )
+            assert record.resource_cleanup_completed_at is not None
+            assert (
+                await session.scalar(
+                    text(
+                        "select active_call_count from ai_call_runtime_worker "
+                        "where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker.worker_id)
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("effect_status", "effect_error", "decision"),
+    [
+        ("APPLIED", None, "resource_present"),
+        ("RECONCILE_REQUIRED", "provider timeout", "unknown"),
+    ],
+)
+async def test_startup_uncertain_deadline_establishes_end_for_present_or_unknown(
+    effect_status: str,
+    effect_error: str | None,
+    decision: str,
+) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key=f"start:startup-uncertain-{decision}",
+                    payload={"business_id": f"startup-uncertain-{decision}"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-startup-end",
+                    startup_id=UUID("22222222-2222-4222-8222-222222222222"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            now = await read_database_time(session)
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=93002,
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    command_id=start.command_id,
+                    effect_type="CREATE_ROOM",
+                    idempotency_key=f"effect:startup-uncertain-{decision}",
+                    fencing_token=lease.fencing_token,
+                    status=effect_status,
+                    provider_namespace="stub:startup-uncertain",
+                    provider_idempotency_key=f"room:startup-uncertain-{decision}",
+                    resource_key=f"room:startup-uncertain-{decision}",
+                    resource_generation=lease.fencing_token,
+                    error_message=effect_error,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            await session.execute(
+                text(
+                    "update ai_call_record set "
+                    "startup_reconcile_deadline_at=clock_timestamp() - interval '1 second' "
+                    "where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+
+        assert await StartupReconcileService(factory).run_once() == 1
+
+        async with factory() as session:
+            commands = (
+                await session.execute(
+                    text(
+                        "select command_type, status from ai_call_runtime_command "
+                        "where call_id=:call_id order by command_seq"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).all()
+            assert commands == [("START_CALL", "SUPERSEDED"), ("END_CALL", "PENDING")]
+            record = (
+                await session.execute(
+                    text(
+                        "select status, terminal_requested_at, runtime_owner_id, "
+                        "failure_stage, failure_message from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert record.status == "ending"
+            assert record.terminal_requested_at is not None
+            assert record.runtime_owner_id == worker.worker_id
+            assert record.failure_stage == "startup_reconcile"
+            assert record.failure_message == f"START_UNCERTAIN:{decision}"
+    finally:
+        await engine.dispose()
+
+
+async def test_startup_uncertain_reservation_blocks_no_resource_failure() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:startup-uncertain-reservation",
+                    payload={"phone_hash": "hash-startup-uncertain-reservation"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-startup-reservation",
+                    startup_id=UUID("33333333-3333-4333-8333-333333333333"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            now = await read_database_time(session)
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=93003,
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    command_id=start.command_id,
+                    effect_type="CREATE_ROOM",
+                    idempotency_key="effect:startup-uncertain-reservation",
+                    fencing_token=lease.fencing_token,
+                    status="FAILED",
+                    provider_namespace="stub:startup-uncertain",
+                    provider_idempotency_key="room:startup-uncertain-reservation",
+                    resource_key="room:startup-uncertain-reservation",
+                    resource_generation=lease.fencing_token,
+                    error_message="no_resource",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                AiCallSipLineReservationModel(
+                    id=93004,
+                    tenant_id="tenant-a",
+                    line_id=301,
+                    call_id=start.call_id,
+                    status="RECONCILE_REQUIRED",
+                    reservation_token="reservation:startup-uncertain",
+                    fencing_token=lease.fencing_token,
+                    acquired_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            await session.execute(
+                text(
+                    "update ai_call_record set "
+                    "startup_reconcile_deadline_at=clock_timestamp() - interval '1 second' "
+                    "where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+
+        assert await StartupReconcileService(factory).run_once() == 1
+
+        async with factory() as session:
+            commands = (
+                await session.execute(
+                    text(
+                        "select command_type, status from ai_call_runtime_command "
+                        "where call_id=:call_id order by command_seq"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).all()
+            assert commands == [("START_CALL", "SUPERSEDED"), ("END_CALL", "PENDING")]
+            record = (
+                await session.execute(
+                    text(
+                        "select status, resource_cleanup_status, runtime_owner_id "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == ("ending", "reconciling", worker.worker_id)
+            assert (
+                await session.scalar(
+                    text(
+                        "select status from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "RECONCILE_REQUIRED"
+            )
     finally:
         await engine.dispose()
 

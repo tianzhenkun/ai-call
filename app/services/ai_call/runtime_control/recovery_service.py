@@ -12,6 +12,9 @@ from app.core.logger import log
 from app.services.ai_call.runtime_control.owner_repository import (
     RecoveryOwnerRepository,
 )
+from app.services.ai_call.runtime_control.startup_recovery import (
+    StartupReconcileService,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 
 
@@ -34,6 +37,11 @@ class RecoveryControlService:
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
         self._database_clock = database_clock
+        self._startup_reconcile = StartupReconcileService(
+            session_factory,
+            batch_size=batch_size,
+            database_clock=database_clock,
+        )
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -80,7 +88,7 @@ class RecoveryControlService:
                 )
                 if lease is not None:
                     assigned += 1
-        return assigned
+        return assigned + await self._startup_reconcile.run_once()
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
