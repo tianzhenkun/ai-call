@@ -971,6 +971,90 @@ async def test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token(
         await engine.dispose()
 
 
+async def test_reservation_insert_failure_rolls_back_owner_and_worker_capacity() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            await _insert_sip_line(session, line_id=704, max_concurrency=1)
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:reservation-fault",
+                    payload={"line_id": 704, "phone_hash": "hash-reservation-fault"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-reservation-fault",
+                    startup_id=UUID("a4444444-4444-4444-8444-444444444444"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            await session.execute(
+                text(
+                    """
+                    create or replace function ai_call_test_fail_reservation_insert()
+                    returns trigger language plpgsql as $$
+                    begin
+                        raise exception 'injected reservation failure';
+                    end;
+                    $$
+                    """
+                )
+            )
+            await session.execute(
+                text(
+                    """
+                    create trigger ai_call_test_fail_reservation_insert_trigger
+                    before insert on ai_call_sip_line_reservation
+                    for each row execute function ai_call_test_fail_reservation_insert()
+                    """
+                )
+            )
+
+        with pytest.raises(Exception, match="injected reservation failure"):
+            async with factory.begin() as session:
+                await DispatcherOwnerRepository(session).assign_initial_owner(
+                    "tenant-a", start.call_id
+                )
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count from ai_call_runtime_worker "
+                        "where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker.worker_id)
+                )
+            ).one()
+            assert tuple(record) == (None, 0, "none")
+            assert counts.active_call_count == 0
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
+
+
 async def test_owner_concurrent_dispatchers_only_consume_one_capacity_slot() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
