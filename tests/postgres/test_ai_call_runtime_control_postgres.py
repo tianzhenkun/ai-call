@@ -1014,6 +1014,48 @@ async def test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token(
             assert await effects.submit(
                 create_claim,
                 ProviderObservation(
+                    kind=ProviderObservationKind.ACCEPTED,
+                    provider_reference=None,
+                ),
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select status from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "RECONCILE_REQUIRED"
+            )
+
+            create_claim = await effects.claim_next(lease)
+            assert create_claim is not None
+            assert create_claim.effect_id == sip_effect.effect_id
+            assert create_claim.reservation_token == reservation_token
+            assert await effects.submit(
+                create_claim,
+                ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_PRESENT,
+                    provider_reference=None,
+                ),
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select status from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "RECONCILE_REQUIRED"
+            )
+
+            create_claim = await effects.claim_next(lease)
+            assert create_claim is not None
+            assert create_claim.effect_id == sip_effect.effect_id
+            assert create_claim.reservation_token == reservation_token
+            assert await effects.submit(
+                create_claim,
+                ProviderObservation(
                     kind=ProviderObservationKind.RESOURCE_PRESENT,
                     provider_reference="sip-ref",
                 ),
