@@ -102,6 +102,10 @@ MIGRATION_PATH = (
     PROJECT_ROOT
     / "docs/livekit-ai-outbound/sql/phase-i1-owner-command-db-control-plane.sql"
 )
+DIRECT_SIP_MIGRATION_PATH = (
+    PROJECT_ROOT
+    / "docs/livekit-ai-outbound/sql/phase-i2-direct-sip-db-only-plaintext.sql"
+)
 
 
 def _async_dsn() -> str:
@@ -265,6 +269,32 @@ async def test_migration_is_idempotent_and_uses_portable_contract_types() -> Non
         assert timezone_column_count == 2
         assert jsonb_column_count == 0
         assert foreign_key_count == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_direct_sip_plaintext_migration_is_idempotent() -> None:
+    _reset_legacy_schema()
+    _execute_script(MIGRATION_PATH.read_text(encoding="utf-8"))
+    migration_sql = DIRECT_SIP_MIGRATION_PATH.read_text(encoding="utf-8")
+    _execute_script(migration_sql)
+    _execute_script(migration_sql)
+
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    try:
+        async with engine.connect() as connection:
+            column = (
+                await connection.execute(
+                    text(
+                        "select data_type, character_maximum_length, is_nullable "
+                        "from information_schema.columns "
+                        "where table_schema=current_schema() "
+                        "and table_name='ai_call_record' "
+                        "and column_name='callee_phone_number'"
+                    )
+                )
+            ).one()
+        assert tuple(column) == ("character varying", 32, "YES")
     finally:
         await engine.dispose()
 

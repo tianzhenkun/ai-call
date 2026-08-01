@@ -67,6 +67,17 @@ def test_record_has_owner_terminal_and_cleanup_contract_fields() -> None:
     ) in {tuple(index.columns.keys()) for index in AiCallRecordModel.__table__.indexes}
 
 
+def test_record_has_direct_sip_plaintext_column_without_plaintext_index() -> None:
+    columns = inspect(AiCallRecordModel).columns
+
+    assert columns.callee_phone_number.nullable is True
+    assert columns.callee_phone_number.type.length == 32
+    assert all(
+        "callee_phone_number" not in tuple(index.columns.keys())
+        for index in AiCallRecordModel.__table__.indexes
+    )
+
+
 def test_outbound_attempt_has_independent_projection_lease_fields() -> None:
     assert {
         "reconcile_owner_id",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from app.services.ai_call.runtime_control import command_repository
 from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
     EndCallIntent,
+    InvalidCommandIntentError,
     RuntimeCommandRepository,
     StartCallIntent,
     canonical_request_fingerprint,
@@ -69,6 +71,26 @@ def test_start_fingerprint_excludes_server_allocation_policy() -> None:
     assert start_call_request_fingerprint(first) == start_call_request_fingerprint(second)
 
 
+def test_direct_sip_start_fingerprint_changes_with_phone_number() -> None:
+    first = StartCallIntent(
+        tenant_id="tenant-a",
+        entry_type="direct_sip",
+        idempotency_key="sip:1",
+        payload={"voice": "v1"},
+        callee_phone_number="13812345678",
+        callee_phone_number_masked="138****5678",
+        callee_phone_number_hash="sha256:first",
+    )
+    second = replace(
+        first,
+        callee_phone_number="13912345678",
+        callee_phone_number_masked="139****5678",
+        callee_phone_number_hash="sha256:second",
+    )
+
+    assert start_call_request_fingerprint(first) != start_call_request_fingerprint(second)
+
+
 class _NestedTransaction:
     async def __aenter__(self):
         return self
@@ -124,6 +146,86 @@ async def test_start_deadline_uses_database_time_and_server_timeout() -> None:
 
     command = session.rows[1]
     assert command.allocation_deadline_at == now + timedelta(seconds=30)
+
+
+@pytest.mark.anyio
+async def test_direct_sip_start_stores_phone_only_on_record() -> None:
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    ids = iter((101, 102, 103))
+    session = _FakeSession()
+    repository = RuntimeCommandRepository(
+        session,
+        id_generator=lambda: next(ids),
+        database_clock=lambda _session: _constant_time(now),
+    )
+
+    await repository.create_start_call(
+        StartCallIntent(
+            tenant_id="tenant-a",
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:persistence",
+            payload={"voice": "v1"},
+            callee_phone_number="13812345678",
+            callee_phone_number_masked="138****5678",
+            callee_phone_number_hash="sha256:stable",
+        )
+    )
+
+    record, command = session.rows
+    assert record.callee_phone_number == "13812345678"
+    assert record.callee_phone_number_masked == "138****5678"
+    assert record.callee_phone_number_hash == "sha256:stable"
+    assert record.participant_identity == "sip-call_101"
+    assert "13812345678" not in (command.payload_json or "")
+    assert command.sensitive_payload_ciphertext is None
+    assert command.payload_key_version is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "intent",
+    (
+        StartCallIntent(
+            tenant_id="tenant-a",
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:payload-leak",
+            payload={"note": "call 13812345678 now"},
+            callee_phone_number="13812345678",
+            callee_phone_number_masked="138****5678",
+            callee_phone_number_hash="sha256:stable",
+        ),
+        StartCallIntent(
+            tenant_id="tenant-a",
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:kms",
+            payload={"voice": "v1"},
+            sensitive_payload_ciphertext="ciphertext",
+            payload_key_version="kms:v1",
+            callee_phone_number="13812345678",
+            callee_phone_number_masked="138****5678",
+            callee_phone_number_hash="sha256:stable",
+        ),
+        StartCallIntent(
+            tenant_id="tenant-a",
+            entry_type="web",
+            idempotency_key="start:web:phone-metadata",
+            payload={"voice": "v1"},
+            callee_phone_number="13812345678",
+            callee_phone_number_masked="138****5678",
+            callee_phone_number_hash="sha256:stable",
+        ),
+    ),
+)
+async def test_start_rejects_phone_data_outside_record_contract(
+    intent: StartCallIntent,
+) -> None:
+    session = _FakeSession()
+    repository = RuntimeCommandRepository(session)
+
+    with pytest.raises(InvalidCommandIntentError):
+        await repository.create_start_call(intent)
+
+    assert session.rows == []
 
 
 @pytest.mark.anyio

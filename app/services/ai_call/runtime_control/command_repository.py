@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.services.ai_call.runtime_control.direct_sip_phone import payload_contains_phone
 from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
     AiCallRuntimeCommandModel,
@@ -86,6 +87,9 @@ class StartCallIntent:
     allocation_timeout_seconds: float | None = None
     sensitive_payload_ciphertext: str | None = None
     payload_key_version: str | None = None
+    callee_phone_number: str | None = None
+    callee_phone_number_masked: str | None = None
+    callee_phone_number_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,14 +190,43 @@ def canonical_request_fingerprint(parts: Mapping[str, object]) -> str:
 
 
 def start_call_request_fingerprint(request: StartCallIntent) -> str:
-    return canonical_request_fingerprint(
-        {
-            "tenant_id": request.tenant_id,
-            "command_type": START_CALL,
-            "entry_type": request.entry_type,
-            "payload": request.payload,
-        }
+    parts: dict[str, object] = {
+        "tenant_id": request.tenant_id,
+        "command_type": START_CALL,
+        "entry_type": request.entry_type,
+        "payload": request.payload,
+    }
+    if request.callee_phone_number is not None:
+        parts["callee_phone_number"] = request.callee_phone_number
+    return canonical_request_fingerprint(parts)
+
+
+def _validate_start_call_intent(request: StartCallIntent) -> None:
+    phone_fields = (
+        request.callee_phone_number,
+        request.callee_phone_number_masked,
+        request.callee_phone_number_hash,
     )
+    if request.entry_type == "direct_sip":
+        if not all(phone_fields):
+            raise InvalidCommandIntentError(
+                "Direct SIP start requires complete phone metadata"
+            )
+        if (
+            request.sensitive_payload_ciphertext is not None
+            or request.payload_key_version is not None
+        ):
+            raise InvalidCommandIntentError(
+                "Direct SIP start does not accept encrypted phone payload"
+            )
+        if payload_contains_phone(request.payload, request.callee_phone_number or ""):
+            raise InvalidCommandIntentError(
+                "Direct SIP start payload contains restricted phone data"
+            )
+    elif any(value is not None for value in phone_fields):
+        raise InvalidCommandIntentError(
+            "Non-Direct-SIP start does not accept phone metadata"
+        )
 
 
 def command_request_fingerprint(request: CommandIntent) -> str:
@@ -250,6 +283,7 @@ class RuntimeCommandRepository:
         return self._query_snapshot(command)
 
     async def create_start_call(self, request: StartCallIntent) -> CommandSnapshot:
+        _validate_start_call_intent(request)
         fingerprint = start_call_request_fingerprint(request)
         existing = await self._find_by_idempotency(
             tenant_id=request.tenant_id,
@@ -278,7 +312,14 @@ class RuntimeCommandRepository:
             prompt_source_key=request.prompt_source_key,
             entry_type=request.entry_type,
             room_name=f"ai-call-{call_id}",
-            participant_identity=f"caller-{call_id}",
+            participant_identity=(
+                f"sip-{call_id}"
+                if request.entry_type == "direct_sip"
+                else f"caller-{call_id}"
+            ),
+            callee_phone_number=request.callee_phone_number,
+            callee_phone_number_masked=request.callee_phone_number_masked,
+            callee_phone_number_hash=request.callee_phone_number_hash,
             status="preparing",
             started_at=now,
             runtime_control_mode="owner_command_v1",

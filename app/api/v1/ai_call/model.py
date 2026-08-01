@@ -81,6 +81,11 @@ class AiCallRecordModel(MappedBase):
         nullable=True,
         comment="SIP 被叫号码指纹",
     )
+    callee_phone_number: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="Direct SIP 被叫号码明文",
+    )
     callee_phone_number_masked: Mapped[str | None] = mapped_column(
         String(32),
         nullable=True,
