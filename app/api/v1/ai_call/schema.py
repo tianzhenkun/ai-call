@@ -128,6 +128,29 @@ class CreateSipSessionOut(AiCallBaseSchema):
     sip_call_status: str | None = None
 
 
+class RuntimeStartCallRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    entry_type: Literal["web", "preview", "direct_sip"]
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    business_type: str | None = Field(default=None, max_length=32)
+    business_id: str | None = Field(default=None, max_length=64)
+    scene_code: str | None = Field(default=None, max_length=64)
+    prompt_source_key: str | None = Field(default=None, max_length=64)
+    allocation_deadline_at: datetime | None = None
+    sensitive_payload_ciphertext: str | None = None
+    payload_key_version: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeStartCallOut(AiCallBaseSchema):
+    command_id: str
+    call_id: str
+    command_seq: str
+    command_type: str
+    status: str
+
+
 class TokenOut(AiCallBaseSchema):
     call_id: str
     room_name: str
