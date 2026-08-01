@@ -70,6 +70,7 @@ from app.services.ai_call.runtime_control.postgres_wakeup import (
     publish_control_wakeup,
 )
 from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicDbOnlyProviderStub,
     DeterministicWebProviderStub,
     ScriptedProviderStub,
     StubObservationKind,
@@ -4265,6 +4266,213 @@ async def test_web_db_only_two_dispatchers_and_runtimes_complete_start_end_loop(
             (call["effect_type"], call["resource_key"]) for call in provider_calls
         } == expected_effect_calls
         assert len(provider_calls) == len(expected_effect_calls)
+    finally:
+        await engine.dispose()
+
+
+async def test_direct_sip_db_only_two_dispatchers_and_runtimes_complete_start_end_loop(
+) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="direct_sip")
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="direct-sip:db-only:full-loop",
+                    payload={
+                        "voice": "voice-a",
+                        "business_id": "business-direct-sip",
+                        "scene_code": "collection",
+                        "business_params": {"case": "direct-sip-full-loop"},
+                        "ringing_timeout_seconds": 30,
+                    },
+                    business_id="business-direct-sip",
+                    scene_code="collection",
+                    allocation_timeout_seconds=30,
+                    callee_phone_number="13812345678",
+                )
+            )
+            assert start is not None
+            worker_a = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="direct-sip-runtime-a",
+                    startup_id=UUID("30303030-3030-4030-8030-303030303030"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            worker_b = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="direct-sip-runtime-b",
+                    startup_id=UUID("40404040-4040-4040-8040-404040404040"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        dispatcher_counts = await asyncio.gather(
+            DispatcherControlService(factory).run_once(),
+            DispatcherControlService(factory).run_once(),
+        )
+        assert sum(dispatcher_counts) == 1
+
+        provider_a = DeterministicDbOnlyProviderStub()
+        provider_b = DeterministicDbOnlyProviderStub()
+        runtime_a = RuntimeControlService(
+            worker_id=worker_a.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_a,
+        )
+        runtime_b = RuntimeControlService(
+            worker_id=worker_b.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_b,
+        )
+
+        start_counts = await asyncio.gather(
+            runtime_a.run_once(),
+            runtime_b.run_once(),
+        )
+        assert sorted(start_counts) == [0, 1]
+
+        async with factory() as session:
+            start_query = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=start.command_id,
+            )
+            assert start_query is not None
+            assert start_query.status == "SUCCEEDED"
+            record_and_command = (
+                await session.execute(
+                    text(
+                        "select r.callee_phone_number, "
+                        "r.callee_phone_number_masked, c.payload_json, "
+                        "c.sensitive_payload_ciphertext, c.payload_key_version "
+                        "from ai_call_record r join ai_call_runtime_command c "
+                        "on c.tenant_id=r.tenant_id and c.call_id=r.call_id "
+                        "where r.call_id=:call_id and c.command_type='START_CALL'"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert record_and_command.callee_phone_number == "13812345678"
+            assert record_and_command.callee_phone_number_masked == "138****5678"
+            assert "13812345678" not in (record_and_command.payload_json or "")
+            assert record_and_command.sensitive_payload_ciphertext is None
+            assert record_and_command.payload_key_version is None
+
+            create_effects = (
+                await session.execute(
+                    text(
+                        "select effect_type, status from ai_call_runtime_effect "
+                        "where call_id=:call_id and effect_type in "
+                        "('CREATE_ROOM', 'ATTACH_AGENT_PARTICIPANT', "
+                        "'CREATE_SIP_PARTICIPANT') order by effect_type"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).all()
+            assert {effect.effect_type for effect in create_effects} == {
+                "CREATE_ROOM",
+                "ATTACH_AGENT_PARTICIPANT",
+                "CREATE_SIP_PARTICIPANT",
+            }
+            assert {effect.status for effect in create_effects} == {"APPLIED"}
+
+        async with factory.begin() as session:
+            end = await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="direct_sip_client",
+                    end_reason="user_requested",
+                    dedupe_key="direct-sip:db-only:full-loop:end",
+                )
+            )
+
+        end_counts = await asyncio.gather(
+            runtime_a.run_once(),
+            runtime_b.run_once(),
+        )
+        assert sorted(end_counts) == [0, 1]
+
+        async with factory() as session:
+            end_query = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=end.command_id,
+            )
+            assert end_query is not None
+            assert end_query.status == "SUCCEEDED"
+            record = (
+                await session.execute(
+                    text(
+                        "select status, resource_cleanup_status, runtime_owner_id, "
+                        "runtime_capacity_class, entry_type, callee_phone_number "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (
+                "completed",
+                "clean",
+                None,
+                "none",
+                "direct_sip",
+                "13812345678",
+            )
+
+            destroy_effects = (
+                await session.execute(
+                    text(
+                        "select effect_type, status from ai_call_runtime_effect "
+                        "where call_id=:call_id and effect_type in "
+                        "('HANGUP_SIP', 'DISCONNECT_AGENT_PARTICIPANT', "
+                        "'DELETE_ROOM') order by effect_type"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).all()
+            assert {effect.effect_type for effect in destroy_effects} == {
+                "HANGUP_SIP",
+                "DISCONNECT_AGENT_PARTICIPANT",
+                "DELETE_ROOM",
+            }
+            assert {effect.status for effect in destroy_effects} == {"APPLIED"}
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 0
+            )
+            worker_counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count, active_cleanup_count "
+                        "from ai_call_runtime_worker order by worker_id"
+                    )
+                )
+            ).all()
+            assert worker_counts == [(0, 0), (0, 0)]
+
+        provider_calls = provider_a.calls + provider_b.calls
+        assert len(provider_calls) == 6
+        assert all(
+            set(call) == {"provider_namespace", "effect_type", "resource_key"}
+            for call in provider_calls
+        )
+        assert len(
+            {(call["effect_type"], call["resource_key"]) for call in provider_calls}
+        ) == 6
+        assert "13812345678" not in json.dumps(provider_calls, ensure_ascii=False)
     finally:
         await engine.dispose()
 
