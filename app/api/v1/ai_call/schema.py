@@ -151,6 +151,18 @@ class RuntimeStartCallOut(AiCallBaseSchema):
     status: str
 
 
+class RuntimeBootstrapOut(AiCallBaseSchema):
+    call_id: str
+    entry_type: str
+    phase: Literal["starting", "ready", "ending", "terminal"]
+    room_name: str
+    participant_identity: str | None = None
+    runtime_fencing_token: int
+    agent_media_ready_at: datetime | None = None
+    terminal_requested_at: datetime | None = None
+    token_available: bool = False
+
+
 class TokenOut(AiCallBaseSchema):
     call_id: str
     room_name: str

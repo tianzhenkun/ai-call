@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.v1.ai_call.schema import (
+    RuntimeBootstrapOut,
     RuntimeStartCallOut,
     RuntimeStartCallRequest,
 )
@@ -12,6 +13,11 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse
 from app.config.setting import settings
 from app.core.dependencies import get_current_user
+from app.services.ai_call.runtime_control.bootstrap_service import (
+    RuntimeBootstrapLegacyError,
+    RuntimeBootstrapNotFoundError,
+    RuntimeBootstrapService,
+)
 from app.services.ai_call.runtime_control.command_repository import (
     RuntimeCommandRepository,
 )
@@ -71,4 +77,33 @@ async def create_runtime_start_call_controller(
         ),
         msg="START_CALL 已受理",
         status_code=status.HTTP_202_ACCEPTED,
+    )
+
+
+@RuntimeEntryRouter.get(
+    "/runtime/calls/{call_id}/bootstrap",
+    summary="读取 AI Call owner runtime 启动闸门",
+    response_model=ResponseSchema[RuntimeBootstrapOut],
+)
+async def get_runtime_bootstrap_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    call_id: str,
+):
+    tenant_id = str(getattr(getattr(auth, "user", None), "tenant_id", "") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
+
+    try:
+        snapshot = await RuntimeBootstrapService(auth.db).get(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+    except RuntimeBootstrapNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeBootstrapLegacyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return SuccessResponse(
+        data=RuntimeBootstrapOut.model_validate(snapshot),
+        msg="runtime bootstrap 状态已读取",
     )

@@ -15,6 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
+from app.services.ai_call.runtime_control.bootstrap_service import (
+    RuntimeBootstrapNotFoundError,
+    RuntimeBootstrapService,
+)
 from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
     CommandIntent,
@@ -392,6 +396,82 @@ async def test_committed_start_response_loss_retries_to_original_command() -> No
             == 1
         )
     await engine.dispose()
+
+
+async def test_runtime_bootstrap_reads_owner_snapshot_with_tenant_boundary() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:bootstrap-read",
+                    payload={},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-bootstrap-read",
+                    startup_id=UUID("17171717-1717-4171-8171-171717171717"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.tenant_id == "tenant-a",
+                    AiCallRecordModel.call_id == start.call_id,
+                )
+            )
+            assert record is not None
+            record.agent_participant_identity = "agent-bootstrap"
+            record.agent_resource_generation = lease.fencing_token
+            record.agent_media_ready_at = await read_database_time(session)
+            now = await read_database_time(session)
+            for effect_id, effect_type, resource_key in (
+                (9201, "CREATE_ROOM", "room:bootstrap"),
+                (9202, "ATTACH_AGENT_PARTICIPANT", "agent:bootstrap"),
+            ):
+                session.add(
+                    AiCallRuntimeEffectModel(
+                        id=effect_id,
+                        tenant_id="tenant-a",
+                        call_id=start.call_id,
+                        command_id=start.command_id,
+                        effect_type=effect_type,
+                        idempotency_key=f"bootstrap:{effect_type}",
+                        fencing_token=lease.fencing_token,
+                        status="APPLIED",
+                        provider_namespace="stub:bootstrap",
+                        provider_idempotency_key=f"provider:{effect_type}",
+                        resource_key=resource_key,
+                        resource_generation=lease.fencing_token,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        async with factory() as session:
+            snapshot = await RuntimeBootstrapService(session).get(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert snapshot.phase == "ready"
+            assert snapshot.token_available is False
+            with pytest.raises(RuntimeBootstrapNotFoundError):
+                await RuntimeBootstrapService(session).get(
+                    tenant_id="tenant-b",
+                    call_id=start.call_id,
+                )
+    finally:
+        await engine.dispose()
 
 
 async def test_committed_initial_owner_response_loss_does_not_duplicate_capacity() -> None:
