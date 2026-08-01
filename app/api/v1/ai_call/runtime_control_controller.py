@@ -59,24 +59,32 @@ async def create_runtime_start_call_controller(
     if not tenant_id:
         raise HTTPException(status_code=401, detail="租户上下文缺失")
 
-    snapshot = await RuntimeEntryStartService(
-        settings=settings,
-        repository=RuntimeCommandRepository(auth.db),
-    ).submit(
-        StartEntryRequest(
-            tenant_id=tenant_id,
-            entry_type=request.entry_type,
-            idempotency_key=request.idempotency_key,
-            payload=request.payload,
-            business_type=request.business_type,
-            business_id=request.business_id,
-            scene_code=request.scene_code,
-            prompt_source_key=request.prompt_source_key,
-            allocation_deadline_at=request.allocation_deadline_at,
-            sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
-            payload_key_version=request.payload_key_version,
+    try:
+        snapshot = await RuntimeEntryStartService(
+            settings=settings,
+            repository=RuntimeCommandRepository(auth.db),
+        ).submit(
+            StartEntryRequest(
+                tenant_id=tenant_id,
+                entry_type=request.entry_type,
+                idempotency_key=request.idempotency_key,
+                payload=request.payload,
+                business_type=request.business_type,
+                business_id=request.business_id,
+                scene_code=request.scene_code,
+                prompt_source_key=request.prompt_source_key,
+                allocation_deadline_at=request.allocation_deadline_at,
+                sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
+                payload_key_version=request.payload_key_version,
+            )
         )
-    )
+    except IdempotencyConflictError as exc:
+        raise CustomException(
+            msg="幂等键已用于不同的请求",
+            code=RET.ERROR.code,
+            status_code=status.HTTP_409_CONFLICT,
+            data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+        ) from exc
     if snapshot is None:
         raise CustomException(
             msg="该入口仍由 legacy_local 承载",

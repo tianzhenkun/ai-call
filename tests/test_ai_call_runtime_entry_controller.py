@@ -12,7 +12,10 @@ from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapNotFoundError,
     RuntimeBootstrapSnapshot,
 )
-from app.services.ai_call.runtime_control.command_repository import CommandSnapshot
+from app.services.ai_call.runtime_control.command_repository import (
+    CommandSnapshot,
+    IdempotencyConflictError,
+)
 from app.services.ai_call.runtime_control.runtime_token_service import (
     RuntimeIssuedToken,
     RuntimeTokenGateError,
@@ -119,6 +122,40 @@ def test_runtime_start_request_rejects_preview_entry() -> None:
             entry_type="preview",
             idempotency_key="start:preview:1",
         )
+
+
+@pytest.mark.anyio
+async def test_runtime_start_controller_maps_idempotency_conflict_to_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _ConflictRepository:
+        def __init__(self, _db) -> None:
+            pass
+
+        async def create_start_call(self, _request):
+            raise IdempotencyConflictError("different request fingerprint")
+
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", _ConflictRepository)
+    monkeypatch.setattr(
+        controller,
+        "settings",
+        SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web"),
+    )
+
+    with pytest.raises(controller.CustomException) as exc_info:
+        await controller.create_runtime_start_call_controller(
+            auth=_auth(),
+            request=controller.RuntimeStartCallRequest(
+                entry_type="web",
+                idempotency_key="start:web:conflict",
+                payload={"voice": "v2"},
+            ),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.data == {"errorCode": "IDEMPOTENCY_CONFLICT"}
 
 
 class _FakeBootstrapService:

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
 from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
     EndCallIntent,
@@ -42,6 +46,79 @@ def test_start_fingerprint_excludes_server_generated_identifiers() -> None:
     )
 
     assert start_call_request_fingerprint(request) == expected
+
+
+def test_start_fingerprint_excludes_server_allocation_policy() -> None:
+    first = StartCallIntent(
+        tenant_id="tenant-a",
+        entry_type="web",
+        idempotency_key="start:business-1",
+        payload={"business_id": "business-1", "voice": "v1"},
+        allocation_timeout_seconds=30.0,
+    )
+    second = StartCallIntent(
+        tenant_id="tenant-a",
+        entry_type="web",
+        idempotency_key="start:business-1",
+        payload={"business_id": "business-1", "voice": "v1"},
+        allocation_timeout_seconds=60.0,
+    )
+
+    assert start_call_request_fingerprint(first) == start_call_request_fingerprint(second)
+
+
+class _NestedTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.rows: list[object] = []
+
+    async def scalar(self, _statement):
+        return None
+
+    def begin_nested(self) -> _NestedTransaction:
+        return _NestedTransaction()
+
+    def add_all(self, rows) -> None:
+        self.rows.extend(rows)
+
+    async def flush(self) -> None:
+        return None
+
+
+@pytest.mark.anyio
+async def test_start_deadline_uses_database_time_and_server_timeout() -> None:
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    ids = iter((101, 102, 103))
+    session = _FakeSession()
+    repository = RuntimeCommandRepository(
+        session,
+        id_generator=lambda: next(ids),
+        database_clock=lambda _session: _constant_time(now),
+    )
+
+    await repository.create_start_call(
+        StartCallIntent(
+            tenant_id="tenant-a",
+            entry_type="web",
+            idempotency_key="start:database-deadline",
+            payload={"voice": "v1"},
+            allocation_timeout_seconds=30.0,
+        )
+    )
+
+    command = session.rows[1]
+    assert command.allocation_deadline_at == now + timedelta(seconds=30)
+
+
+async def _constant_time(value: datetime) -> datetime:
+    return value
 
 
 def test_end_fingerprint_ignores_source_reason_and_provider_event() -> None:

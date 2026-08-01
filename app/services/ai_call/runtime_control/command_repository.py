@@ -78,6 +78,7 @@ class StartCallIntent:
     scene_code: str | None = None
     prompt_source_key: str | None = None
     allocation_deadline_at: datetime | None = None
+    allocation_timeout_seconds: float | None = None
     sensitive_payload_ciphertext: str | None = None
     payload_key_version: str | None = None
 
@@ -223,6 +224,14 @@ class RuntimeCommandRepository:
             return self._matching_snapshot(existing, fingerprint)
 
         now = await self._database_clock(self._session)
+        allocation_deadline_at = request.allocation_deadline_at
+        if (
+            allocation_deadline_at is None
+            and request.allocation_timeout_seconds is not None
+        ):
+            allocation_deadline_at = now + timedelta(
+                seconds=request.allocation_timeout_seconds
+            )
         call_id = f"call_{self._id_generator()}"
         record = AiCallRecordModel(
             id=self._id_generator(),
@@ -249,7 +258,7 @@ class RuntimeCommandRepository:
             idempotency_key=request.idempotency_key,
             request_fingerprint=fingerprint,
             dispatch_priority=100,
-            allocation_deadline_at=request.allocation_deadline_at,
+            allocation_deadline_at=allocation_deadline_at,
             payload_json=_canonical_json(request.payload),
             sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
             payload_key_version=request.payload_key_version,

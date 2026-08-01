@@ -43,6 +43,7 @@ async def test_enabled_entry_persists_only_an_owner_command_start_intent() -> No
             payload={"business_id": "biz-1", "voice": "v1"},
             business_id="biz-1",
             scene_code="collection",
+            allocation_timeout_seconds=30.0,
         )
     )
 
@@ -55,6 +56,7 @@ async def test_enabled_entry_persists_only_an_owner_command_start_intent() -> No
             payload={"business_id": "biz-1", "voice": "v1"},
             business_id="biz-1",
             scene_code="collection",
+            allocation_timeout_seconds=30.0,
         )
     ]
 
@@ -78,6 +80,25 @@ async def test_disabled_entry_returns_legacy_signal_without_persisting() -> None
 
     assert result is None
     assert repository.requests == []
+
+
+@pytest.mark.anyio
+async def test_enabled_entry_rejects_non_positive_allocation_timeout() -> None:
+    service = RuntimeEntryStartService(
+        settings=_settings("web"),
+        repository=_FakeRepository([]),
+    )
+
+    with pytest.raises(RuntimeEntryStartError, match="排队超时"):
+        await service.submit(
+            StartEntryRequest(
+                tenant_id="tenant-a",
+                entry_type="web",
+                idempotency_key="start:web:invalid-timeout",
+                payload={},
+                allocation_timeout_seconds=0,
+            )
+        )
 
 
 @pytest.mark.anyio

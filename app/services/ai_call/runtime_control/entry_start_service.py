@@ -32,6 +32,7 @@ class StartEntryRequest:
     scene_code: str | None = None
     prompt_source_key: str | None = None
     allocation_deadline_at: datetime | None = None
+    allocation_timeout_seconds: float | None = None
     sensitive_payload_ciphertext: str | None = None
     payload_key_version: str | None = None
 
@@ -64,6 +65,11 @@ class RuntimeEntryStartService:
             raise RuntimeEntryStartError("owner command entry 必须有租户")
         if not idempotency_key:
             raise RuntimeEntryStartError("START_CALL 必须有幂等键")
+        if (
+            request.allocation_timeout_seconds is not None
+            and request.allocation_timeout_seconds <= 0
+        ):
+            raise RuntimeEntryStartError("START_CALL 排队超时必须大于 0 秒")
 
         payload = dict(request.payload)
         if entry is OwnerCommandEntry.DIRECT_SIP:
@@ -94,6 +100,7 @@ class RuntimeEntryStartService:
                 scene_code=request.scene_code,
                 prompt_source_key=request.prompt_source_key,
                 allocation_deadline_at=request.allocation_deadline_at,
+                allocation_timeout_seconds=request.allocation_timeout_seconds,
                 sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
                 payload_key_version=request.payload_key_version,
             )

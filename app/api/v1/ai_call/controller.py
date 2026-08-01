@@ -2,7 +2,17 @@ from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, Request
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    status,
+)
 from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict
 from livekit import api
@@ -13,6 +23,15 @@ from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
+from app.services.ai_call.runtime_control.command_repository import (
+    IdempotencyConflictError,
+    RuntimeCommandRepository,
+)
+from app.services.ai_call.runtime_control.entry_start_service import (
+    RuntimeEntryStartService,
+    StartEntryRequest,
+)
+from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 
 from .outbound.controller import _identity
 from .schema import (
@@ -44,6 +63,7 @@ from .schema import (
     RecordDetailOut,
     RecordEventListOut,
     RecordingOut,
+    RuntimeStartCallOut,
     SemanticAnalysisOut,
     SessionStatusOut,
     TokenOut,
@@ -121,12 +141,75 @@ def _receive_livekit_webhook(body: str, auth_token: str):
 @AiCallRouter.post(
     "/sessions",
     summary="创建 Web 通话会话",
-    response_model=ResponseSchema[CreateSessionOut],
+    response_model=ResponseSchema[CreateSessionOut | RuntimeStartCallOut],
 )
 async def create_session_controller(
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     request: Annotated[CreateWebSessionRequest, Body()],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key"),
+    ] = None,
 ) -> JSONResponse:
+    if runtime_control_mode_for_entry(settings, "web") == "owner_command_v1":
+        tenant_id = str(
+            getattr(getattr(auth, "user", None), "tenant_id", "") or ""
+        ).strip()
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="租户上下文缺失")
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        if not normalized_idempotency_key:
+            raise CustomException(
+                msg="Web START_CALL 必须提供 Idempotency-Key",
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                data={"errorCode": "IDEMPOTENCY_KEY_REQUIRED"},
+            )
+        try:
+            snapshot = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(auth.db),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id=tenant_id,
+                    entry_type="web",
+                    idempotency_key=normalized_idempotency_key,
+                    payload={
+                        "voice": request.voice,
+                        "business_id": request.business_id,
+                        "scene_code": request.scene_code,
+                        "business_params": request.business_params,
+                    },
+                    business_id=request.business_id,
+                    scene_code=request.scene_code,
+                    allocation_timeout_seconds=(
+                        settings.AI_CALL_WEB_ALLOCATION_TIMEOUT_SECONDS
+                    ),
+                )
+            )
+        except IdempotencyConflictError as exc:
+            raise CustomException(
+                msg="幂等键已用于不同的请求",
+                status_code=status.HTTP_409_CONFLICT,
+                data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+            ) from exc
+        if snapshot is None:
+            raise CustomException(
+                msg="web 入口仍由 legacy_local 承载",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return SuccessResponse(
+            data=RuntimeStartCallOut(
+                command_id=str(snapshot.command_id),
+                call_id=snapshot.call_id,
+                command_seq=str(snapshot.command_seq),
+                command_type=snapshot.command_type,
+                status=snapshot.status,
+            ),
+            msg="START_CALL 已受理",
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
     result = await service.create_web_session(
         voice=request.voice,
         prompt=None,
