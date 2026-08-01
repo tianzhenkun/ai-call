@@ -122,6 +122,14 @@ def test_payload_contains_phone_checks_nested_business_params() -> None:
         {"business_params": {"contact": "13812345678"}},
         "13812345678",
     )
+    assert payload_contains_phone(
+        {"business_params": {"note": "请联系 13812345678"}},
+        "13812345678",
+    )
+    assert payload_contains_phone(
+        {"business_params": {"13812345678": "contact"}},
+        "13812345678",
+    )
     assert not payload_contains_phone(
         {"business_params": {"customerName": "张三"}},
         "13812345678",
@@ -178,9 +186,13 @@ def prepare_direct_sip_phone(value: str) -> DirectSipPhone:
 
 def payload_contains_phone(value: object, phone_number: str) -> bool:
     if isinstance(value, str):
-        return value.strip() == phone_number
+        return phone_number in value
     if isinstance(value, Mapping):
-        return any(payload_contains_phone(item, phone_number) for item in value.values())
+        return any(
+            payload_contains_phone(item, phone_number)
+            for pair in value.items()
+            for item in pair
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(payload_contains_phone(item, phone_number) for item in value)
     return False
