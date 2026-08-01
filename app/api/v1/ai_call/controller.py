@@ -23,11 +23,17 @@ from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
+from app.core.security import OAuth2Schema
 from app.services.ai_call.runtime_control.command_repository import (
     IdempotencyConflictError,
     RuntimeCommandRepository,
 )
+from app.services.ai_call.runtime_control.direct_sip_phone import (
+    DirectSipPhoneError,
+    prepare_direct_sip_phone,
+)
 from app.services.ai_call.runtime_control.entry_start_service import (
+    RuntimeEntryStartError,
     RuntimeEntryStartService,
     StartEntryRequest,
 )
@@ -63,6 +69,7 @@ from .schema import (
     RecordDetailOut,
     RecordEventListOut,
     RecordingOut,
+    RuntimeDirectSipStartCallOut,
     RuntimeStartCallOut,
     SemanticAnalysisOut,
     SessionStatusOut,
@@ -223,15 +230,109 @@ async def create_session_controller(
     )
 
 
+async def _get_sip_session_auth(
+    request: Request,
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    token: Annotated[str | None, Depends(OAuth2Schema)],
+) -> AuthSchema | None:
+    if runtime_control_mode_for_entry(settings, "direct_sip") != "owner_command_v1":
+        return None
+    record_service = getattr(service, "record_service", None)
+    repository = getattr(record_service, "repository", None)
+    db = getattr(repository, "db", None)
+    if db is None:
+        raise CustomException(
+            msg="Direct SIP 认证数据库会话缺失",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    return await get_current_user(request=request, db=db, redis=None, token=token)
+
+
 @AiCallRouter.post(
     "/sip-sessions",
     summary="创建 SIP 外呼会话",
-    response_model=ResponseSchema[CreateSipSessionOut],
+    response_model=ResponseSchema[
+        CreateSipSessionOut | RuntimeDirectSipStartCallOut
+    ],
 )
 async def create_sip_session_controller(
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     request: Annotated[CreateSipSessionRequest, Body()],
+    auth: Annotated[AuthSchema | None, Depends(_get_sip_session_auth)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key"),
+    ] = None,
 ) -> JSONResponse:
+    if runtime_control_mode_for_entry(settings, "direct_sip") == "owner_command_v1":
+        tenant_id = str(
+            getattr(getattr(auth, "user", None), "tenant_id", "") or ""
+        ).strip()
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="租户上下文缺失")
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        if not normalized_idempotency_key:
+            raise CustomException(
+                msg="Direct SIP START_CALL 必须提供 Idempotency-Key",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                data={"errorCode": "IDEMPOTENCY_KEY_REQUIRED"},
+            )
+        try:
+            phone = prepare_direct_sip_phone(request.callee_phone_number)
+            snapshot = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(auth.db),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id=tenant_id,
+                    entry_type="direct_sip",
+                    idempotency_key=normalized_idempotency_key,
+                    payload={
+                        "voice": request.voice,
+                        "business_id": request.business_id,
+                        "scene_code": request.scene_code,
+                        "business_params": request.business_params,
+                        "ringing_timeout_seconds": request.ringing_timeout_seconds,
+                    },
+                    business_id=request.business_id,
+                    scene_code=request.scene_code,
+                    allocation_timeout_seconds=(
+                        settings.AI_CALL_DIRECT_SIP_ALLOCATION_TIMEOUT_SECONDS
+                    ),
+                    callee_phone_number=phone.plaintext,
+                )
+            )
+        except IdempotencyConflictError as exc:
+            raise CustomException(
+                msg="幂等键已用于不同的请求",
+                status_code=status.HTTP_409_CONFLICT,
+                data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+            ) from exc
+        except (DirectSipPhoneError, RuntimeEntryStartError) as exc:
+            raise CustomException(
+                msg=str(exc),
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                data={"errorCode": "INVALID_START_REQUEST"},
+            ) from exc
+        if snapshot is None:
+            raise CustomException(
+                msg="Direct SIP 入口未启用 Owner Command 模式",
+                status_code=status.HTTP_409_CONFLICT,
+                data={"errorCode": "LEGACY_ENTRY_ACTIVE"},
+            )
+        return SuccessResponse(
+            data=RuntimeDirectSipStartCallOut(
+                command_id=str(snapshot.command_id),
+                call_id=snapshot.call_id,
+                command_seq=str(snapshot.command_seq),
+                command_type=snapshot.command_type,
+                status=snapshot.status,
+                callee_phone_number_masked=phone.masked,
+            ),
+            msg="START_CALL 已受理",
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
     try:
         result = await service.create_sip_session(
             callee_phone_number=request.callee_phone_number,

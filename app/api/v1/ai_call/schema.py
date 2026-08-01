@@ -151,6 +151,10 @@ class RuntimeStartCallOut(AiCallBaseSchema):
     status: str
 
 
+class RuntimeDirectSipStartCallOut(RuntimeStartCallOut):
+    callee_phone_number_masked: str
+
+
 class RuntimeCommandOut(AiCallBaseSchema):
     command_id: str
     call_id: str

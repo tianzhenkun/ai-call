@@ -189,6 +189,7 @@ class Settings(BaseSettings):
     AI_CALL_RUNTIME_COMMAND_SCAN_INTERVAL_SECONDS: float = 1.0
     AI_CALL_RUNTIME_FAIL_CLOSED_MARGIN_SECONDS: float = 3.0
     AI_CALL_WEB_ALLOCATION_TIMEOUT_SECONDS: float = 30.0
+    AI_CALL_DIRECT_SIP_ALLOCATION_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_OPENING_MESSAGE: str = "您好，我是灵宸智能助手，请问现在方便简单沟通一下吗？"
     AI_CALL_EVENT_STORE: Literal["memory", "jsonl"] = "memory"
     AI_CALL_RECORDING_ENABLED: bool = True
