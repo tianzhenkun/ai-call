@@ -78,9 +78,11 @@ async def create_runtime_start_call_controller(
         )
     )
     if snapshot is None:
-        raise HTTPException(
+        raise CustomException(
+            msg="该入口仍由 legacy_local 承载",
+            code=RET.ERROR.code,
             status_code=status.HTTP_409_CONFLICT,
-            detail="该入口仍由 legacy_local 承载",
+            data={"errorCode": "LEGACY_ENTRY_ACTIVE"},
         )
 
     return SuccessResponse(

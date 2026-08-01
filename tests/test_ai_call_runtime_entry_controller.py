@@ -95,7 +95,7 @@ async def test_runtime_start_controller_rejects_disabled_entry_without_persistin
         SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="preview"),
     )
 
-    with pytest.raises(controller.HTTPException) as exc_info:
+    with pytest.raises(controller.CustomException) as exc_info:
         await controller.create_runtime_start_call_controller(
             auth=_auth(),
             request=controller.RuntimeStartCallRequest(
@@ -106,6 +106,7 @@ async def test_runtime_start_controller_rejects_disabled_entry_without_persistin
         )
 
     assert exc_info.value.status_code == 409
+    assert exc_info.value.data == {"errorCode": "LEGACY_ENTRY_ACTIVE"}
     assert repository.calls == []
 
 
