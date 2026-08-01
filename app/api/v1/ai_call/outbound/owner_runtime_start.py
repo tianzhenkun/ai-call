@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from datetime import datetime
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.ai_call.runtime_control.command_repository import (
+    RuntimeCommandRepository,
+    StartCallIntent,
+)
+from app.services.ai_call.runtime_control.timing import read_database_time
+from app.utils.id_util import generate_snowflake_id
+
+from .rule_task_model import AiCallOutboundAttemptModel
+from .task_executor import OutboundDialRequest
+
+
+class OwnerRuntimeOutboundStart:
+    """在现有外呼认领事务中创建 DB-only Runtime 启动事实。"""
+
+    def __init__(
+        self,
+        *,
+        id_generator: Callable[[], int] = generate_snowflake_id,
+        allocation_timeout_seconds: float = 30.0,
+        database_clock: Callable[
+            [AsyncSession], Awaitable[datetime]
+        ] = read_database_time,
+    ) -> None:
+        self._id_generator = id_generator
+        self._allocation_timeout_seconds = allocation_timeout_seconds
+        self._database_clock = database_clock
+
+    async def create(
+        self,
+        session: AsyncSession,
+        request: OutboundDialRequest,
+        *,
+        now: datetime,
+    ) -> str:
+        if request.line is None:
+            raise ValueError("Owner Runtime 外呼缺少 SIP 线路快照")
+
+        attempt_id = self._id_generator()
+        idempotency_key = (
+            f"outbound:{request.tenant_id}:{request.task_id}:"
+            f"{request.target_id}:{request.attempt_no}"
+        )
+        payload = {
+            "attempt_id": str(attempt_id),
+            "attempt_no": request.attempt_no,
+            "line_code": request.line.line_code,
+            "line_id": str(request.line.line_id),
+            "prompt_profile_id": request.prompt_profile_id,
+            "scene_code": request.scene_code,
+            "target_id": str(request.target_id),
+            "task_id": str(request.task_id),
+            "voice": request.voice,
+        }
+        command = await RuntimeCommandRepository(
+            session,
+            database_clock=self._database_clock,
+        ).create_start_call(
+            StartCallIntent(
+                tenant_id=request.tenant_id,
+                entry_type="outbound",
+                idempotency_key=idempotency_key,
+                payload=payload,
+                business_type="outbound_attempt",
+                business_id=str(attempt_id),
+                scene_code=request.scene_code,
+                prompt_source_key=request.prompt_profile_id,
+                allocation_timeout_seconds=self._allocation_timeout_seconds,
+            )
+        )
+        session.add(
+            AiCallOutboundAttemptModel(
+                id=attempt_id,
+                tenant_id=request.tenant_id,
+                task_id=request.task_id,
+                target_id=request.target_id,
+                attempt_no=request.attempt_no,
+                call_id=command.call_id,
+                dialer_type="owner_runtime",
+                test_scenario=None,
+                command_idempotency_key=idempotency_key,
+                active_slot=None,
+                status="QUEUED",
+                call_result=None,
+                error_message=None,
+                line_id=int(request.line.line_id),
+                line_code=request.line.line_code,
+                provider_status_code=None,
+                provider_reason=None,
+                hangup_cause=None,
+                started_at=now,
+                ended_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.flush()
+        return command.call_id

@@ -104,6 +104,16 @@ class OutboundDialer(Protocol):
     ) -> DialResult: ...
 
 
+class OwnerRuntimeStart(Protocol):
+    async def create(
+        self,
+        session: AsyncSession,
+        request: OutboundDialRequest,
+        *,
+        now: datetime,
+    ) -> str: ...
+
+
 class MockOutboundDialer:
     """只产生数据库演练结果，不发起网络或 SIP 请求。"""
 
@@ -145,6 +155,7 @@ class OutboundTaskExecutor:
         managed_attempt_timeout_seconds: int = 900,
         settle_retry_delays_seconds: tuple[float, ...] = (0.0, 0.25, 1.0),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        owner_runtime_start: OwnerRuntimeStart | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
@@ -161,6 +172,7 @@ class OutboundTaskExecutor:
             max(0.0, delay) for delay in settle_retry_delays_seconds
         )
         self.sleep = sleep
+        self.owner_runtime_start = owner_runtime_start
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -175,7 +187,8 @@ class OutboundTaskExecutor:
                 if claimed is None:
                     await self._refresh_task_counters(task_key, self.now_provider())
                     break
-                await self.execute_claimed(claimed)
+                if self.owner_runtime_start is None:
+                    await self.execute_claimed(claimed)
                 processed += 1
         return processed
 
@@ -747,14 +760,22 @@ class OutboundTaskExecutor:
             ):
                 return None
             line = self._task_line_snapshot(task)
-            if self.dialer.dialer_type == "sip" and line is None:
+            requires_sip_line = (
+                self.dialer.dialer_type == "sip"
+                or self.owner_runtime_start is not None
+            )
+            if requires_sip_line and line is None:
                 task.status = "FAILED"
                 task.error_message = "任务缺少有效的 SIP 线路快照"
                 task.ended_at = now
                 task.updated_at = now
                 await db.commit()
                 return None
-            if self.dialer.dialer_type == "sip" and line is not None:
+            if (
+                self.owner_runtime_start is None
+                and self.dialer.dialer_type == "sip"
+                and line is not None
+            ):
                 current_line = await db.scalar(
                     select(AiCallSipLineModel)
                     .where(
@@ -860,6 +881,14 @@ class OutboundTaskExecutor:
                     prompt_profile_id=task.prompt_profile_id,
                     line=line,
                 )
+                if self.owner_runtime_start is not None:
+                    call_id = await self.owner_runtime_start.create(
+                        db,
+                        request,
+                        now=now,
+                    )
+                    await db.commit()
+                    return ClaimedAttempt(request=request, call_id=call_id)
                 call_id = uuid4().hex
                 db.add(
                     AiCallOutboundAttemptModel(
