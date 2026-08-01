@@ -394,6 +394,73 @@ async def test_committed_start_response_loss_retries_to_original_command() -> No
     await engine.dispose()
 
 
+async def test_dispatcher_expires_unallocated_start_at_persisted_deadline() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:allocation-deadline",
+                    payload={"business_id": "allocation-deadline"},
+                    allocation_deadline_at=await read_database_time(session),
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_command set "
+                    "allocation_deadline_at=clock_timestamp() - interval '1 second' "
+                    "where id=:command_id"
+                ).bindparams(command_id=start.command_id)
+            )
+
+        assert await DispatcherControlService(factory).run_once() == 1
+
+        async with factory() as session:
+            command = (
+                await session.execute(
+                    text(
+                        "select status, error_message, target_owner_id, "
+                        "processing_token from ai_call_runtime_command "
+                        "where id=:command_id"
+                    ).bindparams(command_id=start.command_id)
+                )
+            ).one()
+            record = (
+                await session.execute(
+                    text(
+                        "select status, failure_stage, failure_message, "
+                        "runtime_owner_id, runtime_capacity_class, "
+                        "resource_cleanup_status from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(command) == ("DEAD", "ALLOCATION_TIMEOUT", None, None)
+            assert tuple(record) == (
+                "failed",
+                "allocation",
+                "ALLOCATION_TIMEOUT",
+                None,
+                "none",
+                "clean",
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_command "
+                        "where call_id=:call_id and command_type='END_CALL'"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
+
+
 async def test_concurrent_idempotency_race_keeps_only_the_committed_winner() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)

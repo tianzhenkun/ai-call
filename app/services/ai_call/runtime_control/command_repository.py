@@ -17,6 +17,7 @@ from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
+    AiCallSipLineReservationModel,
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 from app.services.ai_call.runtime_control.timing import read_database_time
@@ -488,6 +489,68 @@ class RuntimeCommandRepository:
         await self._session.flush()
         return True
 
+    async def expire_unallocated_start(self, tenant_id: str, call_id: str) -> bool:
+        """Fail a START_CALL whose persisted allocation deadline passed untouched."""
+        now = await self._database_clock(self._session)
+        record = await self._lock_record(tenant_id, call_id)
+        if (
+            record.runtime_control_mode != "owner_command_v1"
+            or record.runtime_owner_id is not None
+            or record.runtime_fencing_token != 0
+            or record.runtime_lease_expires_at is not None
+            or record.runtime_capacity_class != "none"
+            or record.terminal_requested_at is not None
+        ):
+            return False
+
+        command = await self._session.scalar(
+            select(AiCallRuntimeCommandModel)
+            .where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == START_CALL,
+            )
+            .with_for_update()
+        )
+        if (
+            command is None
+            or command.status not in {CommandStatus.PENDING, CommandStatus.RETRY_WAIT}
+            or command.allocation_deadline_at is None
+            or command.allocation_deadline_at > now
+            or await self._call_has_effect(tenant_id, call_id)
+            or await self._has_unreleased_reservation(tenant_id, call_id)
+        ):
+            return False
+
+        command.status = CommandStatus.DEAD
+        command.target_owner_id = None
+        command.expected_fencing_token = None
+        command.dispatch_token = None
+        command.dispatch_expires_at = None
+        command.processing_owner_id = None
+        command.processing_fencing_token = None
+        command.processing_token = None
+        command.processing_expires_at = None
+        command.next_retry_at = None
+        command.finished_at = now
+        command.error_message = "ALLOCATION_TIMEOUT"
+        command.result_json = _canonical_json({"error": "ALLOCATION_TIMEOUT"})
+        command.updated_at = now
+        record.last_applied_command_seq = max(
+            record.last_applied_command_seq,
+            command.command_seq,
+        )
+        record.status = "failed"
+        record.failure_stage = "allocation"
+        record.failure_message = "ALLOCATION_TIMEOUT"
+        record.ended_at = now
+        record.resource_cleanup_status = "clean"
+        record.resource_cleanup_error = None
+        record.resource_cleanup_next_retry_at = None
+        record.resource_cleanup_completed_at = now
+        await self._session.flush()
+        return True
+
     async def _claim_for_owner(
         self,
         lease: OwnerLease,
@@ -635,6 +698,31 @@ class RuntimeCommandRepository:
                         AiCallRuntimeEffectModel.tenant_id == command.tenant_id,
                         AiCallRuntimeEffectModel.call_id == command.call_id,
                         AiCallRuntimeEffectModel.command_id == command.id,
+                    )
+                )
+            )
+        )
+
+    async def _call_has_effect(self, tenant_id: str, call_id: str) -> bool:
+        return bool(
+            await self._session.scalar(
+                select(
+                    exists().where(
+                        AiCallRuntimeEffectModel.tenant_id == tenant_id,
+                        AiCallRuntimeEffectModel.call_id == call_id,
+                    )
+                )
+            )
+        )
+
+    async def _has_unreleased_reservation(self, tenant_id: str, call_id: str) -> bool:
+        return bool(
+            await self._session.scalar(
+                select(
+                    exists().where(
+                        AiCallSipLineReservationModel.tenant_id == tenant_id,
+                        AiCallSipLineReservationModel.call_id == call_id,
+                        AiCallSipLineReservationModel.status != "RELEASED",
                     )
                 )
             )

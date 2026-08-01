@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
+from app.services.ai_call.runtime_control.command_repository import (
+    RuntimeCommandRepository,
+)
 from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
 from app.services.ai_call.runtime_control.owner_repository import (
     DispatcherOwnerRepository,
@@ -30,10 +33,13 @@ class DispatcherControlService:
 
     async def run_once(self) -> int:
         async with self._session_factory() as session:
-            call_ids = list(
+            candidates = list(
                 (
-                    await session.scalars(
-                        select(AiCallRecordModel.call_id)
+                    await session.execute(
+                        select(
+                            AiCallRecordModel.tenant_id,
+                            AiCallRecordModel.call_id,
+                        )
                         .where(
                             AiCallRecordModel.runtime_control_mode
                             == "owner_command_v1",
@@ -47,8 +53,12 @@ class DispatcherControlService:
                                 AiCallRuntimeCommandModel.call_id
                                 == AiCallRecordModel.call_id,
                                 AiCallRuntimeCommandModel.command_type == "START_CALL",
-                                AiCallRuntimeCommandModel.status
-                                == CommandStatus.PENDING,
+                                AiCallRuntimeCommandModel.status.in_(
+                                    {
+                                        CommandStatus.PENDING,
+                                        CommandStatus.RETRY_WAIT,
+                                    }
+                                ),
                             ),
                         )
                         .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
@@ -57,18 +67,17 @@ class DispatcherControlService:
                 ).all()
             )
         assigned = 0
-        for call_id in call_ids:
+        for tenant_id, call_id in candidates:
             async with self._session_factory.begin() as session:
-                record = await session.scalar(
-                    select(AiCallRecordModel.tenant_id).where(
-                        AiCallRecordModel.call_id == call_id
-                    )
-                )
-                if record is None:
+                command_repository = RuntimeCommandRepository(session)
+                if await command_repository.expire_unallocated_start(
+                    str(tenant_id), call_id
+                ):
+                    assigned += 1
                     continue
                 lease = await DispatcherOwnerRepository(
                     session
-                ).assign_initial_owner(str(record), call_id)
+                ).assign_initial_owner(str(tenant_id), call_id)
                 if lease is not None:
                     assigned += 1
         return assigned
