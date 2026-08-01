@@ -69,7 +69,9 @@ async def test_runtime_start_controller_returns_accepted_persistent_identifiers(
     )
 
     body = json.loads(response.body)
+    assert response.status_code == 202
     assert body["data"] == {
+        "acceptanceStatus": "ACCEPTED",
         "commandId": "101",
         "callId": "call_101",
         "commandSeq": "1",

@@ -144,6 +144,7 @@ class RuntimeStartCallRequest(AiCallBaseSchema):
 
 
 class RuntimeStartCallOut(AiCallBaseSchema):
+    acceptance_status: Literal["ACCEPTED"] = "ACCEPTED"
     command_id: str
     call_id: str
     command_seq: str
