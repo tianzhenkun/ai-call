@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import exists, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
@@ -17,7 +20,11 @@ from app.services.ai_call.runtime_control.models import (
     AiCallSipLineReservationModel,
 )
 from app.services.ai_call.runtime_control.timing import read_database_time
-from app.services.ai_call.runtime_control.types import EffectStatus
+from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
+from app.utils.id_util import generate_snowflake_id
+
+if TYPE_CHECKING:
+    from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,10 +135,16 @@ class DispatcherOwnerRepository:
         *,
         lease_ttl: timedelta = timedelta(seconds=15),
         database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
+        id_generator: Callable[[], int] = generate_snowflake_id,
+        reservation_token_generator: Callable[[], str] = (
+            lambda: secrets.token_urlsafe(24)
+        ),
     ) -> None:
         self._session = session
         self._lease_ttl = lease_ttl
         self._database_clock = database_clock
+        self._id_generator = id_generator
+        self._reservation_token_generator = reservation_token_generator
 
     async def assign_initial_owner(
         self,
@@ -165,12 +178,42 @@ class DispatcherOwnerRepository:
         if await self._has_provider_resource(tenant_id, call_id):
             return None
 
+        start_command = await self._read_start_command(tenant_id, call_id)
+        if start_command is None:
+            return None
+        line_id = _start_command_line_id(start_command.payload_json)
+        if line_id is _INVALID_LINE_ID:
+            return None
+        line = None
+        if line_id is not None:
+            line = await self._lock_sip_line(tenant_id, line_id)
+            if (
+                line is None
+                or line.deleted
+                or not line.enabled
+                or line.max_concurrency <= 0
+            ):
+                return None
+            active_reservation_count = await self._session.scalar(
+                select(func.count())
+                .select_from(AiCallSipLineReservationModel)
+                .where(
+                    AiCallSipLineReservationModel.tenant_id == tenant_id,
+                    AiCallSipLineReservationModel.line_id == line_id,
+                    AiCallSipLineReservationModel.status.in_(
+                        {"RESERVED", "ACTIVE", "RECONCILE_REQUIRED"}
+                    ),
+                )
+            )
+            if active_reservation_count >= line.max_concurrency:
+                return None
+
         for worker_id in candidate_ids:
             worker = await self._lock_worker(worker_id)
             if worker is None or not _worker_has_active_capacity(worker, now):
                 continue
             start_command = await self._lock_command(tenant_id, call_id, "START_CALL")
-            if start_command is None:
+            if start_command is None or start_command.status != CommandStatus.PENDING:
                 return None
 
             expires_at = now + self._lease_ttl
@@ -184,6 +227,25 @@ class DispatcherOwnerRepository:
             start_command.target_owner_id = worker.worker_id
             start_command.expected_fencing_token = record.runtime_fencing_token
             start_command.updated_at = now
+            if line is not None:
+                self._session.add(
+                    AiCallSipLineReservationModel(
+                        id=self._id_generator(),
+                        tenant_id=tenant_id,
+                        line_id=line.id,
+                        call_id=call_id,
+                        attempt_id=None,
+                        status="RESERVED",
+                        reservation_token=self._reservation_token_generator(),
+                        fencing_token=record.runtime_fencing_token,
+                        acquired_at=now,
+                        reconcile_after=None,
+                        released_at=None,
+                        error_message=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
             await self._session.flush()
             return _owner_lease(record)
         return None
@@ -252,6 +314,35 @@ class DispatcherOwnerRepository:
                 AiCallRuntimeCommandModel.tenant_id == tenant_id,
                 AiCallRuntimeCommandModel.call_id == call_id,
                 AiCallRuntimeCommandModel.command_type == command_type,
+            )
+            .with_for_update()
+        )
+
+    async def _read_start_command(
+        self,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallRuntimeCommandModel | None:
+        return await self._session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+
+    async def _lock_sip_line(
+        self,
+        tenant_id: str,
+        line_id: int,
+    ) -> AiCallSipLineModel | None:
+        from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
+
+        return await self._session.scalar(
+            select(AiCallSipLineModel)
+            .where(
+                AiCallSipLineModel.tenant_id == tenant_id,
+                AiCallSipLineModel.id == line_id,
             )
             .with_for_update()
         )
@@ -591,6 +682,28 @@ class OwnerFailClosedWatchdog:
 
     def trip(self) -> None:
         self._tripped = True
+
+
+_INVALID_LINE_ID = object()
+
+
+def _start_command_line_id(payload_json: str | None) -> int | None | object:
+    if payload_json is None:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return _INVALID_LINE_ID
+    if not isinstance(payload, dict) or "line_id" not in payload:
+        return None
+    value = payload["line_id"]
+    if isinstance(value, bool):
+        return _INVALID_LINE_ID
+    try:
+        line_id = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _INVALID_LINE_ID
+    return line_id if line_id > 0 else _INVALID_LINE_ID
 
 
 def _worker_has_active_capacity(

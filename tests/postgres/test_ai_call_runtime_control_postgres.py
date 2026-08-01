@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
     CommandIntent,
@@ -243,6 +244,7 @@ async def test_migration_is_idempotent_and_uses_portable_contract_types() -> Non
 
 async def _reset_repository_schema(engine) -> None:
     tables = (
+        AiCallSipLineModel.__table__,
         AiCallRuntimeEffectDependencyModel.__table__,
         AiCallRuntimeEffectModel.__table__,
         AiCallEndEvidenceModel.__table__,
@@ -256,6 +258,32 @@ async def _reset_repository_schema(engine) -> None:
             await connection.run_sync(table.drop, checkfirst=True)
         for table in reversed(tables):
             await connection.run_sync(table.create)
+
+
+async def _insert_sip_line(session, *, line_id: int, max_concurrency: int) -> None:
+    now = await session.scalar(text("select clock_timestamp()"))
+    await session.execute(
+        text(
+            """
+            insert into ai_call_sip_line (
+                id, tenant_id, line_code, line_name, enabled, adapter_type,
+                route_mode, auth_mode, caller_number, destination_country,
+                max_concurrency, originate_timeout_seconds, health_status,
+                deleted, created_by, updated_by, created_at, updated_at
+            ) values (
+                :line_id, 'tenant-a', :line_code, :line_name, true, 'stub',
+                'managed_trunk_id', 'managed_trunk', 'masked', 'CN',
+                :max_concurrency, 45, 'READY', false, 1, 1, :now, :now
+            )
+            """
+        ).bindparams(
+            line_id=line_id,
+            line_code=f"line-{line_id}",
+            line_name=f"Line {line_id}",
+            max_concurrency=max_concurrency,
+            now=now,
+        )
+    )
 
 
 async def test_command_idempotency_is_tenant_scoped_and_conflicts_are_atomic() -> None:
@@ -664,6 +692,145 @@ async def test_owner_dispatcher_assigns_once_and_runtime_only_renews_exact_lease
                 await recovery.assign_cleanup_owner("tenant-a", second_call.call_id)
                 is None
             )
+    finally:
+        await engine.dispose()
+
+
+async def test_dispatcher_atomically_reserves_runtime_and_sip_line_capacity() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            await _insert_sip_line(session, line_id=701, max_concurrency=1)
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:dual-resource",
+                    payload={"line_id": 701, "phone_hash": "hash-dual-resource"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-dual-resource",
+                    startup_id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+
+            assert lease is not None
+            assert lease.owner_id == worker.worker_id
+            reservation = (
+                await session.execute(
+                    text(
+                        "select status, line_id, fencing_token, reservation_token "
+                        "from ai_call_sip_line_reservation where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert reservation.status == "RESERVED"
+            assert reservation.line_id == 701
+            assert reservation.fencing_token == lease.fencing_token
+            assert reservation.reservation_token
+
+            counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count from ai_call_runtime_worker "
+                        "where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker.worker_id)
+                )
+            ).one()
+            assert counts.active_call_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_concurrent_dispatchers_cannot_split_the_last_sip_line_slot() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            await _insert_sip_line(session, line_id=702, max_concurrency=1)
+            commands = RuntimeCommandRepository(session)
+            first = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:dual-race-1",
+                    payload={"line_id": 702, "phone_hash": "hash-dual-race-1"},
+                )
+            )
+            second = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:dual-race-2",
+                    payload={"line_id": 702, "phone_hash": "hash-dual-race-2"},
+                )
+            )
+            first_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-dual-race-a",
+                    startup_id=UUID("f1111111-1111-4111-8111-111111111111"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            second_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-dual-race-b",
+                    startup_id=UUID("f2222222-2222-4222-8222-222222222222"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        async def assign_once(call_id: str):
+            async with factory.begin() as session:
+                return await DispatcherOwnerRepository(session).assign_initial_owner(
+                    "tenant-a", call_id
+                )
+
+        leases = await asyncio.gather(
+            assign_once(first.call_id),
+            assign_once(second.call_id),
+        )
+        assert sum(lease is not None for lease in leases) == 1
+
+        async with factory() as session:
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_sip_line_reservation "
+                        "where line_id=702 and status <> 'RELEASED'"
+                    )
+                )
+                == 1
+            )
+            active_counts = {
+                row.worker_id: row.active_call_count
+                for row in (
+                    await session.execute(
+                        text(
+                            "select worker_id, active_call_count "
+                            "from ai_call_runtime_worker where worker_id in "
+                            "(:first_worker, :second_worker)"
+                        ).bindparams(
+                            first_worker=first_worker.worker_id,
+                            second_worker=second_worker.worker_id,
+                        )
+                    )
+                ).all()
+            }
+            assert sum(active_counts.values()) == 1
     finally:
         await engine.dispose()
 
