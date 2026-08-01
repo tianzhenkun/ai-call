@@ -4,7 +4,18 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -16,17 +27,50 @@ class AiCallRecordModel(MappedBase):
     __tablename__ = "ai_call_record"
     __table_args__ = (
         UniqueConstraint("call_id", name="uk_ai_call_record_call_id"),
+        UniqueConstraint("room_name", name="uk_ai_call_record_room_name"),
         Index("idx_ai_call_record_status_started", "status", "started_at"),
         Index("idx_ai_call_record_entry_started", "entry_type", "started_at"),
         Index("idx_ai_call_record_business", "business_type", "business_id"),
         Index("idx_ai_call_record_follow_up", "follow_up_id"),
         Index("idx_ai_call_record_room_name", "room_name"),
         Index(
+            "idx_ai_call_record_runtime_owner_lease",
+            "runtime_owner_id",
+            "runtime_lease_expires_at",
+        ),
+        Index(
             "idx_ai_call_record_sip_callee_active",
             "entry_type",
             "callee_phone_number_hash",
             "status",
             "started_at",
+        ),
+        CheckConstraint(
+            "runtime_control_mode in ('legacy_local', 'owner_command_v1')",
+            name="ck_ai_call_record_runtime_control_mode",
+        ),
+        CheckConstraint(
+            "runtime_control_mode = 'legacy_local' or tenant_id is not null",
+            name="ck_ai_call_record_owner_mode_tenant",
+        ),
+        CheckConstraint(
+            "runtime_capacity_class not in ('active', 'cleanup') or "
+            "(runtime_owner_id is not null and runtime_lease_expires_at is not null)",
+            name="ck_ai_call_record_owned_capacity",
+        ),
+        CheckConstraint(
+            "runtime_capacity_class <> 'attention' or "
+            "(runtime_owner_id is null and runtime_lease_expires_at is null "
+            "and resource_cleanup_status = 'attention_required' "
+            "and resource_cleanup_next_retry_at is not null)",
+            name="ck_ai_call_record_attention_capacity",
+        ),
+        CheckConstraint(
+            "resource_cleanup_status <> 'clean' or "
+            "(runtime_capacity_class = 'none' and runtime_owner_id is null "
+            "and runtime_lease_expires_at is null "
+            "and resource_cleanup_completed_at is not null)",
+            name="ck_ai_call_record_cleanup_clean",
         ),
         {"comment": "AI Call 通话记录表"},
     )
@@ -38,6 +82,7 @@ class AiCallRecordModel(MappedBase):
         autoincrement=False,
         comment="雪花主键",
     )
+    tenant_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
     call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
     follow_up_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -126,6 +171,71 @@ class AiCallRecordModel(MappedBase):
         Integer,
         nullable=True,
         comment="通话持续毫秒",
+    )
+    runtime_control_mode: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="legacy_local",
+        server_default=text("'legacy_local'"),
+    )
+    runtime_owner_id: Mapped[str | None] = mapped_column(String(128))
+    runtime_fencing_token: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    runtime_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    runtime_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    runtime_capacity_class: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="none",
+        server_default=text("'none'"),
+    )
+    startup_reconcile_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    startup_reconcile_policy_version: Mapped[str | None] = mapped_column(String(64))
+    startup_reconcile_budget_json: Mapped[str | None] = mapped_column(Text)
+    agent_participant_identity: Mapped[str | None] = mapped_column(String(255))
+    agent_participant_sid: Mapped[str | None] = mapped_column(String(255))
+    agent_audio_track_sid: Mapped[str | None] = mapped_column(String(255))
+    agent_resource_generation: Mapped[int | None] = mapped_column(BigInteger)
+    agent_media_ready_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    next_command_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    last_applied_command_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    terminal_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    resource_cleanup_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="not_started",
+        server_default=text("'not_started'"),
+    )
+    resource_cleanup_error: Mapped[str | None] = mapped_column(String(1000))
+    resource_cleanup_next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    resource_cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
 
 
