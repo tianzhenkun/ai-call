@@ -4552,6 +4552,160 @@ async def test_web_db_only_latency_measurement() -> None:
         await engine.dispose()
 
 
+async def test_postgres_wakeup_latency_measurement() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    listener_runtime = PostgresWakeupListener(engine)
+    listener_dispatcher = PostgresWakeupListener(engine)
+    worker_id = build_worker_id(
+        "postgres-wakeup-latency",
+        UUID("80808080-8080-4080-8080-808080808080"),
+    )
+    provider = DeterministicWebProviderStub()
+    runtime = RuntimeControlService(
+        worker_id=worker_id,
+        registry=RuntimeRegistry(),
+        session_factory=factory,
+        provider=provider,
+        capacity=64,
+        cleanup_capacity=64,
+        batch_size=64,
+        scan_interval_seconds=30,
+        wakeup_listener=listener_runtime,
+    )
+    dispatcher = DispatcherControlService(
+        factory,
+        batch_size=64,
+        scan_interval_seconds=30,
+        wakeup_listener=listener_dispatcher,
+    )
+    runtime_started = False
+    dispatcher_started = False
+    try:
+        await runtime.start()
+        runtime_started = True
+        await dispatcher.start()
+        dispatcher_started = True
+        starts = []
+        for index in range(20):
+            async with factory.begin() as session:
+                start = await RuntimeEntryStartService(
+                    settings=settings,
+                    repository=RuntimeCommandRepository(session),
+                ).submit(
+                    StartEntryRequest(
+                        tenant_id="tenant-a",
+                        entry_type="web",
+                        idempotency_key=f"postgres-wakeup:latency:{index}",
+                        payload={
+                            "voice": "voice-a",
+                            "business_id": f"latency-{index}",
+                            "scene_code": "collection",
+                            "business_params": {"sample": index},
+                        },
+                        business_id=f"latency-{index}",
+                        scene_code="collection",
+                        allocation_timeout_seconds=30,
+                    )
+                )
+                assert start is not None
+                starts.append(start)
+
+            claimed_at = None
+            for _ in range(200):
+                async with factory() as session:
+                    claimed_at = await session.scalar(
+                        text(
+                            "select claimed_at from ai_call_runtime_command "
+                            "where id=:command_id"
+                        ).bindparams(command_id=start.command_id)
+                    )
+                if claimed_at is not None:
+                    break
+                await asyncio.sleep(0.005)
+            assert claimed_at is not None
+
+        backlog = None
+        for _ in range(400):
+            async with factory() as session:
+                backlog = await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_command "
+                        "where status in ('PENDING', 'RETRY_WAIT', 'PROCESSING')"
+                    )
+                )
+            if backlog == 0:
+                break
+            await asyncio.sleep(0.005)
+        assert backlog == 0
+
+        async with factory() as session:
+            latency_rows = (
+                await session.execute(
+                    text(
+                        "select extract(epoch from (claimed_at - created_at)) * 1000 "
+                        "from ai_call_runtime_command "
+                        "where command_type='START_CALL' order by created_at, id"
+                    )
+                )
+            ).all()
+            latencies_ms = sorted(float(row[0]) for row in latency_rows)
+            worker_state = (
+                await session.execute(
+                    text(
+                        "select active_call_count, capacity "
+                        "from ai_call_runtime_worker where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker_id)
+                )
+            ).one()
+            dispatch_fields_written = await session.scalar(
+                text(
+                    "select count(*) from ai_call_runtime_command where "
+                    "dispatch_token is not null or dispatch_expires_at is not null or "
+                    "published_at is not null or stream_message_id is not null"
+                )
+            )
+            server_version_num = await session.scalar(
+                text("select current_setting('server_version_num')::int")
+            )
+            isolation_level = await session.scalar(text("show transaction_isolation"))
+
+        assert len(latencies_ms) == len(starts) == 20
+        assert worker_state.active_call_count == len(starts)
+        assert worker_state.active_call_count < worker_state.capacity
+        assert dispatch_fields_written == 0
+        assert len(provider.calls) == len(starts) * 2
+
+        p50_index = (50 * len(latencies_ms) + 99) // 100 - 1
+        p95_index = (95 * len(latencies_ms) + 99) // 100 - 1
+        metrics = {
+            "sample_count": len(latencies_ms),
+            "p50_ms": round(latencies_ms[p50_index], 3),
+            "p95_ms": round(latencies_ms[p95_index], 3),
+            "max_ms": round(latencies_ms[-1], 3),
+            "runtime_notification_count": listener_runtime.notification_count,
+            "runtime_timeout_count": listener_runtime.timeout_count,
+            "dispatcher_notification_count": listener_dispatcher.notification_count,
+            "dispatcher_timeout_count": listener_dispatcher.timeout_count,
+            "scan_backlog_remaining": int(backlog),
+            "worker_active_count": int(worker_state.active_call_count),
+            "worker_capacity": int(worker_state.capacity),
+            "dispatch_or_stream_fields_written": int(dispatch_fields_written),
+            "postgres_server_version_num": int(server_version_num),
+            "isolation_level": str(isolation_level),
+        }
+        print("POSTGRES_WAKEUP_LATENCY " + json.dumps(metrics, sort_keys=True))
+        assert metrics["p95_ms"] < 1000
+    finally:
+        if dispatcher_started:
+            await dispatcher.stop()
+        if runtime_started:
+            await runtime.stop()
+        await engine.dispose()
+
+
 async def test_runtime_effect_recovery_releases_owner_after_cleanup_converges() -> None:
     class LocalHandle:
         def __init__(self) -> None:
