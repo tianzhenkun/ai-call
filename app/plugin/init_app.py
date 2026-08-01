@@ -46,6 +46,22 @@ class SystemServiceHandles:
     console_started: bool = False
 
 
+@dataclass(slots=True)
+class _OutboundOwnerRuntimeWorker:
+    task_worker: Any
+    reconcile_worker: Any
+
+    @property
+    def executor(self) -> Any:
+        return self.task_worker.executor
+
+    async def stop(self) -> None:
+        try:
+            await self.reconcile_worker.stop()
+        finally:
+            await self.task_worker.stop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     roles = validate_runtime_role_settings(settings)
@@ -516,8 +532,24 @@ async def _start_ai_call_outbound_task_worker():
         OutboundTaskWorker,
     )
     from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.roles import (
+        runtime_control_mode_for_entry,
+    )
+    from app.services.ai_call.runtime_control.types import OwnerCommandEntry
 
-    if settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
+    owner_mode = (
+        runtime_control_mode_for_entry(settings, OwnerCommandEntry.OUTBOUND)
+        == "owner_command_v1"
+    )
+    owner_runtime_start = None
+    if owner_mode:
+        from app.api.v1.ai_call.outbound.owner_runtime_start import (
+            OwnerRuntimeOutboundStart,
+        )
+
+        dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
+        owner_runtime_start = OwnerRuntimeOutboundStart()
+    elif settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
         if not settings.AI_CALL_SIP_OUTBOUND_ENABLED:
             raise RuntimeError(
                 "AI Call 正式 SIP 拨号模式已启用，但 SIP 外呼总开关未启用"
@@ -542,14 +574,41 @@ async def _start_ai_call_outbound_task_worker():
             + settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS
             + 60
         ),
+        owner_runtime_start=owner_runtime_start,
     )
-    worker = OutboundTaskWorker(
+    task_worker = OutboundTaskWorker(
         executor,
         poll_interval_seconds=settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS,
     )
-    await worker.start()
+    if owner_mode:
+        from app.api.v1.ai_call.outbound.attempt_reconciler import (
+            OutboundAttemptReconcileWorker,
+        )
+
+        reconcile_worker = OutboundAttemptReconcileWorker(
+            async_db_session,
+            worker_id=(
+                f"outbound-reconciler:{settings.AI_CALL_RUNTIME_INSTANCE_ID}:"
+                f"{uuid4().hex}"
+            ),
+            batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
+            poll_interval_seconds=(
+                settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS
+            ),
+        )
+        worker = _OutboundOwnerRuntimeWorker(task_worker, reconcile_worker)
+        await task_worker.start()
+        try:
+            await reconcile_worker.start()
+        except BaseException:
+            await task_worker.stop()
+            raise
+    else:
+        worker = task_worker
+        await worker.start()
     log.warning(
-        f"AI Call 通用外呼执行器已启动，dialer_type={dialer.dialer_type}"
+        "AI Call 通用外呼执行器已启动，"
+        f"dialer_type={dialer.dialer_type}, owner_mode={owner_mode}"
     )
     return worker
 

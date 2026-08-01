@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.core.logger import log
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
@@ -231,6 +233,72 @@ class OutboundAttemptReconciler:
             previous_status=previous_status,
             status=attempt.status,
         )
+
+
+class OutboundAttemptReconcileWorker:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        worker_id: str,
+        batch_size: int = 20,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        self._session_factory = session_factory
+        self._worker_id = worker_id
+        self._batch_size = max(1, batch_size)
+        self._poll_interval_seconds = max(0.05, poll_interval_seconds)
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def run_once(self) -> int:
+        processed = 0
+        for _ in range(self._batch_size):
+            async with self._session_factory.begin() as session:
+                claim = await OutboundAttemptReconciler(
+                    session,
+                    worker_id=self._worker_id,
+                ).claim_next()
+            if claim is None:
+                break
+            async with self._session_factory.begin() as session:
+                result = await OutboundAttemptReconciler(
+                    session,
+                    worker_id=self._worker_id,
+                ).submit(claim)
+            if result is None:
+                break
+            processed += 1
+        return processed
+
+    async def _run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self.run_once()
+            except Exception:
+                log.exception("AI Call 外呼 Attempt 投影轮询失败")
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(),
+                    timeout=self._poll_interval_seconds,
+                )
+            except TimeoutError:
+                continue
 
 
 def _claim_is_current(

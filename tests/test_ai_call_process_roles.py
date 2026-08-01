@@ -376,3 +376,48 @@ async def test_ai_call_worker_start_matrix(
         preview_start.assert_called_once_with(app)
     else:
         preview_start.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_outbound_owner_mode_starts_starter_and_reconciler_without_sip_dialer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconcileWorker,
+    )
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.api.v1.ai_call.outbound.task_executor import OutboundTaskWorker
+
+    task_started = AsyncMock(return_value=None)
+    reconcile_started = AsyncMock(return_value=None)
+    monkeypatch.setattr(OutboundTaskWorker, "start", task_started)
+    monkeypatch.setattr(
+        OutboundAttemptReconcileWorker,
+        "start",
+        reconcile_started,
+    )
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_OUTBOUND_EXECUTOR_ENABLED", True)
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OWNER_COMMAND_V1_ENTRIES",
+        "outbound",
+    )
+    monkeypatch.setattr(init_app.settings, "AI_CALL_OUTBOUND_DIALER_MODE", "sip")
+    monkeypatch.setattr(init_app.settings, "AI_CALL_SIP_OUTBOUND_ENABLED", False)
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_RUNTIME_INSTANCE_ID",
+        "runtime-owner-test",
+    )
+
+    worker = await init_app._start_ai_call_outbound_task_worker()
+
+    assert worker is not None
+    assert isinstance(worker.executor.owner_runtime_start, OwnerRuntimeOutboundStart)
+    assert worker.executor.dialer.dialer_type == "mock"
+    assert worker.reconcile_worker is not None
+    task_started.assert_awaited_once()
+    reconcile_started.assert_awaited_once()
