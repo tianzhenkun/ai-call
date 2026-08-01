@@ -28,7 +28,6 @@ from app.services.ai_call.orchestrator import (
     CreateSessionResult,
     EndSessionResult,
 )
-from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 
 from ..outbound.controller import _identity
 from ..schema import CreateSessionOut, EndSessionOut, EventOut
@@ -400,11 +399,6 @@ async def create_voice_preview_controller(
         Depends(get_voice_preview_lifecycle_service),
     ],
 ) -> JSONResponse:
-    if runtime_control_mode_for_entry(settings, "preview") == "owner_command_v1":
-        raise CustomException(
-            msg="preview 入口已切换为异步 START_CALL，请使用运行时入口",
-            status_code=status.HTTP_409_CONFLICT,
-        )
     tenant_id, user_id = _identity(auth)
     result = await service.create_preview_session(
         tenant_id=tenant_id,

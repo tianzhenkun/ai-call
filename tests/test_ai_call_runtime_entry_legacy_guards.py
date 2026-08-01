@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -59,7 +59,7 @@ async def test_legacy_direct_sip_service_is_blocked_when_direct_sip_is_enabled(
 
 
 @pytest.mark.anyio
-async def test_legacy_preview_controller_is_blocked_when_preview_is_enabled(
+async def test_voice_preview_controller_does_not_route_through_runtime_control(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import app.api.v1.ai_call.voice.controller as controller
@@ -68,18 +68,24 @@ async def test_legacy_preview_controller_is_blocked_when_preview_is_enabled(
         controller,
         "settings",
         SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="preview"),
+        raising=False,
     )
     service = Mock()
+    service.create_preview_session = AsyncMock(
+        return_value={"callId": "preview-call-1"}
+    )
     auth = SimpleNamespace(
         user=SimpleNamespace(tenant_id="tenant-a", user_id=7),
     )
 
-    with pytest.raises(CustomException) as exc_info:
-        await controller.create_voice_preview_controller(
-            request=VoicePreviewRequest(voice="v1"),
-            auth=auth,
-            service=service,
-        )
+    await controller.create_voice_preview_controller(
+        request=VoicePreviewRequest(voice="v1"),
+        auth=auth,
+        service=service,
+    )
 
-    assert exc_info.value.status_code == 409
-    service.create_preview_session.assert_not_called()
+    service.create_preview_session.assert_awaited_once_with(
+        tenant_id="tenant-a",
+        user_id=7,
+        voice="v1",
+    )

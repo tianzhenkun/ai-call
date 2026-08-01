@@ -54,6 +54,7 @@ def test_token_gate_uses_customer_identity_after_all_current_generation_gates() 
     [
         ({"terminal_requested_at": NOW}, False, False, False, "CALL_ENDING"),
         ({"runtime_control_mode": "legacy_local"}, True, True, True, "CALL_NOT_READY"),
+        ({"entry_type": "preview"}, True, True, True, "CALL_NOT_READY"),
         ({}, False, True, True, "OWNER_UNAVAILABLE"),
         ({"status": "preparing"}, True, True, True, "CALL_NOT_READY"),
         ({"agent_media_ready_at": None}, True, True, True, "CALL_NOT_READY"),

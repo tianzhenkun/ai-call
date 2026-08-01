@@ -70,13 +70,34 @@ async def test_disabled_entry_returns_legacy_signal_without_persisting() -> None
     result = await service.submit(
         StartEntryRequest(
             tenant_id="tenant-a",
-            entry_type="preview",
-            idempotency_key="start:preview:1",
-            payload={"voice": "v1"},
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:disabled",
+            payload={},
         )
     )
 
     assert result is None
+    assert repository.requests == []
+
+
+@pytest.mark.anyio
+async def test_preview_is_not_an_owner_command_entry() -> None:
+    repository = _FakeRepository([])
+    service = RuntimeEntryStartService(
+        settings=_settings("web"),
+        repository=repository,
+    )
+
+    with pytest.raises(RuntimeEntryStartError, match="不是合法"):
+        await service.submit(
+            StartEntryRequest(
+                tenant_id="tenant-a",
+                entry_type="preview",
+                idempotency_key="start:preview:1",
+                payload={"voice": "v1"},
+            )
+        )
+
     assert repository.requests == []
 
 

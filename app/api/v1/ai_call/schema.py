@@ -131,7 +131,7 @@ class CreateSipSessionOut(AiCallBaseSchema):
 class RuntimeStartCallRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
-    entry_type: Literal["web", "preview", "direct_sip"]
+    entry_type: Literal["web", "direct_sip"]
     idempotency_key: str = Field(min_length=1, max_length=128)
     payload: dict[str, Any] = Field(default_factory=dict)
     business_type: str | None = Field(default=None, max_length=32)

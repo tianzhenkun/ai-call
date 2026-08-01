@@ -1,9 +1,18 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from app.services.ai_call.runtime_control.effect_repository import EffectSpec
+from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 from app.services.ai_call.runtime_control.start_readiness_repository import (
+    RuntimeStartReadinessRepository,
+    StubStartReadiness,
     build_stub_start_readiness,
 )
+
+NOW = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
 
 
 def _spec(effect_type: str, key: str) -> EffectSpec:
@@ -97,3 +106,55 @@ def test_stub_start_readiness_rejects_missing_or_stale_effect_evidence() -> None
         )
         is None
     )
+
+
+@pytest.mark.anyio
+async def test_stub_readiness_persistence_rejects_preview_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import start_readiness_repository as module
+
+    record = SimpleNamespace(
+        entry_type="preview",
+        runtime_control_mode="owner_command_v1",
+        runtime_owner_id="runtime-a",
+        runtime_fencing_token=7,
+        runtime_lease_expires_at=NOW + timedelta(minutes=1),
+        terminal_requested_at=None,
+        status="preparing",
+        agent_resource_generation=None,
+        agent_media_ready_at=None,
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=record),
+        flush=AsyncMock(),
+    )
+    monkeypatch.setattr(module, "read_database_time", AsyncMock(return_value=NOW))
+
+    persisted = await RuntimeStartReadinessRepository(session).persist_stub_ready(
+        SimpleNamespace(
+            command_type="START_CALL",
+            tenant_id="tenant-a",
+            call_id="call-a",
+            processing_owner_id="runtime-a",
+            processing_fencing_token=7,
+        ),
+        OwnerLease(
+            tenant_id="tenant-a",
+            call_id="call-a",
+            owner_id="runtime-a",
+            fencing_token=7,
+            lease_expires_at=NOW + timedelta(minutes=1),
+            capacity_class="active",
+        ),
+        StubStartReadiness(
+            applied_effect_count=2,
+            agent_participant_identity="agent-call-a-g7",
+            agent_participant_sid="agent-sid",
+            agent_audio_track_sid="track-sid",
+        ),
+    )
+
+    assert persisted is False
+    assert record.status == "preparing"
+    session.flush.assert_not_awaited()

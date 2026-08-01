@@ -14,7 +14,6 @@ class ProcessRole(StrEnum):
 
 class OwnerCommandEntry(StrEnum):
     WEB = "web"
-    PREVIEW = "preview"
     DIRECT_SIP = "direct_sip"
     OUTBOUND = "outbound"
 

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapLegacyError,
@@ -92,7 +93,7 @@ async def test_runtime_start_controller_rejects_disabled_entry_without_persistin
     monkeypatch.setattr(
         controller,
         "settings",
-        SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="preview"),
+        SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="direct_sip"),
     )
 
     with pytest.raises(controller.CustomException) as exc_info:
@@ -108,6 +109,16 @@ async def test_runtime_start_controller_rejects_disabled_entry_without_persistin
     assert exc_info.value.status_code == 409
     assert exc_info.value.data == {"errorCode": "LEGACY_ENTRY_ACTIVE"}
     assert repository.calls == []
+
+
+def test_runtime_start_request_rejects_preview_entry() -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    with pytest.raises(ValidationError):
+        controller.RuntimeStartCallRequest(
+            entry_type="preview",
+            idempotency_key="start:preview:1",
+        )
 
 
 class _FakeBootstrapService:

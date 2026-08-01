@@ -98,7 +98,7 @@ def evaluate_runtime_token_gate(
     fencing_token = int(getattr(record, "runtime_fencing_token", 0))
     participant_identity = str(getattr(record, "participant_identity", "") or "")
     ready = bool(
-        getattr(record, "entry_type", None) in {"web", "preview"}
+        getattr(record, "entry_type", None) == "web"
         and status in _JOINABLE_RECORD_STATUSES
         and fencing_token > 0
         and getattr(record, "room_name", None)

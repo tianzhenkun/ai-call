@@ -46,19 +46,20 @@ def test_parse_process_roles_accepts_only_the_frozen_role_set() -> None:
     )
 
 
-def test_parse_owner_entries_rejects_sip_inbound_and_accepts_frozen_entries() -> None:
+def test_parse_owner_entries_rejects_non_runtime_entries_and_accepts_frozen_entries() -> None:
     roles = _load_roles_module()
 
-    with pytest.raises(roles.RuntimeRoleConfigurationError):
+    with pytest.raises(roles.RuntimeRoleConfigurationError, match="sip_inbound"):
         roles.parse_owner_command_entries("sip_inbound")
+    with pytest.raises(roles.RuntimeRoleConfigurationError, match="preview"):
+        roles.parse_owner_command_entries("preview")
 
     assert roles.parse_owner_command_entries("") == frozenset()
     assert roles.parse_owner_command_entries(
-        "web,preview,direct_sip,outbound",
+        "web,direct_sip,outbound",
     ) == frozenset(
         {
             roles.OwnerCommandEntry.WEB,
-            roles.OwnerCommandEntry.PREVIEW,
             roles.OwnerCommandEntry.DIRECT_SIP,
             roles.OwnerCommandEntry.OUTBOUND,
         }
@@ -148,7 +149,7 @@ def test_owner_command_entries_are_allowed_only_in_non_production_isolated_roles
         roles.validate_runtime_role_settings(
             SimpleNamespace(
                 AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
-                AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,preview,direct_sip",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,direct_sip",
                 AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
                 DATABASE_TYPE="postgres",
                 ENVIRONMENT=EnvironmentEnum.PROD,
@@ -158,7 +159,7 @@ def test_owner_command_entries_are_allowed_only_in_non_production_isolated_roles
     parsed = roles.validate_runtime_role_settings(
         SimpleNamespace(
             AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
-            AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,preview,direct_sip",
+            AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,direct_sip",
             AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
             DATABASE_TYPE="postgres",
             ENVIRONMENT=EnvironmentEnum.DEV,
@@ -184,10 +185,10 @@ def test_runtime_control_mode_is_selected_per_entry_without_fallback_guessing() 
     )
 
     assert roles.runtime_control_mode_for_entry(settings, "web") == "owner_command_v1"
-    assert roles.runtime_control_mode_for_entry(settings, "preview") == "legacy_local"
-
     with pytest.raises(roles.RuntimeRoleConfigurationError):
         roles.runtime_control_mode_for_entry(settings, "sip_inbound")
+    with pytest.raises(roles.RuntimeRoleConfigurationError, match="preview"):
+        roles.runtime_control_mode_for_entry(settings, "preview")
 
 
 def test_runtime_role_requires_instance_identity() -> None:
