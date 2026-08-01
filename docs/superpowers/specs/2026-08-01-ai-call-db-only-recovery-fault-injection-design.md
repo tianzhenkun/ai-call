@@ -69,7 +69,7 @@
 
 | Provider 事实 | Command | Record | Effect/Reservation | 后续 |
 | --- | --- | --- | --- |
-| 确认无 Room、Participant、Egress 等资源 | `DEAD` | `failed`，`failure_stage=startup_reconcile` | 已确认失败/不存在；线路释放 | Owner、容量和本地 handle 收口 |
+| 确认无 `Room`、`SIP Participant`、`Agent Participant`、`Egress` 资源 | `DEAD` | `failed`，`failure_stage=startup_reconcile` | 已确认失败/不存在；线路释放 | Owner、容量和本地 handle 收口 |
 | 任一资源存在 | 由终态屏障抢占为 `SUPERSEDED`，创建/读取唯一 `END_CALL` | `ending`，等待清理 | 创建完整销毁图；线路保持占用直到终态确认 | 只能走 Effect 对账和 cleanup Owner |
 | 截止前 Provider 查询仍不确定 | `RETRY_WAIT`，错误标记 `START_UNCERTAIN` | `preparing` | Effect 保持 `RECONCILE_REQUIRED`；Reservation 保持占用 | 只允许有限重试，不能创建第二个资源 |
 | 截止时 Provider 仍不确定 | 由终态屏障抢占为 `SUPERSEDED`，创建/读取唯一 `END_CALL` | `ending` | Effect 保持 `RECONCILE_REQUIRED`；Reservation 保持占用 | 停止普通启动重试；有限 cleanup 后进入 `attention_required`，不得继续停留在 `RETRY_WAIT` |
@@ -105,11 +105,11 @@ Dispatcher 先在事务外读取候选 Worker/Record，进入短事务后必须�
 
 ### 6.2 Recovery 接管与 Effect 提交
 
-Recovery 接管和容量转换必须使用同一完整顺序：`Record -> SIP Line -> Worker（所有旧/目标 Worker 按 worker_id 升序） -> Command -> Reservation -> Effect/Effect Dependency`。涉及旧 Worker 与目标 Worker 时，不能按业务角色分别加锁，必须合并后按稳定键升序；任何锁冲突或死锁都只能整事务回滚并重试，禁止留下单侧计数变化。
+Recovery 接管和容量转换必须使用上位设计的完整全局顺序，而不是定义本切片的缩短顺序：`Record -> SIP Line -> Worker（所有旧/目标 Worker 按 worker_id 升序） -> Handoff（按 handoff_id 升序） -> Agent Presence（按 agent_id 升序） -> Command -> Reservation -> Effect/Effect Dependency`，后续若事务触及 Evidence、Runtime Event、Recording、ASR、Semantic、Follow-up、Webhook Inbox/Quarantine，继续按上位设计的后续顺序加锁。当前事务未涉及的行类可以跳过，但一旦涉及 Handoff 或 Presence，必须在 Command 之前锁定，不能先锁 Command 再回锁业务子表。涉及旧 Worker 与目标 Worker 时，不能按业务角色分别加锁，必须合并后按稳定键升序；任何锁冲突或死锁都只能整事务回滚并重试，禁止留下单侧计数变化。
 
-Effect 提交事务先以 `FOR UPDATE` 锁定 Record，锁定完成后重新读取数据库时间；随后按完整顺序锁定 SIP Line、Worker、Command、Reservation 和 Effect。提交前必须再次同时匹配 Record 当前 Owner、fencing、未过期租约，以及 Effect 当前 processing owner/fencing/token/未过期租约；任一 CAS 影响 0 行，整个事务回滚，不能继续修改 Reservation、Worker 容量或 Command 结果。来源 Command 是否仍为 `PROCESSING` 不属于 Effect 独立恢复的前置条件：来源 Command 已为 `SUCCEEDED`、`RETRY_WAIT` 或被 `END_CALL` 抢占时，当前有效 Owner/cleanup Owner 仍可使用新的 Effect token 接管。
+Effect 提交事务先以 `FOR UPDATE` 锁定 Record，锁定完成后重新读取数据库时间；随后按完整顺序锁定 SIP Line、Worker、Handoff、Presence、Command、Reservation 和 Effect。提交前必须再次同时匹配 Record 当前 Owner、fencing、未过期租约，以及 Effect 当前 processing owner/fencing/token/未过期租约；任一 CAS 影响 0 行，整个事务回滚，不能继续修改 Reservation、Worker 容量或 Command 结果。来源 Command 是否仍为 `PROCESSING` 不属于 Effect 独立恢复的前置条件：来源 Command 已为 `SUCCEEDED`、`RETRY_WAIT` 或被 `END_CALL` 抢占时，当前有效 Owner/cleanup Owner 仍可使用新的 Effect token 接管。
 
-`attention_required` 停放必须在同一事务完成：先锁定 Record、相关 Line、旧 Worker 和未完成 Effect/Reservation，确认本轮 Provider 调用已返回/超时且 Effect 已提交 `RECONCILE_REQUIRED`，再将 `runtime_capacity_class` 从 `active` 或 `cleanup` 转为 `attention`，清空 Record Owner、fencing 租约和本地执行租约，递减与原容量类别对应的 Worker 计数，保留 Effect、Reservation、资源隔离和 `resource_cleanup_next_retry_at`。停放完成后必须能按 Record 重算 Worker 计数；不能释放 Reservation 或清除 Effect。
+`attention_required` 停放必须在同一事务完成：先锁定 Record、相关 Line、旧 Worker、Handoff、Presence 和未完成 Effect/Reservation，并在最终更新时同时匹配停放事务自身的当前 `Record.runtime_owner_id + runtime_fencing_token + 未过期 runtime_lease_expires_at` 以及本地处理上下文携带的 OwnerLease；若停放由 Command/Effect 处理流程触发，还必须匹配对应的 processing owner/fencing/token/未过期截止。确认本轮 Provider 调用已返回/超时且 Effect 已提交 `RECONCILE_REQUIRED` 后，才将 `runtime_capacity_class` 从 `active` 或 `cleanup` 转为 `attention`，清空 Record Owner、fencing 租约和本地执行租约，递减与原容量类别对应的 Worker 计数，保留 Effect、Reservation、资源隔离和 `resource_cleanup_next_retry_at`。旧 Owner A 在新 Owner B 接管后执行停放时，条件更新必须影响 0 行，不能清除 B 的 Owner、cleanup 容量或递减 B 的计数。停放完成后必须能按 Record 重算 Worker 计数；不能释放 Reservation 或清除 Effect。
 
 ### 6.3 数据库时间与提交结果
 
@@ -128,6 +128,7 @@ Effect 提交事务先以 `FOR UPDATE` 锁定 Record，锁定完成后重新读�
 | Owner 在 CREATE 后失联 | Effect 已登记且状态不确定 | 新 Owner/cleanup Owner 继续 Effect 对账；不按 allocation timeout 释放 |
 | Effect processing lease 过期 | Effect CAS 提交前注入延迟 | 只有新 token 能提交，旧 token 影响 0 行 |
 | Reservation 写入异常 | Reservation INSERT/flush 失败 | Owner、Worker 计数和 Record 事务全部回滚 |
+| 旧 Owner 迟到停放 | Owner A 提交 `RECONCILE_REQUIRED` 后过期，Recovery B 接管并递增 fencing，A 再执行停放 | A 的停放 CAS 影响 0 行；B 的 cleanup Owner、容量计数、Reservation 和 Effect 不被清除或递减 |
 | Command 提交后响应丢失 | `after_commit` 注入连接错误 | 重试命中原命令，命令序号和副作用数量不变 |
 | 首次双资源分配提交后响应丢失 | Owner/Worker/Reservation 事务提交后注入连接错误 | 重试只重读原 Owner、fencing、Worker 计数和 Reservation；不产生第二个 Reservation 或容量增量 |
 | Effect 登记提交后响应丢失 | Effect INSERT 提交后注入连接错误 | 重试命中同一 Effect 幂等键；Effect 数量、resource key 和 provider idempotency key 不变 |
@@ -158,6 +159,7 @@ Effect 提交事务先以 `FOR UPDATE` 锁定 Record，锁定完成后重新读�
 3. `ai_call_sip_line_reservation`：每个 `call_id` 最多一条记录；`RELEASED` 之外的行数与 Line `max_concurrency` 比较，旧 token 不能产生第二行。
 4. `ai_call_runtime_effect`：同一资源键/幂等键的唯一性、`status`、`processing_*`、`fencing_token`、`resource_generation` 和调用次数；旧 token 影响行数必须为 0。
 5. `ai_call_runtime_command`：命令序号连续性、`last_applied_command_seq`、`finished_at`、`error_message`、`result_json` 和 dispatch/processing lease 是否清空。
+6. Handoff/Presence 相关行：状态版本、当前 claim/媒体门禁、坐席状态和最后写入 fencing/租约；旧 Owner 停放不得覆盖新 Owner 的状态或把新 cleanup 状态回退。
 
 ### 8.2 Provider Stub 迟到序列
 
