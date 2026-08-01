@@ -34,6 +34,47 @@ _OBSERVATION_MAPPING = {
 }
 
 
+class DeterministicWebProviderStub:
+    """Deterministic DB-only Web provider; never performs network or SDK calls."""
+
+    _CREATE_EFFECT_TYPES = frozenset(
+        {
+            "CREATE_ROOM",
+            "ATTACH_AGENT_PARTICIPANT",
+        }
+    )
+    _DESTROY_EFFECT_TYPES = frozenset(
+        {
+            "DISCONNECT_AGENT_PARTICIPANT",
+            "DELETE_ROOM",
+        }
+    )
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def apply(self, effect: EffectClaim) -> ProviderObservation:
+        self.calls.append(
+            {
+                "provider_namespace": effect.provider_namespace,
+                "effect_type": effect.effect_type,
+                "resource_key": effect.resource_key,
+            }
+        )
+        if effect.effect_type in self._CREATE_EFFECT_TYPES:
+            return ProviderObservation(
+                kind=ProviderObservationKind.RESOURCE_PRESENT,
+                provider_reference=f"stub:{effect.resource_key}",
+            )
+        if effect.effect_type in self._DESTROY_EFFECT_TYPES:
+            return ProviderObservation(
+                kind=ProviderObservationKind.TERMINAL_CONFIRMED,
+            )
+        raise LookupError(
+            f"unsupported deterministic Web effect type {effect.effect_type}"
+        )
+
+
 class ScriptedProviderStub:
     """In-memory Provider fact source; never performs network or SDK calls."""
 

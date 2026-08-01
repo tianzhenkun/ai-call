@@ -12,7 +12,9 @@ from app.services.ai_call.runtime_control.dispatcher_service import (
     DispatcherControlService,
 )
 from app.services.ai_call.runtime_control.owner_repository import build_worker_id
-from app.services.ai_call.runtime_control.provider_stub import ScriptedProviderStub
+from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicWebProviderStub,
+)
 from app.services.ai_call.runtime_control.recovery_service import RecoveryControlService
 from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
@@ -56,7 +58,7 @@ async def start_runtime_control_lifecycle(
         worker_id=worker_id,
         registry=RuntimeRegistry(),
         session_factory=session_factory,
-        provider=ScriptedProviderStub({}),
+        provider=DeterministicWebProviderStub(),
         capacity=int(settings.AI_CALL_RUNTIME_CAPACITY),
         cleanup_capacity=int(settings.AI_CALL_RUNTIME_CLEANUP_CAPACITY),
         worker_lease_ttl=timedelta(

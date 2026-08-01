@@ -6,10 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.ai_call.runtime_control.command_repository import CommandClaim
-from app.services.ai_call.runtime_control.effect_repository import EffectClaim, EffectSpec
+from app.services.ai_call.runtime_control.effect_repository import (
+    EffectClaim,
+    EffectSpec,
+    ProviderObservationKind,
+)
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicWebProviderStub,
     ScriptedProviderStub,
     StubObservationKind,
 )
@@ -191,6 +196,58 @@ async def test_scripted_provider_stub_rejects_unscripted_network_like_calls() ->
 
     with pytest.raises(LookupError):
         await stub.apply(_effect_claim())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("effect_type", "resource_key"),
+    [
+        ("CREATE_ROOM", "room:call-a:g1"),
+        ("ATTACH_AGENT_PARTICIPANT", "agent:call-a:g1"),
+    ],
+)
+async def test_deterministic_web_provider_stub_returns_stable_created_resource(
+    effect_type: str,
+    resource_key: str,
+) -> None:
+    stub = DeterministicWebProviderStub()
+
+    observation = await stub.apply(
+        _effect_claim(effect_type=effect_type, resource_key=resource_key)
+    )
+
+    assert observation.kind is ProviderObservationKind.RESOURCE_PRESENT
+    assert observation.provider_reference == f"stub:{resource_key}"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "effect_type",
+    ["DISCONNECT_AGENT_PARTICIPANT", "DELETE_ROOM"],
+)
+async def test_deterministic_web_provider_stub_confirms_destroy(
+    effect_type: str,
+) -> None:
+    observation = await DeterministicWebProviderStub().apply(
+        _effect_claim(effect_type=effect_type)
+    )
+
+    assert observation.kind is ProviderObservationKind.TERMINAL_CONFIRMED
+    assert observation.provider_reference is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "effect_type",
+    ["CREATE_SIP_PARTICIPANT", "START_EGRESS", "UNKNOWN_EFFECT"],
+)
+async def test_deterministic_web_provider_stub_rejects_non_web_effects(
+    effect_type: str,
+) -> None:
+    with pytest.raises(LookupError, match=effect_type):
+        await DeterministicWebProviderStub().apply(
+            _effect_claim(effect_type=effect_type)
+        )
 
 
 @pytest.mark.anyio
