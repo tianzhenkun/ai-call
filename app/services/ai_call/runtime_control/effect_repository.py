@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -153,14 +153,22 @@ class RuntimeEffectRepository:
             await self._validate_existing(existing, command_claim, spec)
             return _effect_snapshot(existing)
 
-        now = await self._database_clock(self._session)
-        record, command = await self._authorize_first_registration(command_claim, now)
+        record, command = await self._authorize_first_registration(command_claim)
         if record.terminal_requested_at is not None and spec.effect_type in CREATE_EFFECT_TYPES:
             raise EffectRegistrationError(
                 "terminal barrier forbids registering a new create effect"
             )
         source_create = await self._validate_source_create(command_claim, spec)
         await self._validate_dependency_graph(command_claim, spec)
+
+        now = await self._database_clock(self._session)
+        if (
+            record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at <= now
+            or command.processing_expires_at is None
+            or command.processing_expires_at <= now
+        ):
+            raise EffectRegistrationError("command claim is expired")
 
         existing = await self._find_by_idempotency(
             command_claim.tenant_id,
@@ -306,7 +314,7 @@ class RuntimeEffectRepository:
                 AiCallRecordModel.runtime_owner_id == owner_lease.owner_id,
                 AiCallRecordModel.runtime_fencing_token == owner_lease.fencing_token,
                 AiCallRecordModel.runtime_lease_expires_at.is_not(None),
-                AiCallRecordModel.runtime_lease_expires_at > now,
+                AiCallRecordModel.runtime_lease_expires_at > func.clock_timestamp(),
                 or_(
                     AiCallRecordModel.terminal_requested_at.is_(None),
                     AiCallRuntimeEffectModel.effect_type.in_(DESTROY_EFFECT_TYPES),
@@ -354,9 +362,10 @@ class RuntimeEffectRepository:
                         processing_owner_id=owner_lease.owner_id,
                         processing_fencing_token=owner_lease.fencing_token,
                         processing_token=token,
-                        processing_expires_at=now + self._processing_lease_ttl,
+                        processing_expires_at=func.clock_timestamp()
+                        + self._processing_lease_ttl,
                         attempt_count=AiCallRuntimeEffectModel.attempt_count + 1,
-                        updated_at=now,
+                        updated_at=func.clock_timestamp(),
                     )
                     .returning(
                         AiCallRuntimeEffectModel.id,
@@ -410,7 +419,6 @@ class RuntimeEffectRepository:
         claim: EffectClaim,
         observation: ProviderObservation,
     ) -> bool:
-        now = await self._database_clock(self._session)
         record = await self._session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -424,7 +432,6 @@ class RuntimeEffectRepository:
             or record.runtime_owner_id != claim.processing_owner_id
             or record.runtime_fencing_token != claim.processing_fencing_token
             or record.runtime_lease_expires_at is None
-            or record.runtime_lease_expires_at <= now
         ):
             return False
 
@@ -458,7 +465,6 @@ class RuntimeEffectRepository:
             or effect.processing_fencing_token != claim.processing_fencing_token
             or effect.processing_token != claim.processing_token
             or effect.processing_expires_at is None
-            or effect.processing_expires_at <= now
         ):
             return False
 
@@ -482,6 +488,10 @@ class RuntimeEffectRepository:
             )
             if reservation is None:
                 return False
+
+        now = await self._database_clock(self._session)
+        if record.runtime_lease_expires_at <= now or effect.processing_expires_at <= now:
+            return False
 
         if effect.effect_type in CREATE_EFFECT_TYPES:
             self._apply_create_observation(effect, observation, now)
@@ -535,7 +545,6 @@ class RuntimeEffectRepository:
         reservation.updated_at = now
 
     async def mark_cleanup_clean(self, owner_lease: OwnerLease) -> bool:
-        now = await self._database_clock(self._session)
         record = await self._session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -549,7 +558,6 @@ class RuntimeEffectRepository:
             or record.runtime_owner_id != owner_lease.owner_id
             or record.runtime_fencing_token != owner_lease.fencing_token
             or record.runtime_lease_expires_at is None
-            or record.runtime_lease_expires_at <= now
             or record.terminal_requested_at is None
         ):
             return False
@@ -575,6 +583,7 @@ class RuntimeEffectRepository:
         )
         creates = {effect.id: effect for effect in effects if _is_create(effect)}
         destroys = [effect for effect in effects if _is_destroy(effect)]
+        now = await self._database_clock(self._session)
         for create in creates.values():
             if not _create_is_quiet(create, now):
                 return False
@@ -602,6 +611,10 @@ class RuntimeEffectRepository:
         if unreleased_reservation:
             return False
 
+        now = await self._database_clock(self._session)
+        if record.runtime_lease_expires_at <= now:
+            return False
+
         if record.runtime_capacity_class == "active" and worker.active_call_count > 0:
             worker.active_call_count -= 1
         elif (
@@ -623,7 +636,6 @@ class RuntimeEffectRepository:
     async def _authorize_first_registration(
         self,
         claim: CommandClaim,
-        now: datetime,
     ) -> tuple[AiCallRecordModel, AiCallRuntimeCommandModel]:
         record = await self._session.scalar(
             select(AiCallRecordModel)
@@ -638,7 +650,6 @@ class RuntimeEffectRepository:
             or record.runtime_owner_id != claim.processing_owner_id
             or record.runtime_fencing_token != claim.processing_fencing_token
             or record.runtime_lease_expires_at is None
-            or record.runtime_lease_expires_at <= now
         ):
             raise EffectRegistrationError("command claim does not hold the Record owner")
         command = await self._session.scalar(
@@ -657,7 +668,6 @@ class RuntimeEffectRepository:
             or command.processing_fencing_token != claim.processing_fencing_token
             or command.processing_token != claim.processing_token
             or command.processing_expires_at is None
-            or command.processing_expires_at <= now
         ):
             raise EffectRegistrationError("source Command processing token is not valid")
         return record, command

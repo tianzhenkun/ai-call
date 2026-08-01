@@ -19,6 +19,7 @@
 - 修改：`app/services/ai_call/runtime_control/command_repository.py`
 - 修改：`app/services/ai_call/runtime_control/startup_recovery.py`
 - 修改：`app/services/ai_call/runtime_control/recovery_service.py`
+- 修改：`app/services/ai_call/runtime_control/provider_stub.py`
 - 修改：`app/services/ai_call/runtime_control/timing.py`（仅在测试证明现有接口不足时）
 - 修改测试：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 - 修改测试：`tests/test_ai_call_runtime_effect_repository.py`
@@ -59,7 +60,7 @@
 - 修改：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 - 修改：`tests/test_ai_call_runtime_effect_repository.py`
 
-- [ ] **步骤 1：新增 ACCEPTED 不得 ACTIVE 的 PostgreSQL 测试**
+- [x] **步骤 1：新增 ACCEPTED 不得 ACTIVE 的 PostgreSQL 测试**
 
 在现有 `test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token` 附近增加场景：登记 `CREATE_SIP_PARTICIPANT` Effect，提交 `ProviderObservationKind.ACCEPTED`，断言 Effect 可记录受理事实但 Reservation 仍为 `RECONCILE_REQUIRED`，不能为 `ACTIVE`。
 
@@ -74,7 +75,7 @@ assert await effects.submit(
 assert await session.scalar(text("select status from ai_call_sip_line_reservation where call_id=:call_id").bindparams(call_id=start.call_id)) == "RECONCILE_REQUIRED"
 ```
 
-- [ ] **步骤 2：运行红灯测试**
+- [x] **步骤 2：运行红灯测试**
 
 运行：
 
@@ -84,11 +85,11 @@ bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_run
 
 预期：当前实现因把 `ACCEPTED` 转为 `ACTIVE` 而失败。
 
-- [ ] **步骤 3：增加明确无资源与永久失败边界测试**
+- [x] **步骤 3：增加明确无资源与永久失败边界测试**
 
 断言 `PERMANENT_NO_RESOURCE` 且 Effect 进入 `FAILED` 时才释放 Reservation；`RETRYABLE_FAILURE`、`UNCERTAIN` 和没有 Provider reference 的受理结果均保持线路占用。
 
-- [ ] **步骤 4：提交测试切片**
+- [x] **步骤 4：提交测试切片**
 
 ```bash
 git add tests/postgres/test_ai_call_runtime_control_postgres.py tests/test_ai_call_runtime_effect_repository.py
@@ -102,7 +103,7 @@ git commit -m "test(ai-call): freeze db-core reservation result matrix"
 - 修改：`app/services/ai_call/runtime_control/effect_repository.py`
 - 修改测试：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 
-- [ ] **步骤 1：实现最小结果映射**
+- [x] **步骤 1：实现最小结果映射**
 
 将 CREATE SIP 的 Reservation 转换收敛为以下分支：
 
@@ -121,7 +122,7 @@ else:
 
 `RELEASED` 不允许回退；Reservation 更新必须继续匹配 Effect processing token、Record 当前 Owner/fencing/租约和 `reservation_token`。
 
-- [ ] **步骤 2：运行任务 1 的测试确认转绿**
+- [x] **步骤 2：运行任务 1 的测试确认转绿**
 
 ```bash
 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -k reservation_follows_effect_lifecycle -q
@@ -129,14 +130,14 @@ bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_run
 
 预期：所有 Reservation 结果矩阵断言通过。
 
-- [ ] **步骤 3：运行 Effect 单测和 diff 校验**
+- [x] **步骤 3：运行 Effect 单测和 diff 校验**
 
 ```bash
 uv run pytest tests/test_ai_call_runtime_effect_repository.py -q
 uv run ruff check app/services/ai_call/runtime_control/effect_repository.py tests/test_ai_call_runtime_effect_repository.py && git diff --check
 ```
 
-- [ ] **步骤 4：提交实现切片**
+- [x] **步骤 4：提交实现切片**
 
 ```bash
 git add app/services/ai_call/runtime_control/effect_repository.py tests/postgres/test_ai_call_runtime_control_postgres.py
@@ -154,7 +155,7 @@ git commit -m "fix(ai-call): fence db-core sip reservation outcomes"
 - 修改：`app/services/ai_call/runtime_control/recovery_service.py`
 - 修改测试：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 
-- [ ] **步骤 1：编写跨租约锁等待红灯测试**
+- [x] **步骤 1：编写跨租约锁等待红灯测试**
 
 使用两个 PostgreSQL session：Session A 锁定 Record；Session B 在租约尚未到期时开始停放或 Effect 提交并等待；Session A 将租约推进到过去时间后提交；释放锁；断言 Session B 使用锁后的 `clock_timestamp()` 返回 `False`，不修改 Worker、Record、Effect 或 Reservation。
 
@@ -163,7 +164,7 @@ select * from ai_call_record where tenant_id = :tenant_id and call_id = :call_id
 update ai_call_record set runtime_lease_expires_at = clock_timestamp() - interval '1 second' where call_id = :call_id;
 ```
 
-- [ ] **步骤 2：运行红灯测试**
+- [x] **步骤 2：运行红灯测试**
 
 ```bash
 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -k lock_wait_crosses_lease_deadline -q
@@ -171,18 +172,18 @@ bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_run
 
 预期：至少一个当前使用锁前旧时间的路径失败，输出包含旧租约仍被接受或容量发生变化。
 
-- [ ] **步骤 3：在每个锁定事务的最终 CAS 前重新读取数据库时间**
+- [x] **步骤 3：在每个锁定事务的最终 CAS 前重新读取数据库时间**
 
 保留 `read_database_time()` 使用 `clock_timestamp()`；在锁定 Record、Worker、Command、Reservation、Effect 后重新调用它，最终条件更新统一使用该值。候选扫描时间只能做筛选，不能作为最终授权时间。
 
-- [ ] **步骤 4：运行 Owner/Effect/Command 回归**
+- [x] **步骤 4：运行 Owner/Effect/Command 回归**
 
 ```bash
 uv run pytest tests/test_ai_call_runtime_owner_repository.py tests/test_ai_call_runtime_effect_repository.py tests/test_ai_call_runtime_command_repository.py -q
 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -k 'owner or effect or command or lock_wait' -q
 ```
 
-- [ ] **步骤 5：提交时间语义切片**
+- [x] **步骤 5：提交时间语义切片**
 
 ```bash
 git add app/services/ai_call/runtime_control/owner_repository.py app/services/ai_call/runtime_control/effect_repository.py app/services/ai_call/runtime_control/command_repository.py app/services/ai_call/runtime_control/startup_recovery.py app/services/ai_call/runtime_control/recovery_service.py tests/postgres/test_ai_call_runtime_control_postgres.py

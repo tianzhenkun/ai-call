@@ -1471,6 +1471,99 @@ async def test_cleanup_assignment_rechecks_worker_lease_after_lock_wait() -> Non
         await engine.dispose()
 
 
+async def test_effect_submit_rechecks_owner_lease_after_record_lock_wait() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            effects = RuntimeEffectRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:effect-lock-wait",
+                    payload={"business_id": "effect-lock-wait"},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-effect-lock-wait",
+                    startup_id=UUID("14141414-1414-4141-8141-141414141414"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(
+                session,
+                lease_ttl=timedelta(seconds=1),
+            ).assign_initial_owner("tenant-a", start.call_id)
+            assert lease is not None
+            start_claim = await commands.claim_next_for_owner(lease)
+            assert start_claim is not None
+            await effects.register(
+                start_claim,
+                EffectSpec(
+                    effect_type="CREATE_ROOM",
+                    idempotency_key="effect:create-room:lock-wait",
+                    provider_namespace="stub:lock-wait",
+                    provider_idempotency_key="provider:create-room:lock-wait",
+                    resource_key="room:lock-wait",
+                    resource_generation=lease.fencing_token,
+                ),
+            )
+            assert await commands.complete(
+                start_claim,
+                CommandDecision(status=CommandStatus.SUCCEEDED),
+            )
+            effect_claim = await effects.claim_next(lease)
+            assert effect_claim is not None
+
+        locker = factory()
+        await locker.begin()
+        try:
+            await locker.execute(
+                select(AiCallRecordModel)
+                .where(
+                    AiCallRecordModel.tenant_id == "tenant-a",
+                    AiCallRecordModel.call_id == start.call_id,
+                )
+                .with_for_update()
+            )
+
+            async def submit_after_record_lock() -> bool:
+                async with factory.begin() as session:
+                    return await RuntimeEffectRepository(session).submit(
+                        effect_claim,
+                        ProviderObservation(
+                            kind=ProviderObservationKind.RESOURCE_PRESENT,
+                            provider_reference="room-ref",
+                        ),
+                    )
+
+            submit_task = asyncio.create_task(submit_after_record_lock())
+            await asyncio.sleep(1.25)
+            await locker.commit()
+            submitted = await submit_task
+        finally:
+            await locker.close()
+
+        assert submitted is False
+        async with factory() as session:
+            state = (
+                await session.execute(
+                    text(
+                        "select status, processing_token from ai_call_runtime_effect "
+                        "where id=:effect_id"
+                    ).bindparams(effect_id=effect_claim.effect_id)
+                )
+            ).one()
+            assert tuple(state) == ("APPLYING", effect_claim.processing_token)
+    finally:
+        await engine.dispose()
+
+
 async def test_startup_uncertain_deadline_marks_no_resource_failed_and_releases_owner() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)

@@ -210,11 +210,15 @@ class DispatcherOwnerRepository:
 
         for worker_id in candidate_ids:
             worker = await self._lock_worker(worker_id)
-            if worker is None or not _worker_has_active_capacity(worker, now):
+            if worker is None:
                 continue
             start_command = await self._lock_command(tenant_id, call_id, "START_CALL")
             if start_command is None or start_command.status != CommandStatus.PENDING:
                 return None
+
+            now = await self._database_clock(self._session)
+            if not _worker_has_active_capacity(worker, now):
+                continue
 
             expires_at = now + self._lease_ttl
             record.runtime_owner_id = worker.worker_id
@@ -361,40 +365,43 @@ class RuntimeOwnerRepository:
         self._database_clock = database_clock
 
     async def renew(self, lease: OwnerLease) -> OwnerLease | None:
-        now = await self._database_clock(self._session)
-        expires_at = now + self._lease_ttl
-        worker_is_valid = exists().where(
-            AiCallRuntimeWorkerModel.worker_id == lease.owner_id,
-            AiCallRuntimeWorkerModel.status.in_({"READY", "DRAINING"}),
-            AiCallRuntimeWorkerModel.lease_expires_at > now,
-        )
-        result = await self._session.execute(
-            update(AiCallRecordModel)
+        record = await self._session.scalar(
+            select(AiCallRecordModel)
             .where(
                 AiCallRecordModel.tenant_id == lease.tenant_id,
                 AiCallRecordModel.call_id == lease.call_id,
-                AiCallRecordModel.runtime_owner_id == lease.owner_id,
-                AiCallRecordModel.runtime_fencing_token == lease.fencing_token,
-                AiCallRecordModel.runtime_lease_expires_at == lease.lease_expires_at,
-                AiCallRecordModel.runtime_lease_expires_at > now,
-                worker_is_valid,
             )
-            .values(
-                runtime_lease_expires_at=expires_at,
-                runtime_heartbeat_at=now,
-            )
-            .returning(AiCallRecordModel.runtime_capacity_class)
+            .with_for_update()
         )
-        capacity_class = result.scalar_one_or_none()
-        if capacity_class is None:
+        worker = await self._session.scalar(
+            select(AiCallRuntimeWorkerModel)
+            .where(AiCallRuntimeWorkerModel.worker_id == lease.owner_id)
+            .with_for_update()
+        )
+        now = await self._database_clock(self._session)
+        if (
+            record is None
+            or worker is None
+            or record.runtime_owner_id != lease.owner_id
+            or record.runtime_fencing_token != lease.fencing_token
+            or record.runtime_lease_expires_at != lease.lease_expires_at
+            or record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at <= now
+            or worker.status not in {"READY", "DRAINING"}
+            or worker.lease_expires_at <= now
+        ):
             return None
+        expires_at = now + self._lease_ttl
+        record.runtime_lease_expires_at = expires_at
+        record.runtime_heartbeat_at = now
+        await self._session.flush()
         return OwnerLease(
             tenant_id=lease.tenant_id,
             call_id=lease.call_id,
             owner_id=lease.owner_id,
             fencing_token=lease.fencing_token,
             lease_expires_at=expires_at,
-            capacity_class=capacity_class,
+            capacity_class=record.runtime_capacity_class,
         )
 
     async def validate(self, lease: OwnerLease) -> bool:

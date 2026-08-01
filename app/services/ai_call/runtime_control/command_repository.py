@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -413,7 +413,6 @@ class RuntimeCommandRepository:
         if claim.command_type == END_CALL and status == CommandStatus.DEAD:
             raise InvalidCommandDecisionError("END_CALL cannot transition to DEAD")
 
-        now = await self._database_clock(self._session)
         record = await self._session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -427,7 +426,6 @@ class RuntimeCommandRepository:
             or record.runtime_owner_id != claim.processing_owner_id
             or record.runtime_fencing_token != claim.processing_fencing_token
             or record.runtime_lease_expires_at is None
-            or record.runtime_lease_expires_at <= now
             or (
                 claim.command_type != END_CALL
                 and record.terminal_requested_at is not None
@@ -451,6 +449,12 @@ class RuntimeCommandRepository:
             or command.processing_fencing_token != claim.processing_fencing_token
             or command.processing_token != claim.processing_token
             or command.processing_expires_at is None
+        ):
+            return False
+
+        now = await self._database_clock(self._session)
+        if (
+            record.runtime_lease_expires_at <= now
             or command.processing_expires_at <= now
         ):
             return False
@@ -491,7 +495,6 @@ class RuntimeCommandRepository:
 
     async def expire_unallocated_start(self, tenant_id: str, call_id: str) -> bool:
         """Fail a START_CALL whose persisted allocation deadline passed untouched."""
-        now = await self._database_clock(self._session)
         record = await self._lock_record(tenant_id, call_id)
         if (
             record.runtime_control_mode != "owner_command_v1"
@@ -516,10 +519,13 @@ class RuntimeCommandRepository:
             command is None
             or command.status not in {CommandStatus.PENDING, CommandStatus.RETRY_WAIT}
             or command.allocation_deadline_at is None
-            or command.allocation_deadline_at > now
             or await self._call_has_effect(tenant_id, call_id)
             or await self._has_unreleased_reservation(tenant_id, call_id)
         ):
+            return False
+
+        now = await self._database_clock(self._session)
+        if command.allocation_deadline_at > now:
             return False
 
         command.status = CommandStatus.DEAD
@@ -597,7 +603,6 @@ class RuntimeCommandRepository:
 
         for candidate in candidates:
             token = self._processing_token_generator()
-            expires_at = now + self._processing_lease_ttl
             owner_conditions = [
                 AiCallRecordModel.tenant_id == lease.tenant_id,
                 AiCallRecordModel.call_id == lease.call_id,
@@ -605,7 +610,7 @@ class RuntimeCommandRepository:
                 AiCallRecordModel.runtime_owner_id == lease.owner_id,
                 AiCallRecordModel.runtime_fencing_token == lease.fencing_token,
                 AiCallRecordModel.runtime_lease_expires_at.is_not(None),
-                AiCallRecordModel.runtime_lease_expires_at > now,
+                AiCallRecordModel.runtime_lease_expires_at > func.clock_timestamp(),
             ]
             if end_only:
                 owner_conditions.append(
@@ -651,13 +656,14 @@ class RuntimeCommandRepository:
                         processing_owner_id=lease.owner_id,
                         processing_fencing_token=lease.fencing_token,
                         processing_token=token,
-                        processing_expires_at=expires_at,
-                        claimed_at=now,
+                        processing_expires_at=func.clock_timestamp()
+                        + self._processing_lease_ttl,
+                        claimed_at=func.clock_timestamp(),
                         attempt_count=AiCallRuntimeCommandModel.attempt_count + 1,
                         next_retry_at=None,
                         dispatch_token=None,
                         dispatch_expires_at=None,
-                        updated_at=now,
+                        updated_at=func.clock_timestamp(),
                     )
                     .returning(
                         AiCallRuntimeCommandModel.id,

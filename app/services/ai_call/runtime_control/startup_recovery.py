@@ -97,7 +97,6 @@ class StartupReconcileService:
         tenant_id: str,
         call_id: str,
     ) -> bool:
-        now = await self._database_clock(session)
         record = await session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -110,7 +109,6 @@ class StartupReconcileService:
             record is None
             or record.status != "preparing"
             or record.terminal_requested_at is not None
-            or not startup_reconcile_due(record.startup_reconcile_deadline_at, now)
         ):
             return False
 
@@ -165,6 +163,9 @@ class StartupReconcileService:
                 )
             )
         )
+        now = await self._database_clock(session)
+        if not startup_reconcile_due(record.startup_reconcile_deadline_at, now):
+            return False
         if reservation_present and decision == StartupReconcileDecision.NO_RESOURCE:
             decision = StartupReconcileDecision.RESOURCE_PRESENT
         if decision == StartupReconcileDecision.NO_RESOURCE:

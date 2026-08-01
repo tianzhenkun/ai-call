@@ -63,4 +63,10 @@ class ScriptedProviderStub:
         scripted = observations.popleft()
         if isinstance(scripted, ProviderObservation):
             return scripted
-        return ProviderObservation(kind=_OBSERVATION_MAPPING[scripted])
+        observation = ProviderObservation(kind=_OBSERVATION_MAPPING[scripted])
+        if scripted == StubObservationKind.RESOURCE_PRESENT:
+            return ProviderObservation(
+                kind=observation.kind,
+                provider_reference=f"stub:{effect.resource_key}",
+            )
+        return observation
