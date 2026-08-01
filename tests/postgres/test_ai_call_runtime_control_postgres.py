@@ -32,6 +32,9 @@ from app.services.ai_call.runtime_control.command_repository import (
     StartCallIntent,
     TerminalBarrierError,
 )
+from app.services.ai_call.runtime_control.direct_sip_phone import (
+    prepare_direct_sip_phone,
+)
 from app.services.ai_call.runtime_control.dispatcher_service import (
     DispatcherControlService,
 )
@@ -107,6 +110,23 @@ DIRECT_SIP_MIGRATION_PATH = (
     PROJECT_ROOT
     / "docs/livekit-ai-outbound/sql/phase-i2-direct-sip-db-only-plaintext.sql"
 )
+
+
+def _direct_sip_intent(
+    *,
+    idempotency_key: str,
+    payload: dict[str, object],
+) -> StartCallIntent:
+    phone = prepare_direct_sip_phone("13812345678")
+    return StartCallIntent(
+        tenant_id="tenant-a",
+        entry_type="direct_sip",
+        idempotency_key=idempotency_key,
+        payload=payload,
+        callee_phone_number=phone.plaintext,
+        callee_phone_number_masked=phone.masked,
+        callee_phone_number_hash=phone.fingerprint,
+    )
 
 
 def _async_dsn() -> str:
@@ -1109,9 +1129,7 @@ async def test_end_evidence_is_multi_source_but_end_call_is_unique_and_preempts(
         async with factory.begin() as session:
             repository = RuntimeCommandRepository(session)
             start = await repository.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:end-evidence",
                     payload={"phone_hash": "hash-1"},
                 )
@@ -1497,9 +1515,7 @@ async def test_dispatcher_atomically_reserves_runtime_and_sip_line_capacity() ->
         async with factory.begin() as session:
             await _insert_sip_line(session, line_id=701, max_concurrency=1)
             start = await RuntimeCommandRepository(session).create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:dual-resource",
                     payload={"line_id": 701, "phone_hash": "hash-dual-resource"},
                 )
@@ -1554,17 +1570,13 @@ async def test_concurrent_dispatchers_cannot_split_the_last_sip_line_slot() -> N
             await _insert_sip_line(session, line_id=702, max_concurrency=1)
             commands = RuntimeCommandRepository(session)
             first = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:dual-race-1",
                     payload={"line_id": 702, "phone_hash": "hash-dual-race-1"},
                 )
             )
             second = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:dual-race-2",
                     payload={"line_id": 702, "phone_hash": "hash-dual-race-2"},
                 )
@@ -1638,9 +1650,7 @@ async def test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token(
             commands = RuntimeCommandRepository(session)
             effects = RuntimeEffectRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:reservation-lifecycle",
                     payload={"line_id": 703, "phone_hash": "hash-reservation-lifecycle"},
                 )
@@ -1814,9 +1824,7 @@ async def test_reservation_insert_failure_rolls_back_owner_and_worker_capacity()
         async with factory.begin() as session:
             await _insert_sip_line(session, line_id=704, max_concurrency=1)
             start = await RuntimeCommandRepository(session).create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:reservation-fault",
                     payload={"line_id": 704, "phone_hash": "hash-reservation-fault"},
                 )
@@ -1951,9 +1959,7 @@ async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> 
         async with factory.begin() as session:
             commands = RuntimeCommandRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:recovery-race",
                     payload={"phone_hash": "hash-recovery-race"},
                 )
@@ -2438,9 +2444,7 @@ async def test_startup_uncertain_reservation_blocks_no_resource_failure() -> Non
         async with factory.begin() as session:
             commands = RuntimeCommandRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:startup-uncertain-reservation",
                     payload={"phone_hash": "hash-startup-uncertain-reservation"},
                 )
@@ -2542,9 +2546,7 @@ async def test_owner_recovery_parks_attention_without_releasing_resources() -> N
         async with factory.begin() as session:
             commands = RuntimeCommandRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:owner-recovery",
                     payload={"phone_hash": "hash-owner-recovery"},
                 )
@@ -3159,9 +3161,7 @@ async def test_effect_registration_is_authorized_but_later_claim_is_command_inde
             commands = RuntimeCommandRepository(session)
             effects = RuntimeEffectRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:effect-independent",
                     payload={"phone_hash": "effect-independent"},
                 )
@@ -5269,9 +5269,7 @@ async def test_missing_dependency_row_is_fail_closed_during_effect_claim() -> No
             commands = RuntimeCommandRepository(session)
             effects = RuntimeEffectRepository(session)
             start = await commands.create_start_call(
-                StartCallIntent(
-                    tenant_id="tenant-a",
-                    entry_type="direct_sip",
+                _direct_sip_intent(
                     idempotency_key="start:dangling-dependency",
                     payload={"phone_hash": "dangling-dependency"},
                 )
