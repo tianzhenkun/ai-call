@@ -26,6 +26,10 @@ def _record(**overrides):
         "agent_media_ready_at": datetime(2026, 8, 1, 12, 0, 30, tzinfo=UTC),
         "terminal_requested_at": None,
         "status": "preparing",
+        "resource_cleanup_status": "not_started",
+        "resource_cleanup_error": None,
+        "failure_stage": None,
+        "failure_message": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -50,6 +54,8 @@ def test_bootstrap_is_ready_only_after_room_agent_and_media_gates() -> None:
     assert snapshot.token_available is False
     assert snapshot.room_name == "ai-call-call-1"
     assert snapshot.participant_identity == "caller-call-1"
+    assert snapshot.status == "preparing"
+    assert snapshot.resource_cleanup_status == "not_started"
 
 
 @pytest.mark.parametrize(
@@ -87,6 +93,28 @@ def test_bootstrap_never_exposes_token_during_terminal_barrier() -> None:
 
     assert snapshot.phase == "ending"
     assert snapshot.token_available is False
+
+
+def test_bootstrap_exposes_terminal_business_and_cleanup_facts() -> None:
+    snapshot = build_runtime_bootstrap_snapshot(
+        _record(
+            terminal_requested_at=datetime(2026, 8, 1, 12, tzinfo=UTC),
+            status="failed",
+            resource_cleanup_status="attention_required",
+            resource_cleanup_error="Provider query timed out",
+            failure_stage="runtime_start",
+            failure_message="START_UNCERTAIN",
+        ),
+        [],
+        now=datetime(2026, 8, 1, 12, tzinfo=UTC),
+    )
+
+    assert snapshot.phase == "terminal"
+    assert snapshot.status == "failed"
+    assert snapshot.resource_cleanup_status == "attention_required"
+    assert snapshot.resource_cleanup_error == "Provider query timed out"
+    assert snapshot.failure_stage == "runtime_start"
+    assert snapshot.failure_message == "START_UNCERTAIN"
 
 
 def test_bootstrap_rejects_legacy_record_instead_of_falling_back() -> None:

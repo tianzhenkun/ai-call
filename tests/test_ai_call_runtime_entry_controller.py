@@ -126,6 +126,11 @@ class _FakeBootstrapService:
             agent_media_ready_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
             terminal_requested_at=None,
             token_available=False,
+            status="ready",
+            resource_cleanup_status="not_started",
+            resource_cleanup_error=None,
+            failure_stage=None,
+            failure_message=None,
         )
 
 
@@ -154,6 +159,11 @@ async def test_runtime_bootstrap_controller_returns_readiness_without_token(
         "agentMediaReadyAt": "2026-08-01T00:00:00Z",
         "terminalRequestedAt": None,
         "tokenAvailable": False,
+        "status": "ready",
+        "resourceCleanupStatus": "not_started",
+        "resourceCleanupError": None,
+        "failureStage": None,
+        "failureMessage": None,
     }
     assert service.call_ids == ["tenant-from-auth:call-1"]
 

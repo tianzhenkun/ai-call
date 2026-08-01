@@ -33,10 +33,20 @@ class RuntimeBootstrapSnapshot:
     agent_media_ready_at: datetime | None
     terminal_requested_at: datetime | None
     token_available: bool
+    status: str
+    resource_cleanup_status: str
+    resource_cleanup_error: str | None
+    failure_stage: str | None
+    failure_message: str | None
 
 
 def _value(value: object) -> object:
     return getattr(value, "value", value)
+
+
+def _optional_text(value: object) -> str | None:
+    resolved = _value(value)
+    return None if resolved is None else str(resolved)
 
 
 def build_runtime_bootstrap_snapshot(
@@ -52,8 +62,15 @@ def build_runtime_bootstrap_snapshot(
         )
 
     terminal_requested_at = getattr(record, "terminal_requested_at", None)
-    status = _value(getattr(record, "status", None))
-    cleanup_status = _value(getattr(record, "resource_cleanup_status", None))
+    status = str(_value(getattr(record, "status", "")))
+    cleanup_status = str(
+        _value(getattr(record, "resource_cleanup_status", "not_started"))
+    )
+    resource_cleanup_error = _optional_text(
+        getattr(record, "resource_cleanup_error", None)
+    )
+    failure_stage = _optional_text(getattr(record, "failure_stage", None))
+    failure_message = _optional_text(getattr(record, "failure_message", None))
     if terminal_requested_at is not None:
         phase: RuntimeBootstrapPhase = (
             "terminal"
@@ -70,6 +87,11 @@ def build_runtime_bootstrap_snapshot(
             agent_media_ready_at=getattr(record, "agent_media_ready_at", None),
             terminal_requested_at=terminal_requested_at,
             token_available=False,
+            status=status,
+            resource_cleanup_status=cleanup_status,
+            resource_cleanup_error=resource_cleanup_error,
+            failure_stage=failure_stage,
+            failure_message=failure_message,
         )
 
     fencing_token = int(getattr(record, "runtime_fencing_token", 0))
@@ -109,6 +131,11 @@ def build_runtime_bootstrap_snapshot(
         agent_media_ready_at=getattr(record, "agent_media_ready_at", None),
         terminal_requested_at=None,
         token_available=False,
+        status=status,
+        resource_cleanup_status=cleanup_status,
+        resource_cleanup_error=resource_cleanup_error,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
     )
 
 

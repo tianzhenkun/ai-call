@@ -177,6 +177,11 @@ class RuntimeBootstrapOut(AiCallBaseSchema):
     agent_media_ready_at: datetime | None = None
     terminal_requested_at: datetime | None = None
     token_available: bool = False
+    status: str
+    resource_cleanup_status: str
+    resource_cleanup_error: str | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
 
 
 class TokenOut(AiCallBaseSchema):
