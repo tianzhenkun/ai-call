@@ -23,6 +23,9 @@ from app.services.ai_call.runtime_control.owner_repository import (
     RecoveryOwnerRepository,
 )
 from app.services.ai_call.runtime_control.provider_stub import ScriptedProviderStub
+from app.services.ai_call.runtime_control.start_readiness_repository import (
+    RuntimeStartReadinessRepository,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
 
@@ -43,6 +46,9 @@ class EndHandlerResult:
 EffectRepositoryFactory = Callable[[AsyncSession], RuntimeEffectRepository]
 CommandRepositoryFactory = Callable[[AsyncSession], RuntimeCommandRepository]
 RecoveryOwnerRepositoryFactory = Callable[[AsyncSession], RecoveryOwnerRepository]
+StartReadinessRepositoryFactory = Callable[
+    [AsyncSession], RuntimeStartReadinessRepository
+]
 
 
 class StartCallHandler:
@@ -53,11 +59,15 @@ class StartCallHandler:
         *,
         effect_repository_factory: EffectRepositoryFactory = RuntimeEffectRepository,
         command_repository_factory: CommandRepositoryFactory = RuntimeCommandRepository,
+        readiness_repository_factory: StartReadinessRepositoryFactory = (
+            RuntimeStartReadinessRepository
+        ),
     ) -> None:
         self._session_factory = session_factory
         self._provider = provider
         self._effect_repository_factory = effect_repository_factory
         self._command_repository_factory = command_repository_factory
+        self._readiness_repository_factory = readiness_repository_factory
 
     async def handle(
         self,
@@ -89,8 +99,17 @@ class StartCallHandler:
             if observation.kind == ProviderObservationKind.RESOURCE_PRESENT:
                 applied_count += 1
 
-        succeeded = applied_count == len(effect_specs)
         async with self._session_factory.begin() as session:
+            readiness_repository = self._readiness_repository_factory(session)
+            readiness = await readiness_repository.inspect_applied_effects(
+                command_claim,
+                owner_lease,
+                effect_specs,
+            )
+            succeeded = readiness is not None
+            persisted_count = (
+                readiness.applied_effect_count if readiness is not None else applied_count
+            )
             completed = await self._command_repository_factory(session).complete(
                 command_claim,
                 CommandDecision(
@@ -99,12 +118,18 @@ class StartCallHandler:
                         if succeeded
                         else CommandStatus.RETRY_WAIT
                     ),
-                    result={"applied_effect_count": applied_count},
+                    result={"applied_effect_count": persisted_count},
                 ),
             )
+            if completed and readiness is not None:
+                await readiness_repository.persist_stub_ready(
+                    command_claim,
+                    owner_lease,
+                    readiness,
+                )
         return StartHandlerResult(
             command_completed=completed and succeeded,
-            applied_effect_count=applied_count,
+            applied_effect_count=persisted_count,
         )
 
 

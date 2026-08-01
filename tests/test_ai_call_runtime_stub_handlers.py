@@ -13,6 +13,9 @@ from app.services.ai_call.runtime_control.provider_stub import (
     ScriptedProviderStub,
     StubObservationKind,
 )
+from app.services.ai_call.runtime_control.start_readiness_repository import (
+    StubStartReadiness,
+)
 
 
 def _effect_claim(
@@ -134,6 +137,21 @@ class _FakeCommandRepository:
         return True
 
 
+class _FakeStartReadinessRepository:
+    def __init__(self, readiness: StubStartReadiness | None) -> None:
+        self.readiness = readiness
+        self.inspected = []
+        self.persisted = []
+
+    async def inspect_applied_effects(self, command_claim, owner_lease, specs):
+        self.inspected.append((command_claim, owner_lease, specs))
+        return self.readiness
+
+    async def persist_stub_ready(self, command_claim, owner_lease, readiness):
+        self.persisted.append((command_claim, owner_lease, readiness))
+        return True
+
+
 class _FakeRecoveryOwnerRepository:
     async def park_attention(self, lease, retry_after) -> bool:
         return False
@@ -190,6 +208,13 @@ async def test_start_handler_commits_before_stub_and_completes_after_effects() -
         clean=False,
     )
     command_repository = _FakeCommandRepository()
+    readiness = StubStartReadiness(
+        applied_effect_count=2,
+        agent_participant_identity="agent-call-a-g1",
+        agent_participant_sid="stub:agent:call-a:g1",
+        agent_audio_track_sid="stub-track-call-a-g1",
+    )
+    readiness_repository = _FakeStartReadinessRepository(readiness)
     provider = _AssertingProvider(
         factory,
         {
@@ -221,12 +246,60 @@ async def test_start_handler_commits_before_stub_and_completes_after_effects() -
         provider,
         effect_repository_factory=lambda session: effect_repository,
         command_repository_factory=lambda session: command_repository,
+        readiness_repository_factory=lambda session: readiness_repository,
     ).handle(_command_claim("START_CALL"), _owner_lease(), specs)
 
     assert result.command_completed is True
     assert result.applied_effect_count == 2
     assert len(effect_repository.registered) == 2
     assert command_repository.decisions[0].status == "SUCCEEDED"
+    assert len(readiness_repository.inspected) == 1
+    assert readiness_repository.persisted[0][2] == readiness
+
+
+@pytest.mark.anyio
+async def test_start_handler_recovers_ready_from_already_applied_effects() -> None:
+    factory = _FakeSessionFactory()
+    effect_repository = _FakeEffectRepository([], clean=False)
+    command_repository = _FakeCommandRepository()
+    readiness = StubStartReadiness(
+        applied_effect_count=2,
+        agent_participant_identity="agent-call-a-g1",
+        agent_participant_sid="stub:agent:call-a:g1",
+        agent_audio_track_sid="stub-track-call-a-g1",
+    )
+    readiness_repository = _FakeStartReadinessRepository(readiness)
+    specs = [
+        EffectSpec(
+            effect_type="CREATE_ROOM",
+            idempotency_key="room",
+            provider_namespace="stub:test",
+            provider_idempotency_key="room",
+            resource_key="room:call-a:g1",
+            resource_generation=1,
+        ),
+        EffectSpec(
+            effect_type="ATTACH_AGENT_PARTICIPANT",
+            idempotency_key="agent",
+            provider_namespace="stub:test",
+            provider_idempotency_key="agent",
+            resource_key="agent:call-a:g1",
+            resource_generation=1,
+        ),
+    ]
+
+    result = await StartCallHandler(
+        factory,
+        ScriptedProviderStub({}),
+        effect_repository_factory=lambda session: effect_repository,
+        command_repository_factory=lambda session: command_repository,
+        readiness_repository_factory=lambda session: readiness_repository,
+    ).handle(_command_claim("START_CALL"), _owner_lease(), specs)
+
+    assert result.command_completed is True
+    assert result.applied_effect_count == 2
+    assert command_repository.decisions[0].status == "SUCCEEDED"
+    assert readiness_repository.persisted[0][2] == readiness
 
 
 @pytest.mark.anyio

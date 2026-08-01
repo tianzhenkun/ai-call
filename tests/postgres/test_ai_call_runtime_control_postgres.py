@@ -71,6 +71,9 @@ from app.services.ai_call.runtime_control.runtime_token_service import (
     RuntimeTokenGateRepository,
     RuntimeTokenNotFoundError,
 )
+from app.services.ai_call.runtime_control.start_readiness_repository import (
+    StartReadinessRejected,
+)
 from app.services.ai_call.runtime_control.startup_recovery import (
     StartupReconcileService,
 )
@@ -3327,6 +3330,32 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
         )
         assert start_result.command_completed is True
 
+        async with factory() as session:
+            ready_record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.tenant_id == "tenant-a",
+                    AiCallRecordModel.call_id == start.call_id,
+                )
+            )
+            assert ready_record is not None
+            assert ready_record.status == "ready"
+            assert (
+                ready_record.agent_participant_identity
+                == f"agent-{start.call_id}-g{lease.fencing_token}"
+            )
+            assert ready_record.agent_participant_sid == f"stub:{agent_key}"
+            assert (
+                ready_record.agent_audio_track_sid
+                == f"stub-track-{start.call_id}-g{lease.fencing_token}"
+            )
+            assert ready_record.agent_resource_generation == lease.fencing_token
+            assert ready_record.agent_media_ready_at is not None
+            token_gate = await RuntimeTokenGateRepository(session).authorize(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert token_gate.participant_identity == f"caller-{start.call_id}"
+
         async with factory.begin() as session:
             commands = RuntimeCommandRepository(session)
             await commands.request_end(
@@ -3367,6 +3396,137 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
                 ).bindparams(call_id=start.call_id)
             ) == 4
         assert all(set(call) == {"provider_namespace", "effect_type", "resource_key"} for call in provider.calls)
+    finally:
+        await engine.dispose()
+
+
+async def test_start_handler_recovers_ready_after_effect_commit_before_command_commit() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    provider = ScriptedProviderStub({})
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:ready-after-effect-commit",
+                    payload={"business_id": "ready-after-effect-commit"},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-ready-recovery",
+                    startup_id=UUID("45454545-4545-4545-8545-454545454545"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            start_claim = await commands.claim_next_for_owner(lease)
+            assert start_claim is not None
+
+        specs = [
+            EffectSpec(
+                effect_type="CREATE_ROOM",
+                idempotency_key="effect:create-room:ready-recovery",
+                provider_namespace="stub:ready-recovery",
+                provider_idempotency_key="provider:create-room:ready-recovery",
+                resource_key="room:ready-recovery:g1",
+                resource_generation=lease.fencing_token,
+            ),
+            EffectSpec(
+                effect_type="ATTACH_AGENT_PARTICIPANT",
+                idempotency_key="effect:attach-agent:ready-recovery",
+                provider_namespace="stub:ready-recovery",
+                provider_idempotency_key="provider:attach-agent:ready-recovery",
+                resource_key="agent:ready-recovery:g1",
+                resource_generation=lease.fencing_token,
+            ),
+        ]
+        async with factory.begin() as session:
+            effects = RuntimeEffectRepository(session)
+            for spec in specs:
+                await effects.register(start_claim, spec)
+
+        for spec in specs:
+            async with factory.begin() as session:
+                effect_claim = await RuntimeEffectRepository(session).claim_next(lease)
+                assert effect_claim is not None
+                assert effect_claim.effect_type == spec.effect_type
+            async with factory.begin() as session:
+                assert await RuntimeEffectRepository(session).submit(
+                    effect_claim,
+                    ProviderObservation(
+                        kind=ProviderObservationKind.RESOURCE_PRESENT,
+                        provider_reference=f"persisted:{effect_claim.resource_key}",
+                    ),
+                )
+
+        stale_lease = replace(lease, owner_id="runtime-stale")
+        with pytest.raises(StartReadinessRejected):
+            await StartCallHandler(factory, provider).handle(
+                start_claim,
+                stale_lease,
+                specs,
+            )
+
+        stale_claim = replace(
+            start_claim,
+            processing_owner_id="runtime-stale",
+        )
+        stale_result = await StartCallHandler(factory, provider).handle(
+            stale_claim,
+            stale_lease,
+            specs,
+        )
+        assert stale_result.command_completed is False
+
+        async with factory() as session:
+            unchanged = (
+                await session.execute(
+                    text(
+                        "select r.status, c.status, r.last_applied_command_seq "
+                        "from ai_call_record r "
+                        "join ai_call_runtime_command c on c.call_id=r.call_id "
+                        "where r.call_id=:call_id and c.id=:command_id"
+                    ).bindparams(
+                        call_id=start.call_id,
+                        command_id=start_claim.command_id,
+                    )
+                )
+            ).one()
+            assert tuple(unchanged) == ("preparing", "PROCESSING", 0)
+
+        result = await StartCallHandler(factory, provider).handle(
+            start_claim,
+            lease,
+            specs,
+        )
+
+        assert result.command_completed is True
+        assert result.applied_effect_count == 2
+        assert provider.calls == []
+        async with factory() as session:
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.tenant_id == "tenant-a",
+                    AiCallRecordModel.call_id == start.call_id,
+                )
+            )
+            assert record is not None
+            assert record.status == "ready"
+            assert (
+                record.agent_participant_sid
+                == "persisted:agent:ready-recovery:g1"
+            )
+            assert record.agent_resource_generation == lease.fencing_token
+            assert record.agent_media_ready_at is not None
     finally:
         await engine.dispose()
 
