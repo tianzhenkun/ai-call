@@ -199,7 +199,7 @@ git commit -m "fix(ai-call): validate leases with post-lock db time"
 - 修改：`app/services/ai_call/runtime_control/command_repository.py`
 - 修改测试：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 
-- [ ] **步骤 1：为四类事务分别注入 after-commit 响应丢失**
+- [x] **步骤 1：为四类事务分别注入 after-commit 响应丢失**
 
 覆盖首次双资源分配、Effect 登记、Effect 结果提交、Recovery 接管和 allocation timeout；每个测试在数据库提交后抛出 `ConnectionError`，再以稳定键重试。
 
@@ -215,17 +215,17 @@ finally:
     event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
 ```
 
-- [ ] **步骤 2：断言重复请求只重读原事实**
+- [x] **步骤 2：断言重复请求只重读原事实**
 
 每个场景必须断言：命令、Effect、Reservation 数量不增加，Owner fencing 不再次递增，Worker active/cleanup 计数不重复增加，Resource key 和 Provider idempotency key 保持唯一。
 
-- [ ] **步骤 3：运行 PostgreSQL 故障矩阵**
+- [x] **步骤 3：运行 PostgreSQL 故障矩阵**
 
 ```bash
 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -k 'response_loss or rollback or idempotency or reservation' -q
 ```
 
-- [ ] **步骤 4：提交故障注入切片**
+- [x] **步骤 4：提交故障注入切片**
 
 ```bash
 git add app/services/ai_call/runtime_control/owner_repository.py app/services/ai_call/runtime_control/effect_repository.py app/services/ai_call/runtime_control/command_repository.py tests/postgres/test_ai_call_runtime_control_postgres.py

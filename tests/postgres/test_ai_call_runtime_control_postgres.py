@@ -394,6 +394,184 @@ async def test_committed_start_response_loss_retries_to_original_command() -> No
     await engine.dispose()
 
 
+async def test_committed_initial_owner_response_loss_does_not_duplicate_capacity() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:owner-response-loss",
+                    payload={"business_id": "owner-response-loss"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-owner-response-loss",
+                    startup_id=UUID("15151515-1515-4151-8151-151515151515"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        armed = False
+
+        def fail_after_commit(_session) -> None:
+            if armed:
+                raise ConnectionError("injected committed response loss")
+
+        event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+        try:
+            async with factory() as session:
+                lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                    "tenant-a", start.call_id
+                )
+                assert lease is not None
+                armed = True
+                with pytest.raises(ConnectionError, match="committed response loss"):
+                    await session.commit()
+        finally:
+            event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+        async with factory.begin() as session:
+            assert (
+                await DispatcherOwnerRepository(session).assign_initial_owner(
+                    "tenant-a", start.call_id
+                )
+                is None
+            )
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (worker.worker_id, 1, "active")
+            assert (
+                await session.scalar(
+                    text(
+                        "select active_call_count from ai_call_runtime_worker "
+                        "where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker.worker_id)
+                )
+                == 1
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_committed_effect_registration_and_submit_response_loss_are_replay_safe() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:effect-response-loss",
+                    payload={"business_id": "effect-response-loss"},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-effect-response-loss",
+                    startup_id=UUID("16161616-1616-4161-8161-161616161616"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            start_claim = await commands.claim_next_for_owner(lease)
+            assert start_claim is not None
+
+        spec = EffectSpec(
+            effect_type="CREATE_ROOM",
+            idempotency_key="effect:create-room:response-loss",
+            provider_namespace="stub:response-loss",
+            provider_idempotency_key="provider:create-room:response-loss",
+            resource_key="room:response-loss",
+            resource_generation=lease.fencing_token,
+        )
+
+        armed = False
+
+        def fail_after_commit(_session) -> None:
+            if armed:
+                raise ConnectionError("injected committed response loss")
+
+        event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+        try:
+            async with factory() as session:
+                snapshot = await RuntimeEffectRepository(session).register(
+                    start_claim, spec
+                )
+                armed = True
+                with pytest.raises(ConnectionError, match="committed response loss"):
+                    await session.commit()
+        finally:
+            event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+        async with factory.begin() as session:
+            repeated = await RuntimeEffectRepository(session).register(start_claim, spec)
+            assert repeated == snapshot
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_effect "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 1
+            )
+            assert await RuntimeCommandRepository(session).complete(
+                start_claim,
+                CommandDecision(status=CommandStatus.SUCCEEDED),
+            )
+            effect_claim = await RuntimeEffectRepository(session).claim_next(lease)
+            assert effect_claim is not None
+
+        event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+        try:
+            async with factory() as session:
+                assert await RuntimeEffectRepository(session).submit(
+                    effect_claim,
+                    ProviderObservation(
+                        kind=ProviderObservationKind.RESOURCE_PRESENT,
+                        provider_reference="room-response-loss",
+                    ),
+                )
+                with pytest.raises(ConnectionError, match="committed response loss"):
+                    await session.commit()
+        finally:
+            event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+        async with factory.begin() as session:
+            assert await RuntimeEffectRepository(session).claim_next(lease) is None
+            state = (
+                await session.execute(
+                    text(
+                        "select status, provider_reference, processing_token "
+                        "from ai_call_runtime_effect where id=:effect_id"
+                    ).bindparams(effect_id=effect_claim.effect_id)
+                )
+            ).one()
+            assert tuple(state) == ("APPLIED", "room-response-loss", None)
+    finally:
+        await engine.dispose()
+
+
 async def test_dispatcher_expires_unallocated_start_at_persisted_deadline() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
@@ -676,6 +854,167 @@ async def test_end_evidence_is_multi_source_but_end_call_is_unique_and_preempts(
             assert old_command.processing_token is None
             assert old_command.cancel_requested_at is not None
             assert old_command.preempted_by_command_id == first.command_id
+    finally:
+        await engine.dispose()
+
+
+async def test_committed_recovery_takeover_response_loss_does_not_increment_fencing_twice() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:recovery-response-loss",
+                    payload={"business_id": "recovery-response-loss"},
+                )
+            )
+            old_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-recovery-response-old",
+                    startup_id=UUID("17171717-1717-4171-8171-171717171717"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            old_lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert old_lease is not None
+            await commands.request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="recovery_test",
+                    end_reason="owner_lost",
+                    dedupe_key="recovery-response-loss:owner-lost",
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where worker_id=:worker_id"
+                ).bindparams(worker_id=old_worker.worker_id)
+            )
+            new_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-recovery-response-new",
+                    startup_id=UUID("18181818-1818-4181-8181-181818181818"),
+                    capacity=0,
+                    cleanup_capacity=1,
+                )
+            )
+
+        def fail_after_commit(_session) -> None:
+            raise ConnectionError("injected committed response loss")
+
+        event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+        try:
+            async with factory() as session:
+                takeover = await RecoveryOwnerRepository(session).assign_cleanup_owner(
+                    "tenant-a", start.call_id
+                )
+                assert takeover is not None
+                with pytest.raises(ConnectionError, match="committed response loss"):
+                    await session.commit()
+        finally:
+            event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+        async with factory.begin() as session:
+            assert (
+                await RecoveryOwnerRepository(session).assign_cleanup_owner(
+                    "tenant-a", start.call_id
+                )
+                is None
+            )
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (new_worker.worker_id, 2, "cleanup")
+            counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count, active_cleanup_count "
+                        "from ai_call_runtime_worker where worker_id=:worker_id"
+                    ).bindparams(worker_id=new_worker.worker_id)
+                )
+            ).one()
+            assert tuple(counts) == (0, 1)
+    finally:
+        await engine.dispose()
+
+
+async def test_committed_allocation_timeout_response_loss_replays_terminal_fact() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:allocation-response-loss",
+                    payload={"business_id": "allocation-response-loss"},
+                    allocation_deadline_at=await read_database_time(session),
+                )
+            )
+
+        def fail_after_commit(_session) -> None:
+            raise ConnectionError("injected committed response loss")
+
+        event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+        try:
+            async with factory() as session:
+                assert await RuntimeCommandRepository(session).expire_unallocated_start(
+                    "tenant-a", start.call_id
+                )
+                with pytest.raises(ConnectionError, match="committed response loss"):
+                    await session.commit()
+        finally:
+            event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+        async with factory.begin() as session:
+            assert (
+                await RuntimeCommandRepository(session).expire_unallocated_start(
+                    "tenant-a", start.call_id
+                )
+                is False
+            )
+            command = (
+                await session.execute(
+                    text(
+                        "select status, error_message from ai_call_runtime_command "
+                        "where id=:command_id"
+                    ).bindparams(command_id=start.command_id)
+                )
+            ).one()
+            assert tuple(command) == ("DEAD", "ALLOCATION_TIMEOUT")
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_command "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 1
+            )
     finally:
         await engine.dispose()
 
