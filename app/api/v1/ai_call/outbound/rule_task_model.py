@@ -204,6 +204,8 @@ class AiCallOutboundAttemptModel(MappedBase):
             "attempt_no",
         ),
         Index("idx_outbound_attempt_stale", "status", "started_at"),
+        Index("idx_outbound_attempt_reconcile", "status", "reconcile_after"),
+        Index("idx_outbound_attempt_reconcile_lease", "reconcile_expires_at"),
         {"comment": "通用外呼拨打尝试与通话记录关联"},
     )
     __permission_strategy__ = None
@@ -250,3 +252,13 @@ class AiCallOutboundAttemptModel(MappedBase):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reconcile_owner_id: Mapped[str | None] = mapped_column(String(128))
+    reconcile_token: Mapped[str | None] = mapped_column(String(128))
+    reconcile_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconcile_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconcile_attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )

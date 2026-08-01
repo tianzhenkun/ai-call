@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -91,6 +92,24 @@ def test_outbound_attempt_has_independent_projection_lease_fields() -> None:
     }
     assert ("status", "reconcile_after") in index_columns
     assert ("reconcile_expires_at",) in index_columns
+
+    migration = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "livekit-ai-outbound"
+        / "sql"
+        / "phase-i1-owner-command-db-control-plane.sql"
+    ).read_text(encoding="utf-8").lower()
+    for fragment in (
+        "reconcile_owner_id varchar(128)",
+        "reconcile_token varchar(128)",
+        "reconcile_expires_at timestamptz",
+        "reconcile_after timestamptz",
+        "reconcile_attempt_count integer not null default 0",
+        "idx_outbound_attempt_reconcile",
+        "idx_outbound_attempt_reconcile_lease",
+    ):
+        assert fragment in migration
 
 
 def test_runtime_control_tables_and_required_columns_are_frozen() -> None:
