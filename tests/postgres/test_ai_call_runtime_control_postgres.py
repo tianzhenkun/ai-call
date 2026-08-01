@@ -66,6 +66,11 @@ from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
     RuntimeRegistry,
 )
+from app.services.ai_call.runtime_control.runtime_token_service import (
+    RuntimeTokenGateError,
+    RuntimeTokenGateRepository,
+    RuntimeTokenNotFoundError,
+)
 from app.services.ai_call.runtime_control.startup_recovery import (
     StartupReconcileService,
 )
@@ -431,6 +436,7 @@ async def test_runtime_bootstrap_reads_owner_snapshot_with_tenant_boundary() -> 
                 )
             )
             assert record is not None
+            record.status = "ready"
             record.agent_participant_identity = "agent-bootstrap"
             record.agent_resource_generation = lease.fencing_token
             record.agent_media_ready_at = await read_database_time(session)
@@ -465,11 +471,49 @@ async def test_runtime_bootstrap_reads_owner_snapshot_with_tenant_boundary() -> 
             )
             assert snapshot.phase == "ready"
             assert snapshot.token_available is False
+            token_gate = await RuntimeTokenGateRepository(session).authorize(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert token_gate.participant_identity == f"caller-{start.call_id}"
+            assert token_gate.runtime_fencing_token == lease.fencing_token
             with pytest.raises(RuntimeBootstrapNotFoundError):
                 await RuntimeBootstrapService(session).get(
                     tenant_id="tenant-b",
                     call_id=start.call_id,
                 )
+            with pytest.raises(RuntimeTokenNotFoundError):
+                await RuntimeTokenGateRepository(session).authorize(
+                    tenant_id="tenant-b",
+                    call_id=start.call_id,
+                )
+
+        async with factory.begin() as session:
+            worker = await session.get(AiCallRuntimeWorkerModel, lease.owner_id)
+            assert worker is not None
+            worker.status = "DRAINING"
+
+        async with factory() as session:
+            draining_gate = await RuntimeTokenGateRepository(session).authorize(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert draining_gate.runtime_fencing_token == lease.fencing_token
+
+        async with factory.begin() as session:
+            worker = await session.get(AiCallRuntimeWorkerModel, lease.owner_id)
+            assert worker is not None
+            worker.lease_expires_at = await read_database_time(session) - timedelta(
+                seconds=1
+            )
+
+        async with factory() as session:
+            with pytest.raises(RuntimeTokenGateError) as exc_info:
+                await RuntimeTokenGateRepository(session).authorize(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                )
+            assert exc_info.value.error_code == "OWNER_UNAVAILABLE"
     finally:
         await engine.dispose()
 

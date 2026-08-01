@@ -20,6 +20,7 @@ def _record(**overrides):
         "runtime_fencing_token": 7,
         "runtime_lease_expires_at": datetime(2026, 8, 1, 12, 1, tzinfo=UTC),
         "room_name": "ai-call-call-1",
+        "participant_identity": "caller-call-1",
         "agent_participant_identity": "agent-call-1",
         "agent_resource_generation": 7,
         "agent_media_ready_at": datetime(2026, 8, 1, 12, 0, 30, tzinfo=UTC),
@@ -48,7 +49,7 @@ def test_bootstrap_is_ready_only_after_room_agent_and_media_gates() -> None:
     assert snapshot.phase == "ready"
     assert snapshot.token_available is False
     assert snapshot.room_name == "ai-call-call-1"
-    assert snapshot.participant_identity == "agent-call-1"
+    assert snapshot.participant_identity == "caller-call-1"
 
 
 @pytest.mark.parametrize(

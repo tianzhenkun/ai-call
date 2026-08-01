@@ -12,6 +12,10 @@ from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapSnapshot,
 )
 from app.services.ai_call.runtime_control.command_repository import CommandSnapshot
+from app.services.ai_call.runtime_control.runtime_token_service import (
+    RuntimeIssuedToken,
+    RuntimeTokenGateError,
+)
 
 
 class _FakeRepository:
@@ -114,7 +118,7 @@ class _FakeBootstrapService:
             entry_type="web",
             phase="ready",
             room_name="ai-call-call-1",
-            participant_identity="agent-call-1",
+            participant_identity="caller-call-1",
             runtime_fencing_token=7,
             agent_media_ready_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
             terminal_requested_at=None,
@@ -142,7 +146,7 @@ async def test_runtime_bootstrap_controller_returns_readiness_without_token(
         "entryType": "web",
         "phase": "ready",
         "roomName": "ai-call-call-1",
-        "participantIdentity": "agent-call-1",
+        "participantIdentity": "caller-call-1",
         "runtimeFencingToken": 7,
         "agentMediaReadyAt": "2026-08-01T00:00:00Z",
         "terminalRequestedAt": None,
@@ -197,3 +201,87 @@ async def test_runtime_bootstrap_controller_returns_not_found_without_cross_tena
         )
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_runtime_token_controller_returns_locally_signed_owner_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _TokenService:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def issue_browser_token(self, *, tenant_id: str, call_id: str):
+            assert tenant_id == "tenant-from-auth"
+            assert call_id == "call-1"
+            return RuntimeIssuedToken(
+                call_id=call_id,
+                room_name="ai-call-call-1",
+                livekit_url="wss://livekit.test",
+                participant_token="signed-token",
+                participant_identity="caller-call-1",
+                expires_in_seconds=60,
+            )
+
+    monkeypatch.setattr(controller, "RuntimeTokenService", _TokenService)
+    monkeypatch.setattr(
+        controller,
+        "settings",
+        SimpleNamespace(
+            LIVEKIT_URL="wss://livekit.test",
+            LIVEKIT_API_KEY="livekit-key",
+            LIVEKIT_API_SECRET="livekit-secret-that-is-long-enough",
+            LIVEKIT_BROWSER_TOKEN_TTL_SECONDS=60,
+        ),
+    )
+
+    response = await controller.create_runtime_token_controller(
+        auth=_auth(),
+        call_id="call-1",
+    )
+
+    assert json.loads(response.body)["data"] == {
+        "callId": "call-1",
+        "roomName": "ai-call-call-1",
+        "livekitUrl": "wss://livekit.test",
+        "participantToken": "signed-token",
+        "participantIdentity": "caller-call-1",
+        "expiresInSeconds": 60,
+    }
+
+
+@pytest.mark.anyio
+async def test_runtime_token_controller_returns_stable_gate_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _TokenService:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def issue_browser_token(self, *, tenant_id: str, call_id: str):
+            raise RuntimeTokenGateError("OWNER_UNAVAILABLE", "owner unavailable")
+
+    monkeypatch.setattr(controller, "RuntimeTokenService", _TokenService)
+    monkeypatch.setattr(
+        controller,
+        "settings",
+        SimpleNamespace(
+            LIVEKIT_URL="wss://livekit.test",
+            LIVEKIT_API_KEY="livekit-key",
+            LIVEKIT_API_SECRET="livekit-secret-that-is-long-enough",
+            LIVEKIT_BROWSER_TOKEN_TTL_SECONDS=60,
+        ),
+    )
+
+    with pytest.raises(controller.CustomException) as exc_info:
+        await controller.create_runtime_token_controller(
+            auth=_auth(),
+            call_id="call-1",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.data == {"errorCode": "OWNER_UNAVAILABLE"}

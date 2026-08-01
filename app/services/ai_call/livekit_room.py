@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
@@ -57,11 +59,18 @@ class LiveKitRoomManager:
                 return
             raise
 
-    def issue_browser_token(self, room_name: str, participant_identity: str) -> BrowserRoomToken:
+    def issue_browser_token(
+        self,
+        room_name: str,
+        participant_identity: str,
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> BrowserRoomToken:
         return self.issue_participant_token(
             room_name,
             participant_identity,
             expires_in_seconds=self.browser_token_ttl_seconds,
+            metadata=metadata,
         )
 
     def issue_handoff_token(
@@ -82,6 +91,7 @@ class LiveKitRoomManager:
         participant_identity: str,
         *,
         expires_in_seconds: int,
+        metadata: Mapping[str, object] | None = None,
     ) -> BrowserRoomToken:
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=expires_in_seconds)
@@ -98,6 +108,13 @@ class LiveKitRoomManager:
                 "canPublishData": True,
             },
         }
+        if metadata:
+            payload["metadata"] = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         token = jwt.encode(payload, self.api_secret, algorithm="HS256")
         return BrowserRoomToken(
             livekit_url=self.livekit_url,

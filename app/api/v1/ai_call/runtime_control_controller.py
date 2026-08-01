@@ -8,11 +8,15 @@ from app.api.v1.ai_call.schema import (
     RuntimeBootstrapOut,
     RuntimeStartCallOut,
     RuntimeStartCallRequest,
+    TokenOut,
 )
 from app.api.v1.system.auth.schema import AuthSchema
+from app.common.constant import RET
 from app.common.response import ResponseSchema, SuccessResponse
 from app.config.setting import settings
 from app.core.dependencies import get_current_user
+from app.core.exceptions import CustomException
+from app.services.ai_call.livekit_room import LiveKitRoomManager
 from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapLegacyError,
     RuntimeBootstrapNotFoundError,
@@ -24,6 +28,12 @@ from app.services.ai_call.runtime_control.command_repository import (
 from app.services.ai_call.runtime_control.entry_start_service import (
     RuntimeEntryStartService,
     StartEntryRequest,
+)
+from app.services.ai_call.runtime_control.runtime_token_service import (
+    RuntimeTokenGateError,
+    RuntimeTokenGateRepository,
+    RuntimeTokenNotFoundError,
+    RuntimeTokenService,
 )
 
 RuntimeEntryRouter = APIRouter(tags=["智能外呼运行时"])
@@ -106,4 +116,60 @@ async def get_runtime_bootstrap_controller(
     return SuccessResponse(
         data=RuntimeBootstrapOut.model_validate(snapshot),
         msg="runtime bootstrap 状态已读取",
+    )
+
+
+@RuntimeEntryRouter.post(
+    "/runtime/calls/{call_id}/token",
+    summary="签发 AI Call owner runtime 浏览器 Token",
+    response_model=ResponseSchema[TokenOut],
+)
+async def create_runtime_token_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    call_id: str,
+):
+    tenant_id = str(getattr(getattr(auth, "user", None), "tenant_id", "") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
+    if not (
+        settings.LIVEKIT_URL
+        and settings.LIVEKIT_API_KEY
+        and settings.LIVEKIT_API_SECRET
+        and settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS > 0
+    ):
+        raise CustomException(
+            msg="LiveKit Token 签名配置不可用",
+            code=RET.ERROR.code,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            data={"errorCode": "TOKEN_SIGNER_UNAVAILABLE"},
+        )
+
+    try:
+        token = await RuntimeTokenService(
+            repository=RuntimeTokenGateRepository(auth.db),
+            room_manager=LiveKitRoomManager(
+                settings.LIVEKIT_URL,
+                settings.LIVEKIT_API_KEY,
+                settings.LIVEKIT_API_SECRET,
+                settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
+            ),
+        ).issue_browser_token(tenant_id=tenant_id, call_id=call_id)
+    except RuntimeTokenNotFoundError as exc:
+        raise CustomException(
+            msg=str(exc),
+            code=RET.ERROR.code,
+            status_code=status.HTTP_404_NOT_FOUND,
+            data={"errorCode": exc.error_code},
+        ) from exc
+    except RuntimeTokenGateError as exc:
+        raise CustomException(
+            msg=str(exc),
+            code=RET.ERROR.code,
+            status_code=status.HTTP_409_CONFLICT,
+            data={"errorCode": exc.error_code},
+        ) from exc
+
+    return SuccessResponse(
+        data=TokenOut.model_validate(token),
+        msg="runtime Token 签发成功",
     )
