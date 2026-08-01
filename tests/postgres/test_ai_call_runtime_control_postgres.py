@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import psycopg
@@ -40,6 +41,10 @@ from app.services.ai_call.runtime_control.effect_repository import (
     ProviderObservationKind,
     RuntimeEffectRepository,
 )
+from app.services.ai_call.runtime_control.entry_start_service import (
+    RuntimeEntryStartService,
+    StartEntryRequest,
+)
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
 from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
@@ -58,6 +63,7 @@ from app.services.ai_call.runtime_control.owner_repository import (
     WorkerRegistryRepository,
 )
 from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicWebProviderStub,
     ScriptedProviderStub,
     StubObservationKind,
 )
@@ -3777,6 +3783,377 @@ async def test_two_runtime_services_use_independent_registries_in_db_only_loop()
                 )
             ).one()
             assert tuple(record) == ("completed", "clean", None)
+    finally:
+        await engine.dispose()
+
+
+async def test_web_db_only_two_dispatchers_and_runtimes_complete_start_end_loop() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="web:db-only:full-loop",
+                    payload={
+                        "voice": "voice-a",
+                        "business_id": "business-full-loop",
+                        "scene_code": "collection",
+                        "business_params": {"case": "full-loop"},
+                    },
+                    business_id="business-full-loop",
+                    scene_code="collection",
+                    allocation_timeout_seconds=30,
+                )
+            )
+            assert start is not None
+            worker_a = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="web-runtime-a",
+                    startup_id=UUID("10101010-1010-4010-8010-101010101010"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            worker_b = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="web-runtime-b",
+                    startup_id=UUID("20202020-2020-4020-8020-202020202020"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        dispatcher_counts = await asyncio.gather(
+            DispatcherControlService(factory).run_once(),
+            DispatcherControlService(factory).run_once(),
+        )
+        assert sum(dispatcher_counts) == 1
+
+        provider_a = DeterministicWebProviderStub()
+        provider_b = DeterministicWebProviderStub()
+        runtime_a = RuntimeControlService(
+            worker_id=worker_a.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_a,
+        )
+        runtime_b = RuntimeControlService(
+            worker_id=worker_b.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_b,
+        )
+
+        start_counts = await asyncio.gather(
+            runtime_a.run_once(),
+            runtime_b.run_once(),
+        )
+        assert sorted(start_counts) == [0, 1]
+
+        async with factory() as session:
+            start_query = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=start.command_id,
+            )
+            assert start_query is not None
+            assert start_query.status == "SUCCEEDED"
+            bootstrap = await RuntimeBootstrapService(session).get(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert bootstrap.phase == "ready"
+            assert bootstrap.token_available is False
+
+        async with factory.begin() as session:
+            end = await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="web_client",
+                    end_reason="user_requested",
+                    dedupe_key="web:db-only:full-loop:end",
+                )
+            )
+
+        end_counts = await asyncio.gather(
+            runtime_a.run_once(),
+            runtime_b.run_once(),
+        )
+        assert sorted(end_counts) == [0, 1]
+
+        async with factory() as session:
+            end_query = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=end.command_id,
+            )
+            assert end_query is not None
+            assert end_query.status == "SUCCEEDED"
+            bootstrap = await RuntimeBootstrapService(session).get(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert bootstrap.phase == "terminal"
+            assert bootstrap.token_available is False
+
+            record = (
+                await session.execute(
+                    text(
+                        "select status, resource_cleanup_status, runtime_owner_id, "
+                        "runtime_capacity_class, entry_type from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == ("completed", "clean", None, "none", "web")
+
+            worker_counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count, active_cleanup_count "
+                        "from ai_call_runtime_worker order by worker_id"
+                    )
+                )
+            ).all()
+            assert worker_counts == [(0, 0), (0, 0)]
+            assert (
+                await session.scalar(
+                    text("select count(*) from ai_call_sip_line_reservation")
+                )
+                == 0
+            )
+            assert await session.scalar(text("select count(*) from ai_call_sip_line")) == 0
+            assert (
+                await session.scalar(
+                    text("select count(*) from ai_call_record where entry_type <> 'web'")
+                )
+                == 0
+            )
+
+            commands = (
+                await session.execute(
+                    text(
+                        "select command_type, status, dispatch_token, "
+                        "dispatch_expires_at, published_at, stream_message_id "
+                        "from ai_call_runtime_command where call_id=:call_id "
+                        "order by command_seq"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).all()
+            assert commands == [
+                ("START_CALL", "SUCCEEDED", None, None, None, None),
+                ("END_CALL", "SUCCEEDED", None, None, None, None),
+            ]
+
+        provider_calls = provider_a.calls + provider_b.calls
+        expected_effect_calls = {
+            ("CREATE_ROOM", f"room:{start.call_id}:g1"),
+            ("ATTACH_AGENT_PARTICIPANT", f"agent:{start.call_id}:g1"),
+            ("DISCONNECT_AGENT_PARTICIPANT", f"agent:{start.call_id}:g1"),
+            ("DELETE_ROOM", f"room:{start.call_id}:g1"),
+        }
+        assert {
+            (call["effect_type"], call["resource_key"]) for call in provider_calls
+        } == expected_effect_calls
+        assert len(provider_calls) == len(expected_effect_calls)
+    finally:
+        await engine.dispose()
+
+
+async def test_web_db_only_waits_without_worker_then_expires_from_database_deadline() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="web:db-only:allocation-timeout",
+                    payload={"voice": "voice-a"},
+                    allocation_timeout_seconds=30,
+                )
+            )
+            assert start is not None
+
+        async with factory() as session:
+            pending = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=start.command_id,
+            )
+            assert pending is not None
+            assert pending.status == "PENDING"
+            bootstrap = await RuntimeBootstrapService(session).get(
+                tenant_id="tenant-a",
+                call_id=start.call_id,
+            )
+            assert bootstrap.phase == "starting"
+            assert bootstrap.token_available is False
+
+        async with factory.begin() as session:
+            await session.execute(
+                text(
+                    "update ai_call_runtime_command set "
+                    "allocation_deadline_at=clock_timestamp() - interval '1 second' "
+                    "where id=:command_id"
+                ).bindparams(command_id=start.command_id)
+            )
+
+        assert await DispatcherControlService(factory).run_once() == 1
+
+        async with factory() as session:
+            expired = await RuntimeCommandRepository(session).get_command(
+                tenant_id="tenant-a",
+                command_id=start.command_id,
+            )
+            assert expired is not None
+            assert expired.status == "DEAD"
+            assert expired.result == {"error": "ALLOCATION_TIMEOUT"}
+            assert expired.error_message == "ALLOCATION_TIMEOUT"
+            record = (
+                await session.execute(
+                    text(
+                        "select status, failure_stage, failure_message, "
+                        "resource_cleanup_status, runtime_owner_id "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (
+                "failed",
+                "allocation",
+                "ALLOCATION_TIMEOUT",
+                "clean",
+                None,
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_effect "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 0
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_web_db_only_idempotency_and_terminal_barrier_leave_no_extra_rows() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    request = StartEntryRequest(
+        tenant_id="tenant-a",
+        entry_type="web",
+        idempotency_key="web:db-only:idempotency",
+        payload={"voice": "voice-a", "business_id": "business-a"},
+        business_id="business-a",
+        allocation_timeout_seconds=30,
+    )
+    try:
+        async with factory.begin() as session:
+            service = RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            )
+            first = await service.submit(request)
+            repeated = await service.submit(request)
+            assert first is not None
+            assert repeated == first
+            with pytest.raises(IdempotencyConflictError):
+                await service.submit(
+                    replace(
+                        request,
+                        payload={"voice": "voice-b", "business_id": "business-a"},
+                    )
+                )
+
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="web-runtime-barrier",
+                    startup_id=UUID("30303030-3030-4030-8030-303030303030"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a",
+                first.call_id,
+            )
+            assert lease is not None
+            claim = await RuntimeCommandRepository(session).claim_next_for_owner(lease)
+            assert claim is not None
+            await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=first.call_id,
+                    source="web_client",
+                    end_reason="user_requested",
+                    dedupe_key="web:db-only:idempotency:end",
+                )
+            )
+
+            with pytest.raises(TerminalBarrierError):
+                await RuntimeCommandRepository(session).append_command(
+                    CommandIntent(
+                        tenant_id="tenant-a",
+                        call_id=first.call_id,
+                        command_type="UPDATE_PROMPT",
+                        idempotency_key="web:db-only:late-command",
+                        payload={},
+                    )
+                )
+            with pytest.raises(EffectRegistrationError):
+                await RuntimeEffectRepository(session).register(
+                    claim,
+                    EffectSpec(
+                        effect_type="CREATE_ROOM",
+                        idempotency_key="web:db-only:late-effect",
+                        provider_namespace=f"stub:{worker.worker_id}",
+                        provider_idempotency_key="web:db-only:late-effect",
+                        resource_key=f"room:{first.call_id}:g1",
+                        resource_generation=lease.fencing_token,
+                    ),
+                )
+
+        async with factory() as session:
+            assert await session.scalar(text("select count(*) from ai_call_record")) == 1
+            assert (
+                await session.scalar(
+                    text(
+                        "select count(*) from ai_call_runtime_command "
+                        "where command_type='START_CALL'"
+                    )
+                )
+                == 1
+            )
+            assert (
+                await session.scalar(text("select count(*) from ai_call_runtime_effect"))
+                == 0
+            )
     finally:
         await engine.dispose()
 
