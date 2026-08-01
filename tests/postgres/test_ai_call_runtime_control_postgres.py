@@ -16,7 +16,19 @@ from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.outbound.attempt_reconciler import (
+    OutboundAttemptReconcileWorker,
+)
+from app.api.v1.ai_call.outbound.owner_runtime_start import (
+    OwnerRuntimeOutboundStart,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
+)
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
+from app.api.v1.ai_call.outbound.task_executor import OutboundTaskExecutor
 from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapNotFoundError,
     RuntimeBootstrapService,
@@ -98,6 +110,7 @@ from app.services.ai_call.runtime_control.startup_recovery import (
 )
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
+from app.utils.id_util import generate_snowflake_id
 
 pytestmark = pytest.mark.anyio
 
@@ -329,6 +342,9 @@ async def _reset_repository_schema(engine) -> None:
         AiCallRuntimeCommandModel.__table__,
         AiCallSipLineReservationModel.__table__,
         AiCallRuntimeWorkerModel.__table__,
+        AiCallOutboundAttemptModel.__table__,
+        AiCallOutboundTargetModel.__table__,
+        AiCallOutboundTaskModel.__table__,
         AiCallRecordModel.__table__,
     )
     async with engine.begin() as connection:
@@ -5330,4 +5346,297 @@ async def test_missing_dependency_row_is_fail_closed_during_effect_claim() -> No
         async with factory.begin() as session:
             assert await RuntimeEffectRepository(session).claim_next(lease) is None
     finally:
+        await engine.dispose()
+
+
+async def test_outbound_db_only_two_instances_create_one_dialing_chain() -> None:
+    class RejectingLegacyDialer:
+        dialer_type = "sip"
+        manages_call_record = True
+
+        def __init__(self) -> None:
+            self.called = False
+
+        async def dial(self, *args, **kwargs):
+            del args, kwargs
+            self.called = True
+            raise AssertionError("owner runtime outbound must not call legacy dial()")
+
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    runtime_a = None
+    runtime_b = None
+    try:
+        task_id = generate_snowflake_id()
+        target_id = generate_snowflake_id()
+        line_id = generate_snowflake_id()
+        phone_number = "13800138001"
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(session, line_id=line_id, max_concurrency=1)
+            line_snapshot = {
+                "lineId": str(line_id),
+                "lineCode": f"line-{line_id}",
+                "lineName": f"Line {line_id}",
+                "adapterType": "livekit_sip",
+                "routeMode": "managed_trunk_id",
+                "trunkId": "stub-trunk",
+                "proxyHost": None,
+                "proxyPort": None,
+                "authMode": "managed_trunk",
+                "callerNumber": "masked",
+                "destinationCountry": "CN",
+                "maxConcurrency": 1,
+                "originateTimeoutSeconds": 45,
+            }
+            session.add(
+                AiCallOutboundTaskModel(
+                    id=task_id,
+                    tenant_id="tenant-a",
+                    validation_id=generate_snowflake_id(),
+                    idempotency_key=f"outbound-owner:{task_id}",
+                    request_fingerprint="a" * 64,
+                    task_name="Outbound DB-only 双实例",
+                    task_mode="batch",
+                    status="SCHEDULED",
+                    total_targets=1,
+                    completed_targets=0,
+                    connected_targets=0,
+                    failed_targets=0,
+                    execution_mode="immediate",
+                    scheduled_at=None,
+                    started_at=None,
+                    ended_at=None,
+                    prompt_profile_id="prompt-1",
+                    prompt_name="合同介绍",
+                    scene_code="intro_contract",
+                    voice="Tina",
+                    voice_name="Tina",
+                    rule_id=generate_snowflake_id(),
+                    rule_name="测试规则",
+                    rule_summary="测试规则摘要",
+                    line_id=line_id,
+                    line_name=f"Line {line_id}",
+                    config_snapshot_json=json.dumps(
+                        {
+                            "request": {"taskName": "Outbound DB-only 双实例"},
+                            "prompt": {
+                                "id": "prompt-1",
+                                "sceneCode": "intro_contract",
+                            },
+                            "voice": {"voice": "Tina"},
+                            "rule": {
+                                "retryCount": 0,
+                                "retryIntervalsMinutes": [],
+                                "retryableResults": [],
+                            },
+                            "sipLine": line_snapshot,
+                        }
+                    ),
+                    error_message=None,
+                    created_by=1,
+                    created_by_name="测试用户",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                AiCallOutboundTargetModel(
+                    id=target_id,
+                    tenant_id="tenant-a",
+                    task_id=task_id,
+                    validation_id=generate_snowflake_id(),
+                    source_validation_row_id=generate_snowflake_id(),
+                    source_row_number=2,
+                    phone_number=phone_number,
+                    customer_name="客户一",
+                    status="PENDING",
+                    attempt_count=0,
+                    latest_result=None,
+                    next_attempt_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            worker_a = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="outbound-runtime-a",
+                    startup_id=UUID("11111111-1111-4111-8111-111111111111"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            worker_b = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="outbound-runtime-b",
+                    startup_id=UUID("22222222-2222-4222-8222-222222222222"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        first_dialer = RejectingLegacyDialer()
+        second_dialer = RejectingLegacyDialer()
+
+        def outbound_executor(dialer) -> OutboundTaskExecutor:
+            return OutboundTaskExecutor(
+                factory,
+                dialer,
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(),
+            )
+
+        executor_counts = await asyncio.gather(
+            outbound_executor(first_dialer).run_once(),
+            outbound_executor(second_dialer).run_once(),
+        )
+        assert sum(executor_counts) == 1
+        assert first_dialer.called is False
+        assert second_dialer.called is False
+
+        dispatcher_counts = await asyncio.gather(
+            DispatcherControlService(factory).run_once(),
+            DispatcherControlService(factory).run_once(),
+        )
+        assert sum(dispatcher_counts) == 1
+
+        provider_a = DeterministicDbOnlyProviderStub()
+        provider_b = DeterministicDbOnlyProviderStub()
+        runtime_a = RuntimeControlService(
+            worker_id=worker_a.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_a,
+            capacity=1,
+            cleanup_capacity=1,
+        )
+        runtime_b = RuntimeControlService(
+            worker_id=worker_b.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_b,
+            capacity=1,
+            cleanup_capacity=1,
+        )
+        runtime_counts = await asyncio.gather(
+            runtime_a.run_once(),
+            runtime_b.run_once(),
+        )
+        assert sum(runtime_counts) == 1
+
+        reconciler_counts = await asyncio.gather(
+            OutboundAttemptReconcileWorker(
+                factory,
+                worker_id="outbound-reconciler-a",
+            ).run_once(),
+            OutboundAttemptReconcileWorker(
+                factory,
+                worker_id="outbound-reconciler-b",
+            ).run_once(),
+        )
+        assert sum(reconciler_counts) == 1
+
+        async with factory() as session:
+            attempt = await session.scalar(
+                select(AiCallOutboundAttemptModel).where(
+                    AiCallOutboundAttemptModel.task_id == task_id
+                )
+            )
+            target = await session.get(AiCallOutboundTargetModel, target_id)
+            record = await session.scalar(select(AiCallRecordModel))
+            command = await session.scalar(
+                select(AiCallRuntimeCommandModel).where(
+                    AiCallRuntimeCommandModel.command_type == "START_CALL"
+                )
+            )
+            reservation = await session.scalar(select(AiCallSipLineReservationModel))
+            effects = list(
+                (
+                    await session.scalars(
+                        select(AiCallRuntimeEffectModel).order_by(
+                            AiCallRuntimeEffectModel.id
+                        )
+                    )
+                ).all()
+            )
+            counts = {
+                "attempt": int(
+                    await session.scalar(
+                        select(text("count(*)")).select_from(
+                            AiCallOutboundAttemptModel
+                        )
+                    )
+                    or 0
+                ),
+                "record": int(
+                    await session.scalar(
+                        select(text("count(*)")).select_from(AiCallRecordModel)
+                    )
+                    or 0
+                ),
+                "start_command": int(
+                    await session.scalar(
+                        select(text("count(*)"))
+                        .select_from(AiCallRuntimeCommandModel)
+                        .where(
+                            AiCallRuntimeCommandModel.command_type == "START_CALL"
+                        )
+                    )
+                    or 0
+                ),
+                "reservation": int(
+                    await session.scalar(
+                        select(text("count(*)")).select_from(
+                            AiCallSipLineReservationModel
+                        )
+                    )
+                    or 0
+                ),
+            }
+
+        assert counts == {
+            "attempt": 1,
+            "record": 1,
+            "start_command": 1,
+            "reservation": 1,
+        }
+        assert attempt is not None and attempt.status == "DIALING"
+        assert target is not None and target.status == "DIALING"
+        assert reservation is not None
+        assert reservation.attempt_id == attempt.id
+        assert reservation.status == "ACTIVE"
+        assert record is not None and record.status == "ready"
+        assert record.callee_phone_number is None
+        assert command is not None and command.status == "SUCCEEDED"
+        assert len(effects) == 3
+        provider_calls = provider_a.calls + provider_b.calls
+        assert len(provider_calls) == 3
+        assert phone_number not in (command.payload_json or "")
+        assert phone_number not in repr(provider_calls)
+        assert phone_number not in repr(
+            [
+                (
+                    effect.provider_namespace,
+                    effect.provider_idempotency_key,
+                    effect.resource_key,
+                    effect.error_message,
+                )
+                for effect in effects
+            ]
+        )
+        assert phone_number not in repr(
+            [
+                attempt.error_message,
+                record.failure_message,
+                command.error_message,
+                reservation.error_message,
+            ]
+        )
+    finally:
+        if runtime_a is not None:
+            await runtime_a.stop()
+        if runtime_b is not None:
+            await runtime_b.stop()
         await engine.dispose()
