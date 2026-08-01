@@ -10,6 +10,12 @@ from app.services.ai_call.runtime_control.command_repository import (
     RuntimeCommandRepository,
     StartCallIntent,
 )
+from app.services.ai_call.runtime_control.direct_sip_phone import (
+    DirectSipPhone,
+    DirectSipPhoneError,
+    payload_contains_phone,
+    prepare_direct_sip_phone,
+)
 from app.services.ai_call.runtime_control.roles import (
     RuntimeRoleConfigurationError,
     runtime_control_mode_for_entry,
@@ -33,8 +39,7 @@ class StartEntryRequest:
     prompt_source_key: str | None = None
     allocation_deadline_at: datetime | None = None
     allocation_timeout_seconds: float | None = None
-    sensitive_payload_ciphertext: str | None = None
-    payload_key_version: str | None = None
+    callee_phone_number: str | None = None
 
 
 class RuntimeEntryStartService:
@@ -72,22 +77,20 @@ class RuntimeEntryStartService:
             raise RuntimeEntryStartError("START_CALL 排队超时必须大于 0 秒")
 
         payload = dict(request.payload)
+        direct_sip_phone: DirectSipPhone | None = None
         if entry is OwnerCommandEntry.DIRECT_SIP:
-            if not request.sensitive_payload_ciphertext or not request.payload_key_version:
-                raise RuntimeEntryStartError(
-                    "direct_sip 必须提供敏感参数密文和密钥版本"
+            try:
+                direct_sip_phone = prepare_direct_sip_phone(
+                    request.callee_phone_number or ""
                 )
-            if {
-                "callee_phone_number",
-                "calleePhoneNumber",
-                "phone_number",
-                "phoneNumber",
-                "destination_phone",
-                "destinationPhone",
-            } & payload.keys():
+            except DirectSipPhoneError as exc:
+                raise RuntimeEntryStartError(str(exc)) from exc
+            if payload_contains_phone(payload, direct_sip_phone.plaintext):
                 raise RuntimeEntryStartError(
-                    "direct_sip payload 不得包含明文号码"
+                    "direct_sip payload 不得包含完整被叫号码"
                 )
+        elif request.callee_phone_number is not None:
+            raise RuntimeEntryStartError("Web 入口不接受 Direct SIP 号码")
 
         return await self._repository.create_start_call(
             StartCallIntent(
@@ -101,7 +104,14 @@ class RuntimeEntryStartService:
                 prompt_source_key=request.prompt_source_key,
                 allocation_deadline_at=request.allocation_deadline_at,
                 allocation_timeout_seconds=request.allocation_timeout_seconds,
-                sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
-                payload_key_version=request.payload_key_version,
+                callee_phone_number=(
+                    direct_sip_phone.plaintext if direct_sip_phone else None
+                ),
+                callee_phone_number_masked=(
+                    direct_sip_phone.masked if direct_sip_phone else None
+                ),
+                callee_phone_number_hash=(
+                    direct_sip_phone.fingerprint if direct_sip_phone else None
+                ),
             )
         )

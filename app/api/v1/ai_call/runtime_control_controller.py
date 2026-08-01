@@ -122,8 +122,7 @@ async def create_runtime_start_call_controller(
                 scene_code=request.scene_code,
                 prompt_source_key=request.prompt_source_key,
                 allocation_deadline_at=request.allocation_deadline_at,
-                sensitive_payload_ciphertext=request.sensitive_payload_ciphertext,
-                payload_key_version=request.payload_key_version,
+                callee_phone_number=request.callee_phone_number,
             )
         )
     except IdempotencyConflictError as exc:

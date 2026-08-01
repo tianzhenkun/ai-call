@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -123,52 +123,76 @@ async def test_preview_is_not_an_owner_command_entry() -> None:
 
 
 @pytest.mark.anyio
-async def test_direct_sip_requires_encrypted_sensitive_payload_and_rejects_plain_number(
+async def test_direct_sip_builds_plain_record_fields_without_sensitive_command_payload(
 ) -> None:
     repository = _FakeRepository([])
     service = RuntimeEntryStartService(
         settings=_settings("direct_sip"),
         repository=repository,
     )
-    base = {
-        "tenant_id": "tenant-a",
-        "entry_type": "direct_sip",
-        "idempotency_key": "start:sip:1",
-        "business_type": "manual_sip",
-        "business_id": "biz-1",
-    }
-
-    with pytest.raises(RuntimeEntryStartError, match="密文"):
-        await service.submit(
-            StartEntryRequest(
-                **base,
-                payload={"calleePhoneNumber": "13800000000"},
-            )
-        )
-
-    with pytest.raises(RuntimeEntryStartError, match="明文号码"):
-        await service.submit(
-            StartEntryRequest(
-                **base,
-                payload={"callee_phone_number": "13800000000"},
-                sensitive_payload_ciphertext="ciphertext",
-                payload_key_version="v1",
-            )
-        )
 
     result = await service.submit(
         StartEntryRequest(
-            **base,
-            payload={"callee_phone_number_hash": "hash"},
-            sensitive_payload_ciphertext="ciphertext",
-            payload_key_version="v1",
-            allocation_deadline_at=datetime.now(timezone.utc),
+            tenant_id="tenant-a",
+            entry_type="direct_sip",
+            idempotency_key="start:sip:1",
+            payload={"voice": "v1", "business_params": {"customerName": "张三"}},
+            callee_phone_number="13812345678",
         )
     )
 
     assert result == "command-snapshot"
-    assert repository.requests[-1].sensitive_payload_ciphertext == "ciphertext"
-    assert repository.requests[-1].payload_key_version == "v1"
+    intent = repository.requests[-1]
+    assert intent.callee_phone_number == "13812345678"
+    assert intent.callee_phone_number_masked == "138****5678"
+    assert intent.callee_phone_number_hash.startswith("sha256:")
+    assert "13812345678" not in json.dumps(intent.payload, ensure_ascii=False)
+    assert intent.sensitive_payload_ciphertext is None
+    assert intent.payload_key_version is None
+
+
+@pytest.mark.anyio
+async def test_direct_sip_rejects_phone_repeated_in_nested_payload() -> None:
+    repository = _FakeRepository([])
+    service = RuntimeEntryStartService(
+        settings=_settings("direct_sip"),
+        repository=repository,
+    )
+
+    with pytest.raises(RuntimeEntryStartError, match="payload"):
+        await service.submit(
+            StartEntryRequest(
+                tenant_id="tenant-a",
+                entry_type="direct_sip",
+                idempotency_key="start:sip:nested-phone",
+                payload={"business_params": {"note": "联系 13812345678"}},
+                callee_phone_number="13812345678",
+            )
+        )
+
+    assert repository.requests == []
+
+
+@pytest.mark.anyio
+async def test_web_rejects_direct_sip_phone_field() -> None:
+    repository = _FakeRepository([])
+    service = RuntimeEntryStartService(
+        settings=_settings("web"),
+        repository=repository,
+    )
+
+    with pytest.raises(RuntimeEntryStartError, match="Web"):
+        await service.submit(
+            StartEntryRequest(
+                tenant_id="tenant-a",
+                entry_type="web",
+                idempotency_key="start:web:phone",
+                payload={},
+                callee_phone_number="13812345678",
+            )
+        )
+
+    assert repository.requests == []
 
 
 @pytest.mark.anyio

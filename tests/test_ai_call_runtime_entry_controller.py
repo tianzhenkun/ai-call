@@ -251,6 +251,48 @@ async def test_runtime_start_controller_returns_accepted_persistent_identifiers(
 
 
 @pytest.mark.anyio
+async def test_runtime_direct_sip_start_accepts_plain_phone_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    repository = _FakeRepository(object())
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", lambda _db: repository)
+    monkeypatch.setattr(
+        controller,
+        "settings",
+        SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="direct_sip"),
+    )
+
+    response = await controller.create_runtime_start_call_controller(
+        auth=_auth(),
+        request=controller.RuntimeStartCallRequest(
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:controller",
+            payload={"voice": "v1"},
+            callee_phone_number="13812345678",
+        ),
+    )
+
+    assert response.status_code == 202
+    assert repository.calls[0].callee_phone_number == "13812345678"
+    assert "13812345678" not in response.body.decode()
+
+
+def test_runtime_start_request_rejects_removed_kms_fields() -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    with pytest.raises(ValidationError):
+        controller.RuntimeStartCallRequest(
+            entry_type="direct_sip",
+            idempotency_key="start:direct-sip:kms",
+            callee_phone_number="13812345678",
+            sensitive_payload_ciphertext="ciphertext",
+            payload_key_version="kms:v1",
+        )
+
+
+@pytest.mark.anyio
 async def test_runtime_start_controller_rejects_disabled_entry_without_persisting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

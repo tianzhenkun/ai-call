@@ -139,8 +139,7 @@ class RuntimeStartCallRequest(AiCallBaseSchema):
     scene_code: str | None = Field(default=None, max_length=64)
     prompt_source_key: str | None = Field(default=None, max_length=64)
     allocation_deadline_at: datetime | None = None
-    sensitive_payload_ciphertext: str | None = None
-    payload_key_version: str | None = Field(default=None, max_length=64)
+    callee_phone_number: str | None = Field(default=None, min_length=5, max_length=32)
 
 
 class RuntimeStartCallOut(AiCallBaseSchema):
