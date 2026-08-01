@@ -103,7 +103,7 @@ def test_legacy_runtime_requires_api_but_can_coexist_with_outbound_and_jobs() ->
     assert roles.ProcessRole.LEGACY_RUNTIME in parsed
 
 
-def test_current_slice_rejects_nonempty_owner_command_entries() -> None:
+def test_owner_command_entries_require_api_runtime_dispatcher_roles() -> None:
     roles = _load_roles_module()
 
     with pytest.raises(roles.RuntimeRoleConfigurationError):
@@ -115,6 +115,79 @@ def test_current_slice_rejects_nonempty_owner_command_entries() -> None:
                 DATABASE_TYPE="postgres",
             )
         )
+
+
+def test_owner_command_entries_reject_legacy_runtime_and_require_outbound_role() -> None:
+    roles = _load_roles_module()
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError):
+        roles.validate_runtime_role_settings(
+            SimpleNamespace(
+                AI_CALL_PROCESS_ROLES="api,runtime,dispatcher,legacy_runtime",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="web",
+                AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
+                DATABASE_TYPE="postgres",
+            )
+        )
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError):
+        roles.validate_runtime_role_settings(
+            SimpleNamespace(
+                AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="outbound",
+                AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
+                DATABASE_TYPE="postgres",
+            )
+        )
+
+
+def test_owner_command_entries_are_allowed_only_in_non_production_isolated_roles() -> None:
+    roles = _load_roles_module()
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError):
+        roles.validate_runtime_role_settings(
+            SimpleNamespace(
+                AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,preview,direct_sip",
+                AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
+                DATABASE_TYPE="postgres",
+                ENVIRONMENT=EnvironmentEnum.PROD,
+            )
+        )
+
+    parsed = roles.validate_runtime_role_settings(
+        SimpleNamespace(
+            AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
+            AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,preview,direct_sip",
+            AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
+            DATABASE_TYPE="postgres",
+            ENVIRONMENT=EnvironmentEnum.DEV,
+        )
+    )
+    assert parsed == frozenset(
+        {
+            roles.ProcessRole.API,
+            roles.ProcessRole.RUNTIME,
+            roles.ProcessRole.DISPATCHER,
+        }
+    )
+
+
+def test_runtime_control_mode_is_selected_per_entry_without_fallback_guessing() -> None:
+    roles = _load_roles_module()
+    settings = SimpleNamespace(
+        AI_CALL_PROCESS_ROLES="api,runtime,dispatcher",
+        AI_CALL_OWNER_COMMAND_V1_ENTRIES="web",
+        AI_CALL_RUNTIME_INSTANCE_ID="runtime-a",
+        DATABASE_TYPE="postgres",
+        ENVIRONMENT=EnvironmentEnum.DEV,
+    )
+
+    assert roles.runtime_control_mode_for_entry(settings, "web") == "owner_command_v1"
+    assert roles.runtime_control_mode_for_entry(settings, "preview") == "legacy_local"
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError):
+        roles.runtime_control_mode_for_entry(settings, "sip_inbound")
 
 
 def test_runtime_role_requires_instance_identity() -> None:

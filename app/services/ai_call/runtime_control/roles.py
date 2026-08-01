@@ -49,15 +49,58 @@ def parse_owner_command_entries(raw: str) -> frozenset[OwnerCommandEntry]:
     )
 
 
+def _environment_value(settings: Any) -> str | None:
+    value = getattr(settings, "ENVIRONMENT", None)
+    if value is None:
+        return None
+    return str(getattr(value, "value", value)).strip().lower() or None
+
+
+def runtime_control_mode_for_entry(settings: Any, entry: OwnerCommandEntry | str) -> str:
+    try:
+        entry_value = OwnerCommandEntry(entry)
+    except ValueError as exc:
+        raise RuntimeRoleConfigurationError(
+            f"入口 {entry!s} 不是合法的 owner command entry"
+        ) from exc
+    entries = parse_owner_command_entries(
+        str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
+    )
+    return "owner_command_v1" if entry_value in entries else "legacy_local"
+
+
 def validate_runtime_role_settings(settings: Any) -> frozenset[ProcessRole]:
     roles = parse_process_roles(str(settings.AI_CALL_PROCESS_ROLES))
     entries = parse_owner_command_entries(
         str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
     )
     if entries:
-        raise RuntimeRoleConfigurationError(
-            "16.1/16.2A 阶段 AI_CALL_OWNER_COMMAND_V1_ENTRIES 必须为空"
-        )
+        if _environment_value(settings) == "prod":
+            raise RuntimeRoleConfigurationError(
+                "正式环境 AI_CALL_OWNER_COMMAND_V1_ENTRIES 必须为空"
+            )
+        required_roles = {
+            ProcessRole.API,
+            ProcessRole.RUNTIME,
+            ProcessRole.DISPATCHER,
+        }
+        missing_roles = required_roles - roles
+        if missing_roles:
+            raise RuntimeRoleConfigurationError(
+                "owner command entry 必须同时启用 api、runtime、dispatcher；"
+                f"缺少: {','.join(sorted(role.value for role in missing_roles))}"
+            )
+        if ProcessRole.LEGACY_RUNTIME in roles:
+            raise RuntimeRoleConfigurationError(
+                "owner command entry 不得与 legacy_runtime 同进程启用"
+            )
+        if (
+            OwnerCommandEntry.OUTBOUND in entries
+            and ProcessRole.OUTBOUND not in roles
+        ):
+            raise RuntimeRoleConfigurationError(
+                "outbound entry 必须同时启用 outbound 角色"
+            )
     runtime_roles: Iterable[ProcessRole] = (
         ProcessRole.RUNTIME,
         ProcessRole.DISPATCHER,
