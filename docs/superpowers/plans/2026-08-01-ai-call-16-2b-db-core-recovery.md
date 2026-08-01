@@ -238,7 +238,7 @@ git commit -m "test(ai-call): cover db-core committed response loss"
 
 - 不新增业务实现文件；只更新本计划勾选状态和验收记录。
 
-- [ ] **步骤 1：运行完整 DB-Core 单元测试**
+- [x] **步骤 1：运行完整 DB-Core 单元测试**
 
 ```bash
 uv run pytest tests/test_ai_call_runtime_*.py -q
@@ -246,7 +246,7 @@ uv run pytest tests/test_ai_call_runtime_*.py -q
 
 预期：所有 Runtime 单元测试通过，且没有真实外部依赖调用。
 
-- [ ] **步骤 2：运行隔离 PostgreSQL 全量测试**
+- [x] **步骤 2：运行隔离 PostgreSQL 全量测试**
 
 ```bash
 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -q
@@ -254,17 +254,17 @@ bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_run
 
 预期：所有 DB-Core PostgreSQL 场景通过，关键 SQL 快照证明 Worker 计数、Reservation 数量、Effect 唯一性、命令游标和旧 token 影响行数符合合同。
 
-- [ ] **步骤 3：运行静态校验**
+- [x] **步骤 3：运行静态校验**
 
 ```bash
 uv run ruff check . && git diff --check
 ```
 
-- [ ] **步骤 4：确认外部依赖门禁**
+- [x] **步骤 4：确认外部依赖门禁**
 
 确认未连接 Redis、LiveKit、SIP、Egress 或真实 Provider，未拨号，未启动/重启业务服务；确认既有无关 dirty changes 未被暂存。
 
-- [ ] **步骤 5：提交验收证据**
+- [x] **步骤 5：提交验收证据**
 
 ```bash
 git add docs/superpowers/plans/2026-08-01-ai-call-16-2b-db-core-recovery.md
@@ -272,3 +272,12 @@ git commit -m "docs(ai-call): plan 16.2B db-core delivery"
 ```
 
 完成本任务只表示 `16.2B-DB-Core` 可进入下一阶段审查，不表示完整 16.2B、16.2C 或真实业务入口已经完成。
+
+## DB-Core 验收记录（2026-08-01）
+
+- `uv run pytest tests/test_ai_call_runtime_*.py -q`：32 passed。
+- `bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -q`：40 passed；隔离 PostgreSQL 16，未复用业务数据库。
+- `uv run ruff check .`：通过；`git diff --check`：通过。
+- 未连接 Redis、LiveKit、SIP、Egress 或真实 Provider，未拨号，未启动/重启业务服务。
+- 既有 API、外呼、坐席和前端 dirty changes 未纳入本切片提交。
+- 本切片提交：`5e9c8fb`（锁后数据库时间与租约）和 `479df76`（提交响应丢失矩阵）。
