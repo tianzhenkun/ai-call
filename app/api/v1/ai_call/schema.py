@@ -151,6 +151,21 @@ class RuntimeStartCallOut(AiCallBaseSchema):
     status: str
 
 
+class RuntimeEndCallRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    dedupe_key: str = Field(min_length=1, max_length=160)
+    end_reason: str = Field(default="user_requested", min_length=1, max_length=64)
+
+
+class RuntimeEndCallOut(AiCallBaseSchema):
+    acceptance_status: Literal["ACCEPTED"] = "ACCEPTED"
+    call_id: str
+    command_id: str
+    command_seq: str
+    command_status: str
+
+
 class RuntimeBootstrapOut(AiCallBaseSchema):
     call_id: str
     entry_type: str

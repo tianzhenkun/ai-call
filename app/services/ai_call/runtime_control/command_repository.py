@@ -51,6 +51,10 @@ class RuntimeRecordNotFoundError(RuntimeCommandRepositoryError):
     pass
 
 
+class RuntimeControlModeError(RuntimeCommandRepositoryError):
+    pass
+
+
 class TerminalBarrierError(RuntimeCommandRepositoryError):
     pass
 
@@ -120,6 +124,7 @@ class EndCallDecision:
     evidence_id: int
     call_id: str
     command_seq: int
+    command_status: str
     terminal_requested_at: datetime
 
 
@@ -324,6 +329,10 @@ class RuntimeCommandRepository:
 
     async def request_end(self, request: EndCallIntent) -> EndCallDecision:
         record = await self._lock_record(request.tenant_id, request.call_id)
+        if record.runtime_control_mode != "owner_command_v1":
+            raise RuntimeControlModeError(
+                f"call {request.call_id} is not owned by runtime control"
+            )
         now = await self._database_clock(self._session)
         fingerprint = end_call_request_fingerprint(request)
 
@@ -386,6 +395,7 @@ class RuntimeCommandRepository:
             evidence_id=evidence.id,
             call_id=request.call_id,
             command_seq=command.command_seq,
+            command_status=str(command.status),
             terminal_requested_at=terminal_requested_at,
         )
 

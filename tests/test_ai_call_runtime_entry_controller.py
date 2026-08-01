@@ -285,3 +285,50 @@ async def test_runtime_token_controller_returns_stable_gate_error_code(
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.data == {"errorCode": "OWNER_UNAVAILABLE"}
+
+
+@pytest.mark.anyio
+async def test_runtime_end_controller_persists_web_evidence_and_returns_real_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _EndRepository:
+        def __init__(self, _db) -> None:
+            self.requests = []
+
+        async def request_end(self, request):
+            self.requests.append(request)
+            return SimpleNamespace(
+                command_id=202,
+                call_id=request.call_id,
+                command_seq=2,
+                command_status="PENDING",
+            )
+
+    repository = _EndRepository(object())
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", lambda _db: repository)
+
+    response = await controller.create_runtime_end_call_controller(
+        auth=_auth(),
+        call_id="call-1",
+        request=controller.RuntimeEndCallRequest(
+            dedupe_key="call-1:web_client:click-1",
+            end_reason="user_requested",
+        ),
+    )
+
+    assert response.status_code == 202
+    assert json.loads(response.body)["data"] == {
+        "acceptanceStatus": "ACCEPTED",
+        "callId": "call-1",
+        "commandId": "202",
+        "commandSeq": "2",
+        "commandStatus": "PENDING",
+    }
+    persisted = repository.requests[0]
+    assert persisted.tenant_id == "tenant-from-auth"
+    assert persisted.call_id == "call-1"
+    assert persisted.source == "web_client"
+    assert persisted.end_reason == "user_requested"
+    assert persisted.dedupe_key == "call-1:web_client:click-1"

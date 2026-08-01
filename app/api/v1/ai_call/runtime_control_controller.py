@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.v1.ai_call.schema import (
     RuntimeBootstrapOut,
+    RuntimeEndCallOut,
+    RuntimeEndCallRequest,
     RuntimeStartCallOut,
     RuntimeStartCallRequest,
     TokenOut,
@@ -23,7 +25,11 @@ from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapService,
 )
 from app.services.ai_call.runtime_control.command_repository import (
+    EndCallIntent,
+    IdempotencyConflictError,
     RuntimeCommandRepository,
+    RuntimeControlModeError,
+    RuntimeRecordNotFoundError,
 )
 from app.services.ai_call.runtime_control.entry_start_service import (
     RuntimeEntryStartService,
@@ -86,6 +92,48 @@ async def create_runtime_start_call_controller(
             status=snapshot.status,
         ),
         msg="START_CALL 已受理",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+
+
+@RuntimeEntryRouter.post(
+    "/runtime/calls/{call_id}/end",
+    summary="异步受理 AI Call END_CALL",
+    response_model=ResponseSchema[RuntimeEndCallOut],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_runtime_end_call_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    call_id: str,
+    request: RuntimeEndCallRequest,
+):
+    tenant_id = str(getattr(getattr(auth, "user", None), "tenant_id", "") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
+
+    try:
+        decision = await RuntimeCommandRepository(auth.db).request_end(
+            EndCallIntent(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                source="web_client",
+                end_reason=request.end_reason,
+                dedupe_key=request.dedupe_key,
+            )
+        )
+    except RuntimeRecordNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeControlModeError, IdempotencyConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return SuccessResponse(
+        data=RuntimeEndCallOut(
+            call_id=decision.call_id,
+            command_id=str(decision.command_id),
+            command_seq=str(decision.command_seq),
+            command_status=decision.command_status,
+        ),
+        msg="END_CALL 已受理",
         status_code=status.HTTP_202_ACCEPTED,
     )
 

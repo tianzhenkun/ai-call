@@ -25,6 +25,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     EndCallIntent,
     IdempotencyConflictError,
     RuntimeCommandRepository,
+    RuntimeControlModeError,
     StartCallIntent,
     TerminalBarrierError,
 )
@@ -859,6 +860,7 @@ async def test_command_sequence_and_terminal_barrier_are_monotonic() -> None:
                     dedupe_key="agent:sequence:end",
                 )
             )
+            assert end.command_status == "PENDING"
             barrier = end.terminal_requested_at
 
             with pytest.raises(TerminalBarrierError):
@@ -895,6 +897,55 @@ async def test_command_sequence_and_terminal_barrier_are_monotonic() -> None:
                 )
             ).one()
             assert tuple(record) == ("ending", barrier, "agent_hangup", "reconciling")
+    finally:
+        await engine.dispose()
+
+
+async def test_runtime_end_rejects_legacy_record_without_terminal_mutation() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            repository = RuntimeCommandRepository(session)
+            start = await repository.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:legacy-end-rejected",
+                    payload={},
+                )
+            )
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.tenant_id == "tenant-a",
+                    AiCallRecordModel.call_id == start.call_id,
+                )
+            )
+            assert record is not None
+            record.runtime_control_mode = "legacy_local"
+            await session.flush()
+
+            with pytest.raises(RuntimeControlModeError):
+                await repository.request_end(
+                    EndCallIntent(
+                        tenant_id="tenant-a",
+                        call_id=start.call_id,
+                        source="web_client",
+                        end_reason="user_requested",
+                        dedupe_key="web:legacy-end-rejected",
+                    )
+                )
+
+            assert record.terminal_requested_at is None
+            assert record.status == "preparing"
+            assert await session.scalar(
+                select(AiCallRuntimeCommandModel.id).where(
+                    AiCallRuntimeCommandModel.tenant_id == "tenant-a",
+                    AiCallRuntimeCommandModel.call_id == start.call_id,
+                    AiCallRuntimeCommandModel.command_type == "END_CALL",
+                )
+            ) is None
     finally:
         await engine.dispose()
 
