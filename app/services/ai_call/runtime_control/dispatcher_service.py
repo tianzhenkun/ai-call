@@ -14,6 +14,7 @@ from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandMode
 from app.services.ai_call.runtime_control.owner_repository import (
     DispatcherOwnerRepository,
 )
+from app.services.ai_call.runtime_control.postgres_wakeup import WakeupListener
 from app.services.ai_call.runtime_control.types import CommandStatus
 
 
@@ -24,10 +25,12 @@ class DispatcherControlService:
         *,
         batch_size: int = 32,
         scan_interval_seconds: float = 1.0,
+        wakeup_listener: WakeupListener | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
+        self._wakeup_listener = wakeup_listener
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -86,6 +89,11 @@ class DispatcherControlService:
         if self._task is not None and not self._task.done():
             return
         self._stop_event.clear()
+        if self._wakeup_listener is not None:
+            try:
+                await self._wakeup_listener.start()
+            except Exception as exc:
+                log.error(f"AI Call Dispatcher PostgreSQL 唤醒监听启动失败: {exc!s}")
         self._task = asyncio.create_task(
             self._run_loop(), name="ai-call-runtime-dispatcher"
         )
@@ -96,6 +104,11 @@ class DispatcherControlService:
         self._task = None
         if task is not None:
             await task
+        if self._wakeup_listener is not None:
+            try:
+                await self._wakeup_listener.stop()
+            except Exception as exc:
+                log.error(f"AI Call Dispatcher PostgreSQL 唤醒监听关闭失败: {exc!s}")
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -105,10 +118,24 @@ class DispatcherControlService:
                 raise
             except Exception as exc:
                 log.error(f"AI Call Dispatcher DB-only 扫描失败: {exc!s}")
+            await self._wait_for_next_scan()
+
+    async def _wait_for_next_scan(self) -> None:
+        if self._wakeup_listener is not None:
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=self._scan_interval_seconds,
+                await self._wakeup_listener.wait(
+                    timeout_seconds=self._scan_interval_seconds,
+                    stop_event=self._stop_event,
                 )
-            except TimeoutError:
-                continue
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error(f"AI Call Dispatcher PostgreSQL 唤醒等待失败: {exc!s}")
+        try:
+            await asyncio.wait_for(
+                self._stop_event.wait(),
+                timeout=self._scan_interval_seconds,
+            )
+        except TimeoutError:
+            return

@@ -12,6 +12,9 @@ from app.services.ai_call.runtime_control.dispatcher_service import (
     DispatcherControlService,
 )
 from app.services.ai_call.runtime_control.owner_repository import build_worker_id
+from app.services.ai_call.runtime_control.postgres_wakeup import (
+    PostgresWakeupListener,
+)
 from app.services.ai_call.runtime_control.provider_stub import (
     DeterministicWebProviderStub,
 )
@@ -71,6 +74,7 @@ async def start_runtime_control_lifecycle(
             settings.AI_CALL_RUNTIME_FAIL_CLOSED_MARGIN_SECONDS
         ),
         scan_interval_seconds=float(settings.AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS),
+        wakeup_listener=PostgresWakeupListener(session_factory.kw["bind"]),
     )
     await service.start()
     return service
@@ -86,6 +90,7 @@ async def start_dispatcher_control_lifecycle(
         scan_interval_seconds=float(
             settings.AI_CALL_RUNTIME_COMMAND_SCAN_INTERVAL_SECONDS
         ),
+        wakeup_listener=PostgresWakeupListener(session_factory.kw["bind"]),
     )
     await service.start()
     return service

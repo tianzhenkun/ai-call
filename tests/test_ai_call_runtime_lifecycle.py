@@ -7,6 +7,8 @@ import pytest
 
 from app.services.ai_call.runtime_control.lifecycle import (
     AiCallRuntimeTimingPolicy,
+    start_dispatcher_control_lifecycle,
+    start_recovery_control_lifecycle,
     start_runtime_control_lifecycle,
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerFailClosedWatchdog
@@ -70,6 +72,8 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
     monkeypatch.setattr(lifecycle, "validate_db_only_runtime_database", _validate_database)
     monkeypatch.setattr(lifecycle, "RuntimeControlService", _RuntimeService)
 
+    session_factory = SimpleNamespace(kw={"bind": object()})
+
     service = await start_runtime_control_lifecycle(
         SimpleNamespace(
             AI_CALL_RUNTIME_INSTANCE_ID="runtime-test",
@@ -80,13 +84,72 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
             AI_CALL_RUNTIME_FAIL_CLOSED_MARGIN_SECONDS=3,
             AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS=0.01,
         ),
-        object(),
+        session_factory,
     )
     await service.stop()
 
     assert isinstance(service.provider, DeterministicWebProviderStub)
     assert service.provider.calls == []
     assert calls == ["validate_database", "construct", "start", "stop"]
+
+
+@pytest.mark.anyio
+async def test_lifecycle_constructs_independent_runtime_and_dispatcher_listeners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import lifecycle
+
+    constructed_listeners: list[object] = []
+    service_listeners: list[object] = []
+
+    async def _validate_database(_session_factory):
+        return "runtime-test", "public"
+
+    class _Listener:
+        def __init__(self, engine: object) -> None:
+            self.engine = engine
+            constructed_listeners.append(self)
+
+    class _Service:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            service_listeners.append(kwargs["wakeup_listener"])
+
+        async def start(self) -> None:
+            return None
+
+    class _RecoveryService:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            assert "wakeup_listener" not in kwargs
+
+        async def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(lifecycle, "validate_db_only_runtime_database", _validate_database)
+    monkeypatch.setattr(lifecycle, "PostgresWakeupListener", _Listener)
+    monkeypatch.setattr(lifecycle, "RuntimeControlService", _Service)
+    monkeypatch.setattr(lifecycle, "DispatcherControlService", _Service)
+    monkeypatch.setattr(lifecycle, "RecoveryControlService", _RecoveryService)
+    settings = SimpleNamespace(
+        AI_CALL_RUNTIME_INSTANCE_ID="runtime-test",
+        AI_CALL_RUNTIME_CAPACITY=2,
+        AI_CALL_RUNTIME_CLEANUP_CAPACITY=1,
+        AI_CALL_RUNTIME_WORKER_LEASE_SECONDS=15,
+        AI_CALL_RUNTIME_OWNER_LEASE_SECONDS=15,
+        AI_CALL_RUNTIME_FAIL_CLOSED_MARGIN_SECONDS=3,
+        AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS=0.5,
+        AI_CALL_RUNTIME_COMMAND_SCAN_INTERVAL_SECONDS=1.0,
+    )
+    engine = object()
+    session_factory = SimpleNamespace(kw={"bind": engine})
+
+    await start_runtime_control_lifecycle(settings, session_factory)
+    await start_dispatcher_control_lifecycle(settings, session_factory)
+    await start_recovery_control_lifecycle(settings, session_factory)
+
+    assert len(constructed_listeners) == 2
+    assert constructed_listeners[0] is not constructed_listeners[1]
+    assert service_listeners == constructed_listeners
+    assert all(listener.engine is engine for listener in constructed_listeners)
 
 
 @pytest.mark.anyio

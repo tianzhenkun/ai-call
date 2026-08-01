@@ -33,6 +33,7 @@ from app.services.ai_call.runtime_control.owner_repository import (
     WorkerRegistration,
     WorkerRegistryRepository,
 )
+from app.services.ai_call.runtime_control.postgres_wakeup import WakeupListener
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
 
@@ -103,6 +104,7 @@ class RuntimeControlService:
         fail_closed_margin_seconds: float = 3.0,
         batch_size: int = 32,
         scan_interval_seconds: float = 0.5,
+        wakeup_listener: WakeupListener | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.registry = registry
@@ -115,6 +117,7 @@ class RuntimeControlService:
         self._fail_closed_margin_seconds = fail_closed_margin_seconds
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
+        self._wakeup_listener = wakeup_listener
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -135,6 +138,11 @@ class RuntimeControlService:
         if lease.worker_id != self.worker_id:
             raise RuntimeError("registered worker identity does not match service identity")
         self._stop_event.clear()
+        if self._wakeup_listener is not None:
+            try:
+                await self._wakeup_listener.start()
+            except Exception as exc:
+                log.error(f"AI Call Runtime PostgreSQL 唤醒监听启动失败: {exc!s}")
         self._task = asyncio.create_task(
             self._run_loop(), name=f"ai-call-runtime:{self.worker_id}"
         )
@@ -145,6 +153,11 @@ class RuntimeControlService:
         self._task = None
         if task is not None:
             await task
+        if self._wakeup_listener is not None:
+            try:
+                await self._wakeup_listener.stop()
+            except Exception as exc:
+                log.error(f"AI Call Runtime PostgreSQL 唤醒监听关闭失败: {exc!s}")
         for timer in self.registry.fail_closed_timers.values():
             timer.cancel()
         self.registry.fail_closed_timers.clear()
@@ -390,12 +403,26 @@ class RuntimeControlService:
                 raise
             except Exception as exc:
                 log.error(f"AI Call Runtime DB-only 扫描失败: {exc!s}")
+            await self._wait_for_next_scan()
+
+    async def _wait_for_next_scan(self) -> None:
+        if self._wakeup_listener is not None:
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self._scan_interval_seconds
+                await self._wakeup_listener.wait(
+                    timeout_seconds=self._scan_interval_seconds,
+                    stop_event=self._stop_event,
                 )
-            except TimeoutError:
-                continue
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error(f"AI Call Runtime PostgreSQL 唤醒等待失败: {exc!s}")
+        try:
+            await asyncio.wait_for(
+                self._stop_event.wait(), timeout=self._scan_interval_seconds
+            )
+        except TimeoutError:
+            return
 
     def _require_dependencies(
         self,
