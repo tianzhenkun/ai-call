@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import func, select
@@ -22,6 +22,7 @@ from app.services.ai_call.runtime_control.command_repository import (
 )
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
+    AiCallRuntimeEffectModel,
     AiCallRuntimeWorkerModel,
     AiCallSipLineReservationModel,
 )
@@ -197,6 +198,106 @@ async def _seed_ready_worker(database, now: datetime) -> str:
             )
         )
     return worker_id
+
+
+async def _seed_owner_assigned_chain(
+    database,
+    now: datetime,
+) -> tuple[int, int, str, str]:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    task_id, target_id, _phone_number = await _seed_due_task(database, now)
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        assert attempt is not None
+        lease = await DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(
+                now.replace(tzinfo=None)
+            ),
+        ).assign_initial_owner("tenant-a", attempt.call_id)
+        await session.commit()
+        call_id = attempt.call_id
+    assert lease is not None
+    return task_id, target_id, call_id, worker_id
+
+
+async def _seed_start_completion_facts(
+    database,
+    *,
+    call_id: str,
+    now: datetime,
+    missing: str | None = None,
+) -> None:
+    async with database.begin() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == call_id
+            )
+        )
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        command = await session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        reservation = await session.scalar(
+            select(AiCallSipLineReservationModel).where(
+                AiCallSipLineReservationModel.call_id == call_id
+            )
+        )
+        assert attempt is not None
+        assert record is not None
+        assert command is not None
+        assert reservation is not None
+        record.status = "preparing" if missing == "record" else "ready"
+        command.status = "PENDING" if missing == "command" else "SUCCEEDED"
+        reservation.status = "RESERVED" if missing == "reservation" else "ACTIVE"
+        if missing != "effect":
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=generate_snowflake_id(),
+                    tenant_id="tenant-a",
+                    call_id=call_id,
+                    command_id=command.id,
+                    effect_type="CREATE_SIP_PARTICIPANT",
+                    idempotency_key=f"test:sip:{call_id}",
+                    fencing_token=reservation.fencing_token,
+                    status="APPLIED",
+                    provider_namespace="stub:runtime-a",
+                    provider_idempotency_key=f"provider:sip:{call_id}",
+                    resource_key=f"sip:{call_id}:g{reservation.fencing_token}",
+                    resource_generation=reservation.fencing_token,
+                    source_create_effect_id=None,
+                    create_protection_deadline_at=None,
+                    reconcile_after=None,
+                    reconcile_deadline_at=None,
+                    error_message=None,
+                    provider_reference=f"stub:sip:{call_id}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
 
 @pytest.mark.anyio
@@ -561,3 +662,248 @@ async def test_dispatcher_rejects_outbound_refs_changed_after_candidate_read(
     assert record is not None and record.runtime_owner_id is None
     assert worker is not None and worker.active_call_count == 0
     assert reservation_count == 0
+
+
+@pytest.mark.anyio
+async def test_attempt_reconciler_keeps_queued_without_owner_or_reservation(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+
+    assert result is not None and result.status == "QUEUED"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, claim.attempt_id)
+    assert attempt is not None and attempt.status == "QUEUED"
+    assert attempt.reconcile_owner_id is None
+    assert attempt.reconcile_token is None
+    assert attempt.reconcile_expires_at is None
+    assert attempt.reconcile_after is not None
+
+
+@pytest.mark.anyio
+async def test_attempt_reconciler_projects_reserved_owner_to_starting(database) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database,
+        now,
+    )
+    async with database.begin() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        assert attempt is not None
+        attempt.status = "QUEUED"
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        reconciler = OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        )
+        claim = await reconciler.claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+
+    assert result is not None
+    assert result.previous_status == "QUEUED"
+    assert result.status == "STARTING"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, claim.attempt_id)
+    assert attempt is not None and attempt.status == "STARTING"
+
+
+@pytest.mark.anyio
+async def test_attempt_reconciler_projects_complete_start_facts_to_dialing(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    _task_id, target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database,
+        now,
+    )
+    await _seed_start_completion_facts(database, call_id=call_id, now=now)
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+
+    assert result is not None and result.status == "DIALING"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, claim.attempt_id)
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+    assert attempt is not None and attempt.status == "DIALING"
+    assert target is not None and target.status == "DIALING"
+    assert attempt.reconcile_after is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("missing", ["record", "command", "reservation", "effect"])
+async def test_attempt_reconciler_does_not_project_dialing_with_missing_fact(
+    database,
+    missing: str,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    _task_id, _target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database,
+        now,
+    )
+    await _seed_start_completion_facts(
+        database,
+        call_id=call_id,
+        now=now,
+        missing=missing,
+    )
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+
+    assert result is not None and result.status == "STARTING"
+
+
+@pytest.mark.anyio
+async def test_attempt_reconciler_rejects_old_token_after_lease_takeover(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    await _seed_due_task(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+    database_now = now.replace(tzinfo=None)
+    late = database_now + timedelta(seconds=31)
+
+    async with database.begin() as session:
+        first = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            token_generator=lambda: "token-a",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert first is not None
+    async with database.begin() as session:
+        blocked = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-b",
+            token_generator=lambda: "token-b",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert blocked is None
+    async with database.begin() as session:
+        expired_result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(late),
+        ).submit(first)
+    assert expired_result is None
+    async with database.begin() as session:
+        second = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-b",
+            token_generator=lambda: "token-b",
+            database_clock=lambda _session: _constant_time(late),
+        ).claim_next()
+    assert second is not None
+
+    async with database.begin() as session:
+        stale_result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-a",
+            database_clock=lambda _session: _constant_time(late),
+        ).submit(first)
+    assert stale_result is None
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, first.attempt_id)
+    assert attempt is not None
+    assert attempt.reconcile_owner_id == "reconciler-b"
+    assert attempt.reconcile_token == "token-b"
