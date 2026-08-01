@@ -17,6 +17,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     end_call_request_fingerprint,
     start_call_request_fingerprint,
 )
+from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 from app.services.ai_call.runtime_control.types import CommandStatus
 
 
@@ -396,3 +397,57 @@ def test_command_claim_and_completion_api_is_explicit() -> None:
     assert callable(RuntimeCommandRepository.claim_pending_end)
     assert callable(RuntimeCommandRepository.complete)
     assert CommandDecision(status=CommandStatus.SUCCEEDED).status == "SUCCEEDED"
+
+
+@pytest.mark.anyio
+async def test_command_claim_reads_direct_sip_entry_from_record() -> None:
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    candidate = SimpleNamespace(
+        id=101,
+        command_type="START_CALL",
+        status=CommandStatus.PENDING,
+    )
+    claimed = SimpleNamespace(
+        id=101,
+        tenant_id="tenant-a",
+        call_id="call-a",
+        command_seq=1,
+        command_type="START_CALL",
+        processing_owner_id="runtime-a",
+        processing_fencing_token=7,
+        processing_token="processing-token",
+        processing_expires_at=now + timedelta(seconds=30),
+        payload_json="{}",
+        attempt_count=1,
+    )
+
+    class _ClaimSession:
+        def __init__(self) -> None:
+            self.execute_count = 0
+
+        async def execute(self, _statement):
+            self.execute_count += 1
+            if self.execute_count == 1:
+                return SimpleNamespace(all=lambda: [candidate])
+            return SimpleNamespace(one_or_none=lambda: claimed)
+
+        async def scalar(self, _statement):
+            return "direct_sip"
+
+    claim = await RuntimeCommandRepository(
+        _ClaimSession(),
+        processing_token_generator=lambda: "processing-token",
+        database_clock=lambda _session: _constant_time(now),
+    ).claim_next_for_owner(
+        OwnerLease(
+            tenant_id="tenant-a",
+            call_id="call-a",
+            owner_id="runtime-a",
+            fencing_token=7,
+            lease_expires_at=now + timedelta(seconds=30),
+            capacity_class="active",
+        )
+    )
+
+    assert claim is not None
+    assert claim.entry_type == "direct_sip"

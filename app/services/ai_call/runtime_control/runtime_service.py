@@ -325,7 +325,12 @@ class RuntimeControlService:
             if not watchdog.creation_allowed():
                 await self._trip_owner(lease.call_id, watchdog)
                 return False
-            specs = _default_start_specs(command_claim.call_id, lease, self.worker_id)
+            specs = _default_start_specs(
+                command_claim.call_id,
+                lease,
+                self.worker_id,
+                entry_type=command_claim.entry_type,
+            )
             try:
                 await StartCallHandler(session_factory, guarded_provider).handle(
                     command_claim,
@@ -443,9 +448,13 @@ def _default_start_specs(
     call_id: str,
     lease: OwnerLease,
     worker_id: str,
+    *,
+    entry_type: str,
 ) -> list[EffectSpec]:
+    if entry_type not in {"web", "direct_sip"}:
+        raise ValueError(f"unsupported owner command entry: {entry_type}")
     namespace = f"stub:{worker_id}"
-    return [
+    specs = [
         EffectSpec(
             effect_type="CREATE_ROOM",
             idempotency_key=f"start:{call_id}:create-room:g{lease.fencing_token}",
@@ -463,3 +472,20 @@ def _default_start_specs(
             resource_generation=lease.fencing_token,
         ),
     ]
+    if entry_type == "direct_sip":
+        specs.append(
+            EffectSpec(
+                effect_type="CREATE_SIP_PARTICIPANT",
+                idempotency_key=(
+                    f"start:{call_id}:create-sip-participant:"
+                    f"g{lease.fencing_token}"
+                ),
+                provider_namespace=namespace,
+                provider_idempotency_key=(
+                    f"sip:{call_id}:g{lease.fencing_token}"
+                ),
+                resource_key=f"sip:{call_id}:g{lease.fencing_token}",
+                resource_generation=lease.fencing_token,
+            )
+        )
+    return specs

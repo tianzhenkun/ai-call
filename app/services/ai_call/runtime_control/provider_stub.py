@@ -75,6 +75,15 @@ class DeterministicWebProviderStub:
         )
 
 
+class DeterministicDbOnlyProviderStub(DeterministicWebProviderStub):
+    _CREATE_EFFECT_TYPES = DeterministicWebProviderStub._CREATE_EFFECT_TYPES | {
+        "CREATE_SIP_PARTICIPANT"
+    }
+    _DESTROY_EFFECT_TYPES = DeterministicWebProviderStub._DESTROY_EFFECT_TYPES | {
+        "HANGUP_SIP"
+    }
+
+
 class ScriptedProviderStub:
     """In-memory Provider fact source; never performs network or SDK calls."""
 

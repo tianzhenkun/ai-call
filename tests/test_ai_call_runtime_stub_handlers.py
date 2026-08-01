@@ -14,6 +14,7 @@ from app.services.ai_call.runtime_control.effect_repository import (
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicDbOnlyProviderStub,
     DeterministicWebProviderStub,
     ScriptedProviderStub,
     StubObservationKind,
@@ -248,6 +249,25 @@ async def test_deterministic_web_provider_stub_rejects_non_web_effects(
         await DeterministicWebProviderStub().apply(
             _effect_claim(effect_type=effect_type)
         )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("effect_type", "expected_kind"),
+    [
+        ("CREATE_SIP_PARTICIPANT", ProviderObservationKind.RESOURCE_PRESENT),
+        ("HANGUP_SIP", ProviderObservationKind.TERMINAL_CONFIRMED),
+    ],
+)
+async def test_db_only_provider_stub_supports_direct_sip_effects(
+    effect_type: str,
+    expected_kind: ProviderObservationKind,
+) -> None:
+    observation = await DeterministicDbOnlyProviderStub().apply(
+        _effect_claim(effect_type=effect_type, resource_key="sip:call-a:g1")
+    )
+
+    assert observation.kind is expected_kind
 
 
 @pytest.mark.anyio

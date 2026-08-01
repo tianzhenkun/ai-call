@@ -165,6 +165,7 @@ class CommandClaim:
     processing_expires_at: datetime
     payload_json: str | None
     attempt_count: int
+    entry_type: str = "web"
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,6 +779,14 @@ class RuntimeCommandRepository:
                 )
             ).one_or_none()
             if row is not None:
+                entry_type = await self._session.scalar(
+                    select(AiCallRecordModel.entry_type).where(
+                        AiCallRecordModel.tenant_id == lease.tenant_id,
+                        AiCallRecordModel.call_id == lease.call_id,
+                    )
+                )
+                if entry_type is None:
+                    return None
                 return CommandClaim(
                     command_id=row.id,
                     tenant_id=row.tenant_id,
@@ -790,6 +799,7 @@ class RuntimeCommandRepository:
                     processing_expires_at=row.processing_expires_at,
                     payload_json=row.payload_json,
                     attempt_count=row.attempt_count,
+                    entry_type=str(entry_type),
                 )
         return None
 

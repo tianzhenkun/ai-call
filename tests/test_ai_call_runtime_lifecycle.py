@@ -13,13 +13,45 @@ from app.services.ai_call.runtime_control.lifecycle import (
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerFailClosedWatchdog
 from app.services.ai_call.runtime_control.provider_stub import (
+    DeterministicDbOnlyProviderStub,
     DeterministicWebProviderStub,
 )
 from app.services.ai_call.runtime_control.runtime_service import (
     RuntimeControlService,
     RuntimeRegistry,
+    _default_start_specs,
     _FailClosedProvider,
 )
+
+
+def _lease(*, fencing_token: int = 7):
+    return SimpleNamespace(fencing_token=fencing_token)
+
+
+def test_direct_sip_default_specs_include_sip_participant() -> None:
+    specs = _default_start_specs(
+        "call-a",
+        _lease(fencing_token=7),
+        "runtime-a",
+        entry_type="direct_sip",
+    )
+
+    assert [spec.effect_type for spec in specs] == [
+        "CREATE_ROOM",
+        "ATTACH_AGENT_PARTICIPANT",
+        "CREATE_SIP_PARTICIPANT",
+    ]
+    assert specs[-1].resource_key == "sip:call-a:g7"
+
+
+def test_default_start_specs_fail_closed_for_unknown_entry() -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        _default_start_specs(
+            "call-a",
+            _lease(),
+            "runtime-a",
+            entry_type="preview",
+        )
 
 
 def test_runtime_services_do_not_share_local_registry() -> None:
@@ -88,6 +120,7 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
     )
     await service.stop()
 
+    assert isinstance(service.provider, DeterministicDbOnlyProviderStub)
     assert isinstance(service.provider, DeterministicWebProviderStub)
     assert service.provider.calls == []
     assert calls == ["validate_database", "construct", "start", "stop"]
