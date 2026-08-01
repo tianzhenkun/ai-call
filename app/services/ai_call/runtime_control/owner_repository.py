@@ -561,7 +561,6 @@ class RecoveryOwnerRepository:
     ) -> bool:
         if retry_after.total_seconds() <= 0:
             raise ValueError("retry_after must be positive")
-        now = await self._database_clock(self._session)
         record = await self._session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -576,7 +575,6 @@ class RecoveryOwnerRepository:
             or record.runtime_fencing_token != lease.fencing_token
             or record.runtime_lease_expires_at != lease.lease_expires_at
             or record.runtime_lease_expires_at is None
-            or record.runtime_lease_expires_at <= now
             or record.terminal_requested_at is None
             or record.runtime_capacity_class not in {"active", "cleanup"}
         ):
@@ -632,6 +630,10 @@ class RecoveryOwnerRepository:
             )
         )
         if not reconciling_effect_exists or unsafe_effect_exists:
+            return False
+
+        now = await self._database_clock(self._session)
+        if record.runtime_lease_expires_at <= now:
             return False
 
         _release_worker_capacity(worker, record.runtime_capacity_class)

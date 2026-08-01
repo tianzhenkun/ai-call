@@ -10,7 +10,7 @@ from uuid import UUID
 import psycopg
 import pytest
 from psycopg import ClientCursor
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import AiCallRecordModel
@@ -1865,6 +1865,103 @@ async def test_owner_recovery_parks_attention_without_releasing_resources() -> N
             assert by_worker[new_worker.worker_id].active_call_count == 0
             assert by_worker[new_worker.worker_id].active_cleanup_count == 1
     finally:
+        await engine.dispose()
+
+
+async def test_attention_parking_rechecks_database_time_after_record_lock_wait() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    locker = factory()
+    parking = factory()
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:lock-wait-deadline",
+                    payload={"business_id": "lock-wait-deadline"},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-lock-wait",
+                    startup_id=UUID("77777777-7777-4777-8777-777777777777"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            active_lease = await DispatcherOwnerRepository(
+                session,
+                lease_ttl=timedelta(seconds=1),
+            ).assign_initial_owner("tenant-a", start.call_id)
+            assert active_lease is not None
+            end = await commands.request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="runtime_recovery",
+                    end_reason="lock_wait_deadline",
+                    dedupe_key="runtime-recovery:lock-wait-deadline",
+                )
+            )
+            now = await read_database_time(session)
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=93011,
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    command_id=end.command_id,
+                    effect_type="CREATE_ROOM",
+                    idempotency_key="effect:lock-wait-deadline",
+                    fencing_token=active_lease.fencing_token,
+                    status="RECONCILE_REQUIRED",
+                    provider_namespace="stub:lock-wait-deadline",
+                    provider_idempotency_key="provider:lock-wait-deadline",
+                    resource_key="room:lock-wait-deadline",
+                    resource_generation=active_lease.fencing_token,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+
+        await locker.begin()
+        await locker.scalar(
+            select(AiCallRecordModel)
+            .where(AiCallRecordModel.call_id == start.call_id)
+            .with_for_update()
+        )
+
+        async def park_after_lock_wait() -> bool:
+            async with parking.begin():
+                return await RecoveryOwnerRepository(parking).park_attention(
+                    active_lease,
+                    timedelta(seconds=30),
+                )
+
+        park_task = asyncio.create_task(park_after_lock_wait())
+        await asyncio.sleep(1.25)
+        await locker.commit()
+        assert await park_task is False
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_capacity_class "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (active_lease.owner_id, "active")
+    finally:
+        if locker.in_transaction():
+            await locker.rollback()
+        await locker.close()
+        await parking.close()
         await engine.dispose()
 
 
