@@ -10,8 +10,8 @@ from uuid import UUID
 import psycopg
 import pytest
 from psycopg import ClientCursor
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
@@ -334,6 +334,64 @@ async def test_command_idempotency_is_tenant_scoped_and_conflicts_are_atomic() -
             assert await session.scalar(text("select count(*) from ai_call_record")) == 2
     finally:
         await engine.dispose()
+
+
+async def test_committed_start_response_loss_retries_to_original_command() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    armed = False
+
+    def fail_after_commit(_session) -> None:
+        if armed:
+            raise ConnectionError("injected committed response loss")
+
+    event.listen(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+    try:
+        async with factory() as session:
+            first = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:response-loss",
+                    payload={"business_id": "response-loss"},
+                )
+            )
+            armed = True
+            with pytest.raises(ConnectionError, match="committed response loss"):
+                await session.commit()
+    finally:
+        event.remove(AsyncSession.sync_session_class, "after_commit", fail_after_commit)
+
+    async with factory.begin() as session:
+        repeated = await RuntimeCommandRepository(session).create_start_call(
+            StartCallIntent(
+                tenant_id="tenant-a",
+                entry_type="web",
+                idempotency_key="start:response-loss",
+                payload={"business_id": "response-loss"},
+            )
+        )
+        assert repeated == first
+        assert (
+            await session.scalar(
+                text(
+                    "select count(*) from ai_call_record "
+                    "where tenant_id='tenant-a'"
+                )
+            )
+            == 1
+        )
+        assert (
+            await session.scalar(
+                text(
+                    "select count(*) from ai_call_runtime_command "
+                    "where tenant_id='tenant-a'"
+                )
+            )
+            == 1
+        )
+    await engine.dispose()
 
 
 async def test_concurrent_idempotency_race_keeps_only_the_committed_winner() -> None:
