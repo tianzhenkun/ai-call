@@ -34,17 +34,23 @@ def prepare_direct_sip_phone(value: str) -> DirectSipPhone:
 
 
 def payload_contains_phone(value: object, phone_number: str) -> bool:
-    if isinstance(value, str):
-        return phone_number in value
-    if isinstance(value, Mapping):
-        return any(
-            payload_contains_phone(item, phone_number)
-            for pair in value.items()
-            for item in pair
-        )
-    if isinstance(value, Sequence) and not isinstance(
-        value,
-        (str, bytes, bytearray),
-    ):
-        return any(payload_contains_phone(item, phone_number) for item in value)
-    return False
+    phone_digits = "".join(character for character in phone_number if character.isdigit())
+    if not phone_digits:
+        return False
+
+    def _contains(candidate: object) -> bool:
+        if isinstance(candidate, str):
+            compact = re.sub(r"[\s()+.\-]+", "", candidate)
+            return phone_number in candidate or phone_digits in compact
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            return phone_digits in str(candidate)
+        if isinstance(candidate, Mapping):
+            return any(_contains(item) for pair in candidate.items() for item in pair)
+        if isinstance(candidate, Sequence) and not isinstance(
+            candidate,
+            (str, bytes, bytearray),
+        ):
+            return any(_contains(item) for item in candidate)
+        return False
+
+    return _contains(value)

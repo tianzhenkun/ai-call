@@ -45,3 +45,17 @@ def test_payload_contains_phone_checks_nested_keys_values_and_text() -> None:
         {"business_params": {"customerName": "张三"}},
         "13812345678",
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"phone": "8613812345678"},
+        {"phone": "+86 138 1234 5678"},
+        {"phone": 8613812345678},
+    ),
+)
+def test_payload_contains_phone_rejects_equivalent_international_forms(
+    payload: object,
+) -> None:
+    assert payload_contains_phone(payload, "+8613812345678")
