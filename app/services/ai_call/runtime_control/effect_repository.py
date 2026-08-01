@@ -504,10 +504,11 @@ class RuntimeEffectRepository:
         if reservation is None:
             return
         if effect.effect_type == "CREATE_SIP_PARTICIPANT":
-            if observation.kind in {
-                ProviderObservationKind.RESOURCE_PRESENT,
-                ProviderObservationKind.ACCEPTED,
-            }:
+            if (
+                observation.kind == ProviderObservationKind.RESOURCE_PRESENT
+                and effect.status == EffectStatus.APPLIED
+                and effect.provider_reference
+            ):
                 if reservation.status in {"RESERVED", "RECONCILE_REQUIRED"}:
                     reservation.status = "ACTIVE"
                     reservation.reconcile_after = None
@@ -515,7 +516,12 @@ class RuntimeEffectRepository:
                 reservation.status = "RELEASED"
                 reservation.released_at = now
                 reservation.reconcile_after = None
-            elif observation.kind == ProviderObservationKind.UNCERTAIN:
+            elif observation.kind in {
+                ProviderObservationKind.ACCEPTED,
+                ProviderObservationKind.RETRYABLE_FAILURE,
+                ProviderObservationKind.UNCERTAIN,
+                ProviderObservationKind.RESOURCE_PRESENT,
+            }:
                 reservation.status = "RECONCILE_REQUIRED"
                 reservation.reconcile_after = now + observation.retry_after
         elif effect.effect_type == "HANGUP_SIP":
@@ -828,9 +834,16 @@ class RuntimeEffectRepository:
         observation: ProviderObservation,
         now: datetime,
     ) -> None:
-        if observation.kind == ProviderObservationKind.RESOURCE_PRESENT:
+        if (
+            observation.kind == ProviderObservationKind.RESOURCE_PRESENT
+            and observation.provider_reference
+        ):
             effect.status = EffectStatus.APPLIED
             effect.provider_reference = observation.provider_reference
+        elif observation.kind == ProviderObservationKind.RESOURCE_PRESENT:
+            effect.status = EffectStatus.RECONCILE_REQUIRED
+            effect.reconcile_after = now + observation.retry_after
+            effect.error_message = "resource_reference_missing"
         elif observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE:
             effect.status = EffectStatus.FAILED
             effect.error_message = "no_resource"
