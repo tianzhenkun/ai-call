@@ -62,7 +62,7 @@
 | 条件 | Command | Record | Owner/容量 | Effect/Reservation | 后续 |
 | --- | --- | --- | --- | --- | --- |
 | 截止前，无 Worker/线路资源 | `PENDING` | `preparing` | 无 Owner，容量 `none` | 无 | Dispatcher 继续按数据库时间公平扫描 |
-| `allocation_deadline_at` 到期，且无 Owner/Reservation/任意 Effect，容量 `none` | `DEAD`，`ALLOCATION_TIMEOUT` | `failed`，`failure_stage=allocation` | 保持 `none` | 不存在 | 不创建 `END_CALL`；Attempt 由后续业务投影明确失败 |
+| `allocation_deadline_at` 到期，且无 Owner/Reservation/任意 Effect，容量 `none` | `DEAD`，`error_message=ALLOCATION_TIMEOUT`，写 `result_json`、`finished_at`，清理 dispatch/processing lease | `failed`，`failure_stage=allocation`，`failure_message=ALLOCATION_TIMEOUT`，`ended_at` 和 cleanup 完成时间写入 | 保持 `none` | 不存在 | 同一事务将 `last_applied_command_seq` 推进到 `START_CALL.command_seq`（初始值必须为 1），不创建 `END_CALL`；Attempt 由后续业务投影明确失败 |
 | 到期但存在 Owner、Reservation、任意 Effect 或非 `none` 容量 | 不得改为 allocation timeout | 进入对应终态/清理流程 | 保留资源隔离 | 进入 Effect/Reservation 对账 | 由 Runtime/Recovery 处理，不能释放未知资源 |
 
 ### 5.2 START_UNCERTAIN 截止
@@ -71,14 +71,22 @@
 | --- | --- | --- | --- |
 | 确认无 Room、Participant、Egress 等资源 | `DEAD` | `failed`，`failure_stage=startup_reconcile` | 已确认失败/不存在；线路释放 | Owner、容量和本地 handle 收口 |
 | 任一资源存在 | 由终态屏障抢占为 `SUPERSEDED`，创建/读取唯一 `END_CALL` | `ending`，等待清理 | 创建完整销毁图；线路保持占用直到终态确认 | 只能走 Effect 对账和 cleanup Owner |
-| Provider 查询仍不确定 | `RETRY_WAIT` 或终止后 `attention_required` | `ending` | Effect 保持 `RECONCILE_REQUIRED`；不释放线路 | 停放并按 `resource_cleanup_next_retry_at` 恢复 |
+| 截止前 Provider 查询仍不确定 | `RETRY_WAIT`，错误标记 `START_UNCERTAIN` | `preparing` | Effect 保持 `RECONCILE_REQUIRED`；Reservation 保持占用 | 只允许有限重试，不能创建第二个资源 |
+| 截止时 Provider 仍不确定 | 由终态屏障抢占为 `SUPERSEDED`，创建/读取唯一 `END_CALL` | `ending` | Effect 保持 `RECONCILE_REQUIRED`；Reservation 保持占用 | 停止普通启动重试；有限 cleanup 后进入 `attention_required`，不得继续停留在 `RETRY_WAIT` |
 
 ### 5.3 Effect 与 Reservation
 
-- CREATE Effect 的 `ACCEPTED`/明确资源存在结果使 Reservation 从 `RESERVED` 进入 `ACTIVE`。
-- 明确无资源/永久失败释放 Reservation；结果不确定进入 `RECONCILE_REQUIRED` 并继续计数。
+- 只有 CREATE Effect 已为 `APPLIED`，且已持久化可验证的 Provider reference、资源事实和必要依赖，才允许 Reservation 从 `RESERVED` 进入 `ACTIVE`。
+- `ACCEPTED`、超时、取消、查询失败、Provider 错误或任何无法排除资源的结果都不得直接进入 `ACTIVE`；统一进入 `RECONCILE_REQUIRED` 并继续计入线路并发。
+- 只有调用前失败或已确认 `PERMANENT_NO_RESOURCE` 的结果才能释放 Reservation；Provider 已受理、资源查询失败或结果不确定时不得以“永久失败”名义释放。
 - HANGUP/销毁 Effect 在提交 `APPLIED` 后释放 Reservation；迟到或旧 token 不能回退到未释放前状态。
 - `resource_cleanup_status=clean` 只有在全部创建静默、全部销毁通过保护截止确认、资源不存在且 Reservation 已释放时成立。
+
+### 5.4 失败阶段与结果字段归属
+
+- `ai_call_record.failure_stage` 是业务失败阶段的权威字段，仅使用 `allocation`、`startup_reconcile`、`runtime`、`cleanup` 等已定义枚举；本切片新增的 allocation timeout 固定为 `allocation`，启动不确定性截止固定为 `startup_reconcile`。
+- `ai_call_record.failure_message` 是页面和业务投影读取的权威错误码；allocation timeout 固定为 `ALLOCATION_TIMEOUT`，启动三分支使用 `START_UNCERTAIN:NO_RESOURCE`、`START_UNCERTAIN:RESOURCE_PRESENT`、`START_UNCERTAIN:UNKNOWN`。
+- `ai_call_runtime_command.error_message` 保存命令级错误码，`result_json` 保存可审计的结构化决议，`finished_at` 表示命令终态提交时间；Command 与 Record 必须在同一事务写入，不能由测试或实现自行选择其他字段解释失败阶段。
 
 ## 6. 事务与锁顺序
 
@@ -88,19 +96,25 @@ Dispatcher 先在事务外读取候选 Worker/Record，进入短事务后必须�
 
 1. `Record`；
 2. 指定 SIP `Line`（有线路参数时）；
-3. 候选 `Worker`；
+3. 所有涉及的 `Worker`（旧 Worker、目标 Worker 和容量转换涉及的其他 Worker，按 `worker_id` 升序）；
 4. `START_CALL Command`；
-5. 创建 `Reservation` 并更新 Owner/fencing、Worker 计数和命令目标。
+5. `Reservation`；
+6. 创建/更新 Reservation、Owner/fencing、Worker 计数和命令目标。
 
 无 Worker、无线路槽、终态屏障、已有资源或命令状态不再满足时，事务返回无变更。
 
 ### 6.2 Recovery 接管与 Effect 提交
 
-Recovery 接管先锁 Record，再锁 Worker、Effect/Reservation 和需要更新的 Command；Effect 提交先校验 Record 当前 Owner/fencing，再锁 Effect 自身并匹配 processing token。旧 token 影响 0 行。任何事务异常都回滚 Owner、容量、Reservation、Effect 和命令结果，不能留下单侧占用。
+Recovery 接管和容量转换必须使用同一完整顺序：`Record -> SIP Line -> Worker（所有旧/目标 Worker 按 worker_id 升序） -> Command -> Reservation -> Effect/Effect Dependency`。涉及旧 Worker 与目标 Worker 时，不能按业务角色分别加锁，必须合并后按稳定键升序；任何锁冲突或死锁都只能整事务回滚并重试，禁止留下单侧计数变化。
+
+Effect 提交事务先以 `FOR UPDATE` 锁定 Record，锁定完成后重新读取数据库时间；随后按完整顺序锁定 SIP Line、Worker、Command、Reservation 和 Effect。提交前必须再次同时匹配 Record 当前 Owner、fencing、未过期租约，以及 Effect 当前 processing owner/fencing/token/未过期租约；任一 CAS 影响 0 行，整个事务回滚，不能继续修改 Reservation、Worker 容量或 Command 结果。来源 Command 是否仍为 `PROCESSING` 不属于 Effect 独立恢复的前置条件：来源 Command 已为 `SUCCEEDED`、`RETRY_WAIT` 或被 `END_CALL` 抢占时，当前有效 Owner/cleanup Owner 仍可使用新的 Effect token 接管。
+
+`attention_required` 停放必须在同一事务完成：先锁定 Record、相关 Line、旧 Worker 和未完成 Effect/Reservation，确认本轮 Provider 调用已返回/超时且 Effect 已提交 `RECONCILE_REQUIRED`，再将 `runtime_capacity_class` 从 `active` 或 `cleanup` 转为 `attention`，清空 Record Owner、fencing 租约和本地执行租约，递减与原容量类别对应的 Worker 计数，保留 Effect、Reservation、资源隔离和 `resource_cleanup_next_retry_at`。停放完成后必须能按 Record 重算 Worker 计数；不能释放 Reservation 或清除 Effect。
 
 ### 6.3 数据库时间与提交结果
 
-- 所有租约、deadline、重试时间和静默保护时间读取 PostgreSQL 时间。
+- 所有租约、deadline、重试时间和静默保护时间读取 PostgreSQL 时间；禁止使用事务开始时间的 `now()`/`CURRENT_TIMESTAMP` 作为锁等待后的最终判断。
+- 在完成 Record 及本事务所需下游行锁后，重新读取 `clock_timestamp()` 作为最终 `db_now`；所有租约、deadline 和 CAS 过期判断必须使用同一锁后时间。若在最终更新前再次等待锁，必须重新读取 `clock_timestamp()`，不能复用旧值。
 - 事务提交后响应丢失时，调用方只允许按租户/幂等键重读并返回已提交事实。
 - 不使用本机 watchdog 判断数据库事务是否成功；本地硬截止只负责停止 Provider/媒体调用，最终状态由数据库恢复扫描决定。
 
@@ -109,14 +123,21 @@ Recovery 接管先锁 Record，再锁 Worker、Effect/Reservation 和需要更�
 | 场景 | 注入点 | 必须观察的事实 |
 | --- | --- | --- |
 | 两个 Dispatcher 争抢最后一个 Worker/SIP 槽 | `SELECT ... FOR UPDATE`/Reservation 插入 | 一个 Owner、一个 Reservation、Worker 计数只增加一次 |
-| 两个 Recovery 争抢过期 Owner | Record/Worker 锁竞争 | 一个新 fencing token；旧 token 提交影响 0 行 |
+| 两个 Recovery 争抢过期 Owner | 两个独立 Recovery 实例同时执行 Record/Worker 锁竞争 | 一个新 fencing token；旧 token 提交影响 0 行；Worker 计数无重复变化 |
 | Owner 在 CREATE 前失联 | Command lease/Record lease 过期 | 无 Effect 时可重领；不产生重复 Provider 调用 |
 | Owner 在 CREATE 后失联 | Effect 已登记且状态不确定 | 新 Owner/cleanup Owner 继续 Effect 对账；不按 allocation timeout 释放 |
 | Effect processing lease 过期 | Effect CAS 提交前注入延迟 | 只有新 token 能提交，旧 token 影响 0 行 |
 | Reservation 写入异常 | Reservation INSERT/flush 失败 | Owner、Worker 计数和 Record 事务全部回滚 |
 | Command 提交后响应丢失 | `after_commit` 注入连接错误 | 重试命中原命令，命令序号和副作用数量不变 |
+| 首次双资源分配提交后响应丢失 | Owner/Worker/Reservation 事务提交后注入连接错误 | 重试只重读原 Owner、fencing、Worker 计数和 Reservation；不产生第二个 Reservation 或容量增量 |
+| Effect 登记提交后响应丢失 | Effect INSERT 提交后注入连接错误 | 重试命中同一 Effect 幂等键；Effect 数量、resource key 和 provider idempotency key 不变 |
+| Effect 结果提交后响应丢失 | Effect/Reservation 更新提交后注入连接错误 | 重试只重读原 `APPLIED`/`RECONCILE_REQUIRED` 事实；不重复调用 Provider、不重复释放线路 |
+| Recovery 接管提交后响应丢失 | 新 Owner/fencing/容量转换提交后注入连接错误 | 重试只重读新 fencing 和 Worker 计数；旧 Owner 不能再次接管 |
 | allocation deadline 到期 | 数据库时间推进 | 无任何资源时 `DEAD/failed/ALLOCATION_TIMEOUT`；不创建 END |
-| START_UNCERTAIN deadline 三分支 | Stub 查询返回 no-resource/present/unknown | 分别进入失败、END 清理、重试/attention，不能无限停留 |
+| 锁等待跨越租约截止 | 事务先开始，锁等待后再释放；最终判断使用 `clock_timestamp()` | 过期租约提交影响 0 行；事务完整回滚，不留下单侧容量变化 |
+| START_UNCERTAIN deadline 三分支 | 截止前 Stub 返回 no-resource/present/unknown；截止后连续返回 unknown | 截止前按有限重试运行；截止后分别进入失败、END 清理、`SUPERSEDED + END_CALL + attention`，不能无限停留在 `RETRY_WAIT` |
+| 来源 Command 已结束的 Effect 接管 | START 为 `SUCCEEDED/RETRY_WAIT` 或被 END 抢占，Effect 为 `RECONCILE_REQUIRED` | 新有效 Owner/cleanup Owner 用新的 Effect token 接管；不要求来源 Command 仍为 `PROCESSING` |
+| 迟到创建与销毁保护窗口 | Stub 按固定 resource key/generation 先返回不确定，销毁观察后在保护窗口内迟到创建，静默后再次查询 | 创建 Effect 不早于静默门禁收口；销毁图按 generation 二次确认，`DELETE_ROOM` 依赖不提前满足，Provider Stub 调用次数符合脚本 |
 
 ## 8. 验收与证据
 
@@ -128,12 +149,27 @@ Recovery 接管先锁 Record，再锁 Worker、Effect/Reservation 和需要更�
 - `tests/test_ai_call_runtime_effect_repository.py`：Effect 独立租约、fencing 和资源状态转换。
 - `tests/test_ai_call_runtime_lifecycle.py`、`tests/test_ai_call_runtime_startup_recovery.py`、`tests/test_ai_call_runtime_stub_handlers.py`：生命周期、三分支决议和 Provider Stub。
 
+### 8.1 必须保留的数据库不变量快照
+
+每个并发或故障注入场景至少保留以下 SQL 快照，而不只报告测试通过：
+
+1. `ai_call_record`：`runtime_owner_id`、`runtime_fencing_token`、`runtime_capacity_class`、租约字段、`last_applied_command_seq`、`failure_stage`、`failure_message`、`resource_cleanup_status`。
+2. `ai_call_runtime_worker`：`active_call_count`、`active_cleanup_count`，并与按 Record 当前容量类别重算的计数逐 Worker 比较，差异必须为 0。
+3. `ai_call_sip_line_reservation`：每个 `call_id` 最多一条记录；`RELEASED` 之外的行数与 Line `max_concurrency` 比较，旧 token 不能产生第二行。
+4. `ai_call_runtime_effect`：同一资源键/幂等键的唯一性、`status`、`processing_*`、`fencing_token`、`resource_generation` 和调用次数；旧 token 影响行数必须为 0。
+5. `ai_call_runtime_command`：命令序号连续性、`last_applied_command_seq`、`finished_at`、`error_message`、`result_json` 和 dispatch/processing lease 是否清空。
+
+### 8.2 Provider Stub 迟到序列
+
+Provider Stub 必须支持可编排的固定脚本：同一 `provider_namespace + resource_key + resource_generation` 先返回 `UNCERTAIN`，随后在创建保护窗口内观察到销毁请求，再返回迟到的资源存在事实；保护窗口结束后再次查询确认资源终态，并记录每次查询、创建和销毁调用次数。测试必须证明迟到创建不会使销毁 Effect 提前 `APPLIED`，也不会让 `DELETE_ROOM` 越过 SIP/Agent/Egress 销毁依赖；二次销毁只能复用同一稳定幂等键。
+
 完成门槛：
 
 1. PostgreSQL 测试、Runtime 单测、ruff 和 `git diff --check` 全部通过。
 2. 不连接 Redis、LiveKit、SIP、Egress 或真实 Provider，不拨号，不启动/重启业务服务。
-3. 两个独立 Runtime/Dispatcher 实例只共享同一 PostgreSQL；最终 Owner、fencing、Effect、Reservation 和 Record 事实符合本文件矩阵。
+3. 测试实际实例化两个独立 Dispatcher、两个独立 Recovery 和两个独立 Runtime service；它们只共享同一 PostgreSQL，最终 Owner、fencing、Effect、Reservation 和 Record 事实符合本文件矩阵。
 4. 任何失败注入都能由数据库扫描恢复，且没有双执行、容量泄漏、未知资源提前释放或终态屏障重开。
+5. 所有故障注入都保留第 8.1 节数据库快照；锁等待跨截止测试证明最终使用锁后 `clock_timestamp()`，而不是事务开始时间。
 
 ## 9. 进入下一切片的门槛
 
