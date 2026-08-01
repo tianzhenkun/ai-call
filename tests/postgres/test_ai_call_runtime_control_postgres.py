@@ -62,6 +62,12 @@ from app.services.ai_call.runtime_control.owner_repository import (
     RuntimeOwnerRepository,
     WorkerRegistration,
     WorkerRegistryRepository,
+    build_worker_id,
+)
+from app.services.ai_call.runtime_control.postgres_wakeup import (
+    CONTROL_WAKEUP_CHANNEL,
+    PostgresWakeupListener,
+    publish_control_wakeup,
 )
 from app.services.ai_call.runtime_control.provider_stub import (
     DeterministicWebProviderStub,
@@ -3785,6 +3791,271 @@ async def test_two_runtime_services_use_independent_registries_in_db_only_loop()
             ).one()
             assert tuple(record) == ("completed", "clean", None)
     finally:
+        await engine.dispose()
+
+
+async def test_postgres_wakeup_is_delivered_on_commit_but_not_rollback() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    listener = PostgresWakeupListener(engine)
+    stop_event = asyncio.Event()
+    try:
+        assert await listener.start() is True
+        async with factory.begin() as session:
+            await publish_control_wakeup(session)
+            assert (
+                await listener.wait(timeout_seconds=0.05, stop_event=stop_event)
+                is False
+            )
+
+        assert (
+            await listener.wait(timeout_seconds=0.5, stop_event=stop_event) is True
+        )
+
+        async with factory() as session:
+            transaction = await session.begin()
+            await publish_control_wakeup(session)
+            await transaction.rollback()
+
+        assert (
+            await listener.wait(timeout_seconds=0.05, stop_event=stop_event)
+            is False
+        )
+        assert listener.notification_count == 1
+    finally:
+        await listener.stop()
+        await engine.dispose()
+
+
+async def test_postgres_wakeup_forged_payload_creates_no_business_fact() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    listener = PostgresWakeupListener(engine)
+    dispatcher = DispatcherControlService(
+        factory,
+        scan_interval_seconds=30,
+        wakeup_listener=listener,
+    )
+    try:
+        await dispatcher.start()
+        async with factory.begin() as session:
+            await session.execute(
+                text("select pg_notify(:channel, :payload)"),
+                {
+                    "channel": CONTROL_WAKEUP_CHANNEL,
+                    "payload": "tenant-a:forged-call-id",
+                },
+            )
+
+        for _ in range(50):
+            if listener.notification_count == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert listener.notification_count == 1
+
+        async with factory() as session:
+            assert await session.scalar(text("select count(*) from ai_call_record")) == 0
+            assert (
+                await session.scalar(
+                    text("select count(*) from ai_call_runtime_command")
+                )
+                == 0
+            )
+    finally:
+        await dispatcher.stop()
+        await engine.dispose()
+
+
+async def test_postgres_wakeup_periodic_scan_recovers_without_listener() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    dispatcher = DispatcherControlService(
+        factory,
+        scan_interval_seconds=0.01,
+    )
+    try:
+        async with factory.begin() as session:
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="wakeup-fallback",
+                    startup_id=UUID("50505050-5050-4050-8050-505050505050"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+        await dispatcher.start()
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="postgres-wakeup:fallback",
+                    payload={"business_id": "fallback"},
+                )
+            )
+
+        owner_id = None
+        for _ in range(100):
+            async with factory() as session:
+                owner_id = await session.scalar(
+                    text(
+                        "select runtime_owner_id from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            if owner_id is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert owner_id is not None
+    finally:
+        await dispatcher.stop()
+        await engine.dispose()
+
+
+async def test_postgres_wakeup_two_dispatchers_and_runtimes_keep_single_winner() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    provider_a = DeterministicWebProviderStub()
+    provider_b = DeterministicWebProviderStub()
+    runtimes = (
+        RuntimeControlService(
+            worker_id=build_worker_id(
+                "wakeup-runtime-a",
+                UUID("60606060-6060-4060-8060-606060606060"),
+            ),
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_a,
+            scan_interval_seconds=30,
+            wakeup_listener=PostgresWakeupListener(engine),
+        ),
+        RuntimeControlService(
+            worker_id=build_worker_id(
+                "wakeup-runtime-b",
+                UUID("70707070-7070-4070-8070-707070707070"),
+            ),
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider_b,
+            scan_interval_seconds=30,
+            wakeup_listener=PostgresWakeupListener(engine),
+        ),
+    )
+    dispatchers = (
+        DispatcherControlService(
+            factory,
+            scan_interval_seconds=30,
+            wakeup_listener=PostgresWakeupListener(engine),
+        ),
+        DispatcherControlService(
+            factory,
+            scan_interval_seconds=30,
+            wakeup_listener=PostgresWakeupListener(engine),
+        ),
+    )
+    started_services: list[object] = []
+    try:
+        for service in (*runtimes, *dispatchers):
+            await service.start()
+            started_services.append(service)
+
+        async with factory.begin() as session:
+            start = await RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            ).submit(
+                StartEntryRequest(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="postgres-wakeup:single-winner",
+                    payload={"voice": "voice-a", "business_id": "single-winner"},
+                    business_id="single-winner",
+                    allocation_timeout_seconds=30,
+                )
+            )
+            assert start is not None
+
+        start_status = None
+        for _ in range(200):
+            async with factory() as session:
+                start_status = await session.scalar(
+                    text(
+                        "select status from ai_call_runtime_command "
+                        "where id=:command_id"
+                    ).bindparams(command_id=start.command_id)
+                )
+            if start_status == "SUCCEEDED":
+                break
+            await asyncio.sleep(0.01)
+        assert start_status == "SUCCEEDED"
+
+        async with factory.begin() as session:
+            end = await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="web_client",
+                    end_reason="user_requested",
+                    dedupe_key="postgres-wakeup:single-winner:end",
+                )
+            )
+
+        end_status = None
+        for _ in range(200):
+            async with factory() as session:
+                end_status = await session.scalar(
+                    text(
+                        "select status from ai_call_runtime_command "
+                        "where id=:command_id"
+                    ).bindparams(command_id=end.command_id)
+                )
+            if end_status == "SUCCEEDED":
+                break
+            await asyncio.sleep(0.01)
+        assert end_status == "SUCCEEDED"
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select status, resource_cleanup_status, runtime_owner_id, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == ("completed", "clean", None, "none")
+            worker_counts = (
+                await session.execute(
+                    text(
+                        "select active_call_count, active_cleanup_count "
+                        "from ai_call_runtime_worker order by worker_id"
+                    )
+                )
+            ).all()
+            assert worker_counts == [(0, 0), (0, 0)]
+            dispatch_fields_written = await session.scalar(
+                text(
+                    "select count(*) from ai_call_runtime_command where "
+                    "dispatch_token is not null or dispatch_expires_at is not null or "
+                    "published_at is not null or stream_message_id is not null"
+                )
+            )
+            assert dispatch_fields_written == 0
+
+        provider_calls = provider_a.calls + provider_b.calls
+        assert len(provider_calls) == 4
+        assert len(
+            {(call["effect_type"], call["resource_key"]) for call in provider_calls}
+        ) == 4
+    finally:
+        for service in reversed(started_services):
+            await service.stop()
         await engine.dispose()
 
 
