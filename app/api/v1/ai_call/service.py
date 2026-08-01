@@ -60,6 +60,7 @@ from app.services.ai_call.prompt_config import (
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
 from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
+from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 from app.services.ai_call.semantic_analysis import (
     AiCallSemanticAnalysisService,
     build_default_semantic_analyzer,
@@ -130,6 +131,7 @@ class AiCallService:
         scene_code: str | None = None,
         business_params: dict | None = None,
     ) -> CreateSessionResult:
+        self._ensure_legacy_entry_allowed("web")
         if self.record_service is None:
             try:
                 return await self.orchestrator.create_web_session(voice=voice, prompt=prompt)
@@ -209,6 +211,7 @@ class AiCallService:
         ringing_timeout_seconds: int | None = None,
         before_sip_invite: Callable[[], Awaitable[None]] | None = None,
     ) -> CreateSipSessionResult:
+        self._ensure_legacy_entry_allowed("direct_sip")
         self._ensure_record_service()
         if self.sip_client is None:
             raise CustomException(
@@ -365,6 +368,15 @@ class AiCallService:
             sip_trunk_id=sip_participant.sip_trunk_id,
             sip_call_status=sip_participant.sip_call_status,
         )
+
+    @staticmethod
+    def _ensure_legacy_entry_allowed(entry: str) -> None:
+        if runtime_control_mode_for_entry(settings, entry) == "owner_command_v1":
+            raise CustomException(
+                msg=f"{entry} 入口已切换为异步 START_CALL，请使用运行时入口",
+                code=RET.ERROR.code,
+                status_code=409,
+            )
 
     async def list_voice_profiles(
         self,
