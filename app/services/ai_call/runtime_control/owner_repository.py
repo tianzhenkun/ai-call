@@ -464,7 +464,7 @@ class RecoveryOwnerRepository:
             )
             .with_for_update()
         )
-        if record is None or not _cleanup_assignment_allowed(record, now):
+        if record is None:
             return None
 
         worker_ids = sorted(
@@ -486,7 +486,7 @@ class RecoveryOwnerRepository:
             ).all()
         }
         target_worker = locked_workers.get(candidate_id)
-        if target_worker is None or not _worker_has_cleanup_capacity(target_worker, now):
+        if target_worker is None:
             return None
 
         end_command = await self._session.scalar(
@@ -524,6 +524,12 @@ class RecoveryOwnerRepository:
                 )
             ).all()
         )
+
+        now = await self._database_clock(self._session)
+        if not _cleanup_assignment_allowed(record, now) or not _worker_has_cleanup_capacity(
+            target_worker, now
+        ):
+            return None
 
         old_worker = (
             locked_workers.get(record.runtime_owner_id)

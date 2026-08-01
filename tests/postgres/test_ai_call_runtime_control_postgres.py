@@ -1364,6 +1364,113 @@ async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> 
         await engine.dispose()
 
 
+async def test_cleanup_assignment_rechecks_worker_lease_after_lock_wait() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:cleanup-lock-wait",
+                    payload={"business_id": "cleanup-lock-wait"},
+                )
+            )
+            old_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-cleanup-old",
+                    startup_id=UUID("12121212-1212-4121-8121-121212121212"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            old_lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert old_lease is not None
+            await commands.request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="recovery_test",
+                    end_reason="owner_lost",
+                    dedupe_key="recovery-test:cleanup-lock-wait",
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where worker_id=:worker_id"
+                ).bindparams(worker_id=old_worker.worker_id)
+            )
+            new_worker = await WorkerRegistryRepository(
+                session,
+                lease_ttl=timedelta(seconds=1),
+            ).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-cleanup-new",
+                    startup_id=UUID("13131313-1313-4131-8131-131313131313"),
+                    capacity=0,
+                    cleanup_capacity=1,
+                )
+            )
+
+        locker = factory()
+        await locker.begin()
+        try:
+            await locker.execute(
+                select(AiCallRuntimeWorkerModel)
+                .where(AiCallRuntimeWorkerModel.worker_id == new_worker.worker_id)
+                .with_for_update()
+            )
+
+            async def assign_after_worker_lock() -> OwnerLease | None:
+                async with factory.begin() as session:
+                    return await RecoveryOwnerRepository(session).assign_cleanup_owner(
+                        "tenant-a", start.call_id
+                    )
+
+            assign_task = asyncio.create_task(assign_after_worker_lock())
+            await asyncio.sleep(1.25)
+            await locker.commit()
+            lease = await assign_task
+        finally:
+            await locker.close()
+
+        assert lease is None
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (old_worker.worker_id, 1, "active")
+            assert (
+                await session.scalar(
+                    text(
+                        "select active_cleanup_count from ai_call_runtime_worker "
+                        "where worker_id=:worker_id"
+                    ).bindparams(worker_id=new_worker.worker_id)
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
+
+
 async def test_startup_uncertain_deadline_marks_no_resource_failed_and_releases_owner() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
