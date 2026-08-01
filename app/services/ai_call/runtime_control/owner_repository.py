@@ -19,6 +19,7 @@ from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeWorkerModel,
     AiCallSipLineReservationModel,
 )
+from app.services.ai_call.runtime_control.postgres_wakeup import publish_control_wakeup
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
 from app.utils.id_util import generate_snowflake_id
@@ -251,6 +252,7 @@ class DispatcherOwnerRepository:
                     )
                 )
             await self._session.flush()
+            await publish_control_wakeup(self._session)
             return _owner_lease(record)
         return None
 

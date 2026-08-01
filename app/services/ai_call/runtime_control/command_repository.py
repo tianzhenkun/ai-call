@@ -20,6 +20,7 @@ from app.services.ai_call.runtime_control.models import (
     AiCallSipLineReservationModel,
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
+from app.services.ai_call.runtime_control.postgres_wakeup import publish_control_wakeup
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
 from app.utils.id_util import generate_snowflake_id
@@ -314,6 +315,7 @@ class RuntimeCommandRepository:
                 raise
             return self._matching_snapshot(winner, fingerprint)
 
+        await publish_control_wakeup(self._session)
         return self._snapshot(command)
 
     async def append_command(self, request: CommandIntent) -> CommandSnapshot:
@@ -429,6 +431,7 @@ class RuntimeCommandRepository:
             received_at=now,
         )
         await self._session.flush()
+        await publish_control_wakeup(self._session)
 
         terminal_requested_at = record.terminal_requested_at
         if terminal_requested_at is None:
