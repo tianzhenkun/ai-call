@@ -20,7 +20,14 @@ from app.core.base_model import MappedBase
 from app.services.ai_call.runtime_control.command_repository import (
     RuntimeCommandRepository,
 )
-from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
+from app.services.ai_call.runtime_control.models import (
+    AiCallRuntimeCommandModel,
+    AiCallRuntimeWorkerModel,
+    AiCallSipLineReservationModel,
+)
+from app.services.ai_call.runtime_control.owner_repository import (
+    DispatcherOwnerRepository,
+)
 from app.utils.id_util import generate_snowflake_id
 
 
@@ -74,19 +81,17 @@ async def _seed_due_task(database, now: datetime) -> tuple[int, int, str]:
     target_id = generate_snowflake_id()
     phone_number = "13800138001"
     line = _line_snapshot()
-    snapshot = json.dumps(
-        {
-            "request": {"taskName": "Owner Runtime 外呼"},
-            "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
-            "voice": {"voice": "Tina"},
-            "rule": {
-                "retryCount": 0,
-                "retryIntervalsMinutes": [],
-                "retryableResults": [],
-            },
-            "sipLine": line,
-        }
-    )
+    snapshot = json.dumps({
+        "request": {"taskName": "Owner Runtime 外呼"},
+        "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
+        "voice": {"voice": "Tina"},
+        "rule": {
+            "retryCount": 0,
+            "retryIntervalsMinutes": [],
+            "retryableResults": [],
+        },
+        "sipLine": line,
+    })
     async with database.begin() as session:
         session.add(
             AiCallSipLineModel(
@@ -174,6 +179,26 @@ async def _seed_due_task(database, now: datetime) -> tuple[int, int, str]:
     return task_id, target_id, phone_number
 
 
+async def _seed_ready_worker(database, now: datetime) -> str:
+    worker_id = "runtime-a:00000000-0000-0000-0000-000000000001"
+    async with database.begin() as session:
+        session.add(
+            AiCallRuntimeWorkerModel(
+                worker_id=worker_id,
+                status="READY",
+                capacity=1,
+                cleanup_capacity=1,
+                active_call_count=0,
+                active_cleanup_count=0,
+                heartbeat_at=now,
+                lease_expires_at=now.replace(hour=2),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return worker_id
+
+
 @pytest.mark.anyio
 async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
     database,
@@ -201,15 +226,11 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
 
     async with database() as session:
         attempt = await session.scalar(
-            select(AiCallOutboundAttemptModel).where(
-                AiCallOutboundAttemptModel.task_id == task_id
-            )
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
         )
         assert attempt is not None
         record = await session.scalar(
-            select(AiCallRecordModel).where(
-                AiCallRecordModel.call_id == attempt.call_id
-            )
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == attempt.call_id)
         )
         command = await session.scalar(
             select(AiCallRuntimeCommandModel).where(
@@ -289,9 +310,7 @@ async def test_owner_runtime_start_failure_rolls_back_target_and_all_start_facts
         attempt_count = int(
             await session.scalar(select(func.count(AiCallOutboundAttemptModel.id))) or 0
         )
-        record_count = int(
-            await session.scalar(select(func.count(AiCallRecordModel.id))) or 0
-        )
+        record_count = int(await session.scalar(select(func.count(AiCallRecordModel.id))) or 0)
         command_count = int(
             await session.scalar(select(func.count(AiCallRuntimeCommandModel.id))) or 0
         )
@@ -328,18 +347,217 @@ async def test_parallel_owner_runtime_executors_create_one_start_chain(database)
         attempt_count = int(
             await session.scalar(select(func.count(AiCallOutboundAttemptModel.id))) or 0
         )
-        record_count = int(
-            await session.scalar(select(func.count(AiCallRecordModel.id))) or 0
-        )
+        record_count = int(await session.scalar(select(func.count(AiCallRecordModel.id))) or 0)
         command_count = int(
             await session.scalar(select(func.count(AiCallRuntimeCommandModel.id))) or 0
         )
         attempt = await session.scalar(
-            select(AiCallOutboundAttemptModel).where(
-                AiCallOutboundAttemptModel.task_id == task_id
-            )
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
         )
 
     assert sum(processed) == 1
     assert attempt_count == record_count == command_count == 1
     assert attempt is not None and attempt.status == "QUEUED"
+
+
+@pytest.mark.anyio
+async def test_dispatcher_atomically_assigns_outbound_owner_line_and_attempt(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+    database_now = now.replace(tzinfo=None)
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
+        )
+        assert attempt is not None
+        lease = await DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(database_now),
+        ).assign_initial_owner("tenant-a", attempt.call_id)
+        await session.commit()
+        call_id = attempt.call_id
+        attempt_id = attempt.id
+
+    assert lease is not None and lease.owner_id == worker_id
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, attempt_id)
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        worker = await session.get(AiCallRuntimeWorkerModel, worker_id)
+        reservation = await session.scalar(
+            select(AiCallSipLineReservationModel).where(
+                AiCallSipLineReservationModel.call_id == call_id
+            )
+        )
+
+    assert attempt is not None and attempt.status == "STARTING"
+    assert reservation is not None
+    assert reservation.attempt_id == attempt.id
+    assert reservation.status == "RESERVED"
+    assert record is not None and record.runtime_owner_id == worker_id
+    assert worker is not None and worker.active_call_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "invalid_attempt",
+    ["missing", "tenant", "call_id", "status"],
+)
+async def test_dispatcher_fails_closed_for_invalid_outbound_attempt_graph(
+    database,
+    invalid_attempt: str,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+
+    async with database.begin() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
+        )
+        assert attempt is not None
+        call_id = attempt.call_id
+        if invalid_attempt == "missing":
+            await session.delete(attempt)
+        elif invalid_attempt == "tenant":
+            attempt.tenant_id = "tenant-b"
+        elif invalid_attempt == "call_id":
+            attempt.call_id = "call-other"
+        else:
+            attempt.status = "DIALING"
+
+    async with database() as session:
+        lease = await DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(now.replace(tzinfo=None)),
+        ).assign_initial_owner("tenant-a", call_id)
+        await session.commit()
+
+    assert lease is None
+    async with database() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        worker = await session.get(AiCallRuntimeWorkerModel, worker_id)
+        reservation_count = int(
+            await session.scalar(
+                select(func.count(AiCallSipLineReservationModel.id)).where(
+                    AiCallSipLineReservationModel.call_id == call_id
+                )
+            )
+            or 0
+        )
+
+    assert record is not None and record.runtime_owner_id is None
+    assert worker is not None and worker.active_call_count == 0
+    assert reservation_count == 0
+
+
+@pytest.mark.anyio
+async def test_dispatcher_rejects_outbound_refs_changed_after_candidate_read(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
+        )
+        assert attempt is not None
+        repository = DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(now.replace(tzinfo=None)),
+        )
+        original_lock_command = repository._lock_command
+
+        async def lock_changed_command(
+            tenant_id: str,
+            call_id: str,
+            command_type: str,
+        ):
+            command = await original_lock_command(tenant_id, call_id, command_type)
+            assert command is not None
+            changed_payload = json.loads(command.payload_json or "{}")
+            changed_payload["attempt_id"] = str(attempt.id + 1)
+            return type(
+                "ChangedCommand",
+                (),
+                {
+                    "status": command.status,
+                    "payload_json": json.dumps(changed_payload),
+                },
+            )()
+
+        monkeypatch.setattr(repository, "_lock_command", lock_changed_command)
+        lease = await repository.assign_initial_owner("tenant-a", attempt.call_id)
+        call_id = attempt.call_id
+        await session.rollback()
+
+    assert lease is None
+    async with database() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        worker = await session.get(AiCallRuntimeWorkerModel, worker_id)
+        reservation_count = int(
+            await session.scalar(
+                select(func.count(AiCallSipLineReservationModel.id)).where(
+                    AiCallSipLineReservationModel.call_id == call_id
+                )
+            )
+            or 0
+        )
+
+    assert record is not None and record.runtime_owner_id is None
+    assert worker is not None and worker.active_call_count == 0
+    assert reservation_count == 0
