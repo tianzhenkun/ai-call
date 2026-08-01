@@ -189,43 +189,7 @@ git add app/services/ai_call/runtime_control/owner_repository.py app/services/ai
 git commit -m "fix(ai-call): validate leases with post-lock db time"
 ```
 
-### 任务 4：验证 attention 停放的旧 Owner CAS 与 DB-Core 锁序
-
-**文件：**
-
-- 修改：`app/services/ai_call/runtime_control/owner_repository.py`
-- 修改测试：`tests/postgres/test_ai_call_runtime_control_postgres.py`
-
-- [ ] **步骤 1：编写旧 Owner 迟到停放红灯测试**
-
-先让 Owner A 将 Effect 写为 `RECONCILE_REQUIRED`，再让 Recovery B 接管并递增 Record fencing、转入 cleanup；最后使用 A 的旧 `OwnerLease` 调用 `park_attention`。断言返回 `False`，B 的 Owner、fencing、cleanup 计数、Reservation 和 Effect 不变。
-
-```python
-assert not await RecoveryOwnerRepository(session).park_attention(old_owner_lease, timedelta(seconds=30))
-assert record.runtime_owner_id == new_owner_lease.owner_id
-assert record.runtime_fencing_token == new_owner_lease.fencing_token
-assert worker.active_cleanup_count == 1
-```
-
-- [ ] **步骤 2：补齐 DB-Core 锁序说明对应的实现校验**
-
-本任务只验证实际触及的行类：`Record -> SIP Line -> Worker -> Command -> Reservation -> Effect`。Handoff/Presence 不在 DB-Core 代码路径内，不在本任务新增表或事务；后续集成切片必须再验证总设计的完整顺序。
-
-- [ ] **步骤 3：运行 Recovery 并发回归**
-
-```bash
-bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/test_ai_call_runtime_control_postgres.py -k 'recovery or attention or owner_concurrent' -q
-uv run pytest tests/test_ai_call_runtime_owner_repository.py tests/test_ai_call_runtime_lifecycle.py -q
-```
-
-- [ ] **步骤 4：提交停放切片**
-
-```bash
-git add app/services/ai_call/runtime_control/owner_repository.py tests/postgres/test_ai_call_runtime_control_postgres.py
-git commit -m "test(ai-call): fence stale attention parking"
-```
-
-### 任务 5：补齐 DB-Core 提交响应丢失矩阵
+### 任务 4：补齐 DB-Core 提交响应丢失矩阵
 
 **文件：**
 
@@ -267,7 +231,7 @@ git add app/services/ai_call/runtime_control/owner_repository.py app/services/ai
 git commit -m "test(ai-call): cover db-core committed response loss"
 ```
 
-### 任务 6：最终 DB-Core 验收与交接
+### 任务 5：最终 DB-Core 验收与交接
 
 **文件：**
 
