@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.services.ai_call.runtime_control.bootstrap_service import (
@@ -46,6 +48,169 @@ def _auth() -> SimpleNamespace:
         db=object(),
         user=SimpleNamespace(tenant_id="tenant-from-auth"),
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command_status", ["PENDING", "RETRY_WAIT", "PROCESSING"])
+async def test_runtime_command_query_returns_tenant_scoped_persistent_status(
+    monkeypatch: pytest.MonkeyPatch,
+    command_status: str,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _CommandQueryRepository:
+        def __init__(self, _db) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        async def get_command(self, tenant_id: str, command_id: int):
+            self.calls.append((tenant_id, command_id))
+            return SimpleNamespace(
+                command_id=command_id,
+                call_id="call-query-1",
+                command_seq=1,
+                command_type="START_CALL",
+                status=command_status,
+                result=None,
+                error_message=None,
+                created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                claimed_at=None,
+                finished_at=None,
+                sensitive_payload_ciphertext="must-not-leak",
+                processing_token="must-not-leak",
+                dispatch_token="must-not-leak",
+            )
+
+    repository = _CommandQueryRepository(object())
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", lambda _db: repository)
+
+    response = await controller.get_runtime_command_controller(
+        auth=_auth(),
+        command_id=101,
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["data"] == {
+        "commandId": "101",
+        "callId": "call-query-1",
+        "commandSeq": "1",
+        "commandType": "START_CALL",
+        "status": command_status,
+        "result": None,
+        "errorMessage": None,
+        "createdAt": "2026-08-01T00:00:00Z",
+        "claimedAt": None,
+        "finishedAt": None,
+    }
+    assert repository.calls == [("tenant-from-auth", 101)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("command_status", ["SUCCEEDED", "DEAD", "SUPERSEDED", "CANCELED"])
+async def test_runtime_command_query_returns_terminal_result_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+    command_status: str,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _CommandQueryRepository:
+        def __init__(self, _db) -> None:
+            pass
+
+        async def get_command(self, tenant_id: str, command_id: int):
+            assert tenant_id == "tenant-from-auth"
+            return SimpleNamespace(
+                command_id=command_id,
+                call_id="call-query-terminal",
+                command_seq=2,
+                command_type="END_CALL",
+                status=command_status,
+                result={"outcome": "done"},
+                error_message=None if command_status == "SUCCEEDED" else "terminal",
+                created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                claimed_at=datetime(2026, 8, 1, 0, 0, 1, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 8, 1, 0, 0, 2, tzinfo=timezone.utc),
+            )
+
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", _CommandQueryRepository)
+
+    response = await controller.get_runtime_command_controller(
+        auth=_auth(),
+        command_id=202,
+    )
+
+    data = json.loads(response.body)["data"]
+    assert data["status"] == command_status
+    assert data["result"] == {"outcome": "done"}
+    assert data["errorMessage"] == (
+        None if command_status == "SUCCEEDED" else "terminal"
+    )
+
+
+@pytest.mark.anyio
+async def test_runtime_command_query_returns_404_for_missing_or_cross_tenant_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _MissingRepository:
+        def __init__(self, _db) -> None:
+            pass
+
+        async def get_command(self, tenant_id: str, command_id: int):
+            assert tenant_id == "tenant-from-auth"
+            assert command_id == 303
+            return None
+
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", _MissingRepository)
+
+    with pytest.raises(controller.HTTPException) as exc_info:
+        await controller.get_runtime_command_controller(
+            auth=_auth(),
+            command_id=303,
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_runtime_command_query_maps_corrupt_result_to_stable_service_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+
+    class _CorruptRepository:
+        def __init__(self, _db) -> None:
+            pass
+
+        async def get_command(self, tenant_id: str, command_id: int):
+            raise controller.RuntimeCommandResultError("raw-result-must-not-leak")
+
+    monkeypatch.setattr(controller, "RuntimeCommandRepository", _CorruptRepository)
+
+    with pytest.raises(controller.CustomException) as exc_info:
+        await controller.get_runtime_command_controller(
+            auth=_auth(),
+            command_id=404,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.data == {"errorCode": "COMMAND_RESULT_CORRUPTED"}
+    assert "raw-result-must-not-leak" not in exc_info.value.msg
+
+
+@pytest.mark.parametrize("command_id", ["not-a-number", "0", str(2**63)])
+def test_runtime_command_query_rejects_invalid_command_id(command_id: str) -> None:
+    from app.api.v1.ai_call import runtime_control_controller as controller
+    from app.core.dependencies import get_current_user
+
+    app = FastAPI()
+    app.include_router(controller.RuntimeEntryRouter, prefix="/ai-call")
+    app.dependency_overrides[get_current_user] = _auth
+
+    with TestClient(app) as client:
+        response = client.get(f"/ai-call/runtime/commands/{command_id}")
+
+    assert response.status_code == 422
 
 
 @pytest.mark.anyio

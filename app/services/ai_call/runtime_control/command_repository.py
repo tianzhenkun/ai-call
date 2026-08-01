@@ -43,6 +43,10 @@ class RuntimeCommandRepositoryError(RuntimeError):
     pass
 
 
+class RuntimeCommandResultError(RuntimeCommandRepositoryError):
+    pass
+
+
 class IdempotencyConflictError(RuntimeCommandRepositoryError):
     pass
 
@@ -117,6 +121,20 @@ class CommandSnapshot:
     request_fingerprint: str
     status: str
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CommandQuerySnapshot:
+    command_id: int
+    call_id: str
+    command_seq: int
+    command_type: str
+    status: str
+    result: dict[str, object] | None
+    error_message: str | None
+    created_at: datetime
+    claimed_at: datetime | None
+    finished_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +231,22 @@ class RuntimeCommandRepository:
         self._processing_token_generator = processing_token_generator
         self._processing_lease_ttl = processing_lease_ttl
         self._database_clock = database_clock
+
+    async def get_command(
+        self,
+        *,
+        tenant_id: str,
+        command_id: int,
+    ) -> CommandQuerySnapshot | None:
+        command = await self._session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.id == command_id,
+            )
+        )
+        if command is None:
+            return None
+        return self._query_snapshot(command)
 
     async def create_start_call(self, request: StartCallIntent) -> CommandSnapshot:
         fingerprint = start_call_request_fingerprint(request)
@@ -920,4 +954,33 @@ class RuntimeCommandRepository:
             request_fingerprint=command.request_fingerprint,
             status=command.status,
             created_at=command.created_at,
+        )
+
+    @staticmethod
+    def _query_snapshot(command: AiCallRuntimeCommandModel) -> CommandQuerySnapshot:
+        result: dict[str, object] | None = None
+        if command.result_json is not None:
+            try:
+                decoded_result = json.loads(command.result_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeCommandResultError(
+                    "runtime command result_json is invalid"
+                ) from exc
+            if decoded_result is not None and not isinstance(decoded_result, dict):
+                raise RuntimeCommandResultError(
+                    "runtime command result_json must be an object or null"
+                )
+            result = decoded_result
+
+        return CommandQuerySnapshot(
+            command_id=command.id,
+            call_id=command.call_id,
+            command_seq=command.command_seq,
+            command_type=command.command_type,
+            status=command.status,
+            result=result,
+            error_message=command.error_message,
+            created_at=command.created_at,
+            claimed_at=command.claimed_at,
+            finished_at=command.finished_at,
         )

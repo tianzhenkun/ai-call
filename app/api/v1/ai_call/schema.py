@@ -152,6 +152,19 @@ class RuntimeStartCallOut(AiCallBaseSchema):
     status: str
 
 
+class RuntimeCommandOut(AiCallBaseSchema):
+    command_id: str
+    call_id: str
+    command_seq: str
+    command_type: str
+    status: str
+    result: dict[str, Any] | None = None
+    error_message: str | None = None
+    created_at: datetime
+    claimed_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class RuntimeEndCallRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 

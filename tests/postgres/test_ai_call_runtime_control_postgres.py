@@ -25,6 +25,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     EndCallIntent,
     IdempotencyConflictError,
     RuntimeCommandRepository,
+    RuntimeCommandResultError,
     RuntimeControlModeError,
     StartCallIntent,
     TerminalBarrierError,
@@ -345,6 +346,112 @@ async def test_command_idempotency_is_tenant_scoped_and_conflicts_are_atomic() -
                 == 2
             )
             assert await session.scalar(text("select count(*) from ai_call_record")) == 2
+    finally:
+        await engine.dispose()
+
+
+async def test_command_query_is_tenant_scoped_and_returns_only_parsed_persistent_state() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            tenant_a = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:command-query:a",
+                    payload={"voice": "voice-a"},
+                    sensitive_payload_ciphertext="ciphertext-must-not-leak",
+                )
+            )
+            tenant_b = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-b",
+                    entry_type="web",
+                    idempotency_key="start:command-query:b",
+                    payload={"voice": "voice-b"},
+                )
+            )
+
+        async with factory.begin() as session:
+            await session.execute(
+                text(
+                    "update ai_call_runtime_command set "
+                    "status='SUCCEEDED', result_json=:result_json, "
+                    "dispatch_token='dispatch-secret', "
+                    "processing_token='processing-secret', "
+                    "claimed_at=clock_timestamp(), finished_at=clock_timestamp() "
+                    "where id=:command_id"
+                ).bindparams(
+                    command_id=tenant_a.command_id,
+                    result_json='{"nested":{"ok":true}}',
+                )
+            )
+
+        async with factory() as session:
+            repository = RuntimeCommandRepository(session)
+            snapshot = await repository.get_command(
+                tenant_id="tenant-a",
+                command_id=tenant_a.command_id,
+            )
+            assert snapshot is not None
+            assert snapshot.command_id == tenant_a.command_id
+            assert snapshot.call_id == tenant_a.call_id
+            assert snapshot.status == "SUCCEEDED"
+            assert snapshot.result == {"nested": {"ok": True}}
+            assert snapshot.error_message is None
+            assert snapshot.claimed_at is not None
+            assert snapshot.finished_at is not None
+            assert not hasattr(snapshot, "sensitive_payload_ciphertext")
+            assert not hasattr(snapshot, "processing_token")
+            assert not hasattr(snapshot, "dispatch_token")
+
+            assert (
+                await repository.get_command(
+                    tenant_id="tenant-b",
+                    command_id=tenant_a.command_id,
+                )
+                is None
+            )
+            assert (
+                await repository.get_command(
+                    tenant_id="tenant-a",
+                    command_id=tenant_b.command_id,
+                )
+                is None
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_command_query_fails_closed_for_non_object_result_json() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:command-query:corrupt",
+                    payload={},
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_command set result_json='[]' "
+                    "where id=:command_id"
+                ).bindparams(command_id=start.command_id)
+            )
+
+        async with factory() as session:
+            with pytest.raises(RuntimeCommandResultError):
+                await RuntimeCommandRepository(session).get_command(
+                    tenant_id="tenant-a",
+                    command_id=start.command_id,
+                )
     finally:
         await engine.dispose()
 

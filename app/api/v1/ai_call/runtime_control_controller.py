@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
 
 from app.api.v1.ai_call.schema import (
     RuntimeBootstrapOut,
+    RuntimeCommandOut,
     RuntimeEndCallOut,
     RuntimeEndCallRequest,
     RuntimeStartCallOut,
@@ -28,6 +29,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     EndCallIntent,
     IdempotencyConflictError,
     RuntimeCommandRepository,
+    RuntimeCommandResultError,
     RuntimeControlModeError,
     RuntimeRecordNotFoundError,
 )
@@ -43,6 +45,52 @@ from app.services.ai_call.runtime_control.runtime_token_service import (
 )
 
 RuntimeEntryRouter = APIRouter(tags=["智能外呼运行时"])
+
+_MAX_BIGINT = 2**63 - 1
+
+
+@RuntimeEntryRouter.get(
+    "/runtime/commands/{command_id}",
+    summary="读取 AI Call 持久命令状态",
+    response_model=ResponseSchema[RuntimeCommandOut],
+)
+async def get_runtime_command_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    command_id: Annotated[int, Path(gt=0, le=_MAX_BIGINT)],
+):
+    tenant_id = str(getattr(getattr(auth, "user", None), "tenant_id", "") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
+
+    try:
+        snapshot = await RuntimeCommandRepository(auth.db).get_command(
+            tenant_id=tenant_id,
+            command_id=command_id,
+        )
+    except RuntimeCommandResultError as exc:
+        raise CustomException(
+            msg="运行时命令结果数据损坏",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            data={"errorCode": "COMMAND_RESULT_CORRUPTED"},
+        ) from exc
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="运行时命令不存在")
+
+    return SuccessResponse(
+        data=RuntimeCommandOut(
+            command_id=str(snapshot.command_id),
+            call_id=snapshot.call_id,
+            command_seq=str(snapshot.command_seq),
+            command_type=snapshot.command_type,
+            status=snapshot.status,
+            result=snapshot.result,
+            error_message=snapshot.error_message,
+            created_at=snapshot.created_at,
+            claimed_at=snapshot.claimed_at,
+            finished_at=snapshot.finished_at,
+        ),
+        msg="运行时命令状态已读取",
+    )
 
 
 @RuntimeEntryRouter.post(
