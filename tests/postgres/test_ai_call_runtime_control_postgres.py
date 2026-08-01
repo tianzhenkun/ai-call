@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import replace
 from datetime import timedelta
@@ -4155,6 +4156,128 @@ async def test_web_db_only_idempotency_and_terminal_barrier_leave_no_extra_rows(
                 == 0
             )
     finally:
+        await engine.dispose()
+
+
+async def test_web_db_only_latency_measurement() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES="web")
+    runtime: RuntimeControlService | None = None
+    try:
+        async with factory.begin() as session:
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="web-runtime-latency",
+                    startup_id=UUID("40404040-4040-4040-8040-404040404040"),
+                    capacity=64,
+                    cleanup_capacity=64,
+                )
+            )
+            service = RuntimeEntryStartService(
+                settings=settings,
+                repository=RuntimeCommandRepository(session),
+            )
+            starts = []
+            for index in range(20):
+                start = await service.submit(
+                    StartEntryRequest(
+                        tenant_id="tenant-a",
+                        entry_type="web",
+                        idempotency_key=f"web:db-only:latency:{index}",
+                        payload={
+                            "voice": "voice-a",
+                            "business_id": f"latency-{index}",
+                            "scene_code": "collection",
+                            "business_params": {"sample": index},
+                        },
+                        business_id=f"latency-{index}",
+                        scene_code="collection",
+                        allocation_timeout_seconds=30,
+                    )
+                )
+                assert start is not None
+                starts.append(start)
+
+        assigned = await DispatcherControlService(factory).run_once()
+        assert assigned == len(starts)
+
+        provider = DeterministicWebProviderStub()
+        runtime = RuntimeControlService(
+            worker_id=worker.worker_id,
+            registry=RuntimeRegistry(),
+            session_factory=factory,
+            provider=provider,
+            batch_size=64,
+        )
+        assert await runtime.run_once() == len(starts)
+        assert await runtime.run_once() == 0
+
+        async with factory() as session:
+            latency_rows = (
+                await session.execute(
+                    text(
+                        "select extract(epoch from (claimed_at - created_at)) * 1000 "
+                        "from ai_call_runtime_command "
+                        "where command_type='START_CALL' order by created_at, id"
+                    )
+                )
+            ).all()
+            latencies_ms = sorted(float(row[0]) for row in latency_rows)
+            backlog = await session.scalar(
+                text(
+                    "select count(*) from ai_call_runtime_command "
+                    "where status in ('PENDING', 'RETRY_WAIT', 'PROCESSING')"
+                )
+            )
+            worker_state = (
+                await session.execute(
+                    text(
+                        "select active_call_count, capacity "
+                        "from ai_call_runtime_worker where worker_id=:worker_id"
+                    ).bindparams(worker_id=worker.worker_id)
+                )
+            ).one()
+            dispatch_fields_written = await session.scalar(
+                text(
+                    "select count(*) from ai_call_runtime_command where "
+                    "dispatch_token is not null or dispatch_expires_at is not null or "
+                    "published_at is not null or stream_message_id is not null"
+                )
+            )
+            server_version_num = await session.scalar(
+                text("select current_setting('server_version_num')::int")
+            )
+            isolation_level = await session.scalar(
+                text("show transaction_isolation")
+            )
+
+        assert len(latencies_ms) == len(starts)
+        assert backlog == 0
+        assert worker_state.active_call_count == len(starts)
+        assert worker_state.active_call_count < worker_state.capacity
+        assert dispatch_fields_written == 0
+        assert len(provider.calls) == len(starts) * 2
+
+        p50_index = (50 * len(latencies_ms) + 99) // 100 - 1
+        p95_index = (95 * len(latencies_ms) + 99) // 100 - 1
+        metrics = {
+            "sample_count": len(latencies_ms),
+            "p50_ms": round(latencies_ms[p50_index], 3),
+            "p95_ms": round(latencies_ms[p95_index], 3),
+            "max_ms": round(latencies_ms[-1], 3),
+            "scan_backlog_remaining": int(backlog),
+            "worker_active_count": int(worker_state.active_call_count),
+            "worker_capacity": int(worker_state.capacity),
+            "dispatch_or_stream_fields_written": int(dispatch_fields_written),
+            "postgres_server_version_num": int(server_version_num),
+            "isolation_level": str(isolation_level),
+        }
+        print("WEB_DB_ONLY_LATENCY " + json.dumps(metrics, sort_keys=True))
+    finally:
+        if runtime is not None:
+            await runtime.stop()
         await engine.dispose()
 
 
