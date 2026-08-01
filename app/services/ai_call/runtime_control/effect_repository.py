@@ -112,6 +112,7 @@ class EffectClaim:
     reconcile_only: bool
     provider_namespace: str
     resource_key: str
+    reservation_token: str | None = None
 
 
 class EffectRegistrationError(RuntimeError):
@@ -375,6 +376,13 @@ class RuntimeEffectRepository:
                 )
             ).one_or_none()
             if row is not None:
+                reservation_token = await self._session.scalar(
+                    select(AiCallSipLineReservationModel.reservation_token).where(
+                        AiCallSipLineReservationModel.tenant_id == owner_lease.tenant_id,
+                        AiCallSipLineReservationModel.call_id == owner_lease.call_id,
+                        AiCallSipLineReservationModel.status != "RELEASED",
+                    )
+                )
                 return EffectClaim(
                     effect_id=row.id,
                     tenant_id=row.tenant_id,
@@ -393,6 +401,7 @@ class RuntimeEffectRepository:
                     ),
                     provider_namespace=row.provider_namespace,
                     resource_key=row.resource_key,
+                    reservation_token=reservation_token,
                 )
         return None
 
@@ -453,6 +462,27 @@ class RuntimeEffectRepository:
         ):
             return False
 
+        reservation = None
+        if claim.reservation_token is not None and effect.effect_type in {
+            "CREATE_SIP_PARTICIPANT",
+            "HANGUP_SIP",
+        }:
+            reservation = await self._session.scalar(
+                select(AiCallSipLineReservationModel)
+                .where(
+                    AiCallSipLineReservationModel.tenant_id == claim.tenant_id,
+                    AiCallSipLineReservationModel.call_id == claim.call_id,
+                    AiCallSipLineReservationModel.reservation_token
+                    == claim.reservation_token,
+                    AiCallSipLineReservationModel.fencing_token
+                    == claim.processing_fencing_token,
+                    AiCallSipLineReservationModel.status != "RELEASED",
+                )
+                .with_for_update()
+            )
+            if reservation is None:
+                return False
+
         if effect.effect_type in CREATE_EFFECT_TYPES:
             self._apply_create_observation(effect, observation, now)
         else:
@@ -460,8 +490,43 @@ class RuntimeEffectRepository:
             if source is None:
                 raise EffectRegistrationError("destroy effect has no source create effect")
             self._apply_destroy_observation(effect, source, observation, now)
+        self._apply_reservation_observation(reservation, effect, observation, now)
         await self._session.flush()
         return True
+
+    @staticmethod
+    def _apply_reservation_observation(
+        reservation: AiCallSipLineReservationModel | None,
+        effect: AiCallRuntimeEffectModel,
+        observation: ProviderObservation,
+        now: datetime,
+    ) -> None:
+        if reservation is None:
+            return
+        if effect.effect_type == "CREATE_SIP_PARTICIPANT":
+            if observation.kind in {
+                ProviderObservationKind.RESOURCE_PRESENT,
+                ProviderObservationKind.ACCEPTED,
+            }:
+                if reservation.status in {"RESERVED", "RECONCILE_REQUIRED"}:
+                    reservation.status = "ACTIVE"
+                    reservation.reconcile_after = None
+            elif observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE:
+                reservation.status = "RELEASED"
+                reservation.released_at = now
+                reservation.reconcile_after = None
+            elif observation.kind == ProviderObservationKind.UNCERTAIN:
+                reservation.status = "RECONCILE_REQUIRED"
+                reservation.reconcile_after = now + observation.retry_after
+        elif effect.effect_type == "HANGUP_SIP":
+            if effect.status == EffectStatus.APPLIED:
+                reservation.status = "RELEASED"
+                reservation.released_at = now
+                reservation.reconcile_after = None
+            elif observation.kind == ProviderObservationKind.UNCERTAIN:
+                reservation.status = "RECONCILE_REQUIRED"
+                reservation.reconcile_after = now + observation.retry_after
+        reservation.updated_at = now
 
     async def mark_cleanup_clean(self, owner_lease: OwnerLease) -> bool:
         now = await self._database_clock(self._session)

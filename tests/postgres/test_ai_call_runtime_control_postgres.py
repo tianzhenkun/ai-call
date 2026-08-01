@@ -835,6 +835,142 @@ async def test_concurrent_dispatchers_cannot_split_the_last_sip_line_slot() -> N
         await engine.dispose()
 
 
+async def test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            await _insert_sip_line(session, line_id=703, max_concurrency=1)
+            commands = RuntimeCommandRepository(session)
+            effects = RuntimeEffectRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="direct_sip",
+                    idempotency_key="start:reservation-lifecycle",
+                    payload={"line_id": 703, "phone_hash": "hash-reservation-lifecycle"},
+                )
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-reservation-lifecycle",
+                    startup_id=UUID("a3333333-3333-4333-8333-333333333333"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            start_claim = await commands.claim_next_for_owner(lease)
+            assert start_claim is not None
+            sip_effect = await effects.register(
+                start_claim,
+                EffectSpec(
+                    effect_type="CREATE_SIP_PARTICIPANT",
+                    idempotency_key="effect:create-sip:reservation-lifecycle",
+                    provider_namespace="stub:reservation-lifecycle",
+                    provider_idempotency_key="provider:create-sip:reservation-lifecycle",
+                    resource_key="sip:reservation-lifecycle:g1",
+                    resource_generation=lease.fencing_token,
+                ),
+            )
+            assert await commands.complete(
+                start_claim,
+                CommandDecision(status=CommandStatus.SUCCEEDED),
+            )
+
+            create_claim = await effects.claim_next(lease)
+            assert create_claim is not None
+            assert create_claim.reservation_token
+            reservation_token = create_claim.reservation_token
+            assert await effects.submit(
+                create_claim,
+                ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_PRESENT,
+                    provider_reference="sip-ref",
+                ),
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select status from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "ACTIVE"
+            )
+
+            end = await commands.request_end(
+                EndCallIntent(
+                    tenant_id="tenant-a",
+                    call_id=start.call_id,
+                    source="customer_sip",
+                    end_reason="customer_hangup",
+                    dedupe_key="customer:reservation-lifecycle:end",
+                )
+            )
+            end_claim = await commands.claim_pending_end(lease)
+            assert end_claim is not None and end_claim.command_id == end.command_id
+            graph = await effects.register_end_graph(end_claim)
+            assert len(graph) == 1 and graph[0].effect_type == "HANGUP_SIP"
+            assert await commands.complete(
+                end_claim,
+                CommandDecision(status=CommandStatus.SUCCEEDED),
+            )
+
+            hangup_claim = await effects.claim_next(lease)
+            assert hangup_claim is not None
+            assert hangup_claim.reservation_token == reservation_token
+            await session.execute(
+                text(
+                    "update ai_call_sip_line_reservation set "
+                    "reservation_token='stale-reservation-token' where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+            assert await effects.submit(
+                hangup_claim,
+                ProviderObservation(kind=ProviderObservationKind.TERMINAL_CONFIRMED),
+            ) is False
+            await session.execute(
+                text(
+                    "update ai_call_sip_line_reservation set "
+                    "reservation_token=:reservation_token where call_id=:call_id"
+                ).bindparams(
+                    reservation_token=reservation_token,
+                    call_id=start.call_id,
+                )
+            )
+            assert await effects.submit(
+                hangup_claim,
+                ProviderObservation(kind=ProviderObservationKind.TERMINAL_CONFIRMED),
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "select status from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "RELEASED"
+            )
+            assert await effects.mark_cleanup_clean(lease)
+            assert (
+                await session.scalar(
+                    text(
+                        "select resource_cleanup_status from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == "clean"
+            )
+            assert sip_effect.effect_id > 0
+    finally:
+        await engine.dispose()
+
+
 async def test_owner_concurrent_dispatchers_only_consume_one_capacity_slot() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
@@ -1378,6 +1514,15 @@ async def test_owner_recovery_parks_attention_without_releasing_resources() -> N
             assert cleanup_lease.owner_id == new_worker.worker_id
             assert cleanup_lease.fencing_token == 2
             assert cleanup_lease.capacity_class == "cleanup"
+            assert (
+                await session.scalar(
+                    text(
+                        "select fencing_token from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 2
+            )
             await session.execute(
                 text(
                     "update ai_call_runtime_effect set status='APPLYING', "
@@ -1446,6 +1591,15 @@ async def test_owner_recovery_parks_attention_without_releasing_resources() -> N
             )
             assert reassigned is not None
             assert reassigned.fencing_token == 3
+            assert (
+                await session.scalar(
+                    text(
+                        "select fencing_token from ai_call_sip_line_reservation "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+                == 3
+            )
 
             counts = (
                 await session.execute(

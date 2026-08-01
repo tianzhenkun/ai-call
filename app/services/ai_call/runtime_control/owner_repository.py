@@ -510,6 +510,21 @@ class RecoveryOwnerRepository:
         if end_command is None and not unfinished_effect:
             return None
 
+        reservations = list(
+            (
+                await self._session.scalars(
+                    select(AiCallSipLineReservationModel)
+                    .where(
+                        AiCallSipLineReservationModel.tenant_id == tenant_id,
+                        AiCallSipLineReservationModel.call_id == call_id,
+                        AiCallSipLineReservationModel.status != "RELEASED",
+                    )
+                    .order_by(AiCallSipLineReservationModel.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+
         old_worker = (
             locked_workers.get(record.runtime_owner_id)
             if record.runtime_owner_id is not None
@@ -525,6 +540,9 @@ class RecoveryOwnerRepository:
         record.runtime_capacity_class = "cleanup"
         record.resource_cleanup_status = "reconciling"
         record.resource_cleanup_next_retry_at = None
+        for reservation in reservations:
+            reservation.fencing_token = record.runtime_fencing_token
+            reservation.updated_at = now
         target_worker.active_cleanup_count += 1
         target_worker.updated_at = now
         if old_worker is not None:
