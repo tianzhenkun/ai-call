@@ -141,7 +141,7 @@ class RuntimeStartReadinessRepository:
             raise StartReadinessRejected(
                 "current Owner/fencing/lease no longer authorizes readiness"
             )
-        if record.entry_type not in {"web", "direct_sip"}:
+        if record.entry_type not in {"web", "direct_sip", "outbound"}:
             return False
         if record.status not in {"preparing", "ready"}:
             raise StartReadinessRejected(

@@ -28,12 +28,13 @@ def _lease(*, fencing_token: int = 7):
     return SimpleNamespace(fencing_token=fencing_token)
 
 
-def test_direct_sip_default_specs_include_sip_participant() -> None:
+@pytest.mark.parametrize("entry_type", ["direct_sip", "outbound"])
+def test_sip_entry_default_specs_include_sip_participant(entry_type: str) -> None:
     specs = _default_start_specs(
         "call-a",
         _lease(fencing_token=7),
         "runtime-a",
-        entry_type="direct_sip",
+        entry_type=entry_type,
     )
 
     assert [spec.effect_type for spec in specs] == [

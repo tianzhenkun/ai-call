@@ -451,7 +451,7 @@ def _default_start_specs(
     *,
     entry_type: str,
 ) -> list[EffectSpec]:
-    if entry_type not in {"web", "direct_sip"}:
+    if entry_type not in {"web", "direct_sip", "outbound"}:
         raise ValueError(f"unsupported owner command entry: {entry_type}")
     namespace = f"stub:{worker_id}"
     specs = [
@@ -472,7 +472,7 @@ def _default_start_specs(
             resource_generation=lease.fencing_token,
         ),
     ]
-    if entry_type == "direct_sip":
+    if entry_type in {"direct_sip", "outbound"}:
         specs.append(
             EffectSpec(
                 effect_type="CREATE_SIP_PARTICIPANT",
