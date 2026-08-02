@@ -40,6 +40,7 @@ from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapService,
 )
 from app.services.ai_call.runtime_control.command_repository import (
+    CommandClaim,
     CommandDecision,
     CommandIntent,
     EndCallIntent,
@@ -68,6 +69,10 @@ from app.services.ai_call.runtime_control.entry_start_service import (
     StartEntryRequest,
 )
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
+from app.services.ai_call.runtime_control.handoff_handlers import (
+    AgentMediaObservation,
+    AgentMediaReadyHandler,
+)
 from app.services.ai_call.runtime_control.handoff_repository import (
     HandoffAcceptIntent,
     HandoffClaimConflictError,
@@ -614,6 +619,210 @@ async def _claim_owner_handoff(
             )
         except HandoffClaimConflictError as exc:
             return exc
+
+
+async def _insert_processing_media_command(
+    session,
+    *,
+    command_id: int,
+    media_state_version: int = 1,
+) -> tuple[CommandClaim, OwnerLease]:
+    now = await read_database_time(session)
+    expires_at = now + timedelta(minutes=1)
+    session.add_all(
+        (
+            AiCallRecordModel(
+                id=4101,
+                tenant_id="tenant-a",
+                call_id="call-media",
+                entry_type="web",
+                room_name="room-call-media",
+                participant_identity="caller-call-media",
+                status="ready",
+                started_at=now,
+                runtime_control_mode="owner_command_v1",
+                runtime_owner_id="runtime-1",
+                runtime_fencing_token=7,
+                runtime_lease_expires_at=expires_at,
+                runtime_capacity_class="active",
+                next_command_seq=3,
+                last_applied_command_seq=1,
+            ),
+            AiCallHandoffModel(
+                id=4201,
+                tenant_id="tenant-a",
+                handoff_id="handoff-media",
+                call_id="call-media",
+                room_name="room-call-media",
+                scene_code="default",
+                status="accepted",
+                request_source="customer",
+                requested_at=now,
+                human_agent_identity="agent-1",
+                accepted_console_session_id="11111111-1111-1111-1111-111111111111",
+                accepted_at=now,
+                participant_identity="human-agent-handoff-media",
+                participant_sid="PA_EVENT",
+                track_sid="TR_EVENT",
+                media_state_version=media_state_version,
+                last_media_event_key="EV_MEDIA",
+            ),
+            AiCallHandoffAgentModel(
+                id=4301,
+                tenant_id="tenant-a",
+                agent_identity="agent-1",
+                skill_group="default",
+                status="claiming",
+                active_handoff_id="handoff-media",
+                active_call_id="call-media",
+                console_session_id="11111111-1111-1111-1111-111111111111",
+                last_seen_at=now,
+                status_updated_at=now,
+            ),
+            AiCallRuntimeCommandModel(
+                id=command_id,
+                tenant_id="tenant-a",
+                call_id="call-media",
+                command_seq=2,
+                command_type="AGENT_MEDIA_READY",
+                idempotency_key=f"media-ready:{command_id}",
+                request_fingerprint="fingerprint",
+                dispatch_priority=100,
+                payload_json=json.dumps(
+                    {
+                        "evidence_id": "4401",
+                        "handoff_id": "handoff-media",
+                        "media_state_version": media_state_version,
+                    }
+                ),
+                expected_fencing_token=7,
+                target_owner_id="runtime-1",
+                status=CommandStatus.PROCESSING,
+                processing_owner_id="runtime-1",
+                processing_fencing_token=7,
+                processing_token=f"token-{command_id}",
+                processing_expires_at=expires_at,
+                claimed_at=now,
+                attempt_count=1,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+    )
+    claim = CommandClaim(
+        command_id=command_id,
+        tenant_id="tenant-a",
+        call_id="call-media",
+        command_seq=2,
+        command_type="AGENT_MEDIA_READY",
+        processing_owner_id="runtime-1",
+        processing_fencing_token=7,
+        processing_token=f"token-{command_id}",
+        processing_expires_at=expires_at,
+        payload_json=json.dumps(
+            {
+                "evidence_id": "4401",
+                "handoff_id": "handoff-media",
+                "media_state_version": media_state_version,
+            }
+        ),
+        attempt_count=1,
+    )
+    lease = OwnerLease(
+        tenant_id="tenant-a",
+        call_id="call-media",
+        owner_id="runtime-1",
+        fencing_token=7,
+        lease_expires_at=expires_at,
+        capacity_class="active",
+    )
+    return claim, lease
+
+
+async def test_handoff_media_version_race_cannot_commit_connected() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            claim, lease = await _insert_processing_media_command(
+                session,
+                command_id=4402,
+            )
+
+        class RacingProvider:
+            async def query_agent_media(self, room_name, participant_identity):
+                assert room_name == "room-call-media"
+                async with factory.begin() as session:
+                    handoff = await session.scalar(
+                        select(AiCallHandoffModel).with_for_update()
+                    )
+                    handoff.media_state_version += 1
+                    handoff.media_invalidated_at = await read_database_time(session)
+                return AgentMediaObservation(
+                    ready=True,
+                    participant_identity=participant_identity,
+                    participant_sid="PA_QUERY",
+                    track_sid="TR_QUERY",
+                )
+
+        result = await AgentMediaReadyHandler(factory, RacingProvider()).handle(
+            claim,
+            lease,
+        )
+        async with factory() as session:
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            presence = await session.scalar(select(AiCallHandoffAgentModel))
+            command = await session.get(AiCallRuntimeCommandModel, claim.command_id)
+        assert result.state_changed is False
+        assert handoff.status == "accepted"
+        assert handoff.media_state_version == 2
+        assert presence.status == "claiming"
+        assert command.status == CommandStatus.RETRY_WAIT
+    finally:
+        await engine.dispose()
+
+
+async def test_handoff_owner_replacement_during_media_query_changes_zero_rows() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            claim, lease = await _insert_processing_media_command(
+                session,
+                command_id=4403,
+            )
+
+        class OwnerReplacingProvider:
+            async def query_agent_media(self, _room_name, participant_identity):
+                async with factory.begin() as session:
+                    record = await session.scalar(
+                        select(AiCallRecordModel).with_for_update()
+                    )
+                    record.runtime_owner_id = "runtime-2"
+                    record.runtime_fencing_token = 8
+                return AgentMediaObservation(
+                    ready=True,
+                    participant_identity=participant_identity,
+                    participant_sid="PA_QUERY",
+                    track_sid="TR_QUERY",
+                )
+
+        result = await AgentMediaReadyHandler(
+            factory,
+            OwnerReplacingProvider(),
+        ).handle(claim, lease)
+        async with factory() as session:
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            presence = await session.scalar(select(AiCallHandoffAgentModel))
+            command = await session.get(AiCallRuntimeCommandModel, claim.command_id)
+        assert result.state_changed is False
+        assert handoff.status == "accepted"
+        assert presence.status == "claiming"
+        assert command.status == CommandStatus.PROCESSING
+    finally:
+        await engine.dispose()
 
 
 async def test_handoff_claim_competition_has_one_winner() -> None:

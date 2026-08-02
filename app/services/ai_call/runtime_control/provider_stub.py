@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections import deque
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
@@ -8,6 +9,9 @@ from app.services.ai_call.runtime_control.effect_repository import (
     EffectClaim,
     ProviderObservation,
     ProviderObservationKind,
+)
+from app.services.ai_call.runtime_control.handoff_handlers import (
+    AgentMediaObservation,
 )
 
 
@@ -74,6 +78,21 @@ class DeterministicWebProviderStub:
             f"unsupported deterministic Web effect type {effect.effect_type}"
         )
 
+    async def query_agent_media(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> AgentMediaObservation:
+        digest = hashlib.sha256(
+            f"{room_name}|{participant_identity}".encode()
+        ).hexdigest()
+        return AgentMediaObservation(
+            ready=True,
+            participant_identity=participant_identity,
+            participant_sid=f"PA_stub_{digest[:24]}",
+            track_sid=f"TR_stub_{digest[24:48]}",
+        )
+
 
 class DeterministicDbOnlyProviderStub(DeterministicWebProviderStub):
     _CREATE_EFFECT_TYPES = DeterministicWebProviderStub._CREATE_EFFECT_TYPES | {
@@ -120,3 +139,18 @@ class ScriptedProviderStub:
                 provider_reference=f"stub:{effect.resource_key}",
             )
         return observation
+
+    async def query_agent_media(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> AgentMediaObservation:
+        digest = hashlib.sha256(
+            f"{room_name}|{participant_identity}".encode()
+        ).hexdigest()
+        return AgentMediaObservation(
+            ready=True,
+            participant_identity=participant_identity,
+            participant_sid=f"PA_stub_{digest[:24]}",
+            track_sid=f"TR_stub_{digest[24:48]}",
+        )

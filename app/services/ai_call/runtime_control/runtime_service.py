@@ -24,6 +24,13 @@ from app.services.ai_call.runtime_control.effect_repository import (
     RuntimeEffectRepository,
 )
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
+from app.services.ai_call.runtime_control.handoff_handlers import (
+    AgentMediaInvalidatedHandler,
+    AgentMediaObservation,
+    AgentMediaReadyHandler,
+    CancelHandoffHandler,
+    HandoffAcceptedHandler,
+)
 from app.services.ai_call.runtime_control.models import AiCallRuntimeWorkerModel
 from app.services.ai_call.runtime_control.owner_repository import (
     OwnerFailClosedWatchdog,
@@ -40,6 +47,12 @@ from app.services.ai_call.runtime_control.types import CommandStatus
 
 class RuntimeProvider(Protocol):
     async def apply(self, effect: object) -> ProviderObservation: ...
+
+    async def query_agent_media(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> AgentMediaObservation: ...
 
 
 class RuntimeLocalHandle(Protocol):
@@ -77,6 +90,32 @@ class _FailClosedProvider:
         try:
             async with asyncio.timeout(remaining):
                 observation = await self._delegate.apply(effect)
+        except TimeoutError as exc:
+            if self._watchdog.creation_allowed():
+                raise
+            self._watchdog.trip()
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached") from exc
+        if self._watchdog.must_stop_media():
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached")
+        return observation
+
+    async def query_agent_media(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> AgentMediaObservation:
+        remaining = self._watchdog.seconds_until_hard_deadline()
+        if remaining <= 0:
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached")
+        try:
+            async with asyncio.timeout(remaining):
+                observation = await self._delegate.query_agent_media(
+                    room_name,
+                    participant_identity,
+                )
         except TimeoutError as exc:
             if self._watchdog.creation_allowed():
                 raise
@@ -339,6 +378,32 @@ class RuntimeControlService:
                 )
             except _OwnerFailClosed:
                 return False
+        elif command_claim.command_type == "HANDOFF_ACCEPTED":
+            await HandoffAcceptedHandler(session_factory).handle(
+                command_claim,
+                lease,
+            )
+        elif command_claim.command_type == "AGENT_MEDIA_READY":
+            try:
+                await AgentMediaReadyHandler(
+                    session_factory,
+                    guarded_provider,
+                ).handle(command_claim, lease)
+            except _OwnerFailClosed:
+                return False
+        elif command_claim.command_type == "AGENT_MEDIA_INVALIDATED":
+            try:
+                await AgentMediaInvalidatedHandler(
+                    session_factory,
+                    guarded_provider,
+                ).handle(command_claim, lease)
+            except _OwnerFailClosed:
+                return False
+        elif command_claim.command_type == "CANCEL_HANDOFF":
+            await CancelHandoffHandler(session_factory).handle(
+                command_claim,
+                lease,
+            )
         else:
             async with session_factory.begin() as session:
                 await RuntimeCommandRepository(session).complete(

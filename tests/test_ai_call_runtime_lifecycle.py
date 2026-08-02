@@ -210,3 +210,123 @@ async def test_provider_timeout_before_owner_deadline_does_not_trip_watchdog() -
 
     assert watchdog.creation_allowed() is True
     assert fail_closed.is_set() is False
+
+
+@pytest.mark.anyio
+async def test_media_query_timeout_before_owner_deadline_does_not_trip_watchdog() -> None:
+    class TimeoutProvider:
+        async def query_agent_media(self, _room_name, _participant_identity):
+            raise TimeoutError("provider query timeout")
+
+    fail_closed = asyncio.Event()
+
+    async def mark_fail_closed() -> None:
+        fail_closed.set()
+
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+
+    with pytest.raises(TimeoutError, match="provider query timeout"):
+        await _FailClosedProvider(
+            TimeoutProvider(), watchdog, mark_fail_closed
+        ).query_agent_media("room-1", "agent-1")
+
+    assert watchdog.creation_allowed() is True
+    assert fail_closed.is_set() is False
+
+
+@pytest.mark.anyio
+async def test_runtime_routes_media_ready_to_specialized_handler(monkeypatch) -> None:
+    from app.services.ai_call.runtime_control import runtime_service
+
+    routed: list[tuple[object, object]] = []
+    claim = SimpleNamespace(
+        command_type="AGENT_MEDIA_READY",
+        call_id="call-1",
+    )
+    lease = SimpleNamespace(call_id="call-1")
+
+    class _Transaction:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+            return None
+
+    class _SessionFactory:
+        def begin(self):
+            return _Transaction()
+
+    class _CommandRepository:
+        claim_count = 0
+
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_pending_end(self, _lease):
+            return None
+
+        async def claim_next_for_owner(self, _lease):
+            return claim
+
+        async def complete(self, *_args, **_kwargs):
+            raise AssertionError("media command must not use the generic success path")
+
+    class _EffectRepository:
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_next(self, _lease):
+            return None
+
+        async def mark_cleanup_clean(self, _lease):
+            return False
+
+    class _ReadyHandler:
+        def __init__(self, session_factory, provider) -> None:
+            routed.append((session_factory, provider))
+
+        async def handle(self, received_claim, received_lease):
+            assert received_claim is claim
+            assert received_lease is lease
+            return SimpleNamespace(command_completed=True, state_changed=True)
+
+    class _Provider:
+        async def apply(self, _effect):
+            raise AssertionError("no effect should be applied")
+
+        async def query_agent_media(self, _room_name, _participant_identity):
+            raise AssertionError("specialized handler is mocked")
+
+    monkeypatch.setattr(runtime_service, "RuntimeCommandRepository", _CommandRepository)
+    monkeypatch.setattr(runtime_service, "RuntimeEffectRepository", _EffectRepository)
+    monkeypatch.setattr(
+        runtime_service,
+        "AgentMediaReadyHandler",
+        _ReadyHandler,
+        raising=False,
+    )
+    service = RuntimeControlService(
+        worker_id="runtime-test:12345678-1234-5678-1234-567812345678",
+        registry=RuntimeRegistry(),
+        session_factory=None,
+        provider=None,
+    )
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+
+    processed = await service._process_owned_call(
+        _SessionFactory(),
+        _Provider(),
+        lease,
+        watchdog,
+    )
+
+    assert processed is True
+    assert len(routed) == 1
