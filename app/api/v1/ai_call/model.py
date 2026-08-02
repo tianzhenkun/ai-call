@@ -877,6 +877,34 @@ class AiCallHandoffModel(MappedBase):
     reconnect_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, comment="媒体重连截止时间"
     )
+    participant_identity: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="当前坐席参与方身份"
+    )
+    participant_sid: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="当前坐席参与方SID"
+    )
+    track_sid: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment="当前坐席音频轨SID"
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="当前坐席媒体验证时间"
+    )
+    evidence_source: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="当前坐席媒体证据来源"
+    )
+    media_state_version: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="坐席媒体单调版本",
+    )
+    media_invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="最近媒体失效时间"
+    )
+    last_media_event_key: Mapped[str | None] = mapped_column(
+        String(160), nullable=True, comment="最近媒体事件去重键"
+    )
     end_reason: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,

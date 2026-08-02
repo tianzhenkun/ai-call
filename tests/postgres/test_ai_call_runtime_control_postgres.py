@@ -125,6 +125,10 @@ DIRECT_SIP_MIGRATION_PATH = (
     PROJECT_ROOT
     / "docs/livekit-ai-outbound/sql/phase-i2-direct-sip-db-only-plaintext.sql"
 )
+HANDOFF_MEDIA_MIGRATION_PATH = (
+    PROJECT_ROOT
+    / "docs/livekit-ai-outbound/sql/phase-i3-handoff-media-lifecycle.sql"
+)
 
 
 def _direct_sip_intent(
@@ -331,6 +335,153 @@ async def test_direct_sip_plaintext_migration_is_idempotent() -> None:
                 )
             ).one()
         assert tuple(column) == ("character varying", 32, "YES")
+    finally:
+        await engine.dispose()
+
+
+async def test_handoff_media_migration_is_idempotent_and_portable() -> None:
+    _reset_legacy_schema()
+    with psycopg.connect(_psycopg_dsn(), autocommit=True) as connection:
+        for table_name in (
+            "ai_call_webhook_quarantine",
+            "ai_call_webhook_inbox",
+            "ai_call_handoff_media_evidence",
+            "ai_call_handoff_agent",
+            "ai_call_handoff",
+        ):
+            connection.execute(f"drop table if exists {table_name} cascade")
+        connection.execute(
+            """
+            create table ai_call_handoff (
+                id bigint primary key,
+                tenant_id varchar(20) not null,
+                handoff_id varchar(64) not null,
+                call_id varchar(64) not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table ai_call_handoff_agent (
+                id bigint primary key,
+                tenant_id varchar(20) not null,
+                agent_identity varchar(128) not null,
+                status varchar(32) not null
+            )
+            """
+        )
+    _execute_script(MIGRATION_PATH.read_text(encoding="utf-8"))
+    migration_sql = HANDOFF_MEDIA_MIGRATION_PATH.read_text(encoding="utf-8")
+    _execute_script(migration_sql)
+    _execute_script(migration_sql)
+
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    try:
+        async with engine.connect() as connection:
+            table_count = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from information_schema.tables
+                    where table_schema=current_schema()
+                      and table_name in (
+                        'ai_call_handoff_media_evidence',
+                        'ai_call_webhook_inbox',
+                        'ai_call_webhook_quarantine'
+                      )
+                    """
+                )
+            )
+            handoff_columns = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from information_schema.columns
+                    where table_schema=current_schema()
+                      and table_name='ai_call_handoff'
+                      and column_name in (
+                        'participant_identity',
+                        'participant_sid',
+                        'track_sid',
+                        'verified_at',
+                        'evidence_source',
+                        'media_state_version',
+                        'media_invalidated_at',
+                        'last_media_event_key'
+                      )
+                    """
+                )
+            )
+            timezone_columns = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from information_schema.columns
+                    where table_schema=current_schema()
+                      and table_name in (
+                        'ai_call_handoff_media_evidence',
+                        'ai_call_webhook_inbox',
+                        'ai_call_webhook_quarantine'
+                      )
+                      and data_type='timestamp with time zone'
+                    """
+                )
+            )
+            json_column_count = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from information_schema.columns
+                    where table_schema=current_schema()
+                      and table_name in (
+                        'ai_call_handoff_media_evidence',
+                        'ai_call_webhook_inbox',
+                        'ai_call_webhook_quarantine'
+                      )
+                      and data_type in ('json', 'jsonb')
+                    """
+                )
+            )
+            foreign_key_count = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from information_schema.table_constraints
+                    where constraint_schema=current_schema()
+                      and table_name in (
+                        'ai_call_handoff_media_evidence',
+                        'ai_call_webhook_inbox',
+                        'ai_call_webhook_quarantine'
+                      )
+                      and constraint_type='FOREIGN KEY'
+                    """
+                )
+            )
+            index_count = await connection.scalar(
+                text(
+                    """
+                    select count(*)
+                    from pg_indexes
+                    where schemaname=current_schema()
+                      and indexname in (
+                        'uk_handoff_media_evidence_dedupe',
+                        'uk_handoff_media_evidence_version',
+                        'uk_webhook_inbox_provider_dedupe',
+                        'uk_webhook_quarantine_provider_dedupe',
+                        'idx_webhook_inbox_retry',
+                        'idx_webhook_inbox_recovery',
+                        'idx_webhook_quarantine_retry',
+                        'idx_webhook_quarantine_recovery'
+                      )
+                    """
+                )
+            )
+        assert table_count == 3
+        assert handoff_columns == 8
+        assert timezone_columns == 12
+        assert json_column_count == 0
+        assert foreign_key_count == 0
+        assert index_count == 8
     finally:
         await engine.dispose()
 
