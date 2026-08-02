@@ -82,11 +82,16 @@ async def _seed_due_task(
     now: datetime,
     *,
     target_count: int = 1,
+    tenant_id: str = "tenant-a",
+    line_id: int = 340700000000000001,
 ) -> tuple[int, int, str]:
     task_id = generate_snowflake_id()
     target_id = generate_snowflake_id()
     phone_number = "13800138001"
     line = _line_snapshot()
+    line["lineId"] = str(line_id)
+    if tenant_id != "tenant-a" or line_id != 340700000000000001:
+        line["lineCode"] = f"provider-{tenant_id}-{line_id}"
     snapshot = json.dumps({
         "request": {"taskName": "Owner Runtime 外呼"},
         "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
@@ -102,7 +107,7 @@ async def _seed_due_task(
         session.add(
             AiCallSipLineModel(
                 id=int(line["lineId"]),
-                tenant_id="tenant-a",
+                tenant_id=tenant_id,
                 line_code=str(line["lineCode"]),
                 line_name=str(line["lineName"]),
                 enabled=True,
@@ -131,14 +136,14 @@ async def _seed_due_task(
         session.add(
             AiCallOutboundTaskModel(
                 id=task_id,
-                tenant_id="tenant-a",
+                tenant_id=tenant_id,
                 validation_id=generate_snowflake_id(),
                 idempotency_key=f"owner-runtime-{task_id}",
                 request_fingerprint=f"{task_id:064d}"[-64:],
                 task_name="Owner Runtime 外呼",
                 task_mode="batch",
                 status="SCHEDULED",
-                total_targets=1,
+                total_targets=target_count,
                 completed_targets=0,
                 connected_targets=0,
                 failed_targets=0,
@@ -168,7 +173,7 @@ async def _seed_due_task(
             session.add(
                 AiCallOutboundTargetModel(
                     id=target_id if index == 0 else generate_snowflake_id(),
-                    tenant_id="tenant-a",
+                    tenant_id=tenant_id,
                     task_id=task_id,
                     validation_id=generate_snowflake_id(),
                     source_validation_row_id=generate_snowflake_id(),
@@ -1028,3 +1033,69 @@ async def test_owner_runtime_queue_snapshot_reports_wait_and_timeout_metrics(
     assert snapshot.allocation_timeout_count == 1
     assert snapshot.limits == limits
     assert snapshot.has_capacity is True
+
+
+@pytest.mark.anyio
+async def test_dispatcher_orders_first_candidate_from_each_tenant_line_lane_first(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.services.ai_call.runtime_control.dispatcher_service import (
+        DispatcherControlService,
+    )
+
+    first_time = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    second_time = first_time + timedelta(seconds=1)
+    await _seed_due_task(database, first_time, target_count=3)
+
+    def executor(now: datetime) -> OutboundTaskExecutor:
+        return OutboundTaskExecutor(
+            database,
+            RejectingDialer(),
+            target_batch_size=3,
+            now_provider=lambda: now,
+            business_timezone="UTC",
+            owner_runtime_start=OwnerRuntimeOutboundStart(
+                database_clock=lambda _session: _constant_time(now)
+            ),
+        )
+
+    assert await executor(first_time).run_once() == 3
+    await _seed_due_task(
+        database,
+        second_time,
+        tenant_id="tenant-b",
+        line_id=340700000000000002,
+    )
+    assert await executor(second_time).run_once() == 1
+
+    considered: list[tuple[str, str]] = []
+
+    async def never_expire(self, tenant_id: str, call_id: str) -> bool:
+        del self, tenant_id, call_id
+        return False
+
+    async def capture_candidate(self, tenant_id: str, call_id: str):
+        del self
+        considered.append((tenant_id, call_id))
+        return None
+
+    monkeypatch.setattr(
+        RuntimeCommandRepository,
+        "expire_unallocated_start",
+        never_expire,
+    )
+    monkeypatch.setattr(
+        DispatcherOwnerRepository,
+        "assign_initial_owner",
+        capture_candidate,
+    )
+
+    assert await DispatcherControlService(database, batch_size=2).run_once() == 0
+    assert [tenant_id for tenant_id, _call_id in considered] == [
+        "tenant-a",
+        "tenant-b",
+    ]

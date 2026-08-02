@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import exists, select
+from sqlalchemy import String, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel
 from app.core.logger import log
 from app.services.ai_call.runtime_control.command_repository import (
     RuntimeCommandRepository,
@@ -36,35 +37,75 @@ class DispatcherControlService:
 
     async def run_once(self) -> int:
         async with self._session_factory() as session:
+            lane_key = func.coalesce(
+                cast(AiCallOutboundAttemptModel.line_id, String),
+                AiCallRecordModel.entry_type,
+            )
+            lane_rank = func.row_number().over(
+                partition_by=(AiCallRecordModel.tenant_id, lane_key),
+                order_by=(AiCallRecordModel.started_at, AiCallRecordModel.id),
+            )
+            ranked_candidates = (
+                select(
+                    AiCallRecordModel.tenant_id.label("tenant_id"),
+                    AiCallRecordModel.call_id.label("call_id"),
+                    AiCallRecordModel.started_at.label("started_at"),
+                    AiCallRecordModel.id.label("record_id"),
+                    lane_rank.label("lane_rank"),
+                )
+                .select_from(AiCallRecordModel)
+                .join(
+                    AiCallRuntimeCommandModel,
+                    (
+                        AiCallRuntimeCommandModel.tenant_id
+                        == AiCallRecordModel.tenant_id
+                    )
+                    & (
+                        AiCallRuntimeCommandModel.call_id
+                        == AiCallRecordModel.call_id
+                    )
+                    & (AiCallRuntimeCommandModel.command_type == "START_CALL")
+                    & (
+                        AiCallRuntimeCommandModel.status.in_(
+                            {
+                                CommandStatus.PENDING,
+                                CommandStatus.RETRY_WAIT,
+                            }
+                        )
+                    ),
+                )
+                .outerjoin(
+                    AiCallOutboundAttemptModel,
+                    (
+                        AiCallOutboundAttemptModel.tenant_id
+                        == AiCallRecordModel.tenant_id
+                    )
+                    & (
+                        AiCallOutboundAttemptModel.call_id
+                        == AiCallRecordModel.call_id
+                    ),
+                )
+                .where(
+                    AiCallRecordModel.runtime_control_mode == "owner_command_v1",
+                    AiCallRecordModel.runtime_owner_id.is_(None),
+                    AiCallRecordModel.runtime_fencing_token == 0,
+                    AiCallRecordModel.runtime_capacity_class == "none",
+                    AiCallRecordModel.terminal_requested_at.is_(None),
+                )
+                .subquery()
+            )
             candidates = list(
                 (
                     await session.execute(
                         select(
-                            AiCallRecordModel.tenant_id,
-                            AiCallRecordModel.call_id,
+                            ranked_candidates.c.tenant_id,
+                            ranked_candidates.c.call_id,
                         )
-                        .where(
-                            AiCallRecordModel.runtime_control_mode
-                            == "owner_command_v1",
-                            AiCallRecordModel.runtime_owner_id.is_(None),
-                            AiCallRecordModel.runtime_fencing_token == 0,
-                            AiCallRecordModel.runtime_capacity_class == "none",
-                            AiCallRecordModel.terminal_requested_at.is_(None),
-                            exists().where(
-                                AiCallRuntimeCommandModel.tenant_id
-                                == AiCallRecordModel.tenant_id,
-                                AiCallRuntimeCommandModel.call_id
-                                == AiCallRecordModel.call_id,
-                                AiCallRuntimeCommandModel.command_type == "START_CALL",
-                                AiCallRuntimeCommandModel.status.in_(
-                                    {
-                                        CommandStatus.PENDING,
-                                        CommandStatus.RETRY_WAIT,
-                                    }
-                                ),
-                            ),
+                        .order_by(
+                            ranked_candidates.c.lane_rank,
+                            ranked_candidates.c.started_at,
+                            ranked_candidates.c.record_id,
                         )
-                        .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
                         .limit(self._batch_size)
                     )
                 ).all()
