@@ -715,6 +715,10 @@ async def list_admin_follow_ups_controller(
         Depends(get_agent_console_reconciler),
     ],
     status: Annotated[str | None, Query()] = None,
+    formal_outbound_only: Annotated[
+        bool,
+        Query(alias="formalOutboundOnly"),
+    ] = False,
     source_started_at_begin: Annotated[
         datetime | None,
         Query(alias="sourceStartedAtBegin"),
@@ -730,6 +734,7 @@ async def list_admin_follow_ups_controller(
         data=await service.list_follow_ups(
             auth,
             status=status,
+            formal_outbound_only=formal_outbound_only,
             source_started_at_begin=source_started_at_begin,
             source_started_at_end=source_started_at_end,
             page_num=page_num,

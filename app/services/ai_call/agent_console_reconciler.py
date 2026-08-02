@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import status
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
@@ -24,6 +24,11 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -498,6 +503,7 @@ class AiCallAgentConsoleReconciler:
         auth: AuthSchema,
         *,
         status: str | None = None,
+        formal_outbound_only: bool = False,
         source_started_at_begin: datetime | None = None,
         source_started_at_end: datetime | None = None,
         page_num: int = 1,
@@ -523,9 +529,14 @@ class AiCallAgentConsoleReconciler:
         filtered_stmt = select(AiCallFollowUpTaskModel).where(
             AiCallFollowUpTaskModel.tenant_id == tenant_id
         )
+        formal_source_scope = None
         if normalized_status:
             filtered_stmt = filtered_stmt.where(AiCallFollowUpTaskModel.status == normalized_status)
-        if source_started_at_begin is not None or source_started_at_end is not None:
+        if (
+            formal_outbound_only
+            or source_started_at_begin is not None
+            or source_started_at_end is not None
+        ):
             record_conditions = [
                 or_(
                     AiCallRecordModel.follow_up_id == AiCallFollowUpTaskModel.id,
@@ -536,9 +547,43 @@ class AiCallAgentConsoleReconciler:
                 record_conditions.append(AiCallRecordModel.started_at >= source_started_at_begin)
             if source_started_at_end is not None:
                 record_conditions.append(AiCallRecordModel.started_at < source_started_at_end)
-            filtered_stmt = filtered_stmt.where(
-                select(AiCallRecordModel.id).where(*record_conditions).exists()
-            )
+            record_stmt = select(AiCallRecordModel.id)
+            if formal_outbound_only:
+                record_stmt = (
+                    record_stmt
+                    .join(
+                        AiCallOutboundAttemptModel,
+                        AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
+                    )
+                    .join(
+                        AiCallOutboundTargetModel,
+                        and_(
+                            AiCallOutboundTargetModel.tenant_id
+                            == AiCallOutboundAttemptModel.tenant_id,
+                            AiCallOutboundTargetModel.id
+                            == AiCallOutboundAttemptModel.target_id,
+                            AiCallOutboundTargetModel.task_id
+                            == AiCallOutboundAttemptModel.task_id,
+                        ),
+                    )
+                    .join(
+                        AiCallOutboundTaskModel,
+                        and_(
+                            AiCallOutboundTaskModel.tenant_id
+                            == AiCallOutboundAttemptModel.tenant_id,
+                            AiCallOutboundTaskModel.id
+                            == AiCallOutboundAttemptModel.task_id,
+                        ),
+                    )
+                )
+                record_conditions.extend([
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallRecordModel.entry_type == "sip_outbound",
+                ])
+            source_scope = record_stmt.where(*record_conditions).exists()
+            filtered_stmt = filtered_stmt.where(source_scope)
+            if formal_outbound_only:
+                formal_source_scope = source_scope
 
         total = int(
             (
@@ -577,9 +622,7 @@ class AiCallAgentConsoleReconciler:
                 self.follow_up_service.attempt_payload(latest) if latest else None
             )
             rows.append(row)
-        metrics_row = (
-            await self.db.execute(
-                select(
+        metrics_stmt = select(
                     func.coalesce(
                         func.sum(case((AiCallFollowUpTaskModel.status == "pending", 1), else_=0)),
                         0,
@@ -638,8 +681,9 @@ class AiCallAgentConsoleReconciler:
                         0,
                     ),
                 ).where(AiCallFollowUpTaskModel.tenant_id == tenant_id)
-            )
-        ).one()
+        if formal_source_scope is not None:
+            metrics_stmt = metrics_stmt.where(formal_source_scope)
+        metrics_row = (await self.db.execute(metrics_stmt)).one()
         return {
             "metrics": {
                 "pending": int(metrics_row[0]),

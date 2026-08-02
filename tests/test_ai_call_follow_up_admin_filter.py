@@ -9,6 +9,11 @@ from app.api.v1.ai_call.agent_console_controller import (
     list_admin_follow_ups_controller,
 )
 from app.api.v1.ai_call.model import AiCallFollowUpTaskModel, AiCallRecordModel
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
+)
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
@@ -79,6 +84,34 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
     end = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
     async with session_maker() as session:
+        session.add(
+            AiCallOutboundTaskModel(
+                id=100,
+                tenant_id="tenant-a",
+                validation_id=100,
+                idempotency_key="follow-up-filter-task",
+                request_fingerprint="follow-up-filter-fingerprint",
+                task_name="正式外呼跟进筛选",
+                task_mode="batch",
+                status="COMPLETED",
+                total_targets=3,
+                completed_targets=3,
+                connected_targets=3,
+                failed_targets=0,
+                execution_mode="immediate",
+                prompt_name="产品介绍",
+                scene_code="product_intro",
+                voice="Tina",
+                rule_id=1,
+                rule_name="工作日规则",
+                rule_summary="工作时间",
+                config_snapshot_json="{}",
+                created_by=1,
+                created_by_name="管理员",
+                created_at=begin,
+                updated_at=begin,
+            )
+        )
         for row_id in range(1, 8):
             session.add_all([
                 _follow_up(
@@ -92,6 +125,38 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
                     started_at=begin + timedelta(hours=row_id),
                 ),
             ])
+            if row_id <= 3:
+                session.add_all([
+                    AiCallOutboundTargetModel(
+                        id=200 + row_id,
+                        tenant_id="tenant-a",
+                        task_id=100,
+                        validation_id=100,
+                        source_validation_row_id=row_id,
+                        source_row_number=row_id,
+                        phone_number=f"1380013800{row_id}",
+                        customer_name=f"客户{row_id}",
+                        status="COMPLETED",
+                        attempt_count=1,
+                        latest_result="connected",
+                        created_at=begin,
+                        updated_at=begin,
+                    ),
+                    AiCallOutboundAttemptModel(
+                        id=300 + row_id,
+                        tenant_id="tenant-a",
+                        task_id=100,
+                        target_id=200 + row_id,
+                        attempt_no=1,
+                        call_id=f"call-{row_id}",
+                        status="COMPLETED",
+                        call_result="connected",
+                        started_at=begin + timedelta(hours=row_id),
+                        ended_at=begin + timedelta(hours=row_id, minutes=1),
+                        created_at=begin,
+                        updated_at=begin,
+                    ),
+                ])
         for row_id in range(8, 10):
             session.add_all([
                 _follow_up(
@@ -156,17 +221,30 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
             page_num=2,
             page_size=5,
         )
+        formal_page = await service.list_follow_ups(
+            _auth(session),
+            status="pending",
+            formal_outbound_only=True,
+            source_started_at_begin=begin,
+            source_started_at_end=end,
+            page_num=1,
+            page_size=10,
+        )
 
     await engine.dispose()
 
     assert first_page["total"] == 7
     assert len(first_page["rows"]) == 5
     assert len(second_page["rows"]) == 2
+    assert formal_page["total"] == 3
+    assert {row["id"] for row in formal_page["rows"]} == {"1", "2", "3"}
     assert {row["id"] for row in first_page["rows"] + second_page["rows"]} == {
         str(row_id) for row_id in range(1, 8)
     }
     assert first_page["metrics"]["pending"] == 9
     assert first_page["metrics"]["completed"] == 1
+    assert formal_page["metrics"]["pending"] == 3
+    assert formal_page["metrics"]["completed"] == 0
 
 
 @pytest.mark.anyio
@@ -182,6 +260,7 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
         auth,
         service,
         status="pending",
+        formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,
         page_num=2,
@@ -191,6 +270,7 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
     service.list_follow_ups.assert_awaited_once_with(
         auth,
         status="pending",
+        formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,
         page_num=2,
