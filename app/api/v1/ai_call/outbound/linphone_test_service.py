@@ -513,14 +513,23 @@ class LinphoneTestService:
                         error_message="Linphone 测试恢复失败：宽限期内未生成通话记录",
                     )
                 else:
-                    record.status = "failed"
-                    record.end_reason = "linphone_test_recovery_room_missing"
-                    record.failure_stage = "linphone_test_recovery"
+                    answered = record.answered_at is not None
+                    record.status = "completed" if answered else "failed"
+                    record.end_reason = (
+                        "room_missing"
+                        if answered
+                        else "linphone_test_recovery_room_missing"
+                    )
+                    record.failure_stage = (
+                        None if answered else "linphone_test_recovery"
+                    )
                     record.failure_message = (
-                        "Linphone 测试恢复失败：LiveKit Room 已不存在"
+                        None
+                        if answered
+                        else "Linphone 测试恢复失败：LiveKit Room 已不存在"
                     )
                     record.ended_at = now
-                    if record.answered_at is not None:
+                    if answered:
                         record.duration_ms = self._duration_ms(
                             record.answered_at,
                             now,

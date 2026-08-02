@@ -1384,7 +1384,7 @@ async def test_recovery_fails_unanswered_call_after_room_grace(database) -> None
 
 
 @pytest.mark.anyio
-async def test_recovery_preserves_connected_result_when_answered_room_disappears(
+async def test_recovery_completes_answered_record_when_room_disappears(
     database,
 ) -> None:
     service = await _seed_recovery_case(
@@ -1403,9 +1403,10 @@ async def test_recovery_preserves_connected_result_when_answered_room_disappears
     assert state["target"].latest_result == "connected"
     assert state["task"].status == "COMPLETED"
     assert state["task"].connected_targets == 1
-    assert state["record"].status == "failed"
-    assert state["record"].failure_stage == "linphone_test_recovery"
-    assert state["record"].failure_message
+    assert state["record"].status == "completed"
+    assert state["record"].end_reason == "room_missing"
+    assert state["record"].failure_stage is None
+    assert state["record"].failure_message is None
 
 
 @pytest.mark.anyio

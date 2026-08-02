@@ -413,6 +413,65 @@ async def test_dial_stops_polling_at_reconciliation_deadline(database):
 
 
 @pytest.mark.anyio
+async def test_dial_preserves_connected_result_at_reconciliation_deadline(
+    database,
+    monkeypatch,
+):
+    service = FakeAiCallService()
+    monotonic_values = iter([0.0, 700.0])
+    dialer = SipOutboundDialer(
+        database,
+        ai_call_service_factory=lambda db, config: service,
+        settings=Settings(
+            AI_CALL_SIP_OUTBOUND_ENABLED=True,
+            AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES="199",
+            AI_CALL_SIP_MAX_CALL_DURATION_SECONDS=600,
+            SIP_PUBLIC_IP="127.0.0.1",
+        ),
+        sleep=zero_sleep,
+        monotonic=lambda: next(monotonic_values),
+        reconciliation_grace_seconds=30,
+    )
+    answered_at = datetime.now(timezone.utc)
+    active_record = record(
+        call_id="call-connected-timeout",
+        status="connected",
+        answered_at=answered_at,
+    )
+    terminal_record = record(
+        call_id="call-connected-timeout",
+        status="failed",
+        answered_at=answered_at,
+        end_reason="outbound_reconcile_timeout",
+        failure_message="SIP 通话状态对账超时并已终止资源",
+        duration_ms=600_000,
+    )
+    monkeypatch.setattr(
+        dialer,
+        "_read_evidence",
+        AsyncMock(
+            side_effect=[
+                (active_record, True),
+                (terminal_record, True),
+            ]
+        ),
+    )
+    monkeypatch.setattr(dialer, "terminate", AsyncMock(return_value=True))
+    connected = AsyncMock()
+
+    result = await dialer.dial(
+        dial_request(),
+        call_id="call-connected-timeout",
+        on_connected=connected,
+    )
+
+    assert result.call_result == "connected"
+    assert result.duration_ms == 600_000
+    assert result.retry_allowed is False
+    connected.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_dial_keeps_attempt_unsettled_when_timeout_cleanup_fails(database):
     service = FakeAiCallService(
         terminate_error=RuntimeError("room delete failed"),

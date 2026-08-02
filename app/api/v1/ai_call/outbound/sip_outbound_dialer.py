@@ -174,6 +174,10 @@ class SipOutboundDialer:
                 if self._is_terminal(record):
                     return self._map_evidenced_terminal(record, media_connected)
                 if self.monotonic() >= reconciliation_deadline:
+                    connected_before_deadline = self._is_connected(
+                        record,
+                        media_connected,
+                    )
                     cleaned = await self.terminate(
                         request,
                         call_id=call_id,
@@ -188,6 +192,26 @@ class SipOutboundDialer:
                             retry_allowed=False,
                             settle_attempt=False,
                         )
+                    if connected_before_deadline:
+                        final_record = record
+                        final_media_connected = media_connected
+                        try:
+                            refreshed_record, refreshed_media_connected = (
+                                await self._read_evidence(call_id)
+                            )
+                            if refreshed_record is not None:
+                                final_record = refreshed_record
+                                final_media_connected = refreshed_media_connected
+                        except Exception:
+                            pass
+                        if final_record is not None:
+                            return replace(
+                                self._map_evidenced_terminal(
+                                    final_record,
+                                    final_media_connected,
+                                ),
+                                retry_allowed=False,
+                            )
                     return DialResult(
                         call_result="call_failed",
                         error_message="SIP 通话状态对账超时，禁止自动重拨",
