@@ -662,7 +662,26 @@ class AiCallService:
         try:
             session = await self.orchestrator.get_session(call_id)
         except AiCallError:
-            return {"handled": False, "reason": "session_not_found"}
+            if self.record_service is None:
+                return {"handled": False, "reason": "record_service_unavailable"}
+            record = await self.record_service.get_record(call_id)
+            if record is None:
+                return {"handled": False, "reason": "record_not_found"}
+            if record.entry_type != "sip_outbound":
+                return {"handled": False, "reason": "not_sip_outbound"}
+            if room_name and record.room_name != room_name:
+                return {"handled": False, "reason": "record_room_mismatch"}
+            if participant_identity != record.participant_identity:
+                return {"handled": False, "reason": "record_participant_mismatch"}
+            if str(record.status or "").lower() in {"completed", "failed"}:
+                return {"handled": False, "reason": "record_terminal"}
+            return await self._end_persisted_sip_session_after_remote_hangup(
+                call_id=call_id,
+                room_name=record.room_name,
+                participant_identity=participant_identity,
+                event_type=event_type,
+                payload=payload,
+            )
         if session.status not in RUNNING_STATUSES:
             return {"handled": False, "reason": "session_not_running"}
 
@@ -681,6 +700,55 @@ class AiCallService:
         return {
             "handled": True,
             "action": "end_session",
+            "callId": call_id,
+            "endReason": "remote_hangup",
+        }
+
+    async def _end_persisted_sip_session_after_remote_hangup(
+        self,
+        *,
+        call_id: str,
+        room_name: str,
+        participant_identity: str,
+        event_type: str,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        assert self.record_service is not None
+        hangup_event = self.orchestrator.event_store.append(
+            call_id=call_id,
+            type="sip_hangup",
+            source="livekit",
+            payload=self._sip_hangup_payload(
+                room_name=room_name,
+                participant_identity=participant_identity,
+                event_type=event_type,
+                payload=payload,
+            ),
+        )
+        await self.record_service.mirror_runtime_events([hangup_event])
+        await self._cleanup_sip_resources(
+            call_id=call_id,
+            room_name=room_name,
+        )
+        await self.record_service.complete_session(
+            call_id,
+            end_reason="remote_hangup",
+        )
+        await self._finalize_handoffs_for_call(
+            call_id,
+            end_reason="remote_hangup",
+        )
+        completed_event = self.orchestrator.event_store.append(
+            call_id=call_id,
+            type="session_completed",
+            source="orchestrator",
+            payload={"endReason": "remote_hangup"},
+        )
+        await self.record_service.mirror_runtime_events([completed_event])
+        await self._enqueue_offline_asr_if_recordings_closed(call_id)
+        return {
+            "handled": True,
+            "action": "end_persisted_session",
             "callId": call_id,
             "endReason": "remote_hangup",
         }
@@ -797,6 +865,7 @@ class AiCallService:
         business_id: str | None = None,
         status: str | None = None,
         entry_type: str | None = None,
+        formal_outbound_only: bool = False,
         started_at_begin: datetime | None = None,
         started_at_end: datetime | None = None,
         page_num: int = 1,
@@ -817,6 +886,7 @@ class AiCallService:
             business_id=business_id,
             status=status,
             entry_type=entry_type,
+            formal_outbound_only=formal_outbound_only,
             started_at_begin=started_at_begin,
             started_at_end=started_at_end,
             page_num=page_num,
@@ -1885,6 +1955,24 @@ def get_default_ai_call_service(
         prompt_composer=_build_prompt_composer(_default_orchestrator),
         sip_client=_build_sip_client(config=sip_config),
     )
+
+
+async def end_agent_handoff_session_background(
+    call_id: str,
+    end_reason: str | None,
+) -> None:
+    try:
+        async with async_db_session() as db:
+            async with db.begin():
+                await get_default_ai_call_service(
+                    db
+                ).end_running_session_after_handoff(call_id, end_reason)
+    except Exception as exc:
+        log.exception(
+            "AI Call 坐席通话后台收尾失败: "
+            f"callId={call_id}, endReason={end_reason}, "
+            f"errorType={type(exc).__name__}, message={exc!s}"
+        )
 
 
 def schedule_livekit_webhook_event(

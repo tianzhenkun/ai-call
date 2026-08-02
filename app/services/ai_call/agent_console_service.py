@@ -313,7 +313,7 @@ class AiCallAgentConsoleService:
         presence.status = "reconnecting"
         presence.last_seen_at = current
         presence.status_updated_at = current
-        await self.db.commit()
+        await self.db.flush()
         return handoff
 
     async def complete_handoff(
@@ -324,19 +324,66 @@ class AiCallAgentConsoleService:
         console_session_id: str,
     ) -> AiCallHandoffModel:
         profile = await self.require_current_agent(auth)
-        handoff, presence = await self._require_owned_handoff(
-            profile,
+        session_id = self._console_session_id(console_session_id)
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=profile.tenant_id,
             handoff_id=handoff_id,
-            console_session_id=console_session_id,
-            statuses={"connected", "reconnecting"},
         )
+        if handoff is None:
+            raise CustomException(msg="转人工任务不存在", status_code=404)
+        if handoff.status in {"connected", "reconnecting"}:
+            handoff, presence = await self._require_owned_handoff(
+                profile,
+                handoff_id=handoff_id,
+                console_session_id=session_id,
+                statuses={"connected", "reconnecting"},
+            )
+        elif handoff.status in {"completed", "canceled", "failed"}:
+            if handoff.human_agent_identity != profile.agent_identity:
+                self._raise_conflict("当前坐席不是任务负责人", "HANDOFF_ALREADY_CLAIMED")
+            if handoff.accepted_console_session_id != session_id:
+                self._raise_conflict(
+                    "当前标签页不拥有媒体控制权",
+                    "CONSOLE_SESSION_CONFLICT",
+                )
+            if handoff.connected_at is None:
+                self._raise_conflict(
+                    "未接通的转人工任务不能进入话后处理",
+                    "HANDOFF_STATE_CONFLICT",
+                )
+            presence = await self.repository.get_console_agent_for_claim(
+                tenant_id=profile.tenant_id,
+                agent_identity=profile.agent_identity,
+            )
+            if presence is None:
+                self._raise_conflict("坐席未上线", "AGENT_NOT_AVAILABLE")
+            self._ensure_console_owner(presence, session_id)
+            if presence.active_handoff_id not in {None, handoff.handoff_id}:
+                self._raise_conflict(
+                    "坐席当前正在处理其他通话",
+                    "AGENT_ACTIVE_CALL_EXISTS",
+                )
+            if presence.active_call_id not in {None, handoff.call_id}:
+                self._raise_conflict(
+                    "坐席当前正在处理其他通话",
+                    "AGENT_ACTIVE_CALL_EXISTS",
+                )
+        else:
+            self._raise_conflict(
+                "当前转人工状态不允许该操作",
+                "HANDOFF_STATE_CONFLICT",
+            )
+
         now = datetime.now(timezone.utc)
-        handoff.status = "completed"
-        handoff.ended_at = now
-        handoff.end_reason = "agent_completed"
-        handoff.claim_expires_at = None
-        handoff.reconnect_expires_at = None
+        if handoff.status in {"connected", "reconnecting"}:
+            handoff.status = "completed"
+            handoff.ended_at = now
+            handoff.end_reason = "agent_completed"
+            handoff.claim_expires_at = None
+            handoff.reconnect_expires_at = None
         presence.status = "wrap_up_quick"
+        presence.active_handoff_id = handoff.handoff_id
+        presence.active_call_id = handoff.call_id
         presence.last_seen_at = now
         presence.status_updated_at = now
         await self.db.flush()

@@ -828,6 +828,27 @@ def test_handoff_timeout_default_is_commercial_wait_window() -> None:
     assert settings.AI_CALL_HANDOFF_TIMEOUT_SECONDS == 30
 
 
+@pytest.mark.anyio
+async def test_issue_handoff_token_for_persisted_room_without_runtime_session(
+    b1_service,
+) -> None:
+    orchestrator = b1_service.service.orchestrator
+
+    token = orchestrator.issue_handoff_token_for_room(
+        call_id="worker-owned-call",
+        handoff_id="handoff-cross-process",
+        human_agent_identity="agent-admin",
+        room_name="worker-owned-room",
+    )
+
+    assert token.room_name == "worker-owned-room"
+    assert token.participant_token.startswith("handoff-token-for-")
+    assert [
+        event.type
+        for event in orchestrator.event_store.list_all("worker-owned-call")
+    ] == ["handoff_accepted"]
+
+
 def test_offline_asr_defaults_to_qwen_filetrans_with_chinese_language() -> None:
     settings = Settings(_env_file=None)
 
@@ -3436,6 +3457,99 @@ async def test_end_session_finalizes_active_handoff(b1_service) -> None:
 
 
 @pytest.mark.anyio
+async def test_end_session_keeps_connected_reconnecting_handoff_in_wrap_up(
+    b1_service,
+) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    await service.accept_handoff(
+        handoff_id=handoff["handoffId"],
+        human_agent_identity="agent-debug-001",
+    )
+    await service.mark_handoff_connected(handoff["handoffId"])
+    handoff_row = await service.handoff_service.repository.get_handoff_by_id(
+        handoff["handoffId"]
+    )
+    handoff_row.status = "reconnecting"
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    presence.status = "reconnecting"
+    presence.active_call_id = result.call_id
+    presence.console_session_id = "8ed3e232-907f-49cc-b365-6a9cc5c9aa0a"
+    await service.handoff_service.repository.db.flush()
+
+    await service.end_session(result.call_id, end_reason="remote_hangup")
+
+    history = await service.list_handoffs(result.call_id)
+    assert history["rows"][0]["status"] == "canceled"
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    assert presence.status == "wrap_up_quick"
+    assert presence.active_handoff_id == handoff["handoffId"]
+    assert presence.active_call_id == result.call_id
+
+
+@pytest.mark.anyio
+async def test_unconnected_handoff_cancel_releases_console_agent_as_available(
+    b1_service,
+) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    handoff = await service.create_handoff(
+        call_id=result.call_id,
+        source="operator",
+        reason="customer_request",
+        request_message=None,
+    )
+    await service.set_handoff_agent_status(
+        human_agent_identity="agent-debug-001",
+        status="online",
+    )
+    await service.accept_handoff(
+        handoff_id=handoff["handoffId"],
+        human_agent_identity="agent-debug-001",
+    )
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    presence.active_call_id = result.call_id
+    presence.console_session_id = "8ed3e232-907f-49cc-b365-6a9cc5c9aa0a"
+    await service.handoff_service.repository.db.flush()
+
+    await service.cancel_handoff(
+        handoff_id=handoff["handoffId"],
+        reason="customer_hangup",
+    )
+
+    presence = await service.handoff_service.repository.get_handoff_agent(
+        "agent-debug-001"
+    )
+    assert presence.status == "available"
+    assert presence.active_handoff_id is None
+    assert presence.active_call_id is None
+
+
+@pytest.mark.anyio
 async def test_handoff_lazy_expire_records_expired_event(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
@@ -3904,6 +4018,64 @@ async def test_handoff_waiting_tone_stops_when_agent_connected(
         assert "handoff_waiting_tone_stopped" in event_types
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_handoff_waiting_tone_owner_observes_cross_process_connected_state(
+    b1_service,
+    tmp_path,
+) -> None:
+    service, record_service = b1_service
+    prompt_player = BlockingSystemPromptPlayer()
+    owner_manager = AiCallHandoffExceptionManager(
+        orchestrator=service.orchestrator,
+        session_factory=b1_service.session_maker,
+        recording_service_factory=lambda _repository: None,
+        system_prompt_player=prompt_player,
+        timeout_seconds=30,
+        waiting_tone_enabled=True,
+        waiting_tone_audio_path=tmp_path / "handoff-ringback.wav",
+    )
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        handoff = await service.create_handoff(
+            call_id=result.call_id,
+            source="operator",
+            reason="customer_request",
+            request_message=None,
+        )
+        await service.handoff_service.repository.db.commit()
+        handoff_row = await service.handoff_service.repository.get_handoff_by_id(
+            handoff["handoffId"]
+        )
+        owner_manager.start_waiting_tone(handoff_row)
+        await wait_until(lambda: prompt_player.started.is_set())
+
+        async with b1_service.session_maker() as other_process_db:
+            async with other_process_db.begin():
+                other_process_repository = AiCallRecordRepository(other_process_db)
+                other_process_handoff = (
+                    await other_process_repository.get_handoff_by_id(handoff["handoffId"])
+                )
+                other_process_handoff.status = "connected"
+                other_process_handoff.connected_at = datetime.now(timezone.utc)
+
+        await wait_until(
+            lambda: prompt_player.cancelled.is_set(),
+            attempts=80,
+            delay_seconds=0.05,
+        )
+        await b1_service.flush_events()
+        event_types = [
+            event.event_type for event in await record_service.list_events(result.call_id)
+        ]
+        assert "handoff_waiting_tone_stopped" in event_types
+    finally:
+        await owner_manager.shutdown()
 
 
 @pytest.mark.anyio

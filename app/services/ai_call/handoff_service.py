@@ -524,12 +524,13 @@ class AiCallHandoffService:
         if agent is None or agent.active_handoff_id != handoff.handoff_id:
             return
         now = utc_now()
-        if (
-            agent.console_session_id
-            and agent.active_call_id == handoff.call_id
-            and handoff.status in {HANDOFF_STATUS_COMPLETED, HANDOFF_STATUS_FAILED}
-        ):
-            await self.repository.upsert_handoff_agent(
+        if agent.console_session_id and agent.active_call_id not in {
+            None,
+            handoff.call_id,
+        }:
+            return
+        if agent.console_session_id and handoff.connected_at is not None:
+            updated = await self.repository.upsert_handoff_agent(
                 agent_identity=agent.agent_identity,
                 skill_group=agent.skill_group,
                 status="wrap_up_quick",
@@ -537,15 +538,19 @@ class AiCallHandoffService:
                 last_seen_at=now,
                 status_updated_at=now,
             )
+            updated.active_call_id = handoff.call_id
+            await self.repository.db.flush()
             return
-        await self.repository.upsert_handoff_agent(
+        updated = await self.repository.upsert_handoff_agent(
             agent_identity=agent.agent_identity,
             skill_group=agent.skill_group,
-            status=HANDOFF_AGENT_STATUS_ONLINE,
+            status=("available" if agent.console_session_id else HANDOFF_AGENT_STATUS_ONLINE),
             active_handoff_id=None,
             last_seen_at=now,
             status_updated_at=now,
         )
+        updated.active_call_id = None
+        await self.repository.db.flush()
 
     @staticmethod
     def _validate_source(source: str) -> str:

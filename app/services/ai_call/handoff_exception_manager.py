@@ -44,6 +44,7 @@ DEFAULT_NO_ONLINE_AGENT_PROMPT_TEXT = (
 )
 DEFAULT_BUSY_TIMEOUT_PROMPT_TEXT = "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
 DEFAULT_SERVICE_UNAVAILABLE_PROMPT_TEXT = "人工转接服务暂时不可用，我先为您记录需求。"
+WAITING_TONE_STATE_POLL_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,7 +429,8 @@ class AiCallHandoffExceptionManager:
             )
             while True:
                 try:
-                    await self.system_prompt_player.play(
+                    persisted_status = await self._play_waiting_tone_until_state_change(
+                        handoff_id=handoff_id,
                         call_id=call_id,
                         room_name=room_name,
                         audio_path=self.waiting_tone_audio_path,
@@ -449,10 +451,65 @@ class AiCallHandoffExceptionManager:
                         source="system",
                     )
                     return
+                if persisted_status is not None:
+                    self._record_handoff_event(
+                        call_id=call_id,
+                        event_type="handoff_waiting_tone_stopped",
+                        handoff_id=handoff_id,
+                        handoff_status=persisted_status,
+                        payload={"reason": "persistent_state_changed"},
+                        source="system",
+                    )
+                    return
                 if self.waiting_tone_interval_seconds > 0:
                     await asyncio.sleep(self.waiting_tone_interval_seconds)
         except asyncio.CancelledError:
             raise
+
+    async def _play_waiting_tone_until_state_change(
+        self,
+        *,
+        handoff_id: str,
+        call_id: str,
+        room_name: str,
+        audio_path: Path,
+    ) -> str | None:
+        assert self.system_prompt_player is not None
+        play_task = asyncio.create_task(
+            self.system_prompt_player.play(
+                call_id=call_id,
+                room_name=room_name,
+                audio_path=audio_path,
+            )
+        )
+        state_task = asyncio.create_task(
+            self._wait_for_waiting_tone_stop(handoff_id),
+        )
+        tasks = (play_task, state_task)
+        try:
+            done, _pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if state_task in done:
+                return state_task.result()
+            await play_task
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _wait_for_waiting_tone_stop(self, handoff_id: str) -> str:
+        while True:
+            await asyncio.sleep(WAITING_TONE_STATE_POLL_SECONDS)
+            async with self.session_factory() as db:
+                repository = AiCallRecordRepository(db)
+                handoff = await repository.get_handoff_by_id(handoff_id)
+                status = handoff.status if handoff is not None else "missing"
+            if status not in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
+                return status
 
     async def _expire_handoff_if_due(self, handoff_id: str) -> AiCallHandoffModel | None:
         async with self.session_factory() as db:

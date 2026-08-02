@@ -824,13 +824,46 @@ class AiCallOrchestrator:
                 msg="当前会话状态不允许该操作",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        return self._issue_handoff_token_for_room(
+            call_id=call_id,
+            handoff_id=handoff_id,
+            human_agent_identity=human_agent_identity,
+            room_name=session.room_name,
+            session=session,
+        )
+
+    def issue_handoff_token_for_room(
+        self,
+        *,
+        call_id: str,
+        handoff_id: str,
+        human_agent_identity: str,
+        room_name: str,
+    ) -> HandoffTokenResult:
+        return self._issue_handoff_token_for_room(
+            call_id=call_id,
+            handoff_id=handoff_id,
+            human_agent_identity=human_agent_identity,
+            room_name=room_name,
+            session=None,
+        )
+
+    def _issue_handoff_token_for_room(
+        self,
+        *,
+        call_id: str,
+        handoff_id: str,
+        human_agent_identity: str,
+        room_name: str,
+        session: CallSession | None,
+    ) -> HandoffTokenResult:
         participant_identity = f"human-agent-{handoff_id}"
         token = self.livekit_room_manager.issue_handoff_token(
-            session.room_name,
+            room_name,
             participant_identity,
             self.config.browser_token_ttl_seconds,
         )
-        self._append_event(
+        event = self.event_store.append(
             call_id,
             "handoff_accepted",
             "handoff",
@@ -842,10 +875,12 @@ class AiCallOrchestrator:
                 "expiresInSeconds": token.expires_in_seconds,
             },
         )
+        if session is not None:
+            session.last_event_at = event.timestamp
         return HandoffTokenResult(
             call_id=call_id,
             handoff_id=handoff_id,
-            room_name=session.room_name,
+            room_name=room_name,
             livekit_url=token.livekit_url,
             participant_token=token.participant_token,
             participant_identity=token.participant_identity,

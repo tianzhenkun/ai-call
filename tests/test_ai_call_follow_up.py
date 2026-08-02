@@ -312,6 +312,119 @@ async def test_owned_handoff_completion_enters_quick_wrap_up(session_factory) ->
 
 
 @pytest.mark.anyio
+async def test_repeated_owned_handoff_completion_is_idempotent(session_factory) -> None:
+    now = datetime.now(timezone.utc)
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        status="in_call",
+        active_handoff_id="handoff-connected",
+        active_call_id="call-connected",
+    )
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallHandoffModel(
+                id=21,
+                tenant_id="tenant-a",
+                handoff_id="handoff-connected",
+                call_id="call-connected",
+                room_name="room-connected",
+                scene_code="intro_contract",
+                status="connected",
+                request_source="customer",
+                human_agent_identity="agent-20",
+                accepted_console_session_id=console_session_id,
+                requested_at=now,
+                accepted_at=now,
+                connected_at=now,
+            )
+        )
+
+    async with session_factory() as db, db.begin():
+        service = AiCallAgentConsoleService(db)
+        auth = _auth(db, user_id=20)
+        first = await service.complete_handoff(
+            auth,
+            handoff_id="handoff-connected",
+            console_session_id=console_session_id,
+        )
+        second = await service.complete_handoff(
+            auth,
+            handoff_id="handoff-connected",
+            console_session_id=console_session_id,
+        )
+
+        assert first.status == "completed"
+        assert second.status == "completed"
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        assert presence.status == "wrap_up_quick"
+        assert presence.active_handoff_id == "handoff-connected"
+        assert presence.active_call_id == "call-connected"
+
+
+@pytest.mark.anyio
+async def test_connected_terminal_handoff_completion_recovers_wrap_up_state(
+    session_factory,
+) -> None:
+    now = datetime.now(timezone.utc)
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        status="online",
+        active_handoff_id=None,
+        active_call_id="call-ended",
+    )
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallHandoffModel(
+                id=22,
+                tenant_id="tenant-a",
+                handoff_id="handoff-ended",
+                call_id="call-ended",
+                room_name="room-ended",
+                scene_code="intro_contract",
+                status="canceled",
+                request_source="customer",
+                human_agent_identity="agent-20",
+                accepted_console_session_id=console_session_id,
+                requested_at=now,
+                accepted_at=now,
+                connected_at=now,
+                ended_at=now,
+                end_reason="remote_hangup",
+            )
+        )
+
+    async with session_factory() as db, db.begin():
+        service = AiCallAgentConsoleService(db)
+        handoff = await service.complete_handoff(
+            _auth(db, user_id=20),
+            handoff_id="handoff-ended",
+            console_session_id=console_session_id,
+        )
+
+        assert handoff.status == "canceled"
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        assert presence.status == "wrap_up_quick"
+        assert presence.active_handoff_id == "handoff-ended"
+        assert presence.active_call_id == "call-ended"
+
+
+@pytest.mark.anyio
 async def test_submit_acw_creates_one_owned_follow_up_and_releases_agent(session_factory) -> None:
     console_session_id = await _seed_completed_handoff(session_factory)
     async with session_factory() as db, db.begin():
@@ -359,6 +472,78 @@ async def test_submit_acw_creates_one_owned_follow_up_and_releases_agent(session
             console_session_id=console_session_id,
         )
         assert available_presence.status == "available"
+
+
+@pytest.mark.anyio
+async def test_submit_acw_accepts_connected_handoff_ended_by_remote_hangup(
+    session_factory,
+) -> None:
+    await _seed_completed_handoff(session_factory)
+    async with session_factory() as db, db.begin():
+        handoff = (
+            await db.execute(
+                select(AiCallHandoffModel).where(
+                    AiCallHandoffModel.handoff_id == "handoff-1"
+                )
+            )
+        ).scalar_one()
+        handoff.status = "canceled"
+        handoff.end_reason = "remote_hangup"
+
+    async with session_factory() as db:
+        acw, follow_up = await AiCallFollowUpService(db).submit_after_call_work(
+            _auth(db, user_id=20),
+            call_id="call-1",
+            payload=AfterCallWorkIn(
+                disposition_code="resolved",
+                needs_follow_up=False,
+            ),
+        )
+        await db.commit()
+
+        assert acw.handoff_id == "handoff-1"
+        assert follow_up is None
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        assert presence.status == "available"
+        assert presence.active_handoff_id is None
+        assert presence.active_call_id is None
+
+
+@pytest.mark.anyio
+async def test_submit_acw_rejects_canceled_handoff_that_never_connected(
+    session_factory,
+) -> None:
+    await _seed_completed_handoff(session_factory)
+    async with session_factory() as db, db.begin():
+        handoff = (
+            await db.execute(
+                select(AiCallHandoffModel).where(
+                    AiCallHandoffModel.handoff_id == "handoff-1"
+                )
+            )
+        ).scalar_one()
+        handoff.status = "canceled"
+        handoff.connected_at = None
+        handoff.end_reason = "customer_canceled"
+
+    async with session_factory() as db:
+        with pytest.raises(CustomException) as conflict:
+            await AiCallFollowUpService(db).submit_after_call_work(
+                _auth(db, user_id=20),
+                call_id="call-1",
+                payload=AfterCallWorkIn(
+                    disposition_code="other",
+                    needs_follow_up=False,
+                ),
+            )
+
+    assert _error_code(conflict.value) == "HANDOFF_STATE_CONFLICT"
 
 
 @pytest.mark.anyio

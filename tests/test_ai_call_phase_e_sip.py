@@ -1128,6 +1128,58 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
 
 
 @pytest.mark.anyio
+async def test_livekit_sip_participant_left_ends_persisted_session_without_local_runtime() -> None:
+    (
+        service,
+        room_manager,
+        agent_runner,
+        _sip_client,
+        record_service,
+        _prompt_resolver,
+    ) = build_service_with_sip_fakes()
+    recording_service = FakeRecordingService()
+    service.recording_service = recording_service
+
+    result = await service.create_sip_session(
+        callee_phone_number="13800000000",
+        voice=None,
+        business_id="geo_task_001",
+        scene_code="intro_geo",
+        business_params={},
+    )
+    service.orchestrator.registry._sessions.pop(result.call_id)
+
+    handled = await service.handle_livekit_webhook_event(
+        event_type="participant_left",
+        room_name=result.room_name,
+        participant_identity=result.participant_identity,
+        payload={"disconnectReason": "CLIENT_INITIATED"},
+    )
+
+    assert handled == {
+        "handled": True,
+        "action": "end_persisted_session",
+        "callId": result.call_id,
+        "endReason": "remote_hangup",
+    }
+    assert room_manager.deleted_rooms == [result.room_name]
+    assert agent_runner.stopped_call_ids == [result.call_id]
+    assert recording_service.stopped_call_ids == [result.call_id]
+    assert record_service.completed_sessions == [
+        {
+            "call_id": result.call_id,
+            "end_reason": "remote_hangup",
+            "ended_at": None,
+        }
+    ]
+    event_types = [
+        event.type for event in service.orchestrator.event_store.list_all(result.call_id)
+    ]
+    assert "sip_hangup" in event_types
+    assert event_types.index("sip_hangup") < event_types.index("session_completed")
+
+
+@pytest.mark.anyio
 async def test_livekit_non_sip_participant_left_does_not_end_session() -> None:
     (
         service,

@@ -7,11 +7,12 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter, agent_console_controller
+from app.api.v1.ai_call import service as ai_call_service_module
 from app.api.v1.ai_call.agent_console_controller import (
     get_agent_console_reconciler,
     get_agent_console_service,
@@ -31,6 +32,7 @@ from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException, handle_exception
 from app.services.ai_call.agent_console_reconciler import AiCallAgentConsoleReconciler
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.exceptions import AiCallError
 
 
 def _auth(db, *, user_id: int = 20, tenant_id: str = "tenant-a"):
@@ -65,6 +67,57 @@ def _client(auth_factory, service: AiCallAgentConsoleService) -> TestClient:
         AiCallAgentConsoleReconciler(service.db, room_exists=lambda _room: False)
     )
     return TestClient(app)
+
+
+def test_issue_handoff_token_falls_back_to_persisted_room_for_worker_session(
+    monkeypatch,
+) -> None:
+    token = SimpleNamespace(
+        call_id="call-1",
+        handoff_id="handoff-1",
+        room_name="room-1",
+        livekit_url="wss://livekit.example.test",
+        participant_token="token-1",
+        participant_identity="human-agent-handoff-1",
+        expires_in_seconds=300,
+    )
+    issue_from_registry = Mock(
+        side_effect=AiCallError(
+            error_id="session_not_found",
+            msg="会话不存在",
+            status_code=404,
+        )
+    )
+    issue_for_room = Mock(return_value=token)
+    service = SimpleNamespace(
+        handoff_exception_manager=None,
+        orchestrator=SimpleNamespace(
+            issue_handoff_token=issue_from_registry,
+            issue_handoff_token_for_room=issue_for_room,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_console_controller,
+        "get_default_ai_call_service",
+        lambda _db: service,
+    )
+    auth = SimpleNamespace(db=object())
+    handoff = SimpleNamespace(
+        call_id="call-1",
+        handoff_id="handoff-1",
+        room_name="room-1",
+        human_agent_identity="agent-1",
+    )
+
+    result = agent_console_controller._issue_handoff_token(auth, handoff)
+
+    issue_for_room.assert_called_once_with(
+        call_id="call-1",
+        handoff_id="handoff-1",
+        human_agent_identity="agent-1",
+        room_name="room-1",
+    )
+    assert result["participant_token"] == "token-1"
 
 
 def test_task7_management_and_sse_routes_are_registered() -> None:
@@ -288,7 +341,7 @@ async def test_media_ready_stops_waiting_tone_and_starts_human_recording(
 
 
 @pytest.mark.anyio
-async def test_complete_handoff_ends_running_customer_session(
+async def test_complete_handoff_schedules_customer_session_cleanup_after_response(
     db_session,
     monkeypatch,
 ) -> None:
@@ -302,29 +355,88 @@ async def test_complete_handoff_ends_running_customer_session(
         complete_handoff=AsyncMock(return_value=handoff),
         handoff_payload=AsyncMock(return_value={"handoff_id": "handoff-1"}),
     )
-    ai_call_service = SimpleNamespace(
-        end_running_session_after_handoff=AsyncMock(),
-    )
+    background_tasks = BackgroundTasks()
+    cleanup = AsyncMock()
     publish = AsyncMock()
     monkeypatch.setattr(
         agent_console_controller,
-        "get_default_ai_call_service",
-        lambda _db: ai_call_service,
+        "end_agent_handoff_session_background",
+        cleanup,
     )
     monkeypatch.setattr(agent_console_controller, "_publish", publish)
 
     await agent_console_controller.complete_agent_handoff_controller(
         "handoff-1",
         AgentPresenceSessionIn(console_session_id=uuid4()),
+        background_tasks,
         _auth(db_session),
         console_service,
     )
 
-    ai_call_service.end_running_session_after_handoff.assert_awaited_once_with(
+    cleanup.assert_not_awaited()
+    assert len(background_tasks.tasks) == 1
+    task = background_tasks.tasks[0]
+    assert task.func is cleanup
+    assert task.args == ("call-1", "agent_completed")
+    console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+
+def test_complete_handoff_commits_write_dependency_before_background_tasks() -> None:
+    route = next(
+        route
+        for route in AiCallRouter.routes
+        if route.path == "/ai-call/agent-console/handoffs/{handoff_id}/complete"
+    )
+    service_dependency = next(
+        dependency
+        for dependency in route.dependant.dependencies
+        if dependency.name == "service"
+    )
+    db_dependency = next(
+        dependency
+        for dependency in service_dependency.dependencies
+        if dependency.name == "db"
+    )
+
+    assert db_dependency.scope == "function"
+
+
+@pytest.mark.anyio
+async def test_handoff_background_cleanup_uses_isolated_session_and_contains_failure(
+    monkeypatch,
+) -> None:
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def begin(self):
+            return self
+
+    isolated_db = FakeSession()
+    session_factory = Mock(return_value=isolated_db)
+    cleanup = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+    get_service = Mock(
+        return_value=SimpleNamespace(
+            end_running_session_after_handoff=cleanup,
+        )
+    )
+    log_exception = Mock()
+    monkeypatch.setattr(ai_call_service_module, "async_db_session", session_factory)
+    monkeypatch.setattr(ai_call_service_module, "get_default_ai_call_service", get_service)
+    monkeypatch.setattr(ai_call_service_module.log, "exception", log_exception)
+
+    await ai_call_service_module.end_agent_handoff_session_background(
         "call-1",
         "agent_completed",
     )
-    console_service.handoff_payload.assert_awaited_once_with(handoff)
+
+    session_factory.assert_called_once_with()
+    get_service.assert_called_once_with(isolated_db)
+    cleanup.assert_awaited_once_with("call-1", "agent_completed")
+    log_exception.assert_called_once()
 
 
 @pytest.mark.anyio

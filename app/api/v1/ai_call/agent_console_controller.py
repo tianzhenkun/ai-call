@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,7 +39,10 @@ from .agent_console_schema import (
     FollowUpCallIn,
     FollowUpCloseIn,
 )
-from .service import get_default_ai_call_service
+from .service import (
+    end_agent_handoff_session_background,
+    get_default_ai_call_service,
+)
 
 AgentConsoleRouter = APIRouter(prefix="/agent-console", tags=["AI Call 坐席工作台"])
 AgentAdminRouter = APIRouter(prefix="/admin", tags=["AI Call 坐席管理"])
@@ -55,6 +58,12 @@ async def get_agent_console_service(
         db,
         participant_verifier=room_manager.has_published_microphone,
     )
+
+
+async def get_agent_console_complete_service(
+    db: Annotated[AsyncSession, Depends(db_getter, scope="function")],
+) -> AiCallAgentConsoleService:
+    return AiCallAgentConsoleService(db)
 
 
 async def get_follow_up_service(
@@ -160,16 +169,24 @@ def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
             human_agent_identity=handoff.human_agent_identity,
         )
     except AiCallError as exc:
-        error_code = (
-            "CUSTOMER_NOT_CONNECTED"
-            if exc.error_id in {"session_not_found", "invalid_session_state"}
-            else exc.error_id
-        )
-        raise CustomException(
-            msg=exc.msg,
-            status_code=exc.status_code,
-            data={"errorCode": error_code},
-        ) from exc
+        if exc.error_id == "session_not_found":
+            token = ai_call_service.orchestrator.issue_handoff_token_for_room(
+                call_id=handoff.call_id,
+                handoff_id=handoff.handoff_id,
+                human_agent_identity=handoff.human_agent_identity,
+                room_name=handoff.room_name,
+            )
+        else:
+            error_code = (
+                "CUSTOMER_NOT_CONNECTED"
+                if exc.error_id == "invalid_session_state"
+                else exc.error_id
+            )
+            raise CustomException(
+                msg=exc.msg,
+                status_code=exc.status_code,
+                data={"errorCode": error_code},
+            ) from exc
     return {
         "call_id": token.call_id,
         "handoff_id": token.handoff_id,
@@ -424,16 +441,20 @@ async def reconnect_token_controller(
 async def complete_agent_handoff_controller(
     handoff_id: str,
     payload: AgentPresenceSessionIn,
+    background_tasks: BackgroundTasks,
     auth: AuthenticatedUser,
-    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    service: Annotated[
+        AiCallAgentConsoleService,
+        Depends(get_agent_console_complete_service),
+    ],
 ):
     handoff = await service.complete_handoff(
         auth,
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
     )
-    ai_call_service = get_default_ai_call_service(auth.db)
-    await ai_call_service.end_running_session_after_handoff(
+    background_tasks.add_task(
+        end_agent_handoff_session_background,
         handoff.call_id,
         handoff.end_reason,
     )

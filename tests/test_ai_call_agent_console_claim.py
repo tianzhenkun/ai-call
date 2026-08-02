@@ -989,6 +989,10 @@ async def test_reconnect_timeout_fails_without_returning_to_public_pool(session_
             console_session_id=console_session_id,
             now=now,
         )
+        persisted = (
+            await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        ).scalar_one()
+        assert persisted.status == "reconnecting"
     async with session_factory() as db, db.begin():
         reconnecting = (
             await db.execute(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))

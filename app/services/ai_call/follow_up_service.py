@@ -74,7 +74,11 @@ class AiCallFollowUpService:
             call_id=call_id,
             agent_identity=profile.agent_identity,
         )
-        if handoff.status not in {"completed", "failed"}:
+        is_connected_terminal = (
+            handoff.status in {"completed", "failed"}
+            or (handoff.status == "canceled" and handoff.connected_at is not None)
+        )
+        if not is_connected_terminal:
             self._raise_conflict("人工通话尚未结束，不能提交话后结果", "HANDOFF_STATE_CONFLICT")
 
         existing = await self._after_call_work(profile.tenant_id, handoff.handoff_id)
