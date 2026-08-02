@@ -52,6 +52,13 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _mask_phone_number(phone_number: str) -> str:
+    digits = "".join(character for character in phone_number if character.isdigit())
+    if len(digits) <= 7:
+        return "***"
+    return f"{digits[:3]}****{digits[-4:]}"
+
+
 class OutboundRuleTaskService:
     """呼叫规则、单号校验和正式任务持久化。"""
 
@@ -1021,7 +1028,7 @@ class OutboundRuleTaskService:
             target_id=str(target.id),
             task_id=str(target.task_id),
             customer_name=target.customer_name,
-            phone_number=target.phone_number,
+            phone_number=_mask_phone_number(target.phone_number),
             status=target.status,
             attempt_count=target.attempt_count,
             latest_result=target.latest_result,

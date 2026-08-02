@@ -1278,7 +1278,9 @@ async def test_batch_task_creation_copies_targets_in_batches_and_is_idempotent(d
     assert created_again is False
     assert same.id == task_id
     assert total == 5
-    assert [target.phone_number for target in targets] == [phone for phone, _ in rows]
+    assert [target.phone_number for target in targets] == [
+        f"{phone[:3]}****{phone[-4:]}" for phone, _ in rows
+    ]
     assert all(target.target_id.isdigit() and target.task_id == str(task_id) for target in targets)
 
     other_request = request.model_copy(update={"task_name": "不同任务"})
@@ -1351,7 +1353,7 @@ async def test_single_task_has_one_target_and_uses_snapshots_after_rule_delete(d
             target_status=None,
         )
     assert total == 1
-    assert targets[0].phone_number == "19900001001"
+    assert targets[0].phone_number == "199****1001"
     assert task_out.rule_name == "工作日规则"
     assert "09:00" in task_out.rule_summary
     assert task_out.prompt_name == "合同审查产品介绍"
