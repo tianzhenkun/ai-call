@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -84,6 +84,9 @@ async def _seed_due_task(
     target_count: int = 1,
     tenant_id: str = "tenant-a",
     line_id: int = 340700000000000001,
+    retry_count: int = 0,
+    retry_intervals_minutes: list[int] | None = None,
+    retryable_results: list[str] | None = None,
 ) -> tuple[int, int, str]:
     task_id = generate_snowflake_id()
     target_id = generate_snowflake_id()
@@ -97,9 +100,9 @@ async def _seed_due_task(
         "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
         "voice": {"voice": "Tina"},
         "rule": {
-            "retryCount": 0,
-            "retryIntervalsMinutes": [],
-            "retryableResults": [],
+            "retryCount": retry_count,
+            "retryIntervalsMinutes": retry_intervals_minutes or [],
+            "retryableResults": retryable_results or [],
         },
         "sipLine": line,
     })
@@ -807,7 +810,7 @@ async def test_attempt_reconciler_projects_complete_start_facts_to_dialing(
         target = await session.get(AiCallOutboundTargetModel, target_id)
     assert attempt is not None and attempt.status == "DIALING"
     assert target is not None and target.status == "DIALING"
-    assert attempt.reconcile_after is None
+    assert attempt.reconcile_after == database_now + timedelta(seconds=1)
 
 
 @pytest.mark.anyio
@@ -1099,3 +1102,156 @@ async def test_dispatcher_orders_first_candidate_from_each_tenant_line_lane_firs
         "tenant-a",
         "tenant-b",
     ]
+
+
+@pytest.mark.anyio
+async def test_attempt_terminal_projection_retries_allocation_timeout(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, target_id, _phone_number = await _seed_due_task(
+        database,
+        now,
+        retry_count=1,
+        retry_intervals_minutes=[1],
+        retryable_results=["call_failed"],
+    )
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+    database_now = now.replace(tzinfo=None)
+    expired_at = database_now + timedelta(seconds=31)
+
+    async with database.begin() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        assert attempt is not None
+        assert await RuntimeCommandRepository(
+            session,
+            database_clock=lambda _session: _constant_time(expired_at),
+        ).expire_unallocated_start("tenant-a", attempt.call_id)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-timeout",
+            database_clock=lambda _session: _constant_time(expired_at),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-timeout",
+            database_clock=lambda _session: _constant_time(expired_at),
+        ).submit(claim)
+
+    assert result is not None and result.status == "FAILED"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, claim.attempt_id)
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+    assert attempt is not None
+    assert attempt.status == "FAILED"
+    assert attempt.call_result == "call_failed"
+    assert attempt.error_message == "ALLOCATION_TIMEOUT"
+    assert target is not None and target.status == "RETRY_WAIT"
+    assert target.latest_result == "call_failed"
+    assert target.next_attempt_at == expired_at + timedelta(minutes=1)
+    assert task is not None and task.status == "RUNNING"
+
+
+@pytest.mark.anyio
+async def test_attempt_terminal_projection_requires_media_evidence_for_connected(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database,
+        now,
+    )
+    await _seed_start_completion_facts(database, call_id=call_id, now=now)
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-terminal",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        projected = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-terminal",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+    assert projected is not None and projected.status == "DIALING"
+
+    terminal_at = database_now + timedelta(seconds=2)
+    async with database.begin() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        assert record is not None
+        record.status = "completed"
+        record.answered_at = terminal_at
+        record.ended_at = terminal_at
+        session.add(
+            AiCallEventModel(
+                id=generate_snowflake_id(),
+                call_id=call_id,
+                event_id=f"media-connected-{call_id}",
+                event_type="media_connected",
+                source="provider_stub",
+                event_time=terminal_at,
+                payload_json="{}",
+            )
+        )
+
+    async with database.begin() as session:
+        terminal_claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-terminal-restarted",
+            database_clock=lambda _session: _constant_time(terminal_at),
+        ).claim_next()
+    assert terminal_claim is not None
+    async with database.begin() as session:
+        terminal_result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-terminal-restarted",
+            database_clock=lambda _session: _constant_time(terminal_at),
+        ).submit(terminal_claim)
+
+    assert terminal_result is not None and terminal_result.status == "COMPLETED"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, terminal_claim.attempt_id)
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+    assert attempt is not None and attempt.call_result == "connected"
+    assert target is not None and target.status == "COMPLETED"
+    assert target.latest_result == "connected"
+    assert task is not None and task.status == "COMPLETED"
+    assert task.completed_targets == 1
+    assert task.connected_targets == 1
+    assert task.failed_targets == 0

@@ -17,6 +17,12 @@ from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
 
+from .attempt_projection import (
+    BUSY_END_REASONS,
+    NO_ANSWER_END_REASONS,
+    outbound_retry_interval,
+    refresh_task_counters,
+)
 from .media_evidence import has_persisted_media_evidence
 from .queue_control import (
     DEFAULT_OUTBOUND_QUEUE_LIMITS,
@@ -31,25 +37,6 @@ from .rule_task_model import (
 )
 from .sip_line_model import AiCallSipLineModel
 from .sip_line_schema import SipLineSnapshot
-
-TERMINAL_TARGET_STATUSES = {"COMPLETED", "CANCELLED"}
-BUSY_END_REASONS = {
-    "busy",
-    "busy_here",
-    "callee_busy",
-    "sip_busy",
-    "user_busy",
-    "sip_486",
-}
-NO_ANSWER_END_REASONS = {
-    "connect_timeout",
-    "no_answer",
-    "ringing_timeout",
-    "sip_connect_timeout",
-    "user_unavailable",
-    "sip_408",
-    "sip_480",
-}
 
 
 def _utc_now() -> datetime:
@@ -1173,66 +1160,7 @@ class OutboundTaskExecutor:
         task: AiCallOutboundTaskModel,
         now: datetime,
     ) -> None:
-        status_rows = (
-            await db.execute(
-                select(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                    func.count(AiCallOutboundTargetModel.id),
-                )
-                .where(
-                    AiCallOutboundTargetModel.tenant_id == task.tenant_id,
-                    AiCallOutboundTargetModel.task_id == task.id,
-                )
-                .group_by(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                )
-            )
-        ).all()
-        task.completed_targets = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status in TERMINAL_TARGET_STATUSES
-        )
-        task.connected_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result == "connected"
-        )
-        task.failed_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result != "connected"
-        )
-        active_count = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status not in TERMINAL_TARGET_STATUSES
-        )
-        dialing_count = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status in {"DIALING", "IN_CALL"}
-        )
-        if task.status == "PAUSING" and dialing_count == 0:
-            if active_count == 0:
-                task.status = "COMPLETED"
-                task.ended_at = now
-            else:
-                task.status = "PAUSED"
-        elif task.status == "STOPPING" and dialing_count == 0:
-            task.status = "STOPPED"
-            task.ended_at = now
-        elif active_count == 0 and task.status not in {
-            "PAUSED",
-            "STOPPED",
-            "CANCELLED",
-            "FAILED",
-        }:
-            task.status = "COMPLETED"
-            task.ended_at = now
-        task.updated_at = now
+        await refresh_task_counters(db, task, now)
 
     @staticmethod
     def _retry_interval(
@@ -1240,22 +1168,7 @@ class OutboundTaskExecutor:
         attempt_no: int,
         call_result: str,
     ) -> int | None:
-        try:
-            snapshot = json.loads(task.config_snapshot_json)
-            rule = snapshot["rule"]
-            retry_count = int(rule.get("retryCount", 0))
-            retryable_results = set(rule.get("retryableResults", []))
-            intervals = list(rule.get("retryIntervalsMinutes", []))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if (
-            call_result not in retryable_results
-            or attempt_no > retry_count
-            or attempt_no > len(intervals)
-        ):
-            return None
-        interval = intervals[attempt_no - 1]
-        return interval if isinstance(interval, int) and interval > 0 else None
+        return outbound_retry_interval(task, attempt_no, call_result)
 
     def _within_call_window(
         self,

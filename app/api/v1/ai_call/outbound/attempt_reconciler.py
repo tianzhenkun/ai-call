@@ -19,6 +19,12 @@ from app.services.ai_call.runtime_control.models import (
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
 
+from .attempt_projection import (
+    apply_terminal_projection,
+    refresh_task_counters,
+    terminal_attempt_decision,
+)
+from .media_evidence import has_persisted_media_evidence
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -76,7 +82,9 @@ class OutboundAttemptReconciler:
         attempt = await self._session.scalar(
             select(AiCallOutboundAttemptModel)
             .where(
-                AiCallOutboundAttemptModel.status.in_({"QUEUED", "STARTING"}),
+                AiCallOutboundAttemptModel.status.in_(
+                    {"QUEUED", "STARTING", "DIALING", "IN_CALL"}
+                ),
                 or_(
                     AiCallOutboundAttemptModel.reconcile_after.is_(None),
                     AiCallOutboundAttemptModel.reconcile_after <= now,
@@ -203,7 +211,30 @@ class OutboundAttemptReconciler:
 
         previous_status = attempt.status
         graph_valid = _projection_graph_matches(task, target, attempt)
-        if graph_valid:
+        terminal_projected = False
+        if graph_valid and _terminal_facts_complete(record=record, command=command):
+            media_connected = bool(
+                record is not None
+                and record.answered_at is not None
+                and await has_persisted_media_evidence(self._session, claim.call_id)
+            )
+            decision = terminal_attempt_decision(
+                record,
+                media_connected=media_connected,
+            )
+            if decision is not None:
+                apply_terminal_projection(
+                    task=task,
+                    target=target,
+                    attempt=attempt,
+                    record=record,
+                    decision=decision,
+                    now=now,
+                )
+                await self._session.flush()
+                await refresh_task_counters(self._session, task, now)
+                terminal_projected = True
+        if graph_valid and not terminal_projected:
             if _dialing_facts_complete(
                 attempt=attempt,
                 record=record,
@@ -224,7 +255,9 @@ class OutboundAttemptReconciler:
         attempt.reconcile_token = None
         attempt.reconcile_expires_at = None
         attempt.reconcile_after = (
-            None if attempt.status == "DIALING" else now + self._retry_after
+            None
+            if terminal_projected
+            else now + self._retry_after
         )
         attempt.updated_at = now
         await self._session.flush()
@@ -312,7 +345,26 @@ def _claim_is_current(
         and attempt.reconcile_expires_at == claim.reconcile_expires_at
         and attempt.reconcile_expires_at is not None
         and attempt.reconcile_expires_at > now
-        and attempt.status in {"QUEUED", "STARTING"}
+        and attempt.status in {"QUEUED", "STARTING", "DIALING", "IN_CALL"}
+    )
+
+
+def _terminal_facts_complete(
+    *,
+    record: AiCallRecordModel | None,
+    command: AiCallRuntimeCommandModel | None,
+) -> bool:
+    return (
+        record is not None
+        and record.status in {"completed", "failed"}
+        and record.ended_at is not None
+        and command is not None
+        and command.status
+        in {
+            CommandStatus.SUCCEEDED,
+            CommandStatus.DEAD,
+            CommandStatus.SUPERSEDED,
+        }
     )
 
 
