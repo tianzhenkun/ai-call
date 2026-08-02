@@ -48,6 +48,11 @@ from app.services.ai_call.runtime_control.handoff_repository import (
     HandoffTerminalBarrierError,
     RuntimeHandoffRepository,
 )
+from app.services.ai_call.runtime_control.health import (
+    RuntimeTaskState,
+    RuntimeWorkerHealth,
+    default_runtime_worker_health,
+)
 from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 from app.services.ai_call.runtime_control.webhook_service import (
     RuntimeWebhookIngressService,
@@ -118,8 +123,31 @@ def get_runtime_webhook_ingress_service(
     return RuntimeWebhookIngressService(db, settings)
 
 
-@AiCallRouter.get("/health", summary="智能外呼模块健康检查")
-async def ai_call_health() -> dict[str, str]:
+def get_runtime_worker_health() -> RuntimeWorkerHealth:
+    return default_runtime_worker_health
+
+
+@AiCallRouter.get(
+    "/health",
+    summary="智能外呼模块健康检查",
+    response_model=None,
+)
+async def ai_call_health(
+    runtime_health: Annotated[
+        RuntimeWorkerHealth,
+        Depends(get_runtime_worker_health),
+    ],
+) -> dict[str, str] | JSONResponse:
+    snapshot = runtime_health.snapshot()
+    if snapshot.state == RuntimeTaskState.FAILED:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "error",
+                "runtime": "failed",
+                "errorCode": snapshot.error_code or "runtime_task_failed",
+            },
+        )
     return {"status": "ok"}
 
 
