@@ -573,23 +573,34 @@ async def test_handoff_context_returns_all_final_ai_customer_dialogue_in_order(
                     id=709,
                     call_id="call-handoff-1",
                     segment_no=9,
-                    speaker_type="human_agent",
+                    speaker_type="ai",
                     source="test",
-                    source_segment_id="human-9",
-                    segment_text="人工坐席内容不属于转接前上下文",
-                    segment_status="final",
+                    source_segment_id="interrupted-9",
+                    segment_text="被客户打断但已经产生的 AI 内容",
+                    segment_status="interrupted",
                     started_at=now + timedelta(seconds=9),
                 ),
                 AiCallDialogueSegmentModel(
                     id=710,
                     call_id="call-handoff-1",
                     segment_no=10,
+                    speaker_type="human_agent",
+                    source="test",
+                    source_segment_id="human-10",
+                    segment_text="人工坐席内容不属于转接前上下文",
+                    segment_status="final",
+                    started_at=now + timedelta(seconds=10),
+                ),
+                AiCallDialogueSegmentModel(
+                    id=711,
+                    call_id="call-handoff-1",
+                    segment_no=11,
                     speaker_type="ai",
                     source="test",
-                    source_segment_id="draft-10",
+                    source_segment_id="draft-11",
                     segment_text="未完成内容",
                     segment_status="draft",
-                    started_at=now + timedelta(seconds=10),
+                    started_at=now + timedelta(seconds=11),
                 ),
             ]
         )
@@ -602,10 +613,12 @@ async def test_handoff_context_returns_all_final_ai_customer_dialogue_in_order(
         )
 
     assert [turn["text"] for turn in payload["dialogue"]] == [
-        text for _speaker, text in valid_dialogue
+        *[text for _speaker, text in valid_dialogue],
+        "被客户打断但已经产生的 AI 内容",
     ]
     assert [turn["speaker_type"] for turn in payload["dialogue"]] == [
-        speaker for speaker, _text in valid_dialogue
+        *[speaker for speaker, _text in valid_dialogue],
+        "ai",
     ]
     assert "pending_items" not in payload
     assert "recent_dialogue" not in payload

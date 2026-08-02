@@ -64,6 +64,7 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
             "callResult": "no_answer",
             "customerIntent": "positive",
             "followUpStatus": "suggested",
+            "formalOutboundOnly": "true",
         },
     )
 
@@ -82,6 +83,7 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
         "business_id": None,
         "status": None,
         "entry_type": None,
+        "formal_outbound_only": True,
         "started_at_begin": None,
         "started_at_end": None,
         "page_num": 1,
@@ -140,7 +142,7 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
     async with session_maker() as session:
         task = AiCallOutboundTaskModel(
             id=101,
-            tenant_id="tenant-a",
+            tenant_id="000000",
             validation_id=1,
             idempotency_key="test-task-101",
             request_fingerprint="test-fingerprint",
@@ -172,7 +174,7 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
         )
         target = AiCallOutboundTargetModel(
             id=201,
-            tenant_id="tenant-a",
+            tenant_id="000000",
             task_id=101,
             validation_id=1,
             source_validation_row_id=1,
@@ -182,6 +184,21 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
             status="RETRY_WAIT",
             attempt_count=1,
             latest_result="no_answer",
+            created_at=now,
+            updated_at=now,
+        )
+        web_target = AiCallOutboundTargetModel(
+            id=202,
+            tenant_id="000000",
+            task_id=101,
+            validation_id=2,
+            source_validation_row_id=2,
+            source_row_number=3,
+            phone_number="13800138012",
+            customer_name="客户乙",
+            status="COMPLETED",
+            attempt_count=1,
+            latest_result="connected",
             created_at=now,
             updated_at=now,
         )
@@ -211,13 +228,28 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
             status="completed",
             started_at=now,
         )
+        manual_sip_record = AiCallRecordModel(
+            id=303,
+            call_id="call-manual-sip-1",
+            business_type=None,
+            business_id=None,
+            scene_code="intro_geo",
+            prompt_source_key=None,
+            entry_type="sip_outbound",
+            room_name="room-manual-sip-1",
+            participant_identity="sip-manual",
+            status="completed",
+            started_at=now,
+        )
         attempt_table = MappedBase.metadata.tables["ai_call_outbound_attempt"]
-        session.add_all([task, target, record, unrelated])
+        session.add_all(
+            [task, target, web_target, record, unrelated, manual_sip_record]
+        )
         await session.flush()
         await session.execute(
             attempt_table.insert().values(
                 id=401,
-                tenant_id="tenant-a",
+                tenant_id="000000",
                 task_id=101,
                 target_id=201,
                 attempt_no=1,
@@ -231,11 +263,28 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
                 updated_at=now,
             )
         )
+        await session.execute(
+            attempt_table.insert().values(
+                id=402,
+                tenant_id="000000",
+                task_id=101,
+                target_id=202,
+                attempt_no=1,
+                call_id="call-web-1",
+                status="COMPLETED",
+                call_result="connected",
+                error_message=None,
+                started_at=now,
+                ended_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
         await session.commit()
 
         service = AiCallRecordService(AiCallRecordRepository(session))
         rows, total = await service.list_records(
-            tenant_id="tenant-a",
+            tenant_id="000000",
             task_id=101,
             target_id=201,
             phone_number="13800138011",
@@ -254,8 +303,15 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
         assert payload["attemptNo"] == 1
         assert payload["callResult"] == "no_answer"
 
+        formal_rows, formal_total = await service.list_records(
+            tenant_id="000000",
+            formal_outbound_only=True,
+        )
+        assert formal_total == 1
+        assert [row.call_id for row in formal_rows] == ["call-outbound-1"]
+
         empty_rows, empty_total = await service.list_records(
-            tenant_id="tenant-a",
+            tenant_id="000000",
             task_id=999,
         )
         assert empty_rows == []

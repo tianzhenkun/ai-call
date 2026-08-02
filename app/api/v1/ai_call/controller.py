@@ -480,6 +480,10 @@ async def list_records_controller(
     business_id: Annotated[str | None, Query(alias="businessId")] = None,
     status: str | None = None,
     entry_type: Annotated[str | None, Query(alias="entryType")] = None,
+    formal_outbound_only: Annotated[
+        bool,
+        Query(alias="formalOutboundOnly"),
+    ] = False,
     started_at_begin: Annotated[datetime | None, Query(alias="startedAtBegin")] = None,
     started_at_end: Annotated[datetime | None, Query(alias="startedAtEnd")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
@@ -500,6 +504,7 @@ async def list_records_controller(
         business_id=business_id,
         status=status,
         entry_type=entry_type,
+        formal_outbound_only=formal_outbound_only,
         started_at_begin=started_at_begin,
         started_at_end=started_at_end,
         page_num=page_num,

@@ -146,7 +146,9 @@ class AiCallRecordRepository:
             select(AiCallDialogueSegmentModel)
             .where(
                 AiCallDialogueSegmentModel.call_id == call_id,
-                AiCallDialogueSegmentModel.segment_status == "final",
+                AiCallDialogueSegmentModel.segment_status.in_(
+                    {"final", "interrupted"}
+                ),
                 AiCallDialogueSegmentModel.speaker_type.in_({"ai", "customer"}),
                 func.length(func.trim(AiCallDialogueSegmentModel.segment_text)) > 0,
             )
@@ -251,6 +253,7 @@ class AiCallRecordRepository:
         business_id: str | None = None,
         status: str | None = None,
         entry_type: str | None = None,
+        formal_outbound_only: bool = False,
         started_at_begin: datetime | None = None,
         started_at_end: datetime | None = None,
         page_num: int = 1,
@@ -271,6 +274,7 @@ class AiCallRecordRepository:
             business_id=business_id,
             status=status,
             entry_type=entry_type,
+            formal_outbound_only=formal_outbound_only,
             started_at_begin=started_at_begin,
             started_at_end=started_at_end,
         )
@@ -289,6 +293,7 @@ class AiCallRecordRepository:
             business_id=business_id,
             status=status,
             entry_type=entry_type,
+            formal_outbound_only=formal_outbound_only,
             started_at_begin=started_at_begin,
             started_at_end=started_at_end,
         )
@@ -1650,6 +1655,7 @@ class AiCallRecordRepository:
         follow_up_status = (
             str(filters.get("follow_up_status") or "").strip() or None
         )
+        formal_outbound_only = bool(filters.get("formal_outbound_only"))
         has_outbound_filters = any(
             (
                 filters.get("task_id"),
@@ -1657,6 +1663,7 @@ class AiCallRecordRepository:
                 phone_number,
                 customer_name,
                 call_result,
+                formal_outbound_only,
             )
         )
         if tenant_id or has_outbound_filters:
@@ -1693,7 +1700,7 @@ class AiCallRecordRepository:
                     AiCallOutboundTaskModel.id.is_not(None),
                 )
             ]
-            if tenant_id == DEFAULT_TENANT_ID:
+            if tenant_id == DEFAULT_TENANT_ID and not formal_outbound_only:
                 # 历史/Web 记录没有租户字段，只归属框架默认租户，禁止向其他租户开放。
                 tenant_conditions.append(AiCallOutboundAttemptModel.id.is_(None))
             stmt = stmt.where(or_(*tenant_conditions))
@@ -1705,6 +1712,8 @@ class AiCallRecordRepository:
                     AiCallOutboundTaskModel.id.is_not(None),
                 )
             )
+        if formal_outbound_only:
+            stmt = stmt.where(AiCallRecordModel.entry_type == "sip_outbound")
         if filters.get("call_id"):
             stmt = stmt.where(AiCallRecordModel.call_id == filters["call_id"])
         if filters.get("task_id"):
