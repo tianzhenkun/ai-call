@@ -4186,9 +4186,9 @@ async def test_handoff_fail_plays_unavailable_prompt_before_auto_end(
         assert failed["status"] == "failed"
 
         await wait_until(
-            lambda: (
-                service.orchestrator.registry.get(result.call_id).status
-                == CallSessionStatus.COMPLETED
+            lambda: any(
+                event.type == "handoff_auto_ended"
+                for event in service.orchestrator.event_store.list(result.call_id)
             ),
             attempts=40,
             delay_seconds=0.05,
@@ -4254,9 +4254,9 @@ async def test_handoff_cancel_plays_unavailable_prompt_before_auto_end(
         assert canceled["status"] == "canceled"
 
         await wait_until(
-            lambda: (
-                service.orchestrator.registry.get(result.call_id).status
-                == CallSessionStatus.COMPLETED
+            lambda: any(
+                event.type == "handoff_auto_ended"
+                for event in service.orchestrator.event_store.list(result.call_id)
             ),
             attempts=40,
             delay_seconds=0.05,
