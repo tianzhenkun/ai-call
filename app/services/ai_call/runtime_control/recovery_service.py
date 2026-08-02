@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
+from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
 from app.services.ai_call.runtime_control.owner_repository import (
     RecoveryOwnerRepository,
 )
@@ -16,6 +17,7 @@ from app.services.ai_call.runtime_control.startup_recovery import (
     StartupReconcileService,
 )
 from app.services.ai_call.runtime_control.timing import read_database_time
+from app.services.ai_call.runtime_control.types import CommandStatus
 
 
 class RecoveryControlService:
@@ -78,8 +80,62 @@ class RecoveryControlService:
                     .limit(self._batch_size)
                 )
             ).all()
+            start_candidates = (
+                await session.execute(
+                    select(
+                        AiCallRecordModel.tenant_id,
+                        AiCallRecordModel.call_id,
+                    )
+                    .join(
+                        AiCallRuntimeCommandModel,
+                        (
+                            AiCallRuntimeCommandModel.tenant_id
+                            == AiCallRecordModel.tenant_id
+                        )
+                        & (
+                            AiCallRuntimeCommandModel.call_id
+                            == AiCallRecordModel.call_id
+                        )
+                        & (
+                            AiCallRuntimeCommandModel.command_type
+                            == "START_CALL"
+                        ),
+                    )
+                    .where(
+                        AiCallRecordModel.runtime_control_mode
+                        == "owner_command_v1",
+                        AiCallRecordModel.status == "preparing",
+                        AiCallRecordModel.terminal_requested_at.is_(None),
+                        AiCallRecordModel.runtime_owner_id.is_not(None),
+                        AiCallRecordModel.runtime_lease_expires_at <= now,
+                        AiCallRecordModel.runtime_capacity_class == "active",
+                        or_(
+                            AiCallRuntimeCommandModel.status
+                            == CommandStatus.PENDING,
+                            and_(
+                                AiCallRuntimeCommandModel.status
+                                == CommandStatus.RETRY_WAIT,
+                                AiCallRuntimeCommandModel.next_retry_at.is_not(
+                                    None
+                                ),
+                                AiCallRuntimeCommandModel.next_retry_at <= now,
+                            ),
+                        ),
+                    )
+                    .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
+                    .limit(self._batch_size)
+                )
+            ).all()
 
         assigned = 0
+        for tenant_id, call_id in start_candidates:
+            async with self._session_factory.begin() as session:
+                lease = await RecoveryOwnerRepository(session).assign_start_owner(
+                    str(tenant_id),
+                    call_id,
+                )
+                if lease is not None:
+                    assigned += 1
         for tenant_id, call_id in candidates:
             async with self._session_factory.begin() as session:
                 lease = await RecoveryOwnerRepository(session).assign_cleanup_owner(

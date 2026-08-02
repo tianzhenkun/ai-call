@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
@@ -543,6 +543,246 @@ class RecoveryOwnerRepository:
         self._lease_ttl = lease_ttl
         self._database_clock = database_clock
 
+    async def assign_start_owner(
+        self,
+        tenant_id: str,
+        call_id: str,
+    ) -> OwnerLease | None:
+        """Reassign an expired START_CALL that has not registered any effect."""
+        now = await self._database_clock(self._session)
+        candidate_owner_id = await self._session.scalar(
+            select(AiCallRecordModel.runtime_owner_id).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            )
+        )
+        if candidate_owner_id is None:
+            return None
+        candidate_id = await self._session.scalar(
+            select(AiCallRuntimeWorkerModel.worker_id)
+            .where(
+                AiCallRuntimeWorkerModel.status == "READY",
+                AiCallRuntimeWorkerModel.lease_expires_at > now,
+                or_(
+                    AiCallRuntimeWorkerModel.active_call_count
+                    < AiCallRuntimeWorkerModel.capacity,
+                    and_(
+                        AiCallRuntimeWorkerModel.worker_id
+                        == candidate_owner_id,
+                        AiCallRuntimeWorkerModel.active_call_count > 0,
+                        AiCallRuntimeWorkerModel.active_call_count - 1
+                        < AiCallRuntimeWorkerModel.capacity,
+                    ),
+                ),
+            )
+            .order_by(
+                AiCallRuntimeWorkerModel.active_call_count,
+                AiCallRuntimeWorkerModel.worker_id,
+            )
+            .limit(1)
+        )
+        if candidate_id is None:
+            return None
+
+        start_command = await self._session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        if start_command is None:
+            return None
+        candidate_payload_json = start_command.payload_json
+        outbound_refs = parse_outbound_start_refs(candidate_payload_json)
+        dispatcher = DispatcherOwnerRepository(self._session)
+        outbound_chain = None
+        if outbound_refs is not None:
+            outbound_chain = await dispatcher._lock_outbound_chain(
+                tenant_id,
+                outbound_refs,
+            )
+            if outbound_chain is None:
+                return None
+
+        record = await self._session.scalar(
+            select(AiCallRecordModel)
+            .where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            )
+            .with_for_update()
+        )
+        if record is None:
+            return None
+
+        line_id = (
+            outbound_refs.line_id
+            if outbound_refs is not None
+            else _start_command_line_id(candidate_payload_json)
+        )
+        if line_id is _INVALID_LINE_ID:
+            return None
+        line = None
+        if line_id is not None:
+            line = await dispatcher._lock_sip_line(tenant_id, line_id)
+            if line is None or line.deleted or not line.enabled:
+                return None
+
+        worker_ids = sorted({record.runtime_owner_id, candidate_id} - {None})
+        locked_workers = {
+            worker.worker_id: worker
+            for worker in (
+                await self._session.scalars(
+                    select(AiCallRuntimeWorkerModel)
+                    .where(AiCallRuntimeWorkerModel.worker_id.in_(worker_ids))
+                    .order_by(AiCallRuntimeWorkerModel.worker_id)
+                    .with_for_update()
+                )
+            ).all()
+        }
+        old_worker = locked_workers.get(record.runtime_owner_id)
+        target_worker = locked_workers.get(candidate_id)
+        if old_worker is None or target_worker is None:
+            return None
+
+        start_command = await self._session.scalar(
+            select(AiCallRuntimeCommandModel)
+            .where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        reservations = list(
+            (
+                await self._session.scalars(
+                    select(AiCallSipLineReservationModel)
+                    .where(
+                        AiCallSipLineReservationModel.tenant_id == tenant_id,
+                        AiCallSipLineReservationModel.call_id == call_id,
+                        AiCallSipLineReservationModel.status != "RELEASED",
+                    )
+                    .order_by(AiCallSipLineReservationModel.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        effects = list(
+            (
+                await self._session.scalars(
+                    select(AiCallRuntimeEffectModel)
+                    .where(
+                        AiCallRuntimeEffectModel.tenant_id == tenant_id,
+                        AiCallRuntimeEffectModel.call_id == call_id,
+                    )
+                    .order_by(AiCallRuntimeEffectModel.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+
+        now = await self._database_clock(self._session)
+        if (
+            record.runtime_control_mode != "owner_command_v1"
+            or record.status != "preparing"
+            or record.runtime_owner_id is None
+            or record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at > now
+            or record.runtime_capacity_class != "active"
+            or record.terminal_requested_at is not None
+            or start_command is None
+            or start_command.payload_json != candidate_payload_json
+            or start_command.status not in {
+                CommandStatus.PENDING,
+                CommandStatus.RETRY_WAIT,
+            }
+            or start_command.target_owner_id != record.runtime_owner_id
+            or start_command.expected_fencing_token
+            != record.runtime_fencing_token
+            or start_command.dispatch_token is not None
+            or start_command.dispatch_expires_at is not None
+            or start_command.processing_owner_id is not None
+            or start_command.processing_fencing_token is not None
+            or start_command.processing_token is not None
+            or start_command.processing_expires_at is not None
+            or effects
+        ):
+            return None
+        if (
+            start_command.status == CommandStatus.RETRY_WAIT
+            and (
+                start_command.next_retry_at is None
+                or start_command.next_retry_at > now
+            )
+        ):
+            return None
+        if record.entry_type == "outbound":
+            if (
+                outbound_refs is None
+                or outbound_chain is None
+                or not _outbound_chain_matches(
+                    outbound_chain,
+                    record=record,
+                    refs=outbound_refs,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    expected_attempt_status="STARTING",
+                )
+            ):
+                return None
+        elif outbound_refs is not None:
+            return None
+        if line is None:
+            if reservations:
+                return None
+        elif (
+            len(reservations) != 1
+            or reservations[0].line_id != line.id
+            or reservations[0].status != "RESERVED"
+            or reservations[0].fencing_token != record.runtime_fencing_token
+            or (
+                outbound_refs is not None
+                and reservations[0].attempt_id != outbound_refs.attempt_id
+            )
+        ):
+            return None
+        released_target_slots = (
+            1
+            if target_worker.worker_id == record.runtime_owner_id
+            and target_worker.active_call_count > 0
+            else 0
+        )
+        if (
+            target_worker.status != "READY"
+            or target_worker.lease_expires_at <= now
+            or target_worker.active_call_count - released_target_slots
+            >= target_worker.capacity
+        ):
+            return None
+
+        _release_worker_capacity(old_worker, record.runtime_capacity_class)
+        expires_at = now + self._lease_ttl
+        record.runtime_owner_id = target_worker.worker_id
+        record.runtime_fencing_token += 1
+        record.runtime_lease_expires_at = expires_at
+        record.runtime_heartbeat_at = now
+        record.runtime_capacity_class = "active"
+        target_worker.active_call_count += 1
+        target_worker.updated_at = now
+        old_worker.updated_at = now
+        start_command.target_owner_id = target_worker.worker_id
+        start_command.expected_fencing_token = record.runtime_fencing_token
+        start_command.updated_at = now
+        for reservation in reservations:
+            reservation.fencing_token = record.runtime_fencing_token
+            reservation.updated_at = now
+        await self._session.flush()
+        await publish_control_wakeup(self._session)
+        return _owner_lease(record)
+
     async def assign_cleanup_owner(
         self,
         tenant_id: str,
@@ -886,6 +1126,7 @@ def _outbound_chain_matches(
     refs: OutboundStartRefs,
     tenant_id: str,
     call_id: str,
+    expected_attempt_status: str = "QUEUED",
 ) -> bool:
     task, target, attempt = chain
     return (
@@ -902,7 +1143,7 @@ def _outbound_chain_matches(
         and attempt.target_id == refs.target_id
         and attempt.id == refs.attempt_id
         and attempt.call_id == call_id
-        and attempt.status == "QUEUED"
+        and attempt.status == expected_attempt_status
         and attempt.line_id == refs.line_id
         and attempt.attempt_no == target.attempt_count
         and record.entry_type == "outbound"

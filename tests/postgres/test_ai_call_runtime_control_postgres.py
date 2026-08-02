@@ -2830,6 +2830,185 @@ async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> 
         await engine.dispose()
 
 
+async def test_future_start_retry_does_not_starve_due_recovery_batch() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            future_start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:future-retry-head",
+                    payload={"business_id": "future-retry-head"},
+                )
+            )
+            due_start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:due-recovery-tail",
+                    payload={"business_id": "due-recovery-tail"},
+                )
+            )
+            old_future_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="a-runtime-future-retry",
+                    startup_id=UUID("abababab-abab-4aba-8aba-abababababab"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            old_due_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="b-runtime-due-recovery",
+                    startup_id=UUID("bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            recovery_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="z-runtime-due-recovery",
+                    startup_id=UUID("cdcdcdcd-cdcd-4cdc-8dcd-cdcdcdcdcdcd"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            future_lease = await DispatcherOwnerRepository(
+                session
+            ).assign_initial_owner("tenant-a", future_start.call_id)
+            due_lease = await DispatcherOwnerRepository(
+                session
+            ).assign_initial_owner("tenant-a", due_start.call_id)
+            assert future_lease is not None
+            assert future_lease.owner_id == old_future_worker.worker_id
+            assert due_lease is not None
+            assert due_lease.owner_id == old_due_worker.worker_id
+            await session.execute(
+                text(
+                    "update ai_call_runtime_command set status='RETRY_WAIT', "
+                    "next_retry_at=clock_timestamp() + interval '1 hour' "
+                    "where id=:command_id"
+                ).bindparams(command_id=future_start.command_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' "
+                    "where call_id in (:future_call_id, :due_call_id)"
+                ).bindparams(
+                    future_call_id=future_start.call_id,
+                    due_call_id=due_start.call_id,
+                )
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' "
+                    "where worker_id in (:future_worker_id, :due_worker_id)"
+                ).bindparams(
+                    future_worker_id=old_future_worker.worker_id,
+                    due_worker_id=old_due_worker.worker_id,
+                )
+            )
+
+        assert await RecoveryControlService(factory, batch_size=1).run_once() == 1
+
+        async with factory() as session:
+            owners = {
+                row.call_id: row.runtime_owner_id
+                for row in (
+                    await session.execute(
+                        select(
+                            AiCallRecordModel.call_id,
+                            AiCallRecordModel.runtime_owner_id,
+                        ).where(
+                            AiCallRecordModel.call_id.in_(
+                                {future_start.call_id, due_start.call_id}
+                            )
+                        )
+                    )
+                ).all()
+            }
+            assert owners == {
+                future_start.call_id: old_future_worker.worker_id,
+                due_start.call_id: recovery_worker.worker_id,
+            }
+    finally:
+        await engine.dispose()
+
+
+async def test_recovery_can_refence_start_on_same_full_worker() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            start = await RuntimeCommandRepository(session).create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:same-worker-refence",
+                    payload={"business_id": "same-worker-refence"},
+                )
+            )
+            worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-same-worker-refence",
+                    startup_id=UUID("dededede-dede-4ded-8ded-dededededede"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            old_lease = await DispatcherOwnerRepository(
+                session
+            ).assign_initial_owner("tenant-a", start.call_id)
+            assert old_lease is not None
+            assert old_lease.owner_id == worker.worker_id
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+
+        assert await RecoveryControlService(factory).run_once() == 1
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(record) == (worker.worker_id, 2, "active")
+            command = (
+                await session.execute(
+                    text(
+                        "select status, target_owner_id, expected_fencing_token "
+                        "from ai_call_runtime_command where id=:command_id"
+                    ).bindparams(command_id=start.command_id)
+                )
+            ).one()
+            assert tuple(command) == ("PENDING", worker.worker_id, 2)
+            assert (
+                await session.scalar(
+                    select(AiCallRuntimeWorkerModel.active_call_count).where(
+                        AiCallRuntimeWorkerModel.worker_id == worker.worker_id
+                    )
+                )
+                == 1
+            )
+    finally:
+        await engine.dispose()
+
+
 async def test_cleanup_assignment_rechecks_worker_lease_after_lock_wait() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
@@ -6234,6 +6413,187 @@ class _RejectingOwnerRuntimeDialer:
         del args, kwargs
         self.called = True
         raise AssertionError("owner runtime outbound must not call legacy dial()")
+
+
+async def test_recovery_reassigns_effect_free_start_from_expired_owner() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        line_id = generate_snowflake_id()
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(session, line_id=line_id, max_concurrency=1)
+            task_id, _target_ids = await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_id,
+                now=now,
+            )
+            old_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="a-runtime-expired-start",
+                    startup_id=UUID("11111111-aaaa-4111-8111-111111111111"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            new_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="z-runtime-recovery-start",
+                    startup_id=UUID("22222222-bbbb-4222-8222-222222222222"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        assert (
+            await OutboundTaskExecutor(
+                factory,
+                _RejectingOwnerRuntimeDialer(),
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(),
+            ).run_once()
+            == 1
+        )
+        assert await DispatcherControlService(factory).run_once() == 1
+
+        async with factory.begin() as session:
+            attempt = (
+                await session.execute(
+                    select(
+                        AiCallOutboundAttemptModel.id,
+                        AiCallOutboundAttemptModel.call_id,
+                    ).where(
+                        AiCallOutboundAttemptModel.task_id == task_id
+                    )
+                )
+            ).one()
+            call_id = attempt.call_id
+            reservation_before = (
+                await session.execute(
+                    select(
+                        AiCallSipLineReservationModel.id,
+                        AiCallSipLineReservationModel.reservation_token,
+                        AiCallSipLineReservationModel.attempt_id,
+                    ).where(
+                        AiCallSipLineReservationModel.call_id == call_id
+                    )
+                )
+            ).one()
+            assert reservation_before.attempt_id == attempt.id
+            assert (
+                await session.scalar(
+                    select(AiCallRecordModel.runtime_owner_id).where(
+                        AiCallRecordModel.call_id == call_id
+                    )
+                )
+                == old_worker.worker_id
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set runtime_lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where call_id=:call_id"
+                ).bindparams(call_id=call_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where worker_id=:worker_id"
+                ).bindparams(worker_id=old_worker.worker_id)
+            )
+
+        assert await RecoveryControlService(factory).run_once() == 1
+
+        async with factory() as session:
+            record = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_fencing_token, "
+                        "runtime_capacity_class, terminal_requested_at "
+                        "from ai_call_record "
+                        "where call_id=:call_id"
+                    ).bindparams(call_id=call_id)
+                )
+            ).one()
+            assert tuple(record) == (new_worker.worker_id, 2, "active", None)
+            command = (
+                await session.execute(
+                    text(
+                        "select status, target_owner_id, expected_fencing_token "
+                        "from ai_call_runtime_command where call_id=:call_id "
+                        "and command_type='START_CALL'"
+                    ).bindparams(call_id=call_id)
+                )
+            ).one()
+            assert tuple(command) == ("PENDING", new_worker.worker_id, 2)
+            reservation = (
+                await session.execute(
+                    select(
+                        AiCallSipLineReservationModel.id,
+                        AiCallSipLineReservationModel.reservation_token,
+                        AiCallSipLineReservationModel.attempt_id,
+                        AiCallSipLineReservationModel.status,
+                        AiCallSipLineReservationModel.fencing_token,
+                    ).where(
+                        AiCallSipLineReservationModel.call_id == call_id
+                    )
+                )
+            ).one()
+            assert tuple(reservation) == (
+                reservation_before.id,
+                reservation_before.reservation_token,
+                reservation_before.attempt_id,
+                "RESERVED",
+                2,
+            )
+            worker_counts = {
+                row.worker_id: (row.active_call_count, row.active_cleanup_count)
+                for row in (
+                    await session.execute(
+                        text(
+                            "select worker_id, active_call_count, active_cleanup_count "
+                            "from ai_call_runtime_worker "
+                            "where worker_id in (:old_worker_id, :new_worker_id)"
+                        ).bindparams(
+                            old_worker_id=old_worker.worker_id,
+                            new_worker_id=new_worker.worker_id,
+                        )
+                    )
+                ).all()
+            }
+            assert worker_counts == {
+                old_worker.worker_id: (0, 0),
+                new_worker.worker_id: (1, 0),
+            }
+            assert (
+                await session.scalar(
+                    select(AiCallOutboundAttemptModel.status).where(
+                        AiCallOutboundAttemptModel.call_id == call_id
+                    )
+                )
+                == "STARTING"
+            )
+            assert (
+                await session.scalar(
+                    select(func.count(AiCallRuntimeEffectModel.id)).where(
+                        AiCallRuntimeEffectModel.call_id == call_id
+                    )
+                )
+                == 0
+            )
+            assert (
+                await session.scalar(
+                    select(func.count(AiCallRuntimeCommandModel.id)).where(
+                        AiCallRuntimeCommandModel.call_id == call_id,
+                        AiCallRuntimeCommandModel.command_type == "END_CALL",
+                    )
+                )
+                == 0
+            )
+    finally:
+        await engine.dispose()
 
 
 async def test_outbound_backpressure_serializes_last_tenant_line_slot() -> None:
