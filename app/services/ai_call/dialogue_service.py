@@ -127,6 +127,39 @@ class AiCallDialogueRuntimeStore:
             event_store.remove_listener(self.handle_event)
         self._attached_stores.clear()
 
+    def initialize_call(self, call_id: str, next_segment_no: int) -> None:
+        if next_segment_no <= 0:
+            raise ValueError("next dialogue segment number must be positive")
+        self.discard_call(call_id)
+        self._next_no_by_call[call_id] = next_segment_no
+
+    def finalize_call(self, call_id: str, ended_at: datetime) -> None:
+        self._finalize_all_pending(call_id, ended_at)
+
+    def discard_call(self, call_id: str) -> None:
+        self._segments_by_call.pop(call_id, None)
+        self._next_no_by_call.pop(call_id, None)
+        self._interrupted_ai_source_ids_by_call.pop(call_id, None)
+        self._interrupted_ai_response_ids_by_call.pop(call_id, None)
+        self._unheard_ai_source_ids_by_call.pop(call_id, None)
+        self._unheard_ai_response_ids_by_call.pop(call_id, None)
+        self._ai_source_ids_by_response_id.pop(call_id, None)
+        self._segments_by_source_key = {
+            key: value
+            for key, value in self._segments_by_source_key.items()
+            if key[0] != call_id
+        }
+        self._active_key_by_call_speaker = {
+            key: value
+            for key, value in self._active_key_by_call_speaker.items()
+            if key[0] != call_id
+        }
+        self._merged_key_targets = {
+            key: value
+            for key, value in self._merged_key_targets.items()
+            if key[0] != call_id and value[0] != call_id
+        }
+
     def add_persist_listener(self, listener: Callable[[DialogueSegmentSnapshot], None]) -> None:
         if listener not in self._persist_listeners:
             self._persist_listeners.append(listener)
