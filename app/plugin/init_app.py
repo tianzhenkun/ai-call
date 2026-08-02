@@ -542,13 +542,24 @@ async def _start_ai_call_outbound_task_worker():
         == "owner_command_v1"
     )
     owner_runtime_start = None
+    owner_executor_options = {}
     if owner_mode:
         from app.api.v1.ai_call.outbound.owner_runtime_start import (
             OwnerRuntimeOutboundStart,
         )
+        from app.api.v1.ai_call.outbound.queue_control import OutboundQueueLimits
 
         dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
-        owner_runtime_start = OwnerRuntimeOutboundStart()
+        owner_runtime_start = OwnerRuntimeOutboundStart(
+            allocation_timeout_seconds=(
+                settings.AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS
+            )
+        )
+        owner_executor_options["owner_queue_limits"] = OutboundQueueLimits(
+            per_tenant=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT,
+            per_task=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK,
+            per_line=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE,
+        )
     elif settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
         if not settings.AI_CALL_SIP_OUTBOUND_ENABLED:
             raise RuntimeError(
@@ -575,6 +586,7 @@ async def _start_ai_call_outbound_task_worker():
             + 60
         ),
         owner_runtime_start=owner_runtime_start,
+        **owner_executor_options,
     )
     task_worker = OutboundTaskWorker(
         executor,

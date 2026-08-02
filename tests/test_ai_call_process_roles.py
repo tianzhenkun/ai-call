@@ -12,6 +12,25 @@ from app.config.setting import Settings
 from app.plugin import init_app
 
 
+def test_outbound_owner_runtime_backpressure_defaults() -> None:
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT"].default
+        == 100
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK"].default
+        == 20
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE"].default
+        == 50
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS"].default
+        == 30.0
+    )
+
+
 def _load_roles_module() -> ModuleType:
     try:
         return importlib.import_module("app.services.ai_call.runtime_control.roles")
@@ -412,11 +431,39 @@ async def test_outbound_owner_mode_starts_starter_and_reconciler_without_sip_dia
         "AI_CALL_RUNTIME_INSTANCE_ID",
         "runtime-owner-test",
     )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT",
+        11,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK",
+        7,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE",
+        5,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS",
+        17.5,
+        raising=False,
+    )
 
     worker = await init_app._start_ai_call_outbound_task_worker()
 
     assert worker is not None
     assert isinstance(worker.executor.owner_runtime_start, OwnerRuntimeOutboundStart)
+    assert worker.executor.owner_runtime_start._allocation_timeout_seconds == 17.5
+    assert worker.executor.owner_queue_limits.per_tenant == 11
+    assert worker.executor.owner_queue_limits.per_task == 7
+    assert worker.executor.owner_queue_limits.per_line == 5
     assert worker.executor.dialer.dialer_type == "mock"
     assert worker.reconcile_worker is not None
     task_started.assert_awaited_once()

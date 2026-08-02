@@ -17,11 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.outbound.attempt_reconciler import (
+    OutboundAttemptReconciler,
     OutboundAttemptReconcileWorker,
 )
 from app.api.v1.ai_call.outbound.owner_runtime_start import (
     OwnerRuntimeOutboundStart,
 )
+from app.api.v1.ai_call.outbound.queue_control import OutboundQueueLimits
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -354,7 +356,13 @@ async def _reset_repository_schema(engine) -> None:
             await connection.run_sync(table.create)
 
 
-async def _insert_sip_line(session, *, line_id: int, max_concurrency: int) -> None:
+async def _insert_sip_line(
+    session,
+    *,
+    line_id: int,
+    max_concurrency: int,
+    tenant_id: str = "tenant-a",
+) -> None:
     now = await session.scalar(text("select clock_timestamp()"))
     await session.execute(
         text(
@@ -365,13 +373,14 @@ async def _insert_sip_line(session, *, line_id: int, max_concurrency: int) -> No
                 max_concurrency, originate_timeout_seconds, health_status,
                 deleted, created_by, updated_by, created_at, updated_at
             ) values (
-                :line_id, 'tenant-a', :line_code, :line_name, true, 'stub',
+                :line_id, :tenant_id, :line_code, :line_name, true, 'stub',
                 'managed_trunk_id', 'managed_trunk', 'masked', 'CN',
                 :max_concurrency, 45, 'READY', false, 1, 1, :now, :now
             )
             """
         ).bindparams(
             line_id=line_id,
+            tenant_id=tenant_id,
             line_code=f"line-{line_id}",
             line_name=f"Line {line_id}",
             max_concurrency=max_concurrency,
@@ -5345,6 +5354,369 @@ async def test_missing_dependency_row_is_fail_closed_during_effect_claim() -> No
 
         async with factory.begin() as session:
             assert await RuntimeEffectRepository(session).claim_next(lease) is None
+    finally:
+        await engine.dispose()
+
+
+async def _insert_outbound_task(
+    session,
+    *,
+    tenant_id: str,
+    line_id: int,
+    now,
+    target_count: int = 1,
+) -> tuple[int, list[int]]:
+    task_id = generate_snowflake_id()
+    line_snapshot = {
+        "lineId": str(line_id),
+        "lineCode": f"line-{line_id}",
+        "lineName": f"Line {line_id}",
+        "adapterType": "livekit_sip",
+        "routeMode": "managed_trunk_id",
+        "trunkId": "stub-trunk",
+        "proxyHost": None,
+        "proxyPort": None,
+        "authMode": "managed_trunk",
+        "callerNumber": "masked",
+        "destinationCountry": "CN",
+        "maxConcurrency": max(1, target_count),
+        "originateTimeoutSeconds": 45,
+    }
+    session.add(
+        AiCallOutboundTaskModel(
+            id=task_id,
+            tenant_id=tenant_id,
+            validation_id=generate_snowflake_id(),
+            idempotency_key=f"outbound-owner:{tenant_id}:{task_id}",
+            request_fingerprint="a" * 64,
+            task_name=f"Outbound DB-only {tenant_id}",
+            task_mode="batch",
+            status="SCHEDULED",
+            total_targets=target_count,
+            completed_targets=0,
+            connected_targets=0,
+            failed_targets=0,
+            execution_mode="immediate",
+            scheduled_at=None,
+            started_at=None,
+            ended_at=None,
+            prompt_profile_id="prompt-1",
+            prompt_name="合同介绍",
+            scene_code="intro_contract",
+            voice="Tina",
+            voice_name="Tina",
+            rule_id=generate_snowflake_id(),
+            rule_name="测试规则",
+            rule_summary="测试规则摘要",
+            line_id=line_id,
+            line_name=f"Line {line_id}",
+            config_snapshot_json=json.dumps(
+                {
+                    "request": {"taskName": f"Outbound DB-only {tenant_id}"},
+                    "prompt": {
+                        "id": "prompt-1",
+                        "sceneCode": "intro_contract",
+                    },
+                    "voice": {"voice": "Tina"},
+                    "rule": {
+                        "retryCount": 0,
+                        "retryIntervalsMinutes": [],
+                        "retryableResults": [],
+                    },
+                    "sipLine": line_snapshot,
+                }
+            ),
+            error_message=None,
+            created_by=1,
+            created_by_name="测试用户",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    target_ids: list[int] = []
+    for index in range(target_count):
+        target_id = generate_snowflake_id()
+        target_ids.append(target_id)
+        session.add(
+            AiCallOutboundTargetModel(
+                id=target_id,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                validation_id=generate_snowflake_id(),
+                source_validation_row_id=generate_snowflake_id(),
+                source_row_number=index + 2,
+                phone_number=f"1380013{index:04d}",
+                customer_name=f"客户{index + 1}",
+                status="PENDING",
+                attempt_count=0,
+                latest_result=None,
+                next_attempt_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return task_id, target_ids
+
+
+class _RejectingOwnerRuntimeDialer:
+    dialer_type = "sip"
+    manages_call_record = True
+    called = False
+
+    async def dial(self, *args, **kwargs):
+        del args, kwargs
+        self.called = True
+        raise AssertionError("owner runtime outbound must not call legacy dial()")
+
+
+async def test_outbound_backpressure_serializes_last_tenant_line_slot() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        line_id = generate_snowflake_id()
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(session, line_id=line_id, max_concurrency=2)
+            await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_id,
+                now=now,
+            )
+            await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_id,
+                now=now,
+            )
+
+        def executor() -> OutboundTaskExecutor:
+            return OutboundTaskExecutor(
+                factory,
+                _RejectingOwnerRuntimeDialer(),
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(),
+                owner_queue_limits=OutboundQueueLimits(
+                    per_tenant=1,
+                    per_task=1,
+                    per_line=1,
+                ),
+            )
+
+        processed = await asyncio.gather(executor().run_once(), executor().run_once())
+        assert sum(processed) == 1
+        async with factory() as session:
+            assert (
+                await session.scalar(
+                    select(text("count(*)")).select_from(
+                        AiCallOutboundAttemptModel
+                    )
+                )
+                == 1
+            )
+            assert (
+                await session.scalar(
+                    select(text("count(*)")).select_from(AiCallRecordModel)
+                )
+                == 1
+            )
+            assert (
+                await session.scalar(
+                    select(text("count(*)"))
+                    .select_from(AiCallRuntimeCommandModel)
+                    .where(AiCallRuntimeCommandModel.command_type == "START_CALL")
+                )
+                == 1
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_outbound_fair_dispatcher_selects_one_candidate_per_lane_first() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        line_a = generate_snowflake_id()
+        line_b = generate_snowflake_id()
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_a,
+                max_concurrency=2,
+            )
+            await _insert_sip_line(
+                session,
+                tenant_id="tenant-b",
+                line_id=line_b,
+                max_concurrency=1,
+            )
+            await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_a,
+                now=now,
+                target_count=2,
+            )
+            await _insert_outbound_task(
+                session,
+                tenant_id="tenant-b",
+                line_id=line_b,
+                now=now,
+            )
+            for index in range(2):
+                await WorkerRegistryRepository(session).register(
+                    WorkerRegistration(
+                        deployment_instance_id=f"fair-runtime-{index}",
+                        startup_id=UUID(f"00000000-0000-4000-8000-{index + 1:012d}"),
+                        capacity=1,
+                        cleanup_capacity=1,
+                    )
+                )
+
+        assert (
+            await OutboundTaskExecutor(
+                factory,
+                _RejectingOwnerRuntimeDialer(),
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(),
+            ).run_once()
+            == 3
+        )
+        assert await DispatcherControlService(factory, batch_size=2).run_once() == 2
+
+        async with factory() as session:
+            assigned_lanes = set(
+                (
+                    await session.execute(
+                        select(
+                            AiCallOutboundAttemptModel.tenant_id,
+                            AiCallOutboundAttemptModel.line_id,
+                        )
+                        .join(
+                            AiCallRecordModel,
+                            (
+                                AiCallRecordModel.tenant_id
+                                == AiCallOutboundAttemptModel.tenant_id
+                            )
+                            & (
+                                AiCallRecordModel.call_id
+                                == AiCallOutboundAttemptModel.call_id
+                            ),
+                        )
+                        .where(AiCallRecordModel.runtime_owner_id.is_not(None))
+                    )
+                ).all()
+            )
+        assert assigned_lanes == {("tenant-a", line_a), ("tenant-b", line_b)}
+    finally:
+        await engine.dispose()
+
+
+async def test_outbound_timeout_reconcile_lease_takeover_is_single_projection() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        line_id = generate_snowflake_id()
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(session, line_id=line_id, max_concurrency=1)
+            task_id, target_ids = await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_id,
+                now=now,
+            )
+
+        assert (
+            await OutboundTaskExecutor(
+                factory,
+                _RejectingOwnerRuntimeDialer(),
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(
+                    allocation_timeout_seconds=0.0
+                ),
+            ).run_once()
+            == 1
+        )
+        dispatcher_counts = await asyncio.gather(
+            DispatcherControlService(factory).run_once(),
+            DispatcherControlService(factory).run_once(),
+        )
+        assert sum(dispatcher_counts) == 1
+
+        async with factory.begin() as session:
+            first_claim = await OutboundAttemptReconciler(
+                session,
+                worker_id="outbound-reconciler-crashed",
+            ).claim_next()
+        assert first_claim is not None
+        takeover_at = first_claim.reconcile_expires_at + timedelta(microseconds=1)
+
+        async def takeover_clock(_session):
+            return takeover_at
+
+        async with factory.begin() as session:
+            takeover_claim = await OutboundAttemptReconciler(
+                session,
+                worker_id="outbound-reconciler-takeover",
+                database_clock=takeover_clock,
+            ).claim_next()
+        assert takeover_claim is not None
+        assert takeover_claim.reconcile_token != first_claim.reconcile_token
+
+        async with factory.begin() as session:
+            projected = await OutboundAttemptReconciler(
+                session,
+                worker_id="outbound-reconciler-takeover",
+                database_clock=takeover_clock,
+            ).submit(takeover_claim)
+        assert projected is not None and projected.status == "FAILED"
+
+        async with factory.begin() as session:
+            stale_result = await OutboundAttemptReconciler(
+                session,
+                worker_id="outbound-reconciler-crashed",
+                database_clock=takeover_clock,
+            ).submit(first_claim)
+        assert stale_result is None
+
+        async with factory() as session:
+            attempt = await session.get(
+                AiCallOutboundAttemptModel,
+                takeover_claim.attempt_id,
+            )
+            target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+            task = await session.get(AiCallOutboundTaskModel, task_id)
+            command = await session.scalar(select(AiCallRuntimeCommandModel))
+            owner_count = await session.scalar(
+                select(text("count(*)"))
+                .select_from(AiCallRecordModel)
+                .where(AiCallRecordModel.runtime_owner_id.is_not(None))
+            )
+            reservation_count = await session.scalar(
+                select(text("count(*)")).select_from(
+                    AiCallSipLineReservationModel
+                )
+            )
+            effect_count = await session.scalar(
+                select(text("count(*)")).select_from(AiCallRuntimeEffectModel)
+            )
+        assert attempt is not None and attempt.status == "FAILED"
+        assert attempt.error_message == "ALLOCATION_TIMEOUT"
+        assert target is not None and target.status == "COMPLETED"
+        assert task is not None and task.status == "COMPLETED"
+        assert task.completed_targets == 1
+        assert task.failed_targets == 1
+        assert command is not None and command.status == CommandStatus.DEAD
+        assert owner_count == reservation_count == effect_count == 0
     finally:
         await engine.dispose()
 
