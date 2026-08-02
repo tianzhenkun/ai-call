@@ -168,6 +168,7 @@ def decode_access_token(token: str) -> "JWTPayloadSchema":
             "user_name": username,
             "tenant_id": tenant_id,  # 租户ID
             "dept_id": dept_id,  # 部门ID
+            "permissions": payload.get("permissions", []),
             "ipaddr": "127.0.0.1",
             "login_location": "未知",
             "os": "Unknown",

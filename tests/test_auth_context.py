@@ -119,6 +119,25 @@ def test_decode_access_token_logs_signature_failure_without_token(monkeypatch) -
     assert token not in str(warning.call_args)
 
 
+def test_decode_access_token_preserves_ruoyi_permissions() -> None:
+    token = jwt.encode(
+        {
+            "userId": 123,
+            "userName": "tenant-user",
+            "tenantId": "367705",
+            "permissions": ["ai_call:voice:manage", "*:*:*"],
+            "exp": int(time.time()) + 3600,
+        },
+        key=settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+    payload = decode_access_token(token)
+    subject = json.loads(payload.sub)
+
+    assert subject["permissions"] == ["ai_call:voice:manage", "*:*:*"]
+
+
 def test_get_current_user_parses_permissions_from_jwt_subject(monkeypatch) -> None:
     monkeypatch.setattr(settings, "JWT_ENABLE", True)
     monkeypatch.setattr(
