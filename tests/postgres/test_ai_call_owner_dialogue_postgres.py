@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
 import pytest
 from psycopg import ClientCursor
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.api.v1.ai_call.model import (
+    AiCallDialogueSegmentModel,
+    AiCallRecordModel,
+)
+from app.core.base_model import MappedBase
+from app.services.ai_call.runtime_control.dialogue_repository import (
+    OwnerDialogueFence,
+    OwnerDialogueRepository,
+    OwnerDialogueSegment,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -151,3 +166,110 @@ async def test_owner_dialogue_migration_rejects_unowned_tenant_backfill() -> Non
         match="ai_call_dialogue_segment_tenant_backfill_failed",
     ):
         _execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+
+
+async def test_owner_dialogue_postgres_fences_takeover_and_replay() -> None:
+    engine = create_async_engine(
+        os.environ["AI_CALL_TEST_POSTGRES_DSN"],
+        isolation_level="READ COMMITTED",
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            lambda sync_connection: MappedBase.metadata.drop_all(
+                sync_connection,
+                tables=[
+                    AiCallDialogueSegmentModel.__table__,
+                    AiCallRecordModel.__table__,
+                ],
+            )
+        )
+        await connection.run_sync(
+            lambda sync_connection: MappedBase.metadata.create_all(
+                sync_connection,
+                tables=[
+                    AiCallRecordModel.__table__,
+                    AiCallDialogueSegmentModel.__table__,
+                ],
+            )
+        )
+
+    now = datetime.now(timezone.utc)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    fence_a = OwnerDialogueFence("tenant-a", "call-a", "runtime-a", 7)
+    fence_b = OwnerDialogueFence("tenant-a", "call-a", "runtime-b", 8)
+    segment = OwnerDialogueSegment(
+        segment_no=1,
+        speaker_type="customer",
+        speaker_identity="customer-a",
+        source="qwen_realtime",
+        source_segment_id="item-a",
+        text="你好",
+        segment_status="final",
+        started_at=now - timedelta(seconds=1),
+        ended_at=now,
+        duration_ms=1_000,
+    )
+
+    async with session_factory.begin() as session:
+        session.add(
+            AiCallRecordModel(
+                id=1,
+                tenant_id="tenant-a",
+                call_id="call-a",
+                entry_type="outbound",
+                room_name="room-a",
+                participant_identity="caller-a",
+                status="active",
+                started_at=now,
+                runtime_control_mode="owner_command_v1",
+                runtime_owner_id="runtime-a",
+                runtime_fencing_token=7,
+                runtime_lease_expires_at=now + timedelta(minutes=1),
+                runtime_capacity_class="active",
+                dialogue_persistence_status="pending",
+            )
+        )
+
+    async with session_factory.begin() as session:
+        repository = OwnerDialogueRepository(session)
+        assert (await repository.persist_batch(fence_a, [segment])).accepted is True
+
+    async with session_factory.begin() as session:
+        record = await session.scalar(select(AiCallRecordModel).with_for_update())
+        assert record is not None
+        record.runtime_owner_id = "runtime-b"
+        record.runtime_fencing_token = 8
+        record.runtime_lease_expires_at = now + timedelta(minutes=1)
+
+    async with session_factory.begin() as session:
+        stale = await OwnerDialogueRepository(session).persist_batch(
+            fence_a,
+            [replace(segment, segment_no=2, source_segment_id="item-b")],
+        )
+        assert stale.accepted is False
+
+    async with session_factory.begin() as session:
+        repository = OwnerDialogueRepository(session)
+        assert await repository.next_segment_no(fence_b) == 2
+        takeover = await repository.persist_batch(
+            fence_b,
+            [replace(segment, segment_no=2)],
+        )
+        assert takeover.accepted is True
+        record = await session.scalar(select(AiCallRecordModel).with_for_update())
+        assert record is not None
+        record.terminal_requested_at = now
+        assert await repository.finalize(fence_b, status="complete") is True
+
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(AiCallDialogueSegmentModel).order_by(
+                        AiCallDialogueSegmentModel.segment_no
+                    )
+                )
+            ).all()
+        )
+    assert [row.source_segment_id for row in rows] == ["f7:item-a", "f8:item-a"]
+    await engine.dispose()
