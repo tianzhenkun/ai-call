@@ -18,6 +18,12 @@ from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
 
 from .media_evidence import has_persisted_media_evidence
+from .queue_control import (
+    DEFAULT_OUTBOUND_QUEUE_LIMITS,
+    OutboundQueueLimits,
+    OutboundQueueRepository,
+    OutboundQueueSnapshot,
+)
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -156,6 +162,7 @@ class OutboundTaskExecutor:
         settle_retry_delays_seconds: tuple[float, ...] = (0.0, 0.25, 1.0),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         owner_runtime_start: OwnerRuntimeStart | None = None,
+        owner_queue_limits: OutboundQueueLimits = DEFAULT_OUTBOUND_QUEUE_LIMITS,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
@@ -173,6 +180,8 @@ class OutboundTaskExecutor:
         )
         self.sleep = sleep
         self.owner_runtime_start = owner_runtime_start
+        self.owner_queue_limits = owner_queue_limits
+        self.last_queue_snapshot: OutboundQueueSnapshot | None = None
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -806,6 +815,18 @@ class OutboundTaskExecutor:
                     or 0
                 )
                 if active_line_attempts >= current_line.max_concurrency:
+                    return None
+            if self.owner_runtime_start is not None and line is not None:
+                queue_snapshot = await OutboundQueueRepository(
+                    db,
+                    limits=self.owner_queue_limits,
+                ).lock_and_snapshot(
+                    tenant_id=task.tenant_id,
+                    task_id=task.id,
+                    line_id=int(line.line_id),
+                )
+                self.last_queue_snapshot = queue_snapshot
+                if not queue_snapshot.has_capacity:
                     return None
             candidates = (
                 await db.scalars(

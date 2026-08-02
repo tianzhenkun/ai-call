@@ -77,7 +77,12 @@ def _line_snapshot() -> dict[str, object]:
     }
 
 
-async def _seed_due_task(database, now: datetime) -> tuple[int, int, str]:
+async def _seed_due_task(
+    database,
+    now: datetime,
+    *,
+    target_count: int = 1,
+) -> tuple[int, int, str]:
     task_id = generate_snowflake_id()
     target_id = generate_snowflake_id()
     phone_number = "13800138001"
@@ -159,24 +164,27 @@ async def _seed_due_task(database, now: datetime) -> tuple[int, int, str]:
                 updated_at=now,
             )
         )
-        session.add(
-            AiCallOutboundTargetModel(
-                id=target_id,
-                tenant_id="tenant-a",
-                task_id=task_id,
-                validation_id=generate_snowflake_id(),
-                source_validation_row_id=generate_snowflake_id(),
-                source_row_number=2,
-                phone_number=phone_number,
-                customer_name="客户一",
-                status="PENDING",
-                attempt_count=0,
-                latest_result=None,
-                next_attempt_at=None,
-                created_at=now,
-                updated_at=now,
+        for index in range(target_count):
+            session.add(
+                AiCallOutboundTargetModel(
+                    id=target_id if index == 0 else generate_snowflake_id(),
+                    tenant_id="tenant-a",
+                    task_id=task_id,
+                    validation_id=generate_snowflake_id(),
+                    source_validation_row_id=generate_snowflake_id(),
+                    source_row_number=index + 2,
+                    phone_number=(
+                        phone_number if index == 0 else f"13800138{index + 1:03d}"
+                    ),
+                    customer_name=f"客户{index + 1}",
+                    status="PENDING",
+                    attempt_count=0,
+                    latest_result=None,
+                    next_attempt_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-        )
     return task_id, target_id, phone_number
 
 
@@ -907,3 +915,116 @@ async def test_attempt_reconciler_rejects_old_token_after_lease_takeover(
     assert attempt is not None
     assert attempt.reconcile_owner_id == "reconciler-b"
     assert attempt.reconcile_token == "token-b"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"per_tenant": 1, "per_task": 10, "per_line": 10},
+        {"per_tenant": 10, "per_task": 1, "per_line": 10},
+        {"per_tenant": 10, "per_task": 10, "per_line": 1},
+    ],
+)
+async def test_owner_runtime_queue_limit_stops_before_second_target(
+    database,
+    limits: dict[str, int],
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.api.v1.ai_call.outbound.queue_control import OutboundQueueLimits
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(
+        database,
+        now,
+        target_count=2,
+    )
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        target_batch_size=2,
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+        owner_queue_limits=OutboundQueueLimits(**limits),
+    )
+
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        attempt_count = int(
+            await session.scalar(select(func.count(AiCallOutboundAttemptModel.id))) or 0
+        )
+        pending_count = int(
+            await session.scalar(
+                select(func.count(AiCallOutboundTargetModel.id)).where(
+                    AiCallOutboundTargetModel.task_id == task_id,
+                    AiCallOutboundTargetModel.status == "PENDING",
+                )
+            )
+            or 0
+        )
+        command_count = int(
+            await session.scalar(select(func.count(AiCallRuntimeCommandModel.id))) or 0
+        )
+
+    assert attempt_count == command_count == 1
+    assert pending_count == 1
+
+
+@pytest.mark.anyio
+async def test_owner_runtime_queue_snapshot_reports_wait_and_timeout_metrics(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.api.v1.ai_call.outbound.queue_control import (
+        OutboundQueueLimits,
+        OutboundQueueRepository,
+    )
+
+    created_at = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    observed_at = created_at + timedelta(seconds=12)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, created_at)
+    limits = OutboundQueueLimits(per_tenant=100, per_task=20, per_line=50)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: created_at,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(created_at)
+        ),
+        owner_queue_limits=limits,
+    )
+    assert await executor.run_once() == 1
+
+    async with database.begin() as session:
+        record = await session.scalar(select(AiCallRecordModel))
+        assert record is not None
+        record.failure_stage = "allocation"
+        record.failure_message = "ALLOCATION_TIMEOUT"
+
+    async with database.begin() as session:
+        snapshot = await OutboundQueueRepository(
+            session,
+            limits=limits,
+            database_clock=lambda _session: _constant_time(observed_at),
+        ).lock_and_snapshot(
+            tenant_id="tenant-a",
+            task_id=task_id,
+            line_id=int(_line_snapshot()["lineId"]),
+        )
+
+    assert snapshot.tenant_queued == 1
+    assert snapshot.task_queued == 1
+    assert snapshot.line_queued == 1
+    assert snapshot.oldest_wait_seconds == 12.0
+    assert snapshot.allocation_timeout_count == 1
+    assert snapshot.limits == limits
+    assert snapshot.has_capacity is True
