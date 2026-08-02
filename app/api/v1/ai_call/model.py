@@ -21,6 +21,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.base_model import MappedBase
 
 
+def _default_dialogue_persistence_status(context: Any) -> str:
+    parameters = context.get_current_parameters()
+    if parameters.get("runtime_control_mode") == "owner_command_v1":
+        return "pending"
+    return "not_started"
+
+
 class AiCallRecordModel(MappedBase):
     """AI Call B1 通话记录表。"""
 
@@ -71,6 +78,21 @@ class AiCallRecordModel(MappedBase):
             "and runtime_lease_expires_at is null "
             "and resource_cleanup_completed_at is not null)",
             name="ck_ai_call_record_cleanup_clean",
+        ),
+        CheckConstraint(
+            "dialogue_persistence_status in "
+            "('not_started', 'pending', 'complete', 'uncertain')",
+            name="ck_ai_call_record_dialogue_status",
+        ),
+        CheckConstraint(
+            "runtime_control_mode <> 'owner_command_v1' "
+            "or dialogue_persistence_status <> 'not_started'",
+            name="ck_ai_call_record_owner_dialogue_started",
+        ),
+        CheckConstraint(
+            "dialogue_persistence_status not in ('complete', 'uncertain') "
+            "or dialogue_persistence_completed_at is not null",
+            name="ck_ai_call_record_dialogue_completed_at",
         ),
         {"comment": "AI Call 通话记录表"},
     )
@@ -171,6 +193,20 @@ class AiCallRecordModel(MappedBase):
         Integer,
         nullable=True,
         comment="通话持续毫秒",
+    )
+    dialogue_persistence_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=_default_dialogue_persistence_status,
+        server_default=text("'not_started'"),
+    )
+    dialogue_persistence_error: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+    dialogue_persistence_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     runtime_control_mode: Mapped[str] = mapped_column(
         String(32),
@@ -495,15 +531,27 @@ class AiCallDialogueSegmentModel(MappedBase):
 
     __tablename__ = "ai_call_dialogue_segment"
     __table_args__ = (
-        UniqueConstraint("call_id", "segment_no", name="uk_ai_call_dialogue_call_no"),
         UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            "segment_no",
+            name="uk_ai_call_dialogue_call_no",
+        ),
+        UniqueConstraint(
+            "tenant_id",
             "call_id",
             "speaker_type",
             "source",
             "source_segment_id",
             name="uk_ai_call_dialogue_source_segment",
         ),
-        Index("idx_ai_call_dialogue_speaker", "call_id", "speaker_type", "segment_no"),
+        Index(
+            "idx_ai_call_dialogue_speaker",
+            "tenant_id",
+            "call_id",
+            "speaker_type",
+            "segment_no",
+        ),
         {"comment": "AI Call 对话文本段表"},
     )
     __permission_strategy__ = None
@@ -513,6 +561,11 @@ class AiCallDialogueSegmentModel(MappedBase):
         primary_key=True,
         autoincrement=False,
         comment="雪花主键",
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="000000",
     )
     call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
     segment_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="通话内段落序号")
