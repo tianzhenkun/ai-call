@@ -143,7 +143,7 @@ class RuntimeStartReadinessRepository:
             )
         if record.entry_type not in {"web", "direct_sip", "outbound"}:
             return False
-        if record.status not in {"preparing", "ready"}:
+        if record.status not in {"preparing", "ready", "connected"}:
             raise StartReadinessRejected(
                 f"record status {record.status} does not allow readiness"
             )
@@ -153,7 +153,8 @@ class RuntimeStartReadinessRepository:
         ):
             raise StartReadinessRejected("agent readiness generation conflicts")
 
-        record.status = "ready"
+        if record.status != "connected":
+            record.status = "ready"
         record.agent_participant_identity = readiness.agent_participant_identity
         record.agent_participant_sid = readiness.agent_participant_sid
         record.agent_audio_track_sid = readiness.agent_audio_track_sid
