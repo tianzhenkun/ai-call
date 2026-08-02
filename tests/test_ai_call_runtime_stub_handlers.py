@@ -82,7 +82,12 @@ def _owner_lease() -> OwnerLease:
 
 class _FakeSession:
     def __init__(self) -> None:
-        self.record = SimpleNamespace(status="ending", ended_at=None)
+        self.record = SimpleNamespace(
+            status="ending",
+            answered_at=None,
+            ended_at=None,
+            duration_ms=None,
+        )
 
     async def scalar(self, statement):
         if "clock_timestamp" in str(statement):
@@ -416,6 +421,35 @@ async def test_start_handler_recovers_ready_from_already_applied_effects() -> No
 
 
 @pytest.mark.anyio
+async def test_end_handler_persists_connected_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import handlers
+
+    answered_at = datetime(2026, 8, 3, 1, 0, tzinfo=timezone.utc)
+    ended_at = datetime(2026, 8, 3, 1, 2, 7, 96_000, tzinfo=timezone.utc)
+
+    async def _fixed_database_time(_session) -> datetime:
+        return ended_at
+
+    monkeypatch.setattr(handlers, "read_database_time", _fixed_database_time)
+    factory = _FakeSessionFactory()
+    factory.session.record.answered_at = answered_at
+
+    result = await EndCallHandler(
+        factory,
+        ScriptedProviderStub({}),
+        effect_repository_factory=lambda session: _FakeEffectRepository([], clean=True),
+        command_repository_factory=lambda session: _FakeCommandRepository(),
+        recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
+    ).handle(_command_claim("END_CALL"), _owner_lease())
+
+    assert result.logical_end_completed is True
+    assert factory.session.record.ended_at == ended_at
+    assert factory.session.record.duration_ms == 127_096
+
+
+@pytest.mark.anyio
 async def test_end_handler_separates_logical_end_from_cleanup_status() -> None:
     factory = _FakeSessionFactory()
     effect_repository = _FakeEffectRepository(
@@ -445,3 +479,4 @@ async def test_end_handler_separates_logical_end_from_cleanup_status() -> None:
     assert result.resource_cleanup_status == "reconciling"
     assert effect_repository.end_graph_registered is True
     assert factory.session.record.status == "completed"
+    assert factory.session.record.duration_ms is None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -49,6 +49,14 @@ RecoveryOwnerRepositoryFactory = Callable[[AsyncSession], RecoveryOwnerRepositor
 StartReadinessRepositoryFactory = Callable[
     [AsyncSession], RuntimeStartReadinessRepository
 ]
+
+
+def _connected_duration_ms(answered_at: datetime, ended_at: datetime) -> int:
+    if answered_at.tzinfo is None and ended_at.tzinfo is not None:
+        answered_at = answered_at.replace(tzinfo=ended_at.tzinfo)
+    elif answered_at.tzinfo is not None and ended_at.tzinfo is None:
+        ended_at = ended_at.replace(tzinfo=answered_at.tzinfo)
+    return max(0, int((ended_at - answered_at).total_seconds() * 1_000))
 
 
 class StartCallHandler:
@@ -199,8 +207,14 @@ class EndCallHandler:
                     .with_for_update()
                 )
                 if record is not None:
+                    ended_at = await read_database_time(session)
                     record.status = "completed"
-                    record.ended_at = await read_database_time(session)
+                    record.ended_at = ended_at
+                    if record.answered_at is not None:
+                        record.duration_ms = _connected_duration_ms(
+                            record.answered_at,
+                            ended_at,
+                        )
             clean = (
                 await self._effect_repository_factory(session).mark_cleanup_clean(
                     owner_lease
