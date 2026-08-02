@@ -33,6 +33,7 @@ class AiCallRoleWorkerHandles:
     offline_asr_worker: Any = None
     recording_reconcile_worker: Any = None
     handoff_trigger_worker: Any = None
+    runtime_webhook_worker: Any = None
     outbound_task_worker: Any = None
     linphone_test_worker: Any = None
     voice_worker: Any = None
@@ -130,6 +131,9 @@ async def _start_ai_call_role_workers(
             handles.handoff_trigger_worker = (
                 await _start_ai_call_handoff_trigger_worker()
             )
+            handles.runtime_webhook_worker = (
+                await _start_ai_call_runtime_webhook_worker()
+            )
             if start_voice:
                 handles.voice_worker = await _start_ai_call_voice_worker(app)
     except Exception:
@@ -158,6 +162,8 @@ async def _stop_ai_call_role_workers(
         await _stop_ai_call_outbound_task_worker(handles.outbound_task_worker)
     if handles.handoff_trigger_worker is not None:
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
+    if handles.runtime_webhook_worker is not None:
+        await _stop_ai_call_runtime_webhook_worker(handles.runtime_webhook_worker)
     if handles.event_worker is not None:
         await _stop_ai_call_event_worker(handles.event_worker)
     if handles.recording_reconcile_worker is not None:
@@ -305,6 +311,38 @@ async def _start_ai_call_recovery_control():
 async def _stop_ai_call_recovery_control(service) -> None:
     await service.stop()
     log.info("✅ AI Call DB-only Recovery 已关闭")
+
+
+async def _start_ai_call_runtime_webhook_worker():
+    from app.services.ai_call.runtime_control.roles import (
+        parse_owner_command_entries,
+    )
+
+    if (
+        not settings.SQL_DB_ENABLE
+        or settings.DATABASE_TYPE != "postgres"
+        or not parse_owner_command_entries(
+            str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
+        )
+    ):
+        return None
+    from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.webhook_service import (
+        RuntimeWebhookWorker,
+    )
+
+    worker = RuntimeWebhookWorker(
+        async_db_session,
+        worker_id=f"jobs:webhook:{uuid4().hex}",
+    )
+    await worker.start()
+    log.info("✅ AI Call Runtime webhook worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_runtime_webhook_worker(worker) -> None:
+    await worker.stop()
+    log.info("✅ AI Call Runtime webhook worker 已关闭")
 
 
 def _start_ai_call_voice_preview_service(app: FastAPI) -> None:

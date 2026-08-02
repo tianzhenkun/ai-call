@@ -49,6 +49,9 @@ from app.services.ai_call.runtime_control.handoff_repository import (
     RuntimeHandoffRepository,
 )
 from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
+from app.services.ai_call.runtime_control.webhook_service import (
+    RuntimeWebhookIngressService,
+)
 
 from .outbound.controller import _identity
 from .schema import (
@@ -109,6 +112,12 @@ def get_ai_call_service(
     return get_default_ai_call_service(db)
 
 
+def get_runtime_webhook_ingress_service(
+    db: Annotated[AsyncSession, Depends(ai_call_db_getter)],
+) -> RuntimeWebhookIngressService:
+    return RuntimeWebhookIngressService(db, settings)
+
+
 @AiCallRouter.get("/health", summary="智能外呼模块健康检查")
 async def ai_call_health() -> dict[str, str]:
     return {"status": "ok"}
@@ -117,6 +126,11 @@ async def ai_call_health() -> dict[str, str]:
 @AiCallRouter.post("/livekit-webhook", summary="接收 LiveKit 房间事件")
 async def livekit_webhook_controller(
     request: Request,
+    ingress_service: Annotated[
+        RuntimeWebhookIngressService,
+        Depends(get_runtime_webhook_ingress_service),
+    ],
+    db: Annotated[AsyncSession, Depends(ai_call_db_getter)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     body = (await request.body()).decode("utf-8")
@@ -126,12 +140,27 @@ async def livekit_webhook_controller(
     track = payload.get("track")
     if webhook_event.event == "track_published" and isinstance(track, dict):
         track["type"] = api.TrackType.Name(webhook_event.track.type)
-    result = schedule_livekit_webhook_event(
+    decision = await ingress_service.receive_livekit(
         event_type=webhook_event.event,
         room_name=webhook_event.room.name or None,
         participant_identity=webhook_event.participant.identity or None,
         payload=payload,
     )
+    await db.commit()
+    if decision.disposition == "LEGACY":
+        result = schedule_livekit_webhook_event(
+            event_type=webhook_event.event,
+            room_name=webhook_event.room.name or None,
+            participant_identity=webhook_event.participant.identity or None,
+            payload=payload,
+        )
+    else:
+        result = {
+            "persisted": decision.disposition in {"INBOX", "QUARANTINE"},
+            "disposition": decision.disposition,
+            "rowId": str(decision.row_id) if decision.row_id is not None else None,
+            "status": decision.status,
+        }
     return SuccessResponse(data=result, msg="接收成功")
 
 
