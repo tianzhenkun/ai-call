@@ -31,6 +31,7 @@ from app.services.ai_call.runtime_control.handoff_handlers import (
     CancelHandoffHandler,
     HandoffAcceptedHandler,
 )
+from app.services.ai_call.runtime_control.health import RuntimeWorkerHealth
 from app.services.ai_call.runtime_control.models import AiCallRuntimeWorkerModel
 from app.services.ai_call.runtime_control.owner_repository import (
     OwnerFailClosedWatchdog,
@@ -144,6 +145,7 @@ class RuntimeControlService:
         batch_size: int = 32,
         scan_interval_seconds: float = 0.5,
         wakeup_listener: WakeupListener | None = None,
+        health: RuntimeWorkerHealth | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.registry = registry
@@ -157,58 +159,131 @@ class RuntimeControlService:
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
         self._wakeup_listener = wakeup_listener
+        self._health = health or RuntimeWorkerHealth()
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._supervision_task: asyncio.Task[None] | None = None
+        self._stopping = False
 
     async def start(self) -> None:
         session_factory, _provider = self._require_dependencies()
+        self._health.mark_starting(self.worker_id)
         deployment_id, startup_id = _parse_worker_id(self.worker_id)
-        async with session_factory.begin() as session:
-            lease = await WorkerRegistryRepository(
-                session, lease_ttl=self._worker_lease_ttl
-            ).register(
-                WorkerRegistration(
-                    deployment_instance_id=deployment_id,
-                    startup_id=startup_id,
-                    capacity=self._capacity,
-                    cleanup_capacity=self._cleanup_capacity,
+        try:
+            async with session_factory.begin() as session:
+                lease = await WorkerRegistryRepository(
+                    session, lease_ttl=self._worker_lease_ttl
+                ).register(
+                    WorkerRegistration(
+                        deployment_instance_id=deployment_id,
+                        startup_id=startup_id,
+                        capacity=self._capacity,
+                        cleanup_capacity=self._cleanup_capacity,
+                    )
                 )
+            if lease.worker_id != self.worker_id:
+                raise RuntimeError(
+                    "registered worker identity does not match service identity"
+                )
+            self._stopping = False
+            self._stop_event.clear()
+            if self._wakeup_listener is not None:
+                try:
+                    await self._wakeup_listener.start()
+                except Exception as exc:
+                    log.error(f"AI Call Runtime PostgreSQL 唤醒监听启动失败: {exc!s}")
+            self._task = asyncio.create_task(
+                self._run_loop(), name=f"ai-call-runtime:{self.worker_id}"
             )
-        if lease.worker_id != self.worker_id:
-            raise RuntimeError("registered worker identity does not match service identity")
-        self._stop_event.clear()
-        if self._wakeup_listener is not None:
-            try:
-                await self._wakeup_listener.start()
-            except Exception as exc:
-                log.error(f"AI Call Runtime PostgreSQL 唤醒监听启动失败: {exc!s}")
-        self._task = asyncio.create_task(
-            self._run_loop(), name=f"ai-call-runtime:{self.worker_id}"
-        )
+            self._monitor_runtime_task(self._task)
+            self._health.mark_running(self.worker_id)
+        except BaseException:
+            self._health.mark_failed(self.worker_id, "runtime_start_failed")
+            raise
 
     async def stop(self) -> None:
+        self._stopping = True
         self._stop_event.set()
         task = self._task
         self._task = None
         if task is not None:
-            await task
+            await asyncio.gather(task, return_exceptions=True)
+        supervision_task = self._supervision_task
+        self._supervision_task = None
+        if supervision_task is not None:
+            await supervision_task
         if self._wakeup_listener is not None:
             try:
                 await self._wakeup_listener.stop()
             except Exception as exc:
                 log.error(f"AI Call Runtime PostgreSQL 唤醒监听关闭失败: {exc!s}")
-        for timer in self.registry.fail_closed_timers.values():
-            timer.cancel()
-        self.registry.fail_closed_timers.clear()
-        for call_id in tuple(self.registry.local_handles):
-            await self._fail_closed_local_handle(call_id)
-        if self._session_factory is not None:
-            async with self._session_factory.begin() as session:
-                await session.execute(
-                    update(AiCallRuntimeWorkerModel)
-                    .where(AiCallRuntimeWorkerModel.worker_id == self.worker_id)
-                    .values(status="DRAINING")
-                )
+        call_ids = sorted(
+            set(self.registry.owner_fencing_tokens)
+            | set(self.registry.owner_watchdogs)
+            | set(self.registry.fail_closed_timers)
+            | set(self.registry.local_handles)
+        )
+        for call_id in call_ids:
+            await self._clear_owner_tracking(call_id)
+        await self._mark_worker_draining()
+        self._health.mark_stopped(self.worker_id)
+
+    def _monitor_runtime_task(self, task: asyncio.Task[None]) -> None:
+        task.add_done_callback(self._on_runtime_task_done)
+
+    def _on_runtime_task_done(self, task: asyncio.Task[None]) -> None:
+        exception = None if task.cancelled() else task.exception()
+        if self._stopping:
+            return
+        if task.cancelled():
+            error_code = "runtime_task_cancelled"
+        elif exception is None:
+            error_code = "runtime_task_exited"
+        else:
+            error_code = "runtime_task_failed"
+        self._health.mark_failed(self.worker_id, error_code)
+        log.error(
+            "AI Call Runtime 主任务意外退出: worker_id={}, "
+            "error_code={}, error_type={}",
+            self.worker_id,
+            error_code,
+            type(exception).__name__ if exception is not None else "none",
+        )
+        self._supervision_task = asyncio.create_task(
+            self._fail_closed_after_runtime_exit(),
+            name=f"ai-call-runtime-supervision:{self.worker_id}",
+        )
+
+    async def _fail_closed_after_runtime_exit(self) -> None:
+        call_ids = sorted(
+            set(self.registry.owner_fencing_tokens)
+            | set(self.registry.owner_watchdogs)
+            | set(self.registry.fail_closed_timers)
+            | set(self.registry.local_handles)
+        )
+        for call_id in call_ids:
+            await self._clear_owner_tracking(call_id)
+        try:
+            await self._mark_worker_draining()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(
+                "AI Call Runtime 异常退出后标记 DRAINING 失败: "
+                "worker_id={}, error_type={}",
+                self.worker_id,
+                type(exc).__name__,
+            )
+
+    async def _mark_worker_draining(self) -> None:
+        if self._session_factory is None:
+            return
+        async with self._session_factory.begin() as session:
+            await session.execute(
+                update(AiCallRuntimeWorkerModel)
+                .where(AiCallRuntimeWorkerModel.worker_id == self.worker_id)
+                .values(status="DRAINING")
+            )
 
     async def run_once(self) -> int:
         session_factory, provider = self._require_dependencies()
