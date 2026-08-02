@@ -4069,6 +4069,14 @@ async def test_handoff_waiting_tone_owner_observes_cross_process_connected_state
             attempts=80,
             delay_seconds=0.05,
         )
+        await wait_until(
+            lambda: any(
+                event.type == "handoff_waiting_tone_stopped"
+                for event in service.orchestrator.event_store.list(result.call_id)
+            ),
+            attempts=80,
+            delay_seconds=0.05,
+        )
         await b1_service.flush_events()
         event_types = [
             event.event_type for event in await record_service.list_events(result.call_id)
