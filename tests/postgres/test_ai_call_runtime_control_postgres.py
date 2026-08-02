@@ -6745,6 +6745,101 @@ async def test_outbound_fair_dispatcher_selects_one_candidate_per_lane_first() -
         await engine.dispose()
 
 
+async def test_dispatcher_releases_record_before_reconciler_task_record_lock_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    record_locked = asyncio.Event()
+    task_locked = asyncio.Event()
+    try:
+        line_id = generate_snowflake_id()
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            await _insert_sip_line(session, line_id=line_id, max_concurrency=1)
+            task_id, _target_ids = await _insert_outbound_task(
+                session,
+                tenant_id="tenant-a",
+                line_id=line_id,
+                now=now,
+            )
+            await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-dispatch-reconcile-lock-order",
+                    startup_id=UUID("77777777-7777-4777-8777-777777777777"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+
+        assert (
+            await OutboundTaskExecutor(
+                factory,
+                _RejectingOwnerRuntimeDialer(),
+                now_provider=lambda: now,
+                business_timezone="UTC",
+                owner_runtime_start=OwnerRuntimeOutboundStart(),
+            ).run_once()
+            == 1
+        )
+
+        async with factory() as session:
+            call_id = await session.scalar(
+                select(AiCallOutboundAttemptModel.call_id).where(
+                    AiCallOutboundAttemptModel.task_id == task_id
+                )
+            )
+        assert call_id is not None
+
+        original_expire = RuntimeCommandRepository.expire_unallocated_start
+
+        async def synchronize_after_record_lock(
+            self,
+            tenant_id: str,
+            candidate_call_id: str,
+        ) -> bool:
+            expired = await original_expire(self, tenant_id, candidate_call_id)
+            assert not expired
+            record_locked.set()
+            await asyncio.wait_for(task_locked.wait(), timeout=2)
+            return False
+
+        monkeypatch.setattr(
+            RuntimeCommandRepository,
+            "expire_unallocated_start",
+            synchronize_after_record_lock,
+        )
+
+        async def lock_in_reconciler_order() -> None:
+            await asyncio.wait_for(record_locked.wait(), timeout=2)
+            async with factory.begin() as session:
+                task = await session.scalar(
+                    select(AiCallOutboundTaskModel)
+                    .where(AiCallOutboundTaskModel.id == task_id)
+                    .with_for_update()
+                )
+                assert task is not None
+                task_locked.set()
+                record = await session.scalar(
+                    select(AiCallRecordModel)
+                    .where(AiCallRecordModel.call_id == call_id)
+                    .with_for_update()
+                )
+                assert record is not None
+
+        dispatcher_result, _ = await asyncio.wait_for(
+            asyncio.gather(
+                DispatcherControlService(factory).run_once(),
+                lock_in_reconciler_order(),
+            ),
+            timeout=5,
+        )
+        assert dispatcher_result == 1
+    finally:
+        await engine.dispose()
+
+
 async def test_outbound_timeout_reconcile_lease_takeover_is_single_projection() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)

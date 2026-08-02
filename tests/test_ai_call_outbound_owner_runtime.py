@@ -1105,6 +1105,155 @@ async def test_dispatcher_orders_first_candidate_from_each_tenant_line_lane_firs
 
 
 @pytest.mark.anyio
+async def test_dispatcher_expires_and_assigns_in_separate_transactions(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.services.ai_call.runtime_control.dispatcher_service import (
+        DispatcherControlService,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    await _seed_due_task(database, now)
+    assert (
+        await OutboundTaskExecutor(
+            database,
+            RejectingDialer(),
+            now_provider=lambda: now,
+            business_timezone="UTC",
+            owner_runtime_start=OwnerRuntimeOutboundStart(
+                database_clock=lambda _session: _constant_time(now)
+            ),
+        ).run_once()
+        == 1
+    )
+
+    expire_sessions: list[object] = []
+    assign_sessions: list[object] = []
+
+    async def never_expire(self, tenant_id: str, call_id: str) -> bool:
+        del tenant_id, call_id
+        expire_sessions.append(self._session)
+        return False
+
+    async def capture_assignment(self, tenant_id: str, call_id: str):
+        del tenant_id, call_id
+        assign_sessions.append(self._session)
+        return None
+
+    monkeypatch.setattr(
+        RuntimeCommandRepository,
+        "expire_unallocated_start",
+        never_expire,
+    )
+    monkeypatch.setattr(
+        DispatcherOwnerRepository,
+        "assign_initial_owner",
+        capture_assignment,
+    )
+
+    assert await DispatcherControlService(database).run_once() == 0
+    assert len(expire_sessions) == len(assign_sessions) == 1
+    assert expire_sessions[0] is not assign_sessions[0]
+
+
+@pytest.mark.anyio
+async def test_dispatcher_rolls_back_owner_if_deadline_elapses_before_commit(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.services.ai_call.runtime_control.dispatcher_service import (
+        DispatcherControlService,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    worker_id = await _seed_ready_worker(database, now)
+    assert (
+        await OutboundTaskExecutor(
+            database,
+            RejectingDialer(),
+            now_provider=lambda: now,
+            business_timezone="UTC",
+            owner_runtime_start=OwnerRuntimeOutboundStart(
+                database_clock=lambda _session: _constant_time(now)
+            ),
+        ).run_once()
+        == 1
+    )
+
+    original_expire = RuntimeCommandRepository.expire_unallocated_start
+    expire_call_count = 0
+    database_now = now.replace(tzinfo=None)
+
+    async def expire_after_first_check(
+        self,
+        tenant_id: str,
+        call_id: str,
+    ) -> bool:
+        nonlocal expire_call_count
+        expire_call_count += 1
+        if expire_call_count > 1:
+            return await original_expire(self, tenant_id, call_id)
+        command = await self._session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        assert command is not None
+        command.allocation_deadline_at = datetime(2000, 1, 1)
+        await self._session.flush()
+        return False
+
+    monkeypatch.setattr(
+        RuntimeCommandRepository,
+        "expire_unallocated_start",
+        expire_after_first_check,
+    )
+
+    assert (
+        await DispatcherControlService(
+            database,
+            database_clock=lambda _session: _constant_time(database_now),
+        ).run_once()
+        == 1
+    )
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.task_id == task_id)
+        )
+        assert attempt is not None
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == attempt.call_id)
+        )
+        command = await session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.call_id == attempt.call_id
+            )
+        )
+        worker = await session.get(AiCallRuntimeWorkerModel, worker_id)
+        reservation_count = int(
+            await session.scalar(select(func.count(AiCallSipLineReservationModel.id))) or 0
+        )
+
+    assert expire_call_count == 2
+    assert record is not None and record.runtime_owner_id is None
+    assert record.status == "failed"
+    assert command is not None and command.status == "DEAD"
+    assert worker is not None and worker.active_call_count == 0
+    assert reservation_count == 0
+
+
+@pytest.mark.anyio
 async def test_attempt_terminal_projection_retries_allocation_timeout(
     database,
 ) -> None:

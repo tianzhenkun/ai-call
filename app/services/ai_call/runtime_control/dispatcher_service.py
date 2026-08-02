@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from sqlalchemy import String, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -16,7 +18,12 @@ from app.services.ai_call.runtime_control.owner_repository import (
     DispatcherOwnerRepository,
 )
 from app.services.ai_call.runtime_control.postgres_wakeup import WakeupListener
+from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
+
+
+class _AllocationDeadlineElapsed(RuntimeError):
+    pass
 
 
 class DispatcherControlService:
@@ -27,11 +34,13 @@ class DispatcherControlService:
         batch_size: int = 32,
         scan_interval_seconds: float = 1.0,
         wakeup_listener: WakeupListener | None = None,
+        database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
     ) -> None:
         self._session_factory = session_factory
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
         self._wakeup_listener = wakeup_listener
+        self._database_clock = database_clock
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -113,18 +122,56 @@ class DispatcherControlService:
         assigned = 0
         for tenant_id, call_id in candidates:
             async with self._session_factory.begin() as session:
-                command_repository = RuntimeCommandRepository(session)
+                command_repository = RuntimeCommandRepository(
+                    session,
+                    database_clock=self._database_clock,
+                )
                 if await command_repository.expire_unallocated_start(
                     str(tenant_id), call_id
                 ):
                     assigned += 1
                     continue
-                lease = await DispatcherOwnerRepository(
-                    session
-                ).assign_initial_owner(str(tenant_id), call_id)
-                if lease is not None:
+
+            try:
+                async with self._session_factory.begin() as session:
+                    lease = await DispatcherOwnerRepository(
+                        session,
+                        database_clock=self._database_clock,
+                    ).assign_initial_owner(str(tenant_id), call_id)
+                    if lease is not None and await self._allocation_deadline_elapsed(
+                        session,
+                        str(tenant_id),
+                        call_id,
+                    ):
+                        raise _AllocationDeadlineElapsed
+                    if lease is not None:
+                        assigned += 1
+            except _AllocationDeadlineElapsed:
+                async with self._session_factory.begin() as session:
+                    expired = await RuntimeCommandRepository(
+                        session,
+                        database_clock=self._database_clock,
+                    ).expire_unallocated_start(str(tenant_id), call_id)
+                if expired:
                     assigned += 1
         return assigned
+
+    async def _allocation_deadline_elapsed(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        call_id: str,
+    ) -> bool:
+        allocation_deadline_at = await session.scalar(
+            select(AiCallRuntimeCommandModel.allocation_deadline_at).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        if allocation_deadline_at is None:
+            return False
+        return allocation_deadline_at <= await self._database_clock(session)
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
