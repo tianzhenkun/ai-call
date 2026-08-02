@@ -16,6 +16,7 @@ from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.model import (
+    AiCallEventModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
@@ -529,6 +530,7 @@ async def _reset_repository_schema(engine) -> None:
         AiCallOutboundTaskModel.__table__,
         AiCallHandoffAgentModel.__table__,
         AiCallHandoffModel.__table__,
+        AiCallEventModel.__table__,
         AiCallRecordModel.__table__,
     )
     async with engine.begin() as connection:
@@ -2295,6 +2297,141 @@ async def test_owner_dispatcher_assigns_once_and_runtime_only_renews_exact_lease
                 await recovery.assign_cleanup_owner("tenant-a", second_call.call_id)
                 is None
             )
+    finally:
+        await engine.dispose()
+
+
+async def test_runtime_owner_records_sip_connected_once_and_rejects_stale_or_terminal() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            session.add_all(
+                (
+                    AiCallRuntimeWorkerModel(
+                        worker_id="runtime-1",
+                        status="READY",
+                        capacity=1,
+                        cleanup_capacity=1,
+                        active_call_count=1,
+                        active_cleanup_count=0,
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(minutes=1),
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRecordModel(
+                        id=9101,
+                        tenant_id="tenant-a",
+                        call_id="call-connected",
+                        entry_type="outbound",
+                        room_name="room-call-connected",
+                        participant_identity="sip-call-connected",
+                        status="ready",
+                        started_at=now,
+                        runtime_control_mode="owner_command_v1",
+                        runtime_owner_id="runtime-1",
+                        runtime_fencing_token=7,
+                        runtime_lease_expires_at=now + timedelta(minutes=1),
+                        runtime_capacity_class="active",
+                    ),
+                )
+            )
+
+        async with factory.begin() as session:
+            repository = RuntimeOwnerRepository(session)
+            assert await repository.record_sip_connected(
+                tenant_id="tenant-a",
+                call_id="call-connected",
+                owner_id="runtime-1",
+                fencing_token=7,
+                sip_call_status="active",
+            ) is True
+            answered_at = await session.scalar(
+                select(AiCallRecordModel.answered_at).where(
+                    AiCallRecordModel.call_id == "call-connected"
+                )
+            )
+            assert answered_at is not None
+
+            assert await repository.record_sip_connected(
+                tenant_id="tenant-a",
+                call_id="call-connected",
+                owner_id="runtime-1",
+                fencing_token=7,
+                sip_call_status="connected",
+            ) is True
+            assert await session.scalar(
+                select(AiCallRecordModel.answered_at).where(
+                    AiCallRecordModel.call_id == "call-connected"
+                )
+            ) == answered_at
+            assert await session.scalar(
+                select(func.count()).select_from(AiCallEventModel).where(
+                    AiCallEventModel.call_id == "call-connected",
+                    AiCallEventModel.event_type == "media_connected",
+                )
+            ) == 1
+
+        async with factory.begin() as session:
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == "call-connected"
+                )
+            )
+            assert record is not None
+            record.runtime_fencing_token = 8
+            record.answered_at = None
+            record.status = "ready"
+            await session.execute(
+                text("delete from ai_call_event where call_id='call-connected'")
+            )
+
+        async with factory.begin() as session:
+            repository = RuntimeOwnerRepository(session)
+            assert await repository.record_sip_connected(
+                tenant_id="tenant-a",
+                call_id="call-connected",
+                owner_id="runtime-1",
+                fencing_token=7,
+                sip_call_status="active",
+            ) is False
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == "call-connected"
+                )
+            )
+            assert record is not None and record.answered_at is None
+            assert await session.scalar(
+                select(func.count()).select_from(AiCallEventModel).where(
+                    AiCallEventModel.call_id == "call-connected"
+                )
+            ) == 0
+
+        async with factory.begin() as session:
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == "call-connected"
+                )
+            )
+            assert record is not None
+            record.terminal_requested_at = await read_database_time(session)
+
+        async with factory.begin() as session:
+            assert await RuntimeOwnerRepository(session).record_sip_connected(
+                tenant_id="tenant-a",
+                call_id="call-connected",
+                owner_id="runtime-1",
+                fencing_token=8,
+                sip_call_status="active",
+            ) is False
+            assert await session.scalar(
+                select(func.count()).select_from(AiCallEventModel).where(
+                    AiCallEventModel.call_id == "call-connected"
+                )
+            ) == 0
     finally:
         await engine.dispose()
 

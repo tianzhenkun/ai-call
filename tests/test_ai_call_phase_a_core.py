@@ -1644,6 +1644,7 @@ class FakeLiveKitLocalParticipant:
 class FakeLiveKitRoom:
     def __init__(self) -> None:
         self.local_participant = FakeLiveKitLocalParticipant()
+        self.remote_participants: dict[str, FakeLiveKitParticipant] = {}
         self.connected: tuple[str, str] | None = None
         self.callbacks: dict[str, object] = {}
         self.disconnected = False
@@ -1661,6 +1662,7 @@ class FakeLiveKitRoom:
 @dataclass(slots=True)
 class FakeLiveKitParticipant:
     identity: str
+    attributes: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -2834,6 +2836,102 @@ async def test_livekit_room_audio_transport_filters_to_session_participant_ident
     assert received.data == b"\x01\x00" * 160
     assert received.sample_rate_hz == 8000
     assert received.channels == 1
+
+
+@pytest.mark.anyio
+async def test_livekit_room_audio_transport_reports_only_target_sip_connected_status_once() -> None:
+    room = FakeLiveKitRoom()
+    observed: list[str] = []
+    transport = LiveKitRoomAudioTransport(
+        livekit_url="wss://livekit.test",
+        api_key="livekit-key",
+        api_secret="livekit-secret",
+        rtc_module=FakeRtcModule,
+        room_factory=lambda: room,
+    )
+    transport.bind_sip_connected_observer(
+        "call_sip_connected",
+        lambda status: _append_async(observed, status),
+    )
+    session = CallSession(
+        call_id="call_sip_connected",
+        room_name="ai-call-call_sip_connected",
+        participant_identity="sip-call_sip_connected",
+        status=CallSessionStatus.READY,
+        effective_config={},
+    )
+
+    await transport.start(session)
+    callback = room.callbacks["participant_attributes_changed"]
+    callback(
+        {"sip.callStatus": "ringing"},
+        FakeLiveKitParticipant(
+            identity="sip-call_sip_connected",
+            attributes={"sip.callStatus": "ringing"},
+        ),
+    )
+    callback(
+        {"sip.callStatus": "active"},
+        FakeLiveKitParticipant(
+            identity="another-participant",
+            attributes={"sip.callStatus": "active"},
+        ),
+    )
+    callback(
+        {"sip.callStatus": "active"},
+        FakeLiveKitParticipant(
+            identity="sip-call_sip_connected",
+            attributes={"sip.callStatus": "active"},
+        ),
+    )
+    callback(
+        {"sip.callStatus": "connected"},
+        FakeLiveKitParticipant(
+            identity="sip-call_sip_connected",
+            attributes={"sip.callStatus": "connected"},
+        ),
+    )
+    await asyncio.sleep(0)
+
+    assert observed == ["active"]
+
+
+@pytest.mark.anyio
+async def test_livekit_room_audio_transport_recovers_initial_active_sip_fact() -> None:
+    room = FakeLiveKitRoom()
+    room.remote_participants["sip-call_sip_recovered"] = FakeLiveKitParticipant(
+        identity="sip-call_sip_recovered",
+        attributes={"sip.callStatus": "answered"},
+    )
+    observed: list[str] = []
+    transport = LiveKitRoomAudioTransport(
+        livekit_url="wss://livekit.test",
+        api_key="livekit-key",
+        api_secret="livekit-secret",
+        rtc_module=FakeRtcModule,
+        room_factory=lambda: room,
+    )
+    transport.bind_sip_connected_observer(
+        "call_sip_recovered",
+        lambda status: _append_async(observed, status),
+    )
+
+    await transport.start(
+        CallSession(
+            call_id="call_sip_recovered",
+            room_name="ai-call-call_sip_recovered",
+            participant_identity="sip-call_sip_recovered",
+            status=CallSessionStatus.READY,
+            effective_config={},
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert observed == ["answered"]
+
+
+async def _append_async(values: list[str], value: str) -> None:
+    values.append(value)
 
 
 @pytest.mark.anyio

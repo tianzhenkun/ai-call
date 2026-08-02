@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -12,6 +14,10 @@ from app.services.ai_call.audio_bridge import PcmAudioFrame
 from app.services.ai_call.session_registry import CallSession
 
 RoomFactory = Callable[[], Any]
+SipConnectedObserver = Callable[[str], Awaitable[bool]]
+
+_SIP_CONNECTED_STATUSES = frozenset({"active", "answered", "connected"})
+_LOGGER = logging.getLogger(__name__)
 
 
 class LiveKitRoomAudioTransport:
@@ -45,6 +51,22 @@ class LiveKitRoomAudioTransport:
         self._track_streams: dict[str, Any] = {}
         self._last_output_frames: dict[str, PcmAudioFrame] = {}
         self._target_participant_identities: dict[str, str] = {}
+        self._sip_connected_observers: dict[str, SipConnectedObserver] = {}
+        self._sip_connected_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reported_sip_connected: set[str] = set()
+
+    def bind_sip_connected_observer(
+        self,
+        call_id: str,
+        observer: SipConnectedObserver,
+    ) -> None:
+        self.unbind_sip_connected_observer(call_id)
+        self._sip_connected_observers[call_id] = observer
+
+    def unbind_sip_connected_observer(self, call_id: str) -> None:
+        self._sip_connected_observers.pop(call_id, None)
+        self._reported_sip_connected.discard(call_id)
+        self._sip_connected_tasks.pop(call_id, None)
 
     async def start(self, session: CallSession) -> None:
         room = self.room_factory()
@@ -67,6 +89,21 @@ class LiveKitRoomAudioTransport:
                 participant,
             ),
         )
+        room.on(
+            "participant_connected",
+            lambda participant: self._on_participant_updated(
+                session.call_id,
+                participant,
+            ),
+        )
+        room.on(
+            "participant_attributes_changed",
+            lambda changed_attributes, participant: self._on_participant_updated(
+                session.call_id,
+                participant,
+                changed_attributes,
+            ),
+        )
         await room.connect(
             self.livekit_url,
             self._issue_agent_token(
@@ -78,6 +115,8 @@ class LiveKitRoomAudioTransport:
 
         self._rooms[session.call_id] = room
         self._sources[session.call_id] = source
+        for participant in getattr(room, "remote_participants", {}).values():
+            self._on_participant_updated(session.call_id, participant)
 
     async def publish_audio(self, call_id: str, frame: PcmAudioFrame) -> None:
         source = self._sources[call_id]
@@ -111,6 +150,7 @@ class LiveKitRoomAudioTransport:
                 yield self._from_rtc_audio_frame(audio_event.frame)
 
     async def close(self, call_id: str) -> None:
+        self.unbind_sip_connected_observer(call_id)
         with suppress(Exception):
             await self.stop_audio(call_id)
         stream_queue = self._track_streams.pop(call_id, None)
@@ -123,6 +163,55 @@ class LiveKitRoomAudioTransport:
         self._sources.pop(call_id, None)
         self._last_output_frames.pop(call_id, None)
         self._target_participant_identities.pop(call_id, None)
+
+    def _on_participant_updated(
+        self,
+        call_id: str,
+        participant: Any,
+        changed_attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        target_identity = self._target_participant_identities.get(call_id)
+        if not target_identity or getattr(participant, "identity", None) != target_identity:
+            return
+        attributes = getattr(participant, "attributes", None)
+        status = None
+        if changed_attributes is not None:
+            status = changed_attributes.get("sip.callStatus")
+        if status is None and isinstance(attributes, Mapping):
+            status = attributes.get("sip.callStatus")
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in _SIP_CONNECTED_STATUSES:
+            return
+        if call_id in self._reported_sip_connected:
+            return
+        active_task = self._sip_connected_tasks.get(call_id)
+        if active_task is not None and not active_task.done():
+            return
+        observer = self._sip_connected_observers.get(call_id)
+        if observer is None:
+            return
+        task = asyncio.create_task(
+            self._notify_sip_connected(call_id, normalized_status, observer)
+        )
+        self._sip_connected_tasks[call_id] = task
+
+    async def _notify_sip_connected(
+        self,
+        call_id: str,
+        status: str,
+        observer: SipConnectedObserver,
+    ) -> None:
+        try:
+            accepted = await observer(status)
+            if accepted:
+                self._reported_sip_connected.add(call_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("failed to persist SIP connected fact for call %s", call_id)
+        finally:
+            if self._sip_connected_tasks.get(call_id) is asyncio.current_task():
+                self._sip_connected_tasks.pop(call_id, None)
 
     def _on_track_subscribed(
         self,

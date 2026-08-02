@@ -218,6 +218,64 @@ async def test_livekit_provider_rejects_callee_outside_single_number_allowlist()
 
 
 @pytest.mark.anyio
+async def test_livekit_provider_missing_callee_is_permanent_no_resource() -> None:
+    class MissingCalleeResolver(FakeResolver):
+        async def resolve(self, effect):
+            resource = await super().resolve(effect)
+            return replace(resource, callee_phone_number=None)
+
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    sip_client = FakeSipClient()
+    provider = LiveKitRuntimeProvider(
+        resolver=MissingCalleeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=sip_client,
+        egress_manager=FakeEgressManager(),
+    )
+
+    observation = await provider.apply(_effect("CREATE_SIP_PARTICIPANT"))
+
+    assert observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE
+    assert observation.error_message == "callee_phone_number_missing"
+    assert sip_client.calls == []
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_missing_callee_reconcile_closes_absent_resource() -> None:
+    class MissingCalleeResolver(FakeResolver):
+        async def resolve(self, effect):
+            resource = await super().resolve(effect)
+            return replace(resource, callee_phone_number=None)
+
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    room_manager = FakeRoomManager()
+    room_manager.participants.discard("sip-call-1")
+    sip_client = FakeSipClient()
+    provider = LiveKitRuntimeProvider(
+        resolver=MissingCalleeResolver(),
+        room_manager=room_manager,
+        agent_manager=FakeAgentManager(),
+        sip_client=sip_client,
+        egress_manager=FakeEgressManager(),
+    )
+
+    observation = await provider.apply(
+        _effect("CREATE_SIP_PARTICIPANT", reconcile_only=True)
+    )
+
+    assert observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE
+    assert observation.error_message == "callee_phone_number_missing"
+    assert sip_client.calls == []
+
+
+@pytest.mark.anyio
 async def test_livekit_provider_reconcile_only_queries_without_repeating_mutation() -> None:
     room_manager = FakeRoomManager()
     provider = _provider(room_manager=room_manager)
@@ -417,3 +475,100 @@ async def test_owner_agent_manager_registers_generation_identity_and_fail_closed
     assert runner.stopped == ["call-1"]
     assert await manager.exists("call-1") is False
     assert "call-1" not in runtime_registry.local_handles
+
+
+@pytest.mark.anyio
+async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import livekit_provider
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        OwnerRuntimeAgentManager,
+        RuntimeProviderResource,
+    )
+
+    recorded: list[tuple[str, str, str, int, str]] = []
+
+    class FakeConnectedRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def record_sip_connected(
+            self,
+            *,
+            tenant_id: str,
+            call_id: str,
+            owner_id: str,
+            fencing_token: int,
+            sip_call_status: str,
+        ) -> bool:
+            recorded.append(
+                (tenant_id, call_id, owner_id, fencing_token, sip_call_status)
+            )
+            return True
+
+    class SessionFactory:
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class FakeAudioTransport:
+        def __init__(self) -> None:
+            self.observers = {}
+
+        def bind_sip_connected_observer(self, call_id, observer) -> None:
+            self.observers[call_id] = observer
+
+        def unbind_sip_connected_observer(self, call_id) -> None:
+            self.observers.pop(call_id, None)
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.audio_transport = FakeAudioTransport()
+
+        async def start(self, _session) -> None:
+            return None
+
+        async def stop(self, _call_id: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        livekit_provider,
+        "RuntimeOwnerRepository",
+        FakeConnectedRepository,
+    )
+    runner = FakeRunner()
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=SimpleNamespace(
+            registry=InMemorySessionRegistry(),
+            agent_runner=runner,
+            _build_effective_config=lambda _voice, _prompt: {},
+        ),
+        runtime_registry=RuntimeRegistry(),
+        session_factory=SessionFactory(),
+    )
+
+    await manager.start(
+        RuntimeProviderResource(
+            call_id="call-1",
+            room_name="ai-call-call-1",
+            customer_participant_identity="sip-call-1",
+            agent_participant_identity="agent-call-1-g7",
+            tenant_id="tenant-a",
+            runtime_owner_id="runtime-1",
+            runtime_fencing_token=7,
+        )
+    )
+    assert "call-1" in runner.audio_transport.observers
+
+    assert await runner.audio_transport.observers["call-1"]("active") is True
+    assert recorded == [("tenant-a", "call-1", "runtime-1", 7, "active")]
+
+    await manager.stop("call-1")
+
+    assert "call-1" not in runner.audio_transport.observers

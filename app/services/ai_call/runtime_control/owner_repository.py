@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -12,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
@@ -73,6 +74,11 @@ def build_worker_id(deployment_instance_id: str, startup_id: UUID) -> str:
     if len(worker_id) > 128:
         raise ValueError("worker_id exceeds 128 characters")
     return worker_id
+
+
+def _sip_connected_event_id(tenant_id: str, call_id: str) -> str:
+    digest = hashlib.sha256(f"{tenant_id}\0{call_id}".encode()).hexdigest()[:48]
+    return f"media-connected-{digest}"
 
 
 class WorkerRegistryRepository:
@@ -529,6 +535,87 @@ class RuntimeOwnerRepository:
                 )
             )
         )
+
+    async def record_sip_connected(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        owner_id: str,
+        fencing_token: int,
+        sip_call_status: str,
+    ) -> bool:
+        normalized_status = sip_call_status.strip().lower()
+        if normalized_status not in {"active", "answered", "connected"}:
+            raise ValueError("sip_call_status is not connected")
+
+        record = await self._session.scalar(
+            select(AiCallRecordModel)
+            .where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            )
+            .with_for_update()
+        )
+        worker = await self._session.scalar(
+            select(AiCallRuntimeWorkerModel)
+            .where(AiCallRuntimeWorkerModel.worker_id == owner_id)
+            .with_for_update()
+        )
+        now = await self._database_clock(self._session)
+        if (
+            record is None
+            or worker is None
+            or record.runtime_control_mode != "owner_command_v1"
+            or record.runtime_owner_id != owner_id
+            or record.runtime_fencing_token != fencing_token
+            or record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at <= now
+            or record.runtime_capacity_class != "active"
+            or record.terminal_requested_at is not None
+            or str(record.status).lower() in {"ending", "completed", "failed"}
+            or worker.status not in {"READY", "DRAINING"}
+            or worker.lease_expires_at <= now
+        ):
+            return False
+
+        event_id = _sip_connected_event_id(tenant_id, call_id)
+        existing_event = await self._session.scalar(
+            select(AiCallEventModel).where(AiCallEventModel.event_id == event_id)
+        )
+        if existing_event is not None and (
+            existing_event.call_id != call_id
+            or existing_event.event_type != "media_connected"
+        ):
+            return False
+
+        if record.answered_at is None:
+            record.answered_at = now
+        record.status = "connected"
+
+        if existing_event is None:
+            self._session.add(
+                AiCallEventModel(
+                    id=generate_snowflake_id(),
+                    call_id=call_id,
+                    event_id=event_id,
+                    event_type="media_connected",
+                    source="livekit_runtime",
+                    event_time=record.answered_at,
+                    payload_json=json.dumps(
+                        {
+                            "evidence": "sip_call_status",
+                            "runtimeFencingToken": str(fencing_token),
+                            "sipCallStatus": normalized_status,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+            )
+        await self._session.flush()
+        return True
 
 
 class RecoveryOwnerRepository:

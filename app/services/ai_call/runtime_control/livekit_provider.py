@@ -16,6 +16,7 @@ from app.services.ai_call.runtime_control.effect_repository import (
 from app.services.ai_call.runtime_control.handoff_handlers import (
     AgentMediaObservation,
 )
+from app.services.ai_call.runtime_control.owner_repository import RuntimeOwnerRepository
 from app.services.ai_call.session_registry import CallSession, CallSessionStatus
 
 
@@ -28,6 +29,9 @@ class RuntimeProviderResource:
     callee_phone_number: str | None = None
     egress_id: str | None = None
     voice: str | None = None
+    tenant_id: str | None = None
+    runtime_owner_id: str | None = None
+    runtime_fencing_token: int | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -108,6 +112,9 @@ class DatabaseRuntimeProviderResourceResolver:
                 ),
                 egress_id=egress_id,
                 voice=voice,
+                tenant_id=claim.tenant_id,
+                runtime_owner_id=claim.processing_owner_id,
+                runtime_fencing_token=claim.processing_fencing_token,
             )
 
     @staticmethod
@@ -168,6 +175,10 @@ class ProviderPolicyDeniedError(RuntimeError):
     pass
 
 
+class ProviderPreconditionError(ValueError):
+    pass
+
+
 class _OwnerAgentLocalHandle:
     def __init__(self, manager: OwnerRuntimeAgentManager, call_id: str) -> None:
         self._manager = manager
@@ -180,14 +191,22 @@ class _OwnerAgentLocalHandle:
 class OwnerRuntimeAgentManager:
     """Owns the process-local realtime runner for the fenced Runtime Owner."""
 
-    def __init__(self, *, orchestrator: Any, runtime_registry: Any) -> None:
+    def __init__(
+        self,
+        *,
+        orchestrator: Any,
+        runtime_registry: Any,
+        session_factory: Any | None = None,
+    ) -> None:
         self._orchestrator = orchestrator
         self._runtime_registry = runtime_registry
+        self._session_factory = session_factory
         self._active_identities: dict[str, str] = {}
 
     async def start(self, resource: RuntimeProviderResource) -> str:
         current_identity = self._active_identities.get(resource.call_id)
         if current_identity == resource.agent_participant_identity:
+            self._bind_sip_connected_observer(resource)
             return current_identity
         if current_identity is not None:
             await self.stop(resource.call_id)
@@ -210,12 +229,14 @@ class OwnerRuntimeAgentManager:
         )
         self._runtime_registry.local_handles[resource.call_id] = handle
         try:
+            self._bind_sip_connected_observer(resource)
             await self._orchestrator.agent_runner.start(session)
         except BaseException:
             self._active_identities.pop(resource.call_id, None)
             if self._runtime_registry.local_handles.get(resource.call_id) is handle:
                 self._runtime_registry.local_handles.pop(resource.call_id, None)
             self._orchestrator.registry.discard(resource.call_id)
+            self._unbind_sip_connected_observer(resource.call_id)
             with suppress(Exception):
                 await self._orchestrator.agent_runner.stop(resource.call_id)
             raise
@@ -229,7 +250,40 @@ class OwnerRuntimeAgentManager:
         self._runtime_registry.local_handles.pop(call_id, None)
         with suppress(Exception):
             await self._orchestrator.agent_runner.stop(call_id)
+        self._unbind_sip_connected_observer(call_id)
         self._orchestrator.registry.discard(call_id)
+
+    def _bind_sip_connected_observer(self, resource: RuntimeProviderResource) -> None:
+        if (
+            resource.tenant_id is None
+            or resource.runtime_owner_id is None
+            or resource.runtime_fencing_token is None
+        ):
+            return
+        if self._session_factory is None:
+            raise RuntimeError("runtime connected fact session factory is missing")
+        audio_transport = getattr(self._orchestrator.agent_runner, "audio_transport", None)
+        bind = getattr(audio_transport, "bind_sip_connected_observer", None)
+        if bind is None:
+            raise RuntimeError("runtime audio transport cannot observe SIP connected facts")
+
+        async def persist(sip_call_status: str) -> bool:
+            async with self._session_factory.begin() as session:
+                return await RuntimeOwnerRepository(session).record_sip_connected(
+                    tenant_id=resource.tenant_id,
+                    call_id=resource.call_id,
+                    owner_id=resource.runtime_owner_id,
+                    fencing_token=resource.runtime_fencing_token,
+                    sip_call_status=sip_call_status,
+                )
+
+        bind(resource.call_id, persist)
+
+    def _unbind_sip_connected_observer(self, call_id: str) -> None:
+        audio_transport = getattr(self._orchestrator.agent_runner, "audio_transport", None)
+        unbind = getattr(audio_transport, "unbind_sip_connected_observer", None)
+        if unbind is not None:
+            unbind(call_id)
 
 
 _TERMINAL_EGRESS_STATUSES = frozenset(
@@ -304,6 +358,11 @@ class LiveKitRuntimeProvider:
                 kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
                 error_message="callee_not_allowed",
             )
+        except ProviderPreconditionError as exc:
+            return ProviderObservation(
+                kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                error_message=str(exc),
+            )
 
     async def query_agent_media(
         self,
@@ -335,7 +394,7 @@ class LiveKitRuntimeProvider:
             return await self._agent_manager.start(resource)
         if effect.effect_type == "CREATE_SIP_PARTICIPANT":
             if not resource.callee_phone_number:
-                raise ValueError("CREATE_SIP_PARTICIPANT requires callee phone number")
+                raise ProviderPreconditionError("callee_phone_number_missing")
             if (
                 self._allowed_callee_phone_number is not None
                 and resource.callee_phone_number
@@ -415,6 +474,15 @@ class LiveKitRuntimeProvider:
                 resource.room_name,
                 resource.customer_participant_identity,
             )
+            if (
+                not present
+                and effect.reconcile_only
+                and not resource.callee_phone_number
+            ):
+                return ProviderObservation(
+                    kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                    error_message="callee_phone_number_missing",
+                )
             return ProviderObservation(
                 kind=(
                     ProviderObservationKind.RESOURCE_PRESENT
@@ -499,6 +567,7 @@ def build_livekit_runtime_provider(
         agent_manager=OwnerRuntimeAgentManager(
             orchestrator=orchestrator,
             runtime_registry=registry,
+            session_factory=session_factory,
         ),
         sip_client=LiveKitSipClient(
             config=SipOutboundConfig.from_settings(settings),
