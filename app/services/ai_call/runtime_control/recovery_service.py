@@ -9,6 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
+from app.services.ai_call.runtime_control.dialogue_repository import (
+    OwnerDialogueFence,
+    OwnerDialogueRepository,
+)
 from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
 from app.services.ai_call.runtime_control.owner_repository import (
     RecoveryOwnerRepository,
@@ -30,6 +34,10 @@ class RecoveryControlService:
         batch_size: int = 32,
         scan_interval_seconds: float = 0.5,
         database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
+        dialogue_repository_factory: Callable[
+            [AsyncSession], OwnerDialogueRepository
+        ]
+        | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -39,6 +47,12 @@ class RecoveryControlService:
         self._batch_size = batch_size
         self._scan_interval_seconds = scan_interval_seconds
         self._database_clock = database_clock
+        self._dialogue_repository_factory = dialogue_repository_factory or (
+            lambda session: OwnerDialogueRepository(
+                session,
+                database_clock=database_clock,
+            )
+        )
         self._startup_reconcile = StartupReconcileService(
             session_factory,
             batch_size=batch_size,
@@ -143,6 +157,16 @@ class RecoveryControlService:
                     call_id,
                 )
                 if lease is not None:
+                    await self._dialogue_repository_factory(session).finalize(
+                        OwnerDialogueFence(
+                            tenant_id=lease.tenant_id,
+                            call_id=lease.call_id,
+                            owner_id=lease.owner_id,
+                            fencing_token=lease.fencing_token,
+                        ),
+                        status="uncertain",
+                        error="recovery_owner_takeover",
+                    )
                     assigned += 1
         return assigned + await self._startup_reconcile.run_once()
 
