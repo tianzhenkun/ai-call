@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.common.enums import EnvironmentEnum
 from app.services.ai_call.runtime_control.lifecycle import (
     AiCallRuntimeTimingPolicy,
     start_dispatcher_control_lifecycle,
@@ -28,12 +29,13 @@ def _lease(*, fencing_token: int = 7):
     return SimpleNamespace(fencing_token=fencing_token)
 
 
-def test_direct_sip_default_specs_include_sip_participant() -> None:
+@pytest.mark.parametrize("entry_type", ["direct_sip", "outbound"])
+def test_sip_entry_default_specs_include_sip_participant(entry_type: str) -> None:
     specs = _default_start_specs(
         "call-a",
         _lease(fencing_token=7),
         "runtime-a",
-        entry_type="direct_sip",
+        entry_type=entry_type,
     )
 
     assert [spec.effect_type for spec in specs] == [
@@ -52,6 +54,20 @@ def test_default_start_specs_fail_closed_for_unknown_entry() -> None:
             "runtime-a",
             entry_type="preview",
         )
+
+
+def test_start_specs_use_real_provider_namespace_when_configured() -> None:
+    specs = _default_start_specs(
+        "call-a",
+        _lease(),
+        "runtime-a",
+        entry_type="web",
+        provider_namespace="livekit:isolated-test",
+    )
+
+    assert {spec.provider_namespace for spec in specs} == {
+        "livekit:isolated-test"
+    }
 
 
 def test_runtime_services_do_not_share_local_registry() -> None:
@@ -124,6 +140,56 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
     assert isinstance(service.provider, DeterministicWebProviderStub)
     assert service.provider.calls == []
     assert calls == ["validate_database", "construct", "start", "stop"]
+
+
+@pytest.mark.anyio
+async def test_real_provider_gate_requires_isolated_allowlist_and_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import lifecycle
+
+    marker = object()
+
+    def build_real_provider(**_kwargs):
+        return marker
+
+    monkeypatch.setattr(
+        lifecycle,
+        "build_livekit_runtime_provider",
+        build_real_provider,
+        raising=False,
+    )
+    base = {
+        "AI_CALL_RUNTIME_PROVIDER_MODE": "livekit",
+        "AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED": True,
+        "AI_CALL_OWNER_COMMAND_V1_ENTRIES": "direct_sip",
+        "AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": True,
+        "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": "19900001001",
+        "DATABASE_TYPE": "postgres",
+        "ENVIRONMENT": EnvironmentEnum.DEV,
+    }
+
+    selected = lifecycle.select_runtime_provider(
+        SimpleNamespace(**base),
+        session_factory=object(),
+        registry=RuntimeRegistry(),
+    )
+    assert selected is marker
+
+    for override in (
+        {"AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED": False},
+        {"AI_CALL_OWNER_COMMAND_V1_ENTRIES": ""},
+        {"AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": False},
+        {"AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": ""},
+        {"DATABASE_TYPE": "mysql"},
+        {"ENVIRONMENT": EnvironmentEnum.PROD},
+    ):
+        with pytest.raises(RuntimeError, match="真实 Provider"):
+            lifecycle.select_runtime_provider(
+                SimpleNamespace(**(base | override)),
+                session_factory=object(),
+                registry=RuntimeRegistry(),
+            )
 
 
 @pytest.mark.anyio
@@ -209,3 +275,123 @@ async def test_provider_timeout_before_owner_deadline_does_not_trip_watchdog() -
 
     assert watchdog.creation_allowed() is True
     assert fail_closed.is_set() is False
+
+
+@pytest.mark.anyio
+async def test_media_query_timeout_before_owner_deadline_does_not_trip_watchdog() -> None:
+    class TimeoutProvider:
+        async def query_agent_media(self, _room_name, _participant_identity):
+            raise TimeoutError("provider query timeout")
+
+    fail_closed = asyncio.Event()
+
+    async def mark_fail_closed() -> None:
+        fail_closed.set()
+
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+
+    with pytest.raises(TimeoutError, match="provider query timeout"):
+        await _FailClosedProvider(
+            TimeoutProvider(), watchdog, mark_fail_closed
+        ).query_agent_media("room-1", "agent-1")
+
+    assert watchdog.creation_allowed() is True
+    assert fail_closed.is_set() is False
+
+
+@pytest.mark.anyio
+async def test_runtime_routes_media_ready_to_specialized_handler(monkeypatch) -> None:
+    from app.services.ai_call.runtime_control import runtime_service
+
+    routed: list[tuple[object, object]] = []
+    claim = SimpleNamespace(
+        command_type="AGENT_MEDIA_READY",
+        call_id="call-1",
+    )
+    lease = SimpleNamespace(call_id="call-1")
+
+    class _Transaction:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+            return None
+
+    class _SessionFactory:
+        def begin(self):
+            return _Transaction()
+
+    class _CommandRepository:
+        claim_count = 0
+
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_pending_end(self, _lease):
+            return None
+
+        async def claim_next_for_owner(self, _lease):
+            return claim
+
+        async def complete(self, *_args, **_kwargs):
+            raise AssertionError("media command must not use the generic success path")
+
+    class _EffectRepository:
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_next(self, _lease):
+            return None
+
+        async def mark_cleanup_clean(self, _lease):
+            return False
+
+    class _ReadyHandler:
+        def __init__(self, session_factory, provider) -> None:
+            routed.append((session_factory, provider))
+
+        async def handle(self, received_claim, received_lease):
+            assert received_claim is claim
+            assert received_lease is lease
+            return SimpleNamespace(command_completed=True, state_changed=True)
+
+    class _Provider:
+        async def apply(self, _effect):
+            raise AssertionError("no effect should be applied")
+
+        async def query_agent_media(self, _room_name, _participant_identity):
+            raise AssertionError("specialized handler is mocked")
+
+    monkeypatch.setattr(runtime_service, "RuntimeCommandRepository", _CommandRepository)
+    monkeypatch.setattr(runtime_service, "RuntimeEffectRepository", _EffectRepository)
+    monkeypatch.setattr(
+        runtime_service,
+        "AgentMediaReadyHandler",
+        _ReadyHandler,
+        raising=False,
+    )
+    service = RuntimeControlService(
+        worker_id="runtime-test:12345678-1234-5678-1234-567812345678",
+        registry=RuntimeRegistry(),
+        session_factory=None,
+        provider=None,
+    )
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+
+    processed = await service._process_owned_call(
+        _SessionFactory(),
+        _Provider(),
+        lease,
+        watchdog,
+    )
+
+    assert processed is True
+    assert len(routed) == 1

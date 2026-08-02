@@ -69,7 +69,10 @@ class LiveKitRoomAudioTransport:
         )
         await room.connect(
             self.livekit_url,
-            self._issue_agent_token(session.room_name, f"agent-{session.call_id}"),
+            self._issue_agent_token(
+                session.room_name,
+                session.local_participant_identity or f"agent-{session.call_id}",
+            ),
         )
         await room.local_participant.publish_track(track, options)
 

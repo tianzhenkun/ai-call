@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from types import ModuleType
 
 import pytest
 from sqlalchemy import Text, UniqueConstraint, inspect
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import AiCallHandoffModel, AiCallRecordModel
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel
 
 
@@ -91,6 +92,123 @@ def test_outbound_attempt_has_independent_projection_lease_fields() -> None:
     }
     assert ("status", "reconcile_after") in index_columns
     assert ("reconcile_expires_at",) in index_columns
+
+    migration = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "livekit-ai-outbound"
+        / "sql"
+        / "phase-i1-owner-command-db-control-plane.sql"
+    ).read_text(encoding="utf-8").lower()
+    for fragment in (
+        "reconcile_owner_id varchar(128)",
+        "reconcile_token varchar(128)",
+        "reconcile_expires_at timestamptz",
+        "reconcile_after timestamptz",
+        "reconcile_attempt_count integer not null default 0",
+        "idx_outbound_attempt_reconcile",
+        "idx_outbound_attempt_reconcile_lease",
+    ):
+        assert fragment in migration
+
+
+def test_handoff_media_lifecycle_models_match_postgres_contract() -> None:
+    models = _load_runtime_models()
+
+    assert {
+        "participant_identity",
+        "participant_sid",
+        "track_sid",
+        "verified_at",
+        "evidence_source",
+        "media_state_version",
+        "media_invalidated_at",
+        "last_media_event_key",
+    } <= _column_names(AiCallHandoffModel)
+    handoff_columns = inspect(AiCallHandoffModel).columns
+    assert handoff_columns.media_state_version.nullable is False
+    assert handoff_columns.media_state_version.default.arg == 0
+
+    assert {
+        "id",
+        "tenant_id",
+        "handoff_id",
+        "call_id",
+        "provider_namespace",
+        "dedupe_key",
+        "participant_identity",
+        "participant_sid",
+        "track_sid",
+        "event_type",
+        "media_state_version",
+        "provider_event_id",
+        "event_at",
+        "received_at",
+        "evidence_json",
+    } == _column_names(models.AiCallHandoffMediaEvidenceModel)
+    assert {
+        "id",
+        "tenant_id",
+        "call_id",
+        "provider",
+        "provider_namespace",
+        "dedupe_key",
+        "event_type",
+        "payload_json",
+        "status",
+        "attempt_count",
+        "next_retry_at",
+        "processing_owner_id",
+        "processing_token",
+        "processing_expires_at",
+        "error_message",
+        "received_at",
+        "claimed_at",
+        "processed_at",
+    } == _column_names(models.AiCallWebhookInboxModel)
+    assert {
+        "id",
+        "provider",
+        "provider_namespace",
+        "dedupe_key",
+        "room_name",
+        "participant_identity",
+        "event_type",
+        "payload_json",
+        "status",
+        "attempt_count",
+        "next_retry_at",
+        "processing_owner_id",
+        "processing_generation",
+        "processing_token",
+        "processing_expires_at",
+        "claimed_at",
+        "resolved_tenant_id",
+        "resolved_call_id",
+        "error_message",
+        "received_at",
+        "resolved_at",
+    } == _column_names(models.AiCallWebhookQuarantineModel)
+    assert isinstance(
+        models.AiCallHandoffMediaEvidenceModel.__table__.c.evidence_json.type,
+        Text,
+    )
+    assert isinstance(
+        models.AiCallWebhookInboxModel.__table__.c.payload_json.type,
+        Text,
+    )
+    assert isinstance(
+        models.AiCallWebhookQuarantineModel.__table__.c.payload_json.type,
+        Text,
+    )
+    assert all(
+        not model.__table__.foreign_keys
+        for model in (
+            models.AiCallHandoffMediaEvidenceModel,
+            models.AiCallWebhookInboxModel,
+            models.AiCallWebhookQuarantineModel,
+        )
+    )
 
 
 def test_runtime_control_tables_and_required_columns_are_frozen() -> None:

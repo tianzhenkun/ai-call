@@ -18,6 +18,10 @@ class LiveKitEgressRequestTimeout(TimeoutError):
         super().__init__(f"{method} timed out after {timeout_seconds:g}s")
 
 
+class LiveKitEgressNotFoundError(LookupError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class LiveKitEgressStartResult:
     egress_id: str
@@ -148,6 +152,24 @@ class LiveKitEgressManager:
             error=str(data.get("error") or "") or None,
         )
 
+    async def get_egress_status(self, egress_id: str) -> str | None:
+        try:
+            data = await self._post_egress(
+                "ListEgress",
+                {"egress_id": egress_id},
+            )
+        except LiveKitEgressNotFoundError:
+            return None
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("ListEgress response is missing items")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("egress_id") or "") == egress_id:
+                return str(item.get("status") or "")
+        return None
+
     def build_object_name(self, call_id: str) -> str:
         suffix = self.file_type.lower()
         filename = f"{call_id}.{suffix}"
@@ -195,6 +217,10 @@ class LiveKitEgressManager:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            if response.status_code == 404:
+                raise LiveKitEgressNotFoundError(
+                    str(payload.get("egress_id") or "")
+                ) from exc
             raise RuntimeError(
                 self._http_error_message(method, response.status_code, response.text)
             ) from exc

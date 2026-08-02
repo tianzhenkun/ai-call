@@ -21,6 +21,14 @@ class BrowserRoomToken:
     expires_in_seconds: int
 
 
+@dataclass(frozen=True, slots=True)
+class LiveKitParticipantMediaFact:
+    participant_identity: str
+    participant_sid: str | None
+    track_sid: str | None
+    microphone_ready: bool
+
+
 class LiveKitRoomManager:
     def __init__(
         self,
@@ -128,22 +136,71 @@ class LiveKitRoomManager:
         room_name: str,
         participant_identity: str,
     ) -> bool:
-        participant = await self._post_room_service(
-            method="GetParticipant",
-            payload={"room": room_name, "identity": participant_identity},
-            error_id="participant_lookup_failed",
-            msg="LiveKit 坐席参与方核验失败",
-        )
+        fact = await self.get_participant_media(room_name, participant_identity)
+        return bool(fact and fact.microphone_ready)
+
+    async def get_participant_media(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> LiveKitParticipantMediaFact | None:
+        try:
+            participant = await self._post_room_service(
+                method="GetParticipant",
+                payload={"room": room_name, "identity": participant_identity},
+                error_id="participant_lookup_failed",
+                msg="LiveKit 参与方核验失败",
+            )
+        except AiCallError as exc:
+            if self._is_not_found(exc):
+                return None
+            raise
         tracks = participant.get("tracks")
-        if not isinstance(tracks, list):
-            return False
-        return any(
-            isinstance(track, dict)
-            and track.get("type") in {0, "AUDIO"}
-            and track.get("source") in {2, "MICROPHONE"}
-            and not bool(track.get("muted"))
-            for track in tracks
+        microphone_track = next(
+            (
+                track
+                for track in tracks
+                if isinstance(track, dict)
+                and track.get("type") in {0, "AUDIO"}
+                and track.get("source") in {2, "MICROPHONE"}
+                and not bool(track.get("muted"))
+            ),
+            None,
+        ) if isinstance(tracks, list) else None
+        return LiveKitParticipantMediaFact(
+            participant_identity=str(
+                participant.get("identity") or participant_identity
+            ),
+            participant_sid=str(participant.get("sid") or "") or None,
+            track_sid=(
+                str(microphone_track.get("sid") or "") or None
+                if microphone_track is not None
+                else None
+            ),
+            microphone_ready=microphone_track is not None,
         )
+
+    async def participant_exists(self, room_name: str, participant_identity: str) -> bool:
+        return (
+            await self.get_participant_media(room_name, participant_identity)
+        ) is not None
+
+    async def remove_participant(
+        self,
+        room_name: str,
+        participant_identity: str,
+    ) -> None:
+        try:
+            await self._post_room_service(
+                method="RemoveParticipant",
+                payload={"room": room_name, "identity": participant_identity},
+                error_id="participant_remove_failed",
+                msg="LiveKit 参与方移除失败",
+            )
+        except AiCallError as exc:
+            if self._is_not_found(exc):
+                return
+            raise
 
     async def room_exists(self, room_name: str) -> bool:
         result = await self._post_room_service(
@@ -156,6 +213,14 @@ class LiveKitRoomManager:
         if not isinstance(rooms, list):
             return False
         return any(isinstance(room, dict) and room.get("name") == room_name for room in rooms)
+
+    @staticmethod
+    def _is_not_found(exc: AiCallError) -> bool:
+        cause = exc.__cause__
+        return bool(
+            isinstance(cause, httpx.HTTPStatusError)
+            and cause.response.status_code == status.HTTP_404_NOT_FOUND
+        )
 
     async def _post_room_service(
         self,

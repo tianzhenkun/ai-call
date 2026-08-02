@@ -207,13 +207,15 @@ async def test_stub_readiness_persistence_rejects_preview_entry(
 
 
 @pytest.mark.anyio
-async def test_stub_readiness_persistence_accepts_direct_sip_entry(
+@pytest.mark.parametrize("entry_type", ["direct_sip", "outbound"])
+async def test_stub_readiness_persistence_accepts_sip_entry(
     monkeypatch: pytest.MonkeyPatch,
+    entry_type: str,
 ) -> None:
     from app.services.ai_call.runtime_control import start_readiness_repository as module
 
     record = SimpleNamespace(
-        entry_type="direct_sip",
+        entry_type=entry_type,
         runtime_control_mode="owner_command_v1",
         runtime_owner_id="runtime-a",
         runtime_fencing_token=7,

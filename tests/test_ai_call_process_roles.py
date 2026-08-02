@@ -12,6 +12,25 @@ from app.config.setting import Settings
 from app.plugin import init_app
 
 
+def test_outbound_owner_runtime_backpressure_defaults() -> None:
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT"].default
+        == 100
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK"].default
+        == 20
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE"].default
+        == 50
+    )
+    assert (
+        Settings.model_fields["AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS"].default
+        == 30.0
+    )
+
+
 def _load_roles_module() -> ModuleType:
     try:
         return importlib.import_module("app.services.ai_call.runtime_control.roles")
@@ -174,6 +193,22 @@ def test_owner_command_entries_are_allowed_only_in_non_production_isolated_roles
     )
 
 
+def test_real_provider_mode_is_rejected_in_production_even_without_entries() -> None:
+    roles = _load_roles_module()
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError, match="Provider"):
+        roles.validate_runtime_role_settings(
+            SimpleNamespace(
+                AI_CALL_PROCESS_ROLES="api",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="",
+                AI_CALL_RUNTIME_INSTANCE_ID="",
+                AI_CALL_RUNTIME_PROVIDER_MODE="livekit",
+                DATABASE_TYPE="postgres",
+                ENVIRONMENT=EnvironmentEnum.PROD,
+            )
+        )
+
+
 def test_runtime_control_mode_is_selected_per_entry_without_fallback_guessing() -> None:
     roles = _load_roles_module()
     settings = SimpleNamespace(
@@ -226,6 +261,7 @@ def _patch_ai_call_workers(monkeypatch: pytest.MonkeyPatch):
             "_start_ai_call_offline_asr_worker",
             "_start_ai_call_recording_reconcile_worker",
             "_start_ai_call_handoff_trigger_worker",
+            "_start_ai_call_runtime_webhook_worker",
             "_start_ai_call_outbound_task_worker",
             "_start_ai_call_linphone_test_worker",
             "_start_ai_call_voice_worker",
@@ -244,6 +280,7 @@ def _patch_ai_call_workers(monkeypatch: pytest.MonkeyPatch):
             "_stop_ai_call_offline_asr_worker",
             "_stop_ai_call_recording_reconcile_worker",
             "_stop_ai_call_handoff_trigger_worker",
+            "_stop_ai_call_runtime_webhook_worker",
             "_stop_ai_call_outbound_task_worker",
             "_stop_ai_call_linphone_test_worker",
             "_stop_ai_call_voice_worker",
@@ -345,6 +382,7 @@ async def test_api_role_does_not_start_ai_call_workers_or_require_redis(
                 "_start_ai_call_offline_asr_worker",
                 "_start_ai_call_recording_reconcile_worker",
                 "_start_ai_call_handoff_trigger_worker",
+                "_start_ai_call_runtime_webhook_worker",
                 "_start_ai_call_voice_worker",
             },
             False,
@@ -376,3 +414,76 @@ async def test_ai_call_worker_start_matrix(
         preview_start.assert_called_once_with(app)
     else:
         preview_start.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_outbound_owner_mode_starts_starter_and_reconciler_without_sip_dialer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconcileWorker,
+    )
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+    from app.api.v1.ai_call.outbound.task_executor import OutboundTaskWorker
+
+    task_started = AsyncMock(return_value=None)
+    reconcile_started = AsyncMock(return_value=None)
+    monkeypatch.setattr(OutboundTaskWorker, "start", task_started)
+    monkeypatch.setattr(
+        OutboundAttemptReconcileWorker,
+        "start",
+        reconcile_started,
+    )
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_OUTBOUND_EXECUTOR_ENABLED", True)
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OWNER_COMMAND_V1_ENTRIES",
+        "outbound",
+    )
+    monkeypatch.setattr(init_app.settings, "AI_CALL_OUTBOUND_DIALER_MODE", "sip")
+    monkeypatch.setattr(init_app.settings, "AI_CALL_SIP_OUTBOUND_ENABLED", False)
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_RUNTIME_INSTANCE_ID",
+        "runtime-owner-test",
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT",
+        11,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK",
+        7,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE",
+        5,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        init_app.settings,
+        "AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS",
+        17.5,
+        raising=False,
+    )
+
+    worker = await init_app._start_ai_call_outbound_task_worker()
+
+    assert worker is not None
+    assert isinstance(worker.executor.owner_runtime_start, OwnerRuntimeOutboundStart)
+    assert worker.executor.owner_runtime_start._allocation_timeout_seconds == 17.5
+    assert worker.executor.owner_queue_limits.per_tenant == 11
+    assert worker.executor.owner_queue_limits.per_task == 7
+    assert worker.executor.owner_queue_limits.per_line == 5
+    assert worker.executor.dialer.dialer_type == "mock"
+    assert worker.reconcile_worker is not None
+    task_started.assert_awaited_once()
+    reconcile_started.assert_awaited_once()

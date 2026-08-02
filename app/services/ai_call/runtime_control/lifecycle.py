@@ -57,11 +57,16 @@ async def start_runtime_control_lifecycle(
         str(settings.AI_CALL_RUNTIME_INSTANCE_ID),
         uuid4(),
     )
+    registry = RuntimeRegistry()
     service = RuntimeControlService(
         worker_id=worker_id,
-        registry=RuntimeRegistry(),
+        registry=registry,
         session_factory=session_factory,
-        provider=DeterministicDbOnlyProviderStub(),
+        provider=select_runtime_provider(
+            settings,
+            session_factory=session_factory,
+            registry=registry,
+        ),
         capacity=int(settings.AI_CALL_RUNTIME_CAPACITY),
         cleanup_capacity=int(settings.AI_CALL_RUNTIME_CLEANUP_CAPACITY),
         worker_lease_ttl=timedelta(
@@ -78,6 +83,67 @@ async def start_runtime_control_lifecycle(
     )
     await service.start()
     return service
+
+
+def build_livekit_runtime_provider(
+    *,
+    settings: Any,
+    session_factory: async_sessionmaker[AsyncSession],
+    registry: RuntimeRegistry,
+):
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        build_livekit_runtime_provider as build_provider,
+    )
+
+    return build_provider(
+        settings=settings,
+        session_factory=session_factory,
+        registry=registry,
+    )
+
+
+def select_runtime_provider(
+    settings: Any,
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    registry: RuntimeRegistry,
+):
+    mode = str(getattr(settings, "AI_CALL_RUNTIME_PROVIDER_MODE", "stub"))
+    if mode == "stub":
+        return DeterministicDbOnlyProviderStub()
+    if mode != "livekit":
+        raise RuntimeError(f"未知 AI Call Runtime Provider 模式: {mode}")
+    environment = str(
+        getattr(
+            getattr(settings, "ENVIRONMENT", ""),
+            "value",
+            getattr(settings, "ENVIRONMENT", ""),
+        )
+    ).lower()
+    entries = str(getattr(settings, "AI_CALL_OWNER_COMMAND_V1_ENTRIES", ""))
+    allowed_callee = str(
+        getattr(settings, "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE", "")
+    ).strip()
+    allowed = (
+        bool(getattr(settings, "AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED", False))
+        and bool(entries.strip())
+        and bool(
+            getattr(settings, "AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED", False)
+        )
+        and bool(allowed_callee)
+        and str(getattr(settings, "DATABASE_TYPE", "")) == "postgres"
+        and environment != "prod"
+    )
+    if not allowed:
+        raise RuntimeError(
+            "AI Call 真实 Provider 门禁未满足：仅允许隔离 PostgreSQL、"
+            "显式 opt-in、非正式环境和单号码白名单"
+        )
+    return build_livekit_runtime_provider(
+        settings=settings,
+        session_factory=session_factory,
+        registry=registry,
+    )
 
 
 async def start_dispatcher_control_lifecycle(

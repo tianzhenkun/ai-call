@@ -33,6 +33,7 @@ class AiCallRoleWorkerHandles:
     offline_asr_worker: Any = None
     recording_reconcile_worker: Any = None
     handoff_trigger_worker: Any = None
+    runtime_webhook_worker: Any = None
     outbound_task_worker: Any = None
     linphone_test_worker: Any = None
     voice_worker: Any = None
@@ -44,6 +45,22 @@ class SystemServiceHandles:
     events_loaded: bool = False
     scheduler_started: bool = False
     console_started: bool = False
+
+
+@dataclass(slots=True)
+class _OutboundOwnerRuntimeWorker:
+    task_worker: Any
+    reconcile_worker: Any
+
+    @property
+    def executor(self) -> Any:
+        return self.task_worker.executor
+
+    async def stop(self) -> None:
+        try:
+            await self.reconcile_worker.stop()
+        finally:
+            await self.task_worker.stop()
 
 
 @asynccontextmanager
@@ -114,6 +131,9 @@ async def _start_ai_call_role_workers(
             handles.handoff_trigger_worker = (
                 await _start_ai_call_handoff_trigger_worker()
             )
+            handles.runtime_webhook_worker = (
+                await _start_ai_call_runtime_webhook_worker()
+            )
             if start_voice:
                 handles.voice_worker = await _start_ai_call_voice_worker(app)
     except Exception:
@@ -142,6 +162,8 @@ async def _stop_ai_call_role_workers(
         await _stop_ai_call_outbound_task_worker(handles.outbound_task_worker)
     if handles.handoff_trigger_worker is not None:
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
+    if handles.runtime_webhook_worker is not None:
+        await _stop_ai_call_runtime_webhook_worker(handles.runtime_webhook_worker)
     if handles.event_worker is not None:
         await _stop_ai_call_event_worker(handles.event_worker)
     if handles.recording_reconcile_worker is not None:
@@ -289,6 +311,38 @@ async def _start_ai_call_recovery_control():
 async def _stop_ai_call_recovery_control(service) -> None:
     await service.stop()
     log.info("✅ AI Call DB-only Recovery 已关闭")
+
+
+async def _start_ai_call_runtime_webhook_worker():
+    from app.services.ai_call.runtime_control.roles import (
+        parse_owner_command_entries,
+    )
+
+    if (
+        not settings.SQL_DB_ENABLE
+        or settings.DATABASE_TYPE != "postgres"
+        or not parse_owner_command_entries(
+            str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
+        )
+    ):
+        return None
+    from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.webhook_service import (
+        RuntimeWebhookWorker,
+    )
+
+    worker = RuntimeWebhookWorker(
+        async_db_session,
+        worker_id=f"jobs:webhook:{uuid4().hex}",
+    )
+    await worker.start()
+    log.info("✅ AI Call Runtime webhook worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_runtime_webhook_worker(worker) -> None:
+    await worker.stop()
+    log.info("✅ AI Call Runtime webhook worker 已关闭")
 
 
 def _start_ai_call_voice_preview_service(app: FastAPI) -> None:
@@ -516,8 +570,35 @@ async def _start_ai_call_outbound_task_worker():
         OutboundTaskWorker,
     )
     from app.core.database import async_db_session
+    from app.services.ai_call.runtime_control.roles import (
+        runtime_control_mode_for_entry,
+    )
+    from app.services.ai_call.runtime_control.types import OwnerCommandEntry
 
-    if settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
+    owner_mode = (
+        runtime_control_mode_for_entry(settings, OwnerCommandEntry.OUTBOUND)
+        == "owner_command_v1"
+    )
+    owner_runtime_start = None
+    owner_executor_options = {}
+    if owner_mode:
+        from app.api.v1.ai_call.outbound.owner_runtime_start import (
+            OwnerRuntimeOutboundStart,
+        )
+        from app.api.v1.ai_call.outbound.queue_control import OutboundQueueLimits
+
+        dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
+        owner_runtime_start = OwnerRuntimeOutboundStart(
+            allocation_timeout_seconds=(
+                settings.AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS
+            )
+        )
+        owner_executor_options["owner_queue_limits"] = OutboundQueueLimits(
+            per_tenant=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT,
+            per_task=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TASK,
+            per_line=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_LINE,
+        )
+    elif settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
         if not settings.AI_CALL_SIP_OUTBOUND_ENABLED:
             raise RuntimeError(
                 "AI Call 正式 SIP 拨号模式已启用，但 SIP 外呼总开关未启用"
@@ -542,14 +623,42 @@ async def _start_ai_call_outbound_task_worker():
             + settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS
             + 60
         ),
+        owner_runtime_start=owner_runtime_start,
+        **owner_executor_options,
     )
-    worker = OutboundTaskWorker(
+    task_worker = OutboundTaskWorker(
         executor,
         poll_interval_seconds=settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS,
     )
-    await worker.start()
+    if owner_mode:
+        from app.api.v1.ai_call.outbound.attempt_reconciler import (
+            OutboundAttemptReconcileWorker,
+        )
+
+        reconcile_worker = OutboundAttemptReconcileWorker(
+            async_db_session,
+            worker_id=(
+                f"outbound-reconciler:{settings.AI_CALL_RUNTIME_INSTANCE_ID}:"
+                f"{uuid4().hex}"
+            ),
+            batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
+            poll_interval_seconds=(
+                settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS
+            ),
+        )
+        worker = _OutboundOwnerRuntimeWorker(task_worker, reconcile_worker)
+        await task_worker.start()
+        try:
+            await reconcile_worker.start()
+        except BaseException:
+            await task_worker.stop()
+            raise
+    else:
+        worker = task_worker
+        await worker.start()
     log.warning(
-        f"AI Call 通用外呼执行器已启动，dialer_type={dialer.dialer_type}"
+        "AI Call 通用外呼执行器已启动，"
+        f"dialer_type={dialer.dialer_type}, owner_mode={owner_mode}"
     )
     return worker
 

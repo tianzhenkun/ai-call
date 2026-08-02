@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID
@@ -9,9 +10,11 @@ import pytest
 from app.services.ai_call.runtime_control import owner_repository
 from app.services.ai_call.runtime_control.owner_repository import (
     DispatcherOwnerRepository,
+    OutboundStartRefs,
     OwnerFailClosedWatchdog,
     RuntimeOwnerRepository,
     build_worker_id,
+    parse_outbound_start_refs,
 )
 from app.services.ai_call.runtime_control.types import CommandStatus
 
@@ -52,8 +55,7 @@ def test_worker_id_contains_deployment_identity_and_startup_uuid() -> None:
     startup_id = UUID("12345678-1234-5678-1234-567812345678")
 
     assert (
-        build_worker_id("runtime-a", startup_id)
-        == "runtime-a:12345678-1234-5678-1234-567812345678"
+        build_worker_id("runtime-a", startup_id) == "runtime-a:12345678-1234-5678-1234-567812345678"
     )
 
     with pytest.raises(ValueError):
@@ -69,6 +71,41 @@ def test_runtime_repository_exposes_no_owner_claim_or_takeover_api() -> None:
     }
 
     assert forbidden_names.isdisjoint(dir(RuntimeOwnerRepository))
+
+
+def test_outbound_start_refs_accept_only_canonical_positive_identifiers() -> None:
+    payload = {
+        "attempt_id": "13",
+        "attempt_no": 1,
+        "line_code": "provider-a",
+        "line_id": "14",
+        "prompt_profile_id": "prompt-1",
+        "scene_code": "intro_contract",
+        "target_id": "12",
+        "task_id": "11",
+        "voice": "Tina",
+    }
+
+    assert parse_outbound_start_refs(json.dumps(payload)) == OutboundStartRefs(
+        task_id=11,
+        target_id=12,
+        attempt_id=13,
+        line_id=14,
+    )
+
+    invalid_payloads = [
+        {**payload, "attempt_id": True},
+        {**payload, "attempt_id": 13},
+        {**payload, "attempt_id": "013"},
+        {**payload, "attempt_no": True},
+        {**payload, "attempt_no": 0},
+        {**payload, "line_id": "0"},
+        {key: value for key, value in payload.items() if key != "target_id"},
+        {**payload, "unexpected": "value"},
+    ]
+    assert all(
+        parse_outbound_start_refs(json.dumps(invalid)) is None for invalid in invalid_payloads
+    )
 
 
 @pytest.mark.anyio

@@ -17,7 +17,19 @@ from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
 
+from .attempt_projection import (
+    BUSY_END_REASONS,
+    NO_ANSWER_END_REASONS,
+    outbound_retry_interval,
+    refresh_task_counters,
+)
 from .media_evidence import has_persisted_media_evidence
+from .queue_control import (
+    DEFAULT_OUTBOUND_QUEUE_LIMITS,
+    OutboundQueueLimits,
+    OutboundQueueRepository,
+    OutboundQueueSnapshot,
+)
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -25,25 +37,6 @@ from .rule_task_model import (
 )
 from .sip_line_model import AiCallSipLineModel
 from .sip_line_schema import SipLineSnapshot
-
-TERMINAL_TARGET_STATUSES = {"COMPLETED", "CANCELLED"}
-BUSY_END_REASONS = {
-    "busy",
-    "busy_here",
-    "callee_busy",
-    "sip_busy",
-    "user_busy",
-    "sip_486",
-}
-NO_ANSWER_END_REASONS = {
-    "connect_timeout",
-    "no_answer",
-    "ringing_timeout",
-    "sip_connect_timeout",
-    "user_unavailable",
-    "sip_408",
-    "sip_480",
-}
 
 
 def _utc_now() -> datetime:
@@ -104,6 +97,16 @@ class OutboundDialer(Protocol):
     ) -> DialResult: ...
 
 
+class OwnerRuntimeStart(Protocol):
+    async def create(
+        self,
+        session: AsyncSession,
+        request: OutboundDialRequest,
+        *,
+        now: datetime,
+    ) -> str: ...
+
+
 class MockOutboundDialer:
     """只产生数据库演练结果，不发起网络或 SIP 请求。"""
 
@@ -145,6 +148,8 @@ class OutboundTaskExecutor:
         managed_attempt_timeout_seconds: int = 900,
         settle_retry_delays_seconds: tuple[float, ...] = (0.0, 0.25, 1.0),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        owner_runtime_start: OwnerRuntimeStart | None = None,
+        owner_queue_limits: OutboundQueueLimits = DEFAULT_OUTBOUND_QUEUE_LIMITS,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
@@ -161,6 +166,9 @@ class OutboundTaskExecutor:
             max(0.0, delay) for delay in settle_retry_delays_seconds
         )
         self.sleep = sleep
+        self.owner_runtime_start = owner_runtime_start
+        self.owner_queue_limits = owner_queue_limits
+        self.last_queue_snapshot: OutboundQueueSnapshot | None = None
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -175,7 +183,8 @@ class OutboundTaskExecutor:
                 if claimed is None:
                     await self._refresh_task_counters(task_key, self.now_provider())
                     break
-                await self.execute_claimed(claimed)
+                if self.owner_runtime_start is None:
+                    await self.execute_claimed(claimed)
                 processed += 1
         return processed
 
@@ -747,14 +756,22 @@ class OutboundTaskExecutor:
             ):
                 return None
             line = self._task_line_snapshot(task)
-            if self.dialer.dialer_type == "sip" and line is None:
+            requires_sip_line = (
+                self.dialer.dialer_type == "sip"
+                or self.owner_runtime_start is not None
+            )
+            if requires_sip_line and line is None:
                 task.status = "FAILED"
                 task.error_message = "任务缺少有效的 SIP 线路快照"
                 task.ended_at = now
                 task.updated_at = now
                 await db.commit()
                 return None
-            if self.dialer.dialer_type == "sip" and line is not None:
+            if (
+                self.owner_runtime_start is None
+                and self.dialer.dialer_type == "sip"
+                and line is not None
+            ):
                 current_line = await db.scalar(
                     select(AiCallSipLineModel)
                     .where(
@@ -785,6 +802,18 @@ class OutboundTaskExecutor:
                     or 0
                 )
                 if active_line_attempts >= current_line.max_concurrency:
+                    return None
+            if self.owner_runtime_start is not None and line is not None:
+                queue_snapshot = await OutboundQueueRepository(
+                    db,
+                    limits=self.owner_queue_limits,
+                ).lock_and_snapshot(
+                    tenant_id=task.tenant_id,
+                    task_id=task.id,
+                    line_id=int(line.line_id),
+                )
+                self.last_queue_snapshot = queue_snapshot
+                if not queue_snapshot.has_capacity:
                     return None
             candidates = (
                 await db.scalars(
@@ -860,6 +889,14 @@ class OutboundTaskExecutor:
                     prompt_profile_id=task.prompt_profile_id,
                     line=line,
                 )
+                if self.owner_runtime_start is not None:
+                    call_id = await self.owner_runtime_start.create(
+                        db,
+                        request,
+                        now=now,
+                    )
+                    await db.commit()
+                    return ClaimedAttempt(request=request, call_id=call_id)
                 call_id = uuid4().hex
                 db.add(
                     AiCallOutboundAttemptModel(
@@ -1123,66 +1160,7 @@ class OutboundTaskExecutor:
         task: AiCallOutboundTaskModel,
         now: datetime,
     ) -> None:
-        status_rows = (
-            await db.execute(
-                select(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                    func.count(AiCallOutboundTargetModel.id),
-                )
-                .where(
-                    AiCallOutboundTargetModel.tenant_id == task.tenant_id,
-                    AiCallOutboundTargetModel.task_id == task.id,
-                )
-                .group_by(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                )
-            )
-        ).all()
-        task.completed_targets = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status in TERMINAL_TARGET_STATUSES
-        )
-        task.connected_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result == "connected"
-        )
-        task.failed_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result != "connected"
-        )
-        active_count = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status not in TERMINAL_TARGET_STATUSES
-        )
-        dialing_count = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status in {"DIALING", "IN_CALL"}
-        )
-        if task.status == "PAUSING" and dialing_count == 0:
-            if active_count == 0:
-                task.status = "COMPLETED"
-                task.ended_at = now
-            else:
-                task.status = "PAUSED"
-        elif task.status == "STOPPING" and dialing_count == 0:
-            task.status = "STOPPED"
-            task.ended_at = now
-        elif active_count == 0 and task.status not in {
-            "PAUSED",
-            "STOPPED",
-            "CANCELLED",
-            "FAILED",
-        }:
-            task.status = "COMPLETED"
-            task.ended_at = now
-        task.updated_at = now
+        await refresh_task_counters(db, task, now)
 
     @staticmethod
     def _retry_interval(
@@ -1190,22 +1168,7 @@ class OutboundTaskExecutor:
         attempt_no: int,
         call_result: str,
     ) -> int | None:
-        try:
-            snapshot = json.loads(task.config_snapshot_json)
-            rule = snapshot["rule"]
-            retry_count = int(rule.get("retryCount", 0))
-            retryable_results = set(rule.get("retryableResults", []))
-            intervals = list(rule.get("retryIntervalsMinutes", []))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if (
-            call_result not in retryable_results
-            or attempt_no > retry_count
-            or attempt_no > len(intervals)
-        ):
-            return None
-        interval = intervals[attempt_no - 1]
-        return interval if isinstance(interval, int) and interval > 0 else None
+        return outbound_retry_interval(task, attempt_no, call_result)
 
     def _within_call_window(
         self,

@@ -71,6 +71,14 @@ def runtime_control_mode_for_entry(settings: Any, entry: OwnerCommandEntry | str
 
 def validate_runtime_role_settings(settings: Any) -> frozenset[ProcessRole]:
     roles = parse_process_roles(str(settings.AI_CALL_PROCESS_ROLES))
+    if (
+        _environment_value(settings) == "prod"
+        and str(getattr(settings, "AI_CALL_RUNTIME_PROVIDER_MODE", "stub"))
+        == "livekit"
+    ):
+        raise RuntimeRoleConfigurationError(
+            "正式环境 AI Call Runtime Provider 必须保持 stub"
+        )
     entries = parse_owner_command_entries(
         str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
     )

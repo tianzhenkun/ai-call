@@ -161,6 +161,148 @@ class AiCallEndEvidenceModel(MappedBase):
     evidence_json: Mapped[str | None] = mapped_column(Text)
 
 
+class AiCallHandoffMediaEvidenceModel(MappedBase):
+    __tablename__ = "ai_call_handoff_media_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider_namespace",
+            "dedupe_key",
+            name="uk_handoff_media_evidence_dedupe",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            "handoff_id",
+            "media_state_version",
+            name="uk_handoff_media_evidence_version",
+        ),
+        Index(
+            "idx_handoff_media_evidence_handoff_version",
+            "tenant_id",
+            "handoff_id",
+            "media_state_version",
+        ),
+        {"comment": "AI Call 转人工媒体证据"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    handoff_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    participant_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    participant_sid: Mapped[str | None] = mapped_column(String(255))
+    track_sid: Mapped[str | None] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    media_state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider_event_id: Mapped[str | None] = mapped_column(String(160))
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_json: Mapped[str | None] = mapped_column(Text)
+
+
+class AiCallWebhookInboxModel(MappedBase):
+    __tablename__ = "ai_call_webhook_inbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "provider_namespace",
+            "dedupe_key",
+            name="uk_webhook_inbox_provider_dedupe",
+        ),
+        Index(
+            "idx_webhook_inbox_retry",
+            "status",
+            "next_retry_at",
+            "received_at",
+        ),
+        Index("idx_webhook_inbox_recovery", "status", "processing_expires_at"),
+        Index(
+            "idx_webhook_inbox_call",
+            "tenant_id",
+            "call_id",
+            "received_at",
+        ),
+        {"comment": "AI Call LiveKit Webhook 持久收件箱"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    call_id: Mapped[str | None] = mapped_column(String(64))
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_owner_id: Mapped[str | None] = mapped_column(String(128))
+    processing_token: Mapped[str | None] = mapped_column(String(128))
+    processing_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    error_message: Mapped[str | None] = mapped_column(String(1000))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AiCallWebhookQuarantineModel(MappedBase):
+    __tablename__ = "ai_call_webhook_quarantine"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "provider_namespace",
+            "dedupe_key",
+            name="uk_webhook_quarantine_provider_dedupe",
+        ),
+        Index(
+            "idx_webhook_quarantine_retry",
+            "status",
+            "next_retry_at",
+            "received_at",
+        ),
+        Index("idx_webhook_quarantine_recovery", "status", "processing_expires_at"),
+        {"comment": "AI Call 未匹配 Webhook 隔离队列"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    room_name: Mapped[str | None] = mapped_column(String(255))
+    participant_identity: Mapped[str | None] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_owner_id: Mapped[str | None] = mapped_column(String(128))
+    processing_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    processing_token: Mapped[str | None] = mapped_column(String(128))
+    processing_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_tenant_id: Mapped[str | None] = mapped_column(String(20))
+    resolved_call_id: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(String(1000))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AiCallRuntimeEffectModel(MappedBase):
     __tablename__ = "ai_call_runtime_effect"
     __table_args__ = (

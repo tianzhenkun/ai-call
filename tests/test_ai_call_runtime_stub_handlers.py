@@ -19,6 +19,9 @@ from app.services.ai_call.runtime_control.provider_stub import (
     ScriptedProviderStub,
     StubObservationKind,
 )
+from app.services.ai_call.runtime_control.runtime_service import (
+    _default_start_specs,
+)
 from app.services.ai_call.runtime_control.start_readiness_repository import (
     StubStartReadiness,
 )
@@ -268,6 +271,39 @@ async def test_db_only_provider_stub_supports_direct_sip_effects(
     )
 
     assert observation.kind is expected_kind
+
+
+@pytest.mark.anyio
+async def test_outbound_start_specs_use_only_db_stub_resource_facts() -> None:
+    lease = _owner_lease()
+    specs = _default_start_specs(
+        "call-a",
+        lease,
+        "runtime-a",
+        entry_type="outbound",
+    )
+    stub = DeterministicDbOnlyProviderStub()
+
+    for effect_id, spec in enumerate(specs, start=1):
+        observation = await stub.apply(
+            _effect_claim(
+                effect_id=effect_id,
+                effect_type=spec.effect_type,
+                resource_key=spec.resource_key,
+            )
+        )
+        assert observation.kind is ProviderObservationKind.RESOURCE_PRESENT
+
+    assert [spec.effect_type for spec in specs] == [
+        "CREATE_ROOM",
+        "ATTACH_AGENT_PARTICIPANT",
+        "CREATE_SIP_PARTICIPANT",
+    ]
+    assert all(
+        set(call) == {"provider_namespace", "effect_type", "resource_key"}
+        for call in stub.calls
+    )
+    assert "13800138001" not in repr(stub.calls)
 
 
 @pytest.mark.anyio

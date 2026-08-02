@@ -16,8 +16,10 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict
 from livekit import api
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.model import AiCallHandoffModel, AiCallRecordModel
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
@@ -37,7 +39,19 @@ from app.services.ai_call.runtime_control.entry_start_service import (
     RuntimeEntryStartService,
     StartEntryRequest,
 )
+from app.services.ai_call.runtime_control.handoff_repository import (
+    HandoffCancelIntent,
+    HandoffClaimConflictError,
+    HandoffIdempotencyConflictError,
+    HandoffNotFoundError,
+    HandoffRuntimeModeError,
+    HandoffTerminalBarrierError,
+    RuntimeHandoffRepository,
+)
 from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
+from app.services.ai_call.runtime_control.webhook_service import (
+    RuntimeWebhookIngressService,
+)
 
 from .outbound.controller import _identity
 from .schema import (
@@ -70,6 +84,7 @@ from .schema import (
     RecordEventListOut,
     RecordingOut,
     RuntimeDirectSipStartCallOut,
+    RuntimeHandoffCommandOut,
     RuntimeStartCallOut,
     SemanticAnalysisOut,
     SessionStatusOut,
@@ -97,6 +112,12 @@ def get_ai_call_service(
     return get_default_ai_call_service(db)
 
 
+def get_runtime_webhook_ingress_service(
+    db: Annotated[AsyncSession, Depends(ai_call_db_getter)],
+) -> RuntimeWebhookIngressService:
+    return RuntimeWebhookIngressService(db, settings)
+
+
 @AiCallRouter.get("/health", summary="智能外呼模块健康检查")
 async def ai_call_health() -> dict[str, str]:
     return {"status": "ok"}
@@ -105,6 +126,11 @@ async def ai_call_health() -> dict[str, str]:
 @AiCallRouter.post("/livekit-webhook", summary="接收 LiveKit 房间事件")
 async def livekit_webhook_controller(
     request: Request,
+    ingress_service: Annotated[
+        RuntimeWebhookIngressService,
+        Depends(get_runtime_webhook_ingress_service),
+    ],
+    db: Annotated[AsyncSession, Depends(ai_call_db_getter)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     body = (await request.body()).decode("utf-8")
@@ -114,12 +140,27 @@ async def livekit_webhook_controller(
     track = payload.get("track")
     if webhook_event.event == "track_published" and isinstance(track, dict):
         track["type"] = api.TrackType.Name(webhook_event.track.type)
-    result = schedule_livekit_webhook_event(
+    decision = await ingress_service.receive_livekit(
         event_type=webhook_event.event,
         room_name=webhook_event.room.name or None,
         participant_identity=webhook_event.participant.identity or None,
         payload=payload,
     )
+    await db.commit()
+    if decision.disposition == "LEGACY":
+        result = schedule_livekit_webhook_event(
+            event_type=webhook_event.event,
+            room_name=webhook_event.room.name or None,
+            participant_identity=webhook_event.participant.identity or None,
+            payload=payload,
+        )
+    else:
+        result = {
+            "persisted": decision.disposition in {"INBOX", "QUARANTINE"},
+            "disposition": decision.disposition,
+            "rowId": str(decision.row_id) if decision.row_id is not None else None,
+            "status": decision.status,
+        }
     return SuccessResponse(data=result, msg="接收成功")
 
 
@@ -862,13 +903,84 @@ async def complete_handoff_controller(
 @AiCallRouter.post(
     "/handoffs/{handoffId}/cancel",
     summary="取消转人工",
-    response_model=ResponseSchema[HandoffOut],
+    response_model=ResponseSchema[HandoffOut | RuntimeHandoffCommandOut],
 )
 async def cancel_handoff_controller(
     handoff_id: Annotated[str, Path(alias="handoffId")],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     request: Annotated[FinishHandoffRequest | None, Body()] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key"),
+    ] = None,
 ) -> JSONResponse:
+    tenant_id = str(getattr(auth.user, "tenant_id", "") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
+    runtime_control_mode = await auth.db.scalar(
+        select(AiCallRecordModel.runtime_control_mode)
+        .select_from(AiCallHandoffModel)
+        .join(
+            AiCallRecordModel,
+            (AiCallRecordModel.tenant_id == AiCallHandoffModel.tenant_id)
+            & (AiCallRecordModel.call_id == AiCallHandoffModel.call_id),
+        )
+        .where(
+            AiCallHandoffModel.tenant_id == tenant_id,
+            AiCallHandoffModel.handoff_id == handoff_id,
+        )
+    )
+    if runtime_control_mode is None:
+        raise CustomException(msg="转人工任务不存在", status_code=404)
+    if runtime_control_mode == "owner_command_v1":
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        if not normalized_idempotency_key:
+            raise CustomException(
+                msg="Owner 模式取消必须提供 Idempotency-Key",
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                data={"errorCode": "IDEMPOTENCY_KEY_REQUIRED"},
+            )
+        try:
+            decision = await RuntimeHandoffRepository(auth.db).request_cancel(
+                HandoffCancelIntent(
+                    tenant_id=tenant_id,
+                    handoff_id=handoff_id,
+                    idempotency_key=normalized_idempotency_key,
+                    reason=(request.reason if request and request.reason else "operator_cancelled"),
+                )
+            )
+        except HandoffNotFoundError as exc:
+            raise CustomException(msg="转人工任务不存在", status_code=404) from exc
+        except HandoffIdempotencyConflictError as exc:
+            raise CustomException(
+                msg="幂等键已用于其他转人工操作",
+                status_code=status.HTTP_409_CONFLICT,
+                data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+            ) from exc
+        except (
+            HandoffClaimConflictError,
+            HandoffRuntimeModeError,
+            HandoffTerminalBarrierError,
+        ) as exc:
+            raise CustomException(
+                msg="当前转人工状态不允许取消",
+                status_code=status.HTTP_409_CONFLICT,
+                data={"errorCode": "HANDOFF_CANCEL_CONFLICT"},
+            ) from exc
+        await auth.db.commit()
+        return SuccessResponse(
+            data=RuntimeHandoffCommandOut(
+                handoff_id=decision.handoff_id,
+                call_id=decision.call_id,
+                handoff_status=decision.handoff_status,
+                command_id=str(decision.command_id),
+                command_seq=str(decision.command_seq),
+                command_status=decision.command_status,
+            ),
+            msg="CANCEL_HANDOFF 已受理",
+            status_code=status.HTTP_202_ACCEPTED,
+        )
     result = await service.cancel_handoff(
         handoff_id=handoff_id,
         reason=request.reason if request else None,

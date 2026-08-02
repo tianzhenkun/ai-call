@@ -25,6 +25,11 @@ from app.services.ai_call.runtime_control.types import CommandStatus, EffectStat
 from app.utils.id_util import generate_snowflake_id
 
 if TYPE_CHECKING:
+    from app.api.v1.ai_call.outbound.rule_task_model import (
+        AiCallOutboundAttemptModel,
+        AiCallOutboundTargetModel,
+        AiCallOutboundTaskModel,
+    )
     from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 
 
@@ -50,6 +55,14 @@ class OwnerLease:
     fencing_token: int
     lease_expires_at: datetime
     capacity_class: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundStartRefs:
+    task_id: int
+    target_id: int
+    attempt_id: int
+    line_id: int
 
 
 def build_worker_id(deployment_instance_id: str, startup_id: UUID) -> str:
@@ -137,9 +150,7 @@ class DispatcherOwnerRepository:
         lease_ttl: timedelta = timedelta(seconds=15),
         database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
         id_generator: Callable[[], int] = generate_snowflake_id,
-        reservation_token_generator: Callable[[], str] = (
-            lambda: secrets.token_urlsafe(24)
-        ),
+        reservation_token_generator: Callable[[], str] = (lambda: secrets.token_urlsafe(24)),
     ) -> None:
         self._session = session
         self._lease_ttl = lease_ttl
@@ -173,27 +184,51 @@ class DispatcherOwnerRepository:
         if not candidate_ids:
             return None
 
+        candidate_start_command = await self._read_start_command(tenant_id, call_id)
+        if candidate_start_command is None:
+            return None
+        candidate_payload_json = candidate_start_command.payload_json
+        outbound_refs = parse_outbound_start_refs(candidate_payload_json)
+        outbound_chain = None
+        if outbound_refs is not None:
+            outbound_chain = await self._lock_outbound_chain(
+                tenant_id,
+                outbound_refs,
+            )
+            if outbound_chain is None:
+                return None
+
         record = await self._lock_record(tenant_id, call_id)
         if record is None or not self._initial_assignment_allowed(record):
+            return None
+        is_outbound = getattr(record, "entry_type", None) == "outbound"
+        if is_outbound:
+            if outbound_refs is None or outbound_chain is None:
+                return None
+            if not _outbound_chain_matches(
+                outbound_chain,
+                record=record,
+                refs=outbound_refs,
+                tenant_id=tenant_id,
+                call_id=call_id,
+            ):
+                return None
+        elif outbound_refs is not None:
             return None
         if await self._has_provider_resource(tenant_id, call_id):
             return None
 
-        start_command = await self._read_start_command(tenant_id, call_id)
-        if start_command is None:
-            return None
-        line_id = _start_command_line_id(start_command.payload_json)
+        line_id = (
+            outbound_refs.line_id
+            if outbound_refs is not None
+            else _start_command_line_id(candidate_start_command.payload_json)
+        )
         if line_id is _INVALID_LINE_ID:
             return None
         line = None
         if line_id is not None:
             line = await self._lock_sip_line(tenant_id, line_id)
-            if (
-                line is None
-                or line.deleted
-                or not line.enabled
-                or line.max_concurrency <= 0
-            ):
+            if line is None or line.deleted or not line.enabled or line.max_concurrency <= 0:
                 return None
             active_reservation_count = await self._session.scalar(
                 select(func.count())
@@ -201,9 +236,11 @@ class DispatcherOwnerRepository:
                 .where(
                     AiCallSipLineReservationModel.tenant_id == tenant_id,
                     AiCallSipLineReservationModel.line_id == line_id,
-                    AiCallSipLineReservationModel.status.in_(
-                        {"RESERVED", "ACTIVE", "RECONCILE_REQUIRED"}
-                    ),
+                    AiCallSipLineReservationModel.status.in_({
+                        "RESERVED",
+                        "ACTIVE",
+                        "RECONCILE_REQUIRED",
+                    }),
                 )
             )
             if active_reservation_count >= line.max_concurrency:
@@ -216,6 +253,13 @@ class DispatcherOwnerRepository:
             start_command = await self._lock_command(tenant_id, call_id, "START_CALL")
             if start_command is None or start_command.status != CommandStatus.PENDING:
                 return None
+            if outbound_refs is not None:
+                locked_refs = parse_outbound_start_refs(start_command.payload_json)
+                if (
+                    locked_refs != outbound_refs
+                    or start_command.payload_json != candidate_payload_json
+                ):
+                    return None
 
             now = await self._database_clock(self._session)
             if not _worker_has_active_capacity(worker, now):
@@ -232,6 +276,10 @@ class DispatcherOwnerRepository:
             start_command.target_owner_id = worker.worker_id
             start_command.expected_fencing_token = record.runtime_fencing_token
             start_command.updated_at = now
+            if outbound_chain is not None:
+                _task, _target, attempt = outbound_chain
+                attempt.status = "STARTING"
+                attempt.updated_at = now
             if line is not None:
                 self._session.add(
                     AiCallSipLineReservationModel(
@@ -239,7 +287,9 @@ class DispatcherOwnerRepository:
                         tenant_id=tenant_id,
                         line_id=line.id,
                         call_id=call_id,
-                        attempt_id=None,
+                        attempt_id=(
+                            outbound_refs.attempt_id if outbound_refs is not None else None
+                        ),
                         status="RESERVED",
                         reservation_token=self._reservation_token_generator(),
                         fencing_token=record.runtime_fencing_token,
@@ -289,9 +339,7 @@ class DispatcherOwnerRepository:
             )
         )
 
-    async def _lock_record(
-        self, tenant_id: str, call_id: str
-    ) -> AiCallRecordModel | None:
+    async def _lock_record(self, tenant_id: str, call_id: str) -> AiCallRecordModel | None:
         return await self._session.scalar(
             select(AiCallRecordModel)
             .where(
@@ -322,6 +370,7 @@ class DispatcherOwnerRepository:
                 AiCallRuntimeCommandModel.command_type == command_type,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
 
     async def _read_start_command(
@@ -352,6 +401,59 @@ class DispatcherOwnerRepository:
             )
             .with_for_update()
         )
+
+    async def _lock_outbound_chain(
+        self,
+        tenant_id: str,
+        refs: OutboundStartRefs,
+    ) -> (
+        tuple[
+            AiCallOutboundTaskModel,
+            AiCallOutboundTargetModel,
+            AiCallOutboundAttemptModel,
+        ]
+        | None
+    ):
+        from app.api.v1.ai_call.outbound.rule_task_model import (
+            AiCallOutboundAttemptModel,
+            AiCallOutboundTargetModel,
+            AiCallOutboundTaskModel,
+        )
+
+        task = await self._session.scalar(
+            select(AiCallOutboundTaskModel)
+            .where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.id == refs.task_id,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return None
+        target = await self._session.scalar(
+            select(AiCallOutboundTargetModel)
+            .where(
+                AiCallOutboundTargetModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.task_id == refs.task_id,
+                AiCallOutboundTargetModel.id == refs.target_id,
+            )
+            .with_for_update()
+        )
+        if target is None:
+            return None
+        attempt = await self._session.scalar(
+            select(AiCallOutboundAttemptModel)
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.task_id == refs.task_id,
+                AiCallOutboundAttemptModel.target_id == refs.target_id,
+                AiCallOutboundAttemptModel.id == refs.attempt_id,
+            )
+            .with_for_update()
+        )
+        if attempt is None:
+            return None
+        return task, target, attempt
 
 
 class RuntimeOwnerRepository:
@@ -416,8 +518,7 @@ class RuntimeOwnerRepository:
                         AiCallRecordModel.call_id == lease.call_id,
                         AiCallRecordModel.runtime_owner_id == lease.owner_id,
                         AiCallRecordModel.runtime_fencing_token == lease.fencing_token,
-                        AiCallRecordModel.runtime_lease_expires_at
-                        == lease.lease_expires_at,
+                        AiCallRecordModel.runtime_lease_expires_at == lease.lease_expires_at,
                         AiCallRecordModel.runtime_lease_expires_at > now,
                         exists().where(
                             AiCallRuntimeWorkerModel.worker_id == lease.owner_id,
@@ -476,13 +577,11 @@ class RecoveryOwnerRepository:
         if record is None:
             return None
 
-        worker_ids = sorted(
-            {
-                worker_id
-                for worker_id in (record.runtime_owner_id, candidate_id)
-                if worker_id is not None
-            }
-        )
+        worker_ids = sorted({
+            worker_id
+            for worker_id in (record.runtime_owner_id, candidate_id)
+            if worker_id is not None
+        })
         locked_workers = {
             worker.worker_id: worker
             for worker in (
@@ -630,13 +729,11 @@ class RecoveryOwnerRepository:
                     AiCallRuntimeEffectModel.tenant_id == lease.tenant_id,
                     AiCallRuntimeEffectModel.call_id == lease.call_id,
                     or_(
-                        AiCallRuntimeEffectModel.status.not_in(
-                            {
-                                EffectStatus.APPLIED,
-                                EffectStatus.FAILED,
-                                EffectStatus.RECONCILE_REQUIRED,
-                            }
-                        ),
+                        AiCallRuntimeEffectModel.status.not_in({
+                            EffectStatus.APPLIED,
+                            EffectStatus.FAILED,
+                            EffectStatus.RECONCILE_REQUIRED,
+                        }),
                         AiCallRuntimeEffectModel.processing_owner_id.is_not(None),
                         AiCallRuntimeEffectModel.processing_token.is_not(None),
                         AiCallRuntimeEffectModel.processing_expires_at.is_not(None),
@@ -686,10 +783,7 @@ class OwnerFailClosedWatchdog:
     def observe_renewal(self, *, renewal_started_monotonic: float | None = None) -> None:
         if self._tripped:
             return
-        if (
-            self._hard_deadline is not None
-            and self._monotonic_clock() >= self._hard_deadline
-        ):
+        if self._hard_deadline is not None and self._monotonic_clock() >= self._hard_deadline:
             self._tripped = True
             return
         started_at = (
@@ -720,6 +814,101 @@ class OwnerFailClosedWatchdog:
 
 
 _INVALID_LINE_ID = object()
+
+_OUTBOUND_START_PAYLOAD_KEYS = frozenset({
+    "attempt_id",
+    "attempt_no",
+    "line_code",
+    "line_id",
+    "prompt_profile_id",
+    "scene_code",
+    "target_id",
+    "task_id",
+    "voice",
+})
+
+
+def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | None:
+    if payload_json is None:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != _OUTBOUND_START_PAYLOAD_KEYS:
+        return None
+    if type(payload["attempt_no"]) is not int or payload["attempt_no"] <= 0:
+        return None
+    if not all(
+        isinstance(payload[key], str) and payload[key].strip()
+        for key in ("line_code", "scene_code", "voice")
+    ):
+        return None
+    prompt_profile_id = payload["prompt_profile_id"]
+    if prompt_profile_id is not None and (
+        not isinstance(prompt_profile_id, str) or not prompt_profile_id.strip()
+    ):
+        return None
+    parsed_ids = {
+        key: _canonical_positive_decimal(payload[key])
+        for key in ("task_id", "target_id", "attempt_id", "line_id")
+    }
+    if any(value is None for value in parsed_ids.values()):
+        return None
+    return OutboundStartRefs(
+        task_id=parsed_ids["task_id"],
+        target_id=parsed_ids["target_id"],
+        attempt_id=parsed_ids["attempt_id"],
+        line_id=parsed_ids["line_id"],
+    )
+
+
+def _canonical_positive_decimal(value: object) -> int | None:
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdigit()
+        or value.startswith("0")
+    ):
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def _outbound_chain_matches(
+    chain: tuple[
+        AiCallOutboundTaskModel,
+        AiCallOutboundTargetModel,
+        AiCallOutboundAttemptModel,
+    ],
+    *,
+    record: AiCallRecordModel,
+    refs: OutboundStartRefs,
+    tenant_id: str,
+    call_id: str,
+) -> bool:
+    task, target, attempt = chain
+    return (
+        task.tenant_id == tenant_id
+        and task.id == refs.task_id
+        and task.status == "RUNNING"
+        and task.line_id == refs.line_id
+        and target.tenant_id == tenant_id
+        and target.task_id == refs.task_id
+        and target.id == refs.target_id
+        and target.status == "DIALING"
+        and attempt.tenant_id == tenant_id
+        and attempt.task_id == refs.task_id
+        and attempt.target_id == refs.target_id
+        and attempt.id == refs.attempt_id
+        and attempt.call_id == call_id
+        and attempt.status == "QUEUED"
+        and attempt.line_id == refs.line_id
+        and attempt.attempt_no == target.attempt_count
+        and record.entry_type == "outbound"
+        and record.business_type == "outbound_attempt"
+        and record.business_id == str(refs.attempt_id)
+    )
 
 
 def _start_command_line_id(payload_json: str | None) -> int | None | object:

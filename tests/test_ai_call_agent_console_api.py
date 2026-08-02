@@ -245,6 +245,12 @@ async def test_claim_handoff_uses_payload_built_before_transaction_commit(
             return_value=SimpleNamespace(
                 handoff=handoff,
                 payload=rich_payload,
+                command=SimpleNamespace(
+                    handoff_id="handoff-1",
+                    command_id=202,
+                    command_seq=2,
+                    command_status="PENDING",
+                ),
             )
         ),
     )
@@ -254,16 +260,31 @@ async def test_claim_handoff_uses_payload_built_before_transaction_commit(
         lambda _auth, _handoff: {"participant_token": "test-token"},
     )
     monkeypatch.setattr(agent_console_controller, "_publish", AsyncMock())
+    auth = _auth(db_session)
 
     response = await agent_console_controller.claim_handoff_controller(
         "handoff-1",
         AgentHandoffClaimIn(console_session_id=uuid4()),
-        _auth(db_session),
+        auth,
         console_service,
+        idempotency_key="handoff:handoff-1:claim:test",
     )
 
-    console_service.claim_handoff_with_payload.assert_awaited_once()
-    assert json.loads(response.body)["data"]["handoff"] == rich_payload
+    console_service.claim_handoff_with_payload.assert_awaited_once_with(
+        auth,
+        handoff_id="handoff-1",
+        console_session_id=console_service.claim_handoff_with_payload.call_args.kwargs[
+            "console_session_id"
+        ],
+        idempotency_key="handoff:handoff-1:claim:test",
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 202
+    assert body["data"]["handoff"] == rich_payload
+    assert body["data"]["commandId"] == "202"
+    assert body["data"]["commandSeq"] == "2"
+    assert body["data"]["commandStatus"] == "PENDING"
+    assert "seat_token" not in body["data"]
 
 
 @pytest.mark.anyio

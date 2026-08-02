@@ -1226,14 +1226,22 @@ def _livekit_webhook_auth(body: str) -> str:
     return api.AccessToken("livekit-key", "livekit-secret").with_sha256(body_hash).to_jwt()
 
 
-def test_livekit_webhook_controller_queues_signed_event_without_waiting(monkeypatch) -> None:
+def test_livekit_webhook_controller_commits_before_legacy_queue(monkeypatch) -> None:
     monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "livekit-key")
     monkeypatch.setattr(settings, "LIVEKIT_API_SECRET", "livekit-secret")
     scheduled: list[dict[str, object]] = []
 
-    class SlowWebhookService:
-        async def handle_livekit_webhook_event(self, **_kwargs):
-            raise AssertionError("webhook controller should queue instead of waiting")
+    class FakeDb:
+        committed = False
+
+        async def commit(self) -> None:
+            self.committed = True
+
+    fake_db = FakeDb()
+
+    class FakeIngressService:
+        async def receive_livekit(self, **_kwargs):
+            return SimpleNamespace(disposition="LEGACY", row_id=None, status=None)
 
     def fake_schedule_livekit_webhook_event(**kwargs):
         scheduled.append(kwargs)
@@ -1252,7 +1260,10 @@ def test_livekit_webhook_controller_queues_signed_event_without_waiting(monkeypa
     )
     app = FastAPI()
     app.include_router(AiCallRouter)
-    app.dependency_overrides[get_ai_call_service] = lambda: SlowWebhookService()
+    app.dependency_overrides[ai_call_controller.ai_call_db_getter] = lambda: fake_db
+    app.dependency_overrides[
+        ai_call_controller.get_runtime_webhook_ingress_service
+    ] = lambda: FakeIngressService()
 
     with TestClient(app) as client:
         body = json.dumps(
@@ -1279,6 +1290,7 @@ def test_livekit_webhook_controller_queues_signed_event_without_waiting(monkeypa
         "participantIdentity": "sip-call_queued",
     }
     assert scheduled
+    assert fake_db.committed is True
     assert scheduled[0]["event_type"] == "participant_left"
     assert scheduled[0]["room_name"] == "ai-call-call_queued"
     assert scheduled[0]["participant_identity"] == "sip-call_queued"
@@ -1289,14 +1301,21 @@ def test_livekit_webhook_controller_preserves_audio_track_type(monkeypatch) -> N
     monkeypatch.setattr(settings, "LIVEKIT_API_SECRET", "livekit-secret")
     scheduled: list[dict[str, object]] = []
 
-    def fake_schedule_livekit_webhook_event(**kwargs):
-        scheduled.append(kwargs)
-        return {
-            "queued": True,
-            "eventType": kwargs["event_type"],
-            "roomName": kwargs["room_name"],
-            "participantIdentity": kwargs["participant_identity"],
-        }
+    class FakeDb:
+        committed = False
+
+        async def commit(self) -> None:
+            self.committed = True
+
+    fake_db = FakeDb()
+
+    class FakeIngressService:
+        async def receive_livekit(self, **kwargs):
+            scheduled.append(kwargs)
+            return SimpleNamespace(disposition="INBOX", row_id=901, status="RECEIVED")
+
+    def fake_schedule_livekit_webhook_event(**_kwargs):
+        raise AssertionError("owner webhook must not use the legacy in-process queue")
 
     monkeypatch.setattr(
         ai_call_controller,
@@ -1306,6 +1325,10 @@ def test_livekit_webhook_controller_preserves_audio_track_type(monkeypatch) -> N
     )
     app = FastAPI()
     app.include_router(AiCallRouter)
+    app.dependency_overrides[ai_call_controller.ai_call_db_getter] = lambda: fake_db
+    app.dependency_overrides[
+        ai_call_controller.get_runtime_webhook_ingress_service
+    ] = lambda: FakeIngressService()
 
     with TestClient(app) as client:
         body = json.dumps(
@@ -1326,6 +1349,13 @@ def test_livekit_webhook_controller_preserves_audio_track_type(monkeypatch) -> N
         )
 
     assert response.status_code == 200
+    assert response.json()["data"] == {
+        "persisted": True,
+        "disposition": "INBOX",
+        "rowId": "901",
+        "status": "RECEIVED",
+    }
+    assert fake_db.committed is True
     assert scheduled[0]["payload"]["track"] == {
         "sid": "TR_audio",
         "type": "AUDIO",
