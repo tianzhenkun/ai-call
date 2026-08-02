@@ -204,6 +204,49 @@ async def test_livekit_room_lookup_uses_exact_room_name() -> None:
 
 
 @pytest.mark.anyio
+async def test_livekit_participant_fact_and_remove_are_idempotent() -> None:
+    manager = LiveKitRoomManager("ws://livekit.test", "key", "secret", 60)
+    calls = []
+
+    async def room_service(**kwargs):
+        calls.append((kwargs["method"], kwargs["payload"]))
+        if kwargs["method"] == "GetParticipant":
+            return {
+                "identity": "agent-call-1-g7",
+                "sid": "PA_1",
+                "tracks": [
+                    {
+                        "sid": "TR_1",
+                        "type": "AUDIO",
+                        "source": "MICROPHONE",
+                        "muted": False,
+                    }
+                ],
+            }
+        return {}
+
+    manager._post_room_service = room_service
+
+    fact = await manager.get_participant_media("room-1", "agent-call-1-g7")
+    await manager.remove_participant("room-1", "agent-call-1-g7")
+
+    assert fact is not None
+    assert fact.participant_sid == "PA_1"
+    assert fact.track_sid == "TR_1"
+    assert fact.microphone_ready is True
+    assert calls == [
+        (
+            "GetParticipant",
+            {"room": "room-1", "identity": "agent-call-1-g7"},
+        ),
+        (
+            "RemoveParticipant",
+            {"room": "room-1", "identity": "agent-call-1-g7"},
+        ),
+    ]
+
+
+@pytest.mark.anyio
 async def test_handoff_creation_freezes_source_call_scene_code(session_factory) -> None:
     now = datetime.now(timezone.utc)
     async with session_factory() as db:

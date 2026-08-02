@@ -193,6 +193,22 @@ def test_owner_command_entries_are_allowed_only_in_non_production_isolated_roles
     )
 
 
+def test_real_provider_mode_is_rejected_in_production_even_without_entries() -> None:
+    roles = _load_roles_module()
+
+    with pytest.raises(roles.RuntimeRoleConfigurationError, match="Provider"):
+        roles.validate_runtime_role_settings(
+            SimpleNamespace(
+                AI_CALL_PROCESS_ROLES="api",
+                AI_CALL_OWNER_COMMAND_V1_ENTRIES="",
+                AI_CALL_RUNTIME_INSTANCE_ID="",
+                AI_CALL_RUNTIME_PROVIDER_MODE="livekit",
+                DATABASE_TYPE="postgres",
+                ENVIRONMENT=EnvironmentEnum.PROD,
+            )
+        )
+
+
 def test_runtime_control_mode_is_selected_per_entry_without_fallback_guessing() -> None:
     roles = _load_roles_module()
     settings = SimpleNamespace(

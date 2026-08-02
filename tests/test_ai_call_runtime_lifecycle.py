@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.common.enums import EnvironmentEnum
 from app.services.ai_call.runtime_control.lifecycle import (
     AiCallRuntimeTimingPolicy,
     start_dispatcher_control_lifecycle,
@@ -53,6 +54,20 @@ def test_default_start_specs_fail_closed_for_unknown_entry() -> None:
             "runtime-a",
             entry_type="preview",
         )
+
+
+def test_start_specs_use_real_provider_namespace_when_configured() -> None:
+    specs = _default_start_specs(
+        "call-a",
+        _lease(),
+        "runtime-a",
+        entry_type="web",
+        provider_namespace="livekit:isolated-test",
+    )
+
+    assert {spec.provider_namespace for spec in specs} == {
+        "livekit:isolated-test"
+    }
 
 
 def test_runtime_services_do_not_share_local_registry() -> None:
@@ -125,6 +140,56 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
     assert isinstance(service.provider, DeterministicWebProviderStub)
     assert service.provider.calls == []
     assert calls == ["validate_database", "construct", "start", "stop"]
+
+
+@pytest.mark.anyio
+async def test_real_provider_gate_requires_isolated_allowlist_and_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import lifecycle
+
+    marker = object()
+
+    def build_real_provider(**_kwargs):
+        return marker
+
+    monkeypatch.setattr(
+        lifecycle,
+        "build_livekit_runtime_provider",
+        build_real_provider,
+        raising=False,
+    )
+    base = {
+        "AI_CALL_RUNTIME_PROVIDER_MODE": "livekit",
+        "AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED": True,
+        "AI_CALL_OWNER_COMMAND_V1_ENTRIES": "direct_sip",
+        "AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": True,
+        "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": "19900001001",
+        "DATABASE_TYPE": "postgres",
+        "ENVIRONMENT": EnvironmentEnum.DEV,
+    }
+
+    selected = lifecycle.select_runtime_provider(
+        SimpleNamespace(**base),
+        session_factory=object(),
+        registry=RuntimeRegistry(),
+    )
+    assert selected is marker
+
+    for override in (
+        {"AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED": False},
+        {"AI_CALL_OWNER_COMMAND_V1_ENTRIES": ""},
+        {"AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": False},
+        {"AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": ""},
+        {"DATABASE_TYPE": "mysql"},
+        {"ENVIRONMENT": EnvironmentEnum.PROD},
+    ):
+        with pytest.raises(RuntimeError, match="真实 Provider"):
+            lifecycle.select_runtime_provider(
+                SimpleNamespace(**(base | override)),
+                session_factory=object(),
+                registry=RuntimeRegistry(),
+            )
 
 
 @pytest.mark.anyio

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -2739,6 +2740,7 @@ async def test_livekit_room_audio_transport_connects_publishes_and_receives_pcm_
         participant_identity="browser-call_transport",
         status=CallSessionStatus.READY,
         effective_config={},
+        local_participant_identity="agent-call_transport-g7",
     )
 
     await transport.start(session)
@@ -2746,6 +2748,12 @@ async def test_livekit_room_audio_transport_connects_publishes_and_receives_pcm_
     assert room.connected is not None
     assert room.connected[0] == "wss://livekit.test"
     assert "livekit-secret" not in room.connected[1]
+    token_payload = jwt.decode(
+        room.connected[1],
+        "livekit-secret",
+        algorithms=["HS256"],
+    )
+    assert token_payload["sub"] == "agent-call_transport-g7"
     published_track, publish_options = room.local_participant.published[0]
     assert published_track.name == "ai_audio"
     assert published_track.source.queue_size_ms == 200

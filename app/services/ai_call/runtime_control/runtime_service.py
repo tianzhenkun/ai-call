@@ -369,6 +369,7 @@ class RuntimeControlService:
                 lease,
                 self.worker_id,
                 entry_type=command_claim.entry_type,
+                provider_namespace=getattr(provider, "provider_namespace", None),
             )
             try:
                 await StartCallHandler(session_factory, guarded_provider).handle(
@@ -515,10 +516,11 @@ def _default_start_specs(
     worker_id: str,
     *,
     entry_type: str,
+    provider_namespace: str | None = None,
 ) -> list[EffectSpec]:
     if entry_type not in {"web", "direct_sip", "outbound"}:
         raise ValueError(f"unsupported owner command entry: {entry_type}")
-    namespace = f"stub:{worker_id}"
+    namespace = provider_namespace or f"stub:{worker_id}"
     specs = [
         EffectSpec(
             effect_type="CREATE_ROOM",

@@ -106,6 +106,7 @@ class CallSession:
     participant_identity: str
     status: CallSessionStatus
     effective_config: Any
+    local_participant_identity: str | None = None
     started_at: datetime = field(default_factory=utc_now)
     last_event_at: datetime = field(default_factory=utc_now)
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -135,6 +136,9 @@ class InMemorySessionRegistry:
                 status_code=status.HTTP_404_NOT_FOUND,
             )
         return session
+
+    def discard(self, call_id: str) -> None:
+        self._sessions.pop(call_id, None)
 
     def transition(self, call_id: str, target: CallSessionStatus) -> CallSession:
         session = self.get(call_id)
