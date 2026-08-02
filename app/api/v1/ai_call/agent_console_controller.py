@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Header, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -320,11 +320,16 @@ async def claim_handoff_controller(
     payload: AgentHandoffClaimIn,
     auth: AuthenticatedUser,
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key"),
+    ] = None,
 ):
     claim_result = await service.claim_handoff_with_payload(
         auth,
         handoff_id=handoff_id,
         console_session_id=str(payload.console_session_id),
+        idempotency_key=idempotency_key,
     )
     handoff = claim_result.handoff
     await _publish(
@@ -332,11 +337,24 @@ async def claim_handoff_controller(
         "handoff.changed",
         {"handoff_id": handoff.handoff_id, "call_id": handoff.call_id, "status": handoff.status},
     )
+    if claim_result.command is None:
+        return SuccessResponse(
+            data={
+                "handoff": claim_result.payload,
+                "seat_token": _issue_handoff_token(auth, handoff),
+            }
+        )
+    data = {
+        "handoff": claim_result.payload,
+        "acceptanceStatus": "ACCEPTED",
+        "handoffId": claim_result.command.handoff_id,
+        "commandId": str(claim_result.command.command_id),
+        "commandSeq": str(claim_result.command.command_seq),
+        "commandStatus": claim_result.command.command_status,
+    }
     return SuccessResponse(
-        data={
-            "handoff": claim_result.payload,
-            "seat_token": _issue_handoff_token(auth, handoff),
-        }
+        data=data,
+        status_code=status.HTTP_202_ACCEPTED,
     )
 
 

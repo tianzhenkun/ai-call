@@ -294,6 +294,16 @@ class HandoffOut(AiCallBaseSchema):
     failure_message: str | None = None
 
 
+class RuntimeHandoffCommandOut(AiCallBaseSchema):
+    acceptance_status: Literal["ACCEPTED"] = "ACCEPTED"
+    handoff_id: str
+    call_id: str
+    handoff_status: str
+    command_id: str
+    command_seq: str
+    command_status: str
+
+
 class HandoffTokenOut(AiCallBaseSchema):
     call_id: str
     handoff_id: str

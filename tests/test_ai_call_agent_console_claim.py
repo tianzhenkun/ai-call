@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -679,6 +680,80 @@ async def test_claim_can_build_response_payload_before_leaving_request_transacti
     assert claim_result.payload["handoff_id"] == "handoff-1"
     assert claim_result.payload["status"] == "accepted"
     assert claim_result.handoff.status == "accepted"
+
+
+@pytest.mark.anyio
+async def test_owner_handoff_claim_uses_authenticated_agent_and_appends_command(
+    session_factory,
+    monkeypatch,
+) -> None:
+    from app.services.ai_call import agent_console_service
+    from app.services.ai_call.runtime_control.handoff_repository import (
+        RuntimeHandoffRepository,
+    )
+    from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
+
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    now = datetime.now(timezone.utc)
+
+    async def database_clock(_session):
+        return now
+
+    monkeypatch.setattr(
+        agent_console_service,
+        "RuntimeHandoffRepository",
+        lambda session: RuntimeHandoffRepository(
+            session,
+            database_clock=database_clock,
+        ),
+    )
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallRecordModel(
+                id=900,
+                tenant_id="tenant-a",
+                call_id="call-handoff-1",
+                entry_type="web",
+                room_name="room-call-handoff-1",
+                participant_identity="caller-call-handoff-1",
+                status="ready",
+                started_at=now,
+                runtime_control_mode="owner_command_v1",
+                runtime_owner_id="runtime-1",
+                runtime_fencing_token=7,
+                runtime_lease_expires_at=now + timedelta(minutes=1),
+                runtime_capacity_class="active",
+                next_command_seq=2,
+                last_applied_command_seq=1,
+            )
+        )
+
+    async with session_factory() as db, db.begin():
+        claim_result = await AiCallAgentConsoleService(db).claim_handoff_with_payload(
+            _auth(db, user_id=20),
+            handoff_id="handoff-1",
+            console_session_id=console_session_id,
+            idempotency_key="handoff:handoff-1:claim:browser-1",
+        )
+
+    async with session_factory() as db:
+        command = await db.scalar(select(AiCallRuntimeCommandModel))
+        presence = await db.scalar(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.agent_identity == "agent-20"
+            )
+        )
+    assert claim_result.command.command_id == command.id
+    assert claim_result.command.command_status == "PENDING"
+    assert json.loads(command.payload_json)["agent_identity"] == "agent-20"
+    assert presence.status == "claiming"
 
 
 @pytest.mark.anyio

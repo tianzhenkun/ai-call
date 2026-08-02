@@ -17,11 +17,22 @@ from app.api.v1.ai_call.model import (
     AiCallAgentSceneScopeModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallRecordModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.services.ai_call.runtime_control.handoff_repository import (
+    HandoffAcceptIntent,
+    HandoffClaimConflictError,
+    HandoffCommandDecision,
+    HandoffIdempotencyConflictError,
+    HandoffNotFoundError,
+    HandoffRuntimeModeError,
+    HandoffTerminalBarrierError,
+    RuntimeHandoffRepository,
+)
 from app.utils.id_util import generate_snowflake_id
 
 
@@ -29,6 +40,7 @@ from app.utils.id_util import generate_snowflake_id
 class HandoffClaimResult:
     handoff: AiCallHandoffModel
     payload: dict
+    command: HandoffCommandDecision | None = None
 
 
 class AiCallAgentConsoleService:
@@ -155,7 +167,26 @@ class AiCallAgentConsoleService:
         handoff_id: str,
         console_session_id: str,
         commit: bool = True,
+        idempotency_key: str | None = None,
     ) -> AiCallHandoffModel:
+        handoff, _command = await self._claim_handoff(
+            auth,
+            handoff_id=handoff_id,
+            console_session_id=console_session_id,
+            commit=commit,
+            idempotency_key=idempotency_key,
+        )
+        return handoff
+
+    async def _claim_handoff(
+        self,
+        auth: AuthSchema,
+        *,
+        handoff_id: str,
+        console_session_id: str,
+        commit: bool,
+        idempotency_key: str | None,
+    ) -> tuple[AiCallHandoffModel, HandoffCommandDecision | None]:
         profile = await self.require_current_agent(auth)
         session_id = self._console_session_id(console_session_id)
         handoff = await self.repository.get_console_handoff_for_claim(
@@ -164,12 +195,56 @@ class AiCallAgentConsoleService:
         )
         if handoff is None:
             raise CustomException(msg="转人工任务不存在", status_code=404)
+        runtime_control_mode = await self.db.scalar(
+            select(AiCallRecordModel.runtime_control_mode).where(
+                AiCallRecordModel.tenant_id == profile.tenant_id,
+                AiCallRecordModel.call_id == handoff.call_id,
+            )
+        )
+        if runtime_control_mode == "owner_command_v1":
+            if handoff.scene_code not in await self._scene_codes(profile):
+                raise CustomException(
+                    msg="当前坐席无权处理该业务场景",
+                    code=RET.ERROR.code,
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    data={"errorCode": "AGENT_SCOPE_MISMATCH"},
+                )
+            normalized_key = str(idempotency_key or "").strip()
+            if not normalized_key:
+                raise CustomException(
+                    msg="Owner 模式认领必须提供 Idempotency-Key",
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    data={"errorCode": "IDEMPOTENCY_KEY_REQUIRED"},
+                )
+            try:
+                command = await RuntimeHandoffRepository(self.db).accept(
+                    HandoffAcceptIntent(
+                        tenant_id=profile.tenant_id,
+                        handoff_id=handoff.handoff_id,
+                        agent_identity=profile.agent_identity,
+                        console_session_id=session_id,
+                        idempotency_key=normalized_key,
+                    )
+                )
+            except HandoffNotFoundError as exc:
+                raise CustomException(msg="转人工任务不存在", status_code=404) from exc
+            except HandoffIdempotencyConflictError:
+                self._raise_conflict("幂等键已用于其他认领请求", "IDEMPOTENCY_CONFLICT")
+            except HandoffRuntimeModeError:
+                self._raise_conflict("通话控制模式已经变化", "RUNTIME_MODE_CHANGED")
+            except HandoffTerminalBarrierError:
+                self._raise_conflict("客户通话已经结束", "CUSTOMER_NOT_CONNECTED")
+            except HandoffClaimConflictError:
+                self._raise_conflict("转人工任务已不可认领", "HANDOFF_ALREADY_CLAIMED")
+            if commit:
+                await self.db.commit()
+            return handoff, command
         if handoff.status == "accepted":
             if (
                 handoff.human_agent_identity == profile.agent_identity
                 and handoff.accepted_console_session_id == session_id
             ):
-                return handoff
+                return handoff, None
             error_code = (
                 "CONSOLE_SESSION_CONFLICT"
                 if handoff.human_agent_identity == profile.agent_identity
@@ -236,7 +311,7 @@ class AiCallAgentConsoleService:
         set_committed_value(handoff, "claim_expires_at", claim_expires_at)
         if commit:
             await self.db.commit()
-        return handoff
+        return handoff, None
 
     async def claim_handoff_with_payload(
         self,
@@ -244,16 +319,18 @@ class AiCallAgentConsoleService:
         *,
         handoff_id: str,
         console_session_id: str,
+        idempotency_key: str | None = None,
     ) -> HandoffClaimResult:
-        handoff = await self.claim_handoff(
+        handoff, command = await self._claim_handoff(
             auth,
             handoff_id=handoff_id,
             console_session_id=console_session_id,
             commit=False,
+            idempotency_key=idempotency_key,
         )
         payload = await self.handoff_payload(handoff)
         await self.db.commit()
-        return HandoffClaimResult(handoff=handoff, payload=payload)
+        return HandoffClaimResult(handoff=handoff, payload=payload, command=command)
 
     async def media_ready(
         self,
