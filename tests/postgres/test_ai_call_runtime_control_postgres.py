@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -12,10 +12,14 @@ from uuid import UUID
 import psycopg
 import pytest
 from psycopg import ClientCursor
-from sqlalchemy import event, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallHandoffAgentModel,
+    AiCallHandoffModel,
+    AiCallRecordModel,
+)
 from app.api.v1.ai_call.outbound.attempt_reconciler import (
     OutboundAttemptReconciler,
     OutboundAttemptReconcileWorker,
@@ -64,6 +68,11 @@ from app.services.ai_call.runtime_control.entry_start_service import (
     StartEntryRequest,
 )
 from app.services.ai_call.runtime_control.handlers import EndCallHandler, StartCallHandler
+from app.services.ai_call.runtime_control.handoff_repository import (
+    HandoffAcceptIntent,
+    HandoffClaimConflictError,
+    RuntimeHandoffRepository,
+)
 from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
     AiCallRuntimeCommandModel,
@@ -498,6 +507,8 @@ async def _reset_repository_schema(engine) -> None:
         AiCallOutboundAttemptModel.__table__,
         AiCallOutboundTargetModel.__table__,
         AiCallOutboundTaskModel.__table__,
+        AiCallHandoffAgentModel.__table__,
+        AiCallHandoffModel.__table__,
         AiCallRecordModel.__table__,
     )
     async with engine.begin() as connection:
@@ -538,6 +549,198 @@ async def _insert_sip_line(
             now=now,
         )
     )
+
+
+async def _insert_owner_handoff(
+    session,
+    *,
+    row_id: int,
+    handoff_id: str,
+    call_id: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    session.add(
+        AiCallRecordModel(
+            id=1000 + row_id,
+            tenant_id="tenant-a",
+            call_id=call_id,
+            entry_type="web",
+            room_name=f"room-{call_id}",
+            participant_identity=f"caller-{call_id}",
+            status="ready",
+            started_at=now,
+            runtime_control_mode="owner_command_v1",
+            runtime_owner_id="runtime-1",
+            runtime_fencing_token=7,
+            runtime_lease_expires_at=now + timedelta(minutes=1),
+            runtime_capacity_class="active",
+            next_command_seq=2,
+            last_applied_command_seq=1,
+        )
+    )
+    session.add(
+        AiCallHandoffModel(
+            id=2000 + row_id,
+            tenant_id="tenant-a",
+            handoff_id=handoff_id,
+            call_id=call_id,
+            room_name=f"room-{call_id}",
+            scene_code="default",
+            status="requested",
+            request_source="customer",
+            requested_at=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+    )
+
+
+async def _claim_owner_handoff(
+    factory,
+    *,
+    handoff_id: str,
+    agent_identity: str,
+    console_session_id: str,
+) -> object:
+    async with factory.begin() as session:
+        try:
+            return await RuntimeHandoffRepository(session).accept(
+                HandoffAcceptIntent(
+                    tenant_id="tenant-a",
+                    handoff_id=handoff_id,
+                    agent_identity=agent_identity,
+                    console_session_id=console_session_id,
+                    idempotency_key=f"claim:{handoff_id}:{agent_identity}",
+                )
+            )
+        except HandoffClaimConflictError as exc:
+            return exc
+
+
+async def test_handoff_claim_competition_has_one_winner() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        now = datetime.now(timezone.utc)
+        async with factory.begin() as session:
+            await _insert_owner_handoff(
+                session,
+                row_id=1,
+                handoff_id="handoff-1",
+                call_id="call-1",
+            )
+            session.add_all(
+                (
+                    AiCallHandoffAgentModel(
+                        id=3001,
+                        tenant_id="tenant-a",
+                        agent_identity="agent-1",
+                        skill_group="default",
+                        status="available",
+                        console_session_id="11111111-1111-1111-1111-111111111111",
+                        status_updated_at=now,
+                    ),
+                    AiCallHandoffAgentModel(
+                        id=3002,
+                        tenant_id="tenant-a",
+                        agent_identity="agent-2",
+                        skill_group="default",
+                        status="available",
+                        console_session_id="22222222-2222-2222-2222-222222222222",
+                        status_updated_at=now,
+                    ),
+                )
+            )
+
+        results = await asyncio.gather(
+            _claim_owner_handoff(
+                factory,
+                handoff_id="handoff-1",
+                agent_identity="agent-1",
+                console_session_id="11111111-1111-1111-1111-111111111111",
+            ),
+            _claim_owner_handoff(
+                factory,
+                handoff_id="handoff-1",
+                agent_identity="agent-2",
+                console_session_id="22222222-2222-2222-2222-222222222222",
+            ),
+        )
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert sum(isinstance(result, HandoffClaimConflictError) for result in results) == 1
+
+        async with factory() as session:
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            agents = list((await session.scalars(select(AiCallHandoffAgentModel))).all())
+            command_count = await session.scalar(
+                select(func.count()).select_from(AiCallRuntimeCommandModel)
+            )
+        assert handoff.status == "accepted"
+        assert sum(agent.status == "claiming" for agent in agents) == 1
+        assert sum(agent.status == "available" for agent in agents) == 1
+        assert command_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_handoff_claiming_agent_cannot_win_two_calls() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        now = datetime.now(timezone.utc)
+        async with factory.begin() as session:
+            await _insert_owner_handoff(
+                session,
+                row_id=1,
+                handoff_id="handoff-1",
+                call_id="call-1",
+            )
+            await _insert_owner_handoff(
+                session,
+                row_id=2,
+                handoff_id="handoff-2",
+                call_id="call-2",
+            )
+            session.add(
+                AiCallHandoffAgentModel(
+                    id=3001,
+                    tenant_id="tenant-a",
+                    agent_identity="agent-1",
+                    skill_group="default",
+                    status="available",
+                    console_session_id="11111111-1111-1111-1111-111111111111",
+                    status_updated_at=now,
+                )
+            )
+
+        results = await asyncio.gather(
+            _claim_owner_handoff(
+                factory,
+                handoff_id="handoff-1",
+                agent_identity="agent-1",
+                console_session_id="11111111-1111-1111-1111-111111111111",
+            ),
+            _claim_owner_handoff(
+                factory,
+                handoff_id="handoff-2",
+                agent_identity="agent-1",
+                console_session_id="11111111-1111-1111-1111-111111111111",
+            ),
+        )
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert sum(isinstance(result, HandoffClaimConflictError) for result in results) == 1
+
+        async with factory() as session:
+            handoffs = list((await session.scalars(select(AiCallHandoffModel))).all())
+            command_count = await session.scalar(
+                select(func.count()).select_from(AiCallRuntimeCommandModel)
+            )
+        assert sum(handoff.status == "accepted" for handoff in handoffs) == 1
+        assert sum(handoff.status == "requested" for handoff in handoffs) == 1
+        assert command_count == 1
+    finally:
+        await engine.dispose()
 
 
 async def test_command_idempotency_is_tenant_scoped_and_conflicts_are_atomic() -> None:
