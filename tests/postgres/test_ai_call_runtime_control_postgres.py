@@ -80,11 +80,14 @@ from app.services.ai_call.runtime_control.handoff_repository import (
 )
 from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
+    AiCallHandoffMediaEvidenceModel,
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectDependencyModel,
     AiCallRuntimeEffectModel,
     AiCallRuntimeWorkerModel,
     AiCallSipLineReservationModel,
+    AiCallWebhookInboxModel,
+    AiCallWebhookQuarantineModel,
 )
 from app.services.ai_call.runtime_control.owner_repository import (
     DispatcherOwnerRepository,
@@ -126,6 +129,11 @@ from app.services.ai_call.runtime_control.startup_recovery import (
 )
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus
+from app.services.ai_call.runtime_control.webhook_repository import (
+    RuntimeWebhookRepository,
+    StaleWebhookClaimError,
+    WebhookReceiveIntent,
+)
 from app.utils.id_util import generate_snowflake_id
 
 pytestmark = pytest.mark.anyio
@@ -171,6 +179,10 @@ def _async_dsn() -> str:
 
 def _psycopg_dsn() -> str:
     return _async_dsn().replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+async def _constant_time(value: datetime) -> datetime:
+    return value
 
 
 def _execute_script(sql: str) -> None:
@@ -503,6 +515,9 @@ async def test_handoff_media_migration_is_idempotent_and_portable() -> None:
 async def _reset_repository_schema(engine) -> None:
     tables = (
         AiCallSipLineModel.__table__,
+        AiCallWebhookQuarantineModel.__table__,
+        AiCallWebhookInboxModel.__table__,
+        AiCallHandoffMediaEvidenceModel.__table__,
         AiCallRuntimeEffectDependencyModel.__table__,
         AiCallRuntimeEffectModel.__table__,
         AiCallEndEvidenceModel.__table__,
@@ -948,6 +963,195 @@ async def test_handoff_claiming_agent_cannot_win_two_calls() -> None:
         assert sum(handoff.status == "accepted" for handoff in handoffs) == 1
         assert sum(handoff.status == "requested" for handoff in handoffs) == 1
         assert command_count == 1
+    finally:
+        await engine.dispose()
+
+
+def _postgres_webhook_intent(*, dedupe_key: str) -> WebhookReceiveIntent:
+    return WebhookReceiveIntent(
+        provider="livekit",
+        provider_namespace="livekit:postgres-test",
+        dedupe_key=dedupe_key,
+        event_type="participant_joined",
+        room_name="room-call-webhook",
+        participant_identity="human-agent-handoff-webhook",
+        payload={
+            "event": "participant_joined",
+            "id": dedupe_key,
+            "room": {"name": "room-call-webhook"},
+            "participant": {
+                "identity": "human-agent-handoff-webhook",
+                "sid": "PA_WEBHOOK",
+            },
+        },
+    )
+
+
+async def _seed_postgres_webhook_handoff(factory) -> None:
+    async with factory.begin() as session:
+        await _insert_owner_handoff(
+            session,
+            row_id=501,
+            handoff_id="handoff-webhook",
+            call_id="call-webhook",
+        )
+        handoff = await session.scalar(select(AiCallHandoffModel))
+        handoff.status = "accepted"
+        handoff.human_agent_identity = "agent-webhook"
+        handoff.accepted_console_session_id = (
+            "55555555-5555-4555-8555-555555555555"
+        )
+        handoff.accepted_at = await read_database_time(session)
+        handoff.participant_identity = "human-agent-handoff-webhook"
+        session.add(
+            AiCallHandoffAgentModel(
+                id=3501,
+                tenant_id="tenant-a",
+                agent_identity="agent-webhook",
+                skill_group="default",
+                status="claiming",
+                active_handoff_id="handoff-webhook",
+                active_call_id="call-webhook",
+                console_session_id="55555555-5555-4555-8555-555555555555",
+                last_seen_at=await read_database_time(session),
+                status_updated_at=await read_database_time(session),
+            )
+        )
+
+
+async def test_two_webhook_workers_claim_once_and_expired_claim_is_fenced() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await _seed_postgres_webhook_handoff(factory)
+        async with factory.begin() as session:
+            await RuntimeWebhookRepository(
+                session,
+                id_generator=lambda: 8501,
+            ).receive(_postgres_webhook_intent(dedupe_key="EV_PG_CLAIM"))
+
+        async def claim_once(worker_id: str, token: str):
+            async with factory.begin() as session:
+                return await RuntimeWebhookRepository(
+                    session,
+                    processing_token_generator=lambda: token,
+                    processing_lease_ttl=timedelta(seconds=1),
+                ).claim_inbox(worker_id)
+
+        first, second = await asyncio.gather(
+            claim_once("jobs-a", "token-a"),
+            claim_once("jobs-b", "token-b"),
+        )
+        claims = [claim for claim in (first, second) if claim is not None]
+        assert len(claims) == 1
+        old_claim = claims[0]
+
+        takeover_at = old_claim.processing_expires_at + timedelta(seconds=1)
+        async with factory.begin() as session:
+            new_claim = await RuntimeWebhookRepository(
+                session,
+                processing_token_generator=lambda: "takeover-token",
+                database_clock=lambda _session: _constant_time(takeover_at),
+            ).claim_inbox("jobs-takeover")
+        assert new_claim is not None
+        assert new_claim.attempt_count == 2
+
+        async with factory.begin() as session:
+            with pytest.raises(StaleWebhookClaimError):
+                await RuntimeWebhookRepository(
+                    session,
+                    id_generator=iter((8502, 8503)).__next__,
+                    database_clock=lambda _session: _constant_time(takeover_at),
+                ).apply_inbox_media(old_claim)
+
+        async with factory.begin() as session:
+            await RuntimeWebhookRepository(
+                session,
+                id_generator=iter((8504, 8505)).__next__,
+                database_clock=lambda _session: _constant_time(takeover_at),
+            ).apply_inbox_media(new_claim)
+
+        async with factory() as session:
+            inbox = await session.get(AiCallWebhookInboxModel, 8501)
+            evidence_count = await session.scalar(
+                select(func.count()).select_from(AiCallHandoffMediaEvidenceModel)
+            )
+            command_count = await session.scalar(
+                select(func.count()).select_from(AiCallRuntimeCommandModel)
+            )
+        assert inbox.status == "SUCCEEDED"
+        assert inbox.attempt_count == 2
+        assert evidence_count == 1
+        assert command_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_end_race_with_media_ready_keeps_terminal_barrier_closed() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await _seed_postgres_webhook_handoff(factory)
+        async with factory.begin() as session:
+            await RuntimeWebhookRepository(
+                session,
+                id_generator=lambda: 8601,
+            ).receive(_postgres_webhook_intent(dedupe_key="EV_PG_END_RACE"))
+        async with factory.begin() as session:
+            claim = await RuntimeWebhookRepository(
+                session,
+                processing_token_generator=lambda: "ready-race-token",
+            ).claim_inbox("jobs-ready")
+        assert claim is not None
+
+        async def apply_ready() -> None:
+            async with factory.begin() as session:
+                await RuntimeWebhookRepository(
+                    session,
+                    id_generator=iter((8602, 8603)).__next__,
+                ).apply_inbox_media(claim)
+
+        async def request_end() -> None:
+            async with factory.begin() as session:
+                await RuntimeCommandRepository(
+                    session,
+                    id_generator=iter((8610, 8611)).__next__,
+                ).request_end(
+                    EndCallIntent(
+                        tenant_id="tenant-a",
+                        call_id="call-webhook",
+                        source="customer_sip",
+                        end_reason="customer_hangup",
+                        dedupe_key="customer:end-race",
+                    )
+                )
+
+        await asyncio.gather(apply_ready(), request_end())
+
+        async with factory() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            commands = list(
+                (
+                    await session.scalars(
+                        select(AiCallRuntimeCommandModel).order_by(
+                            AiCallRuntimeCommandModel.command_seq
+                        )
+                    )
+                ).all()
+            )
+            evidence_count = await session.scalar(
+                select(func.count()).select_from(AiCallHandoffMediaEvidenceModel)
+            )
+        by_type = {command.command_type: command for command in commands}
+        assert record.terminal_requested_at is not None
+        assert handoff.status == "accepted"
+        assert handoff.media_state_version == 1
+        assert evidence_count == 1
+        assert by_type["AGENT_MEDIA_READY"].status == CommandStatus.SUPERSEDED
+        assert by_type["END_CALL"].status == CommandStatus.PENDING
     finally:
         await engine.dispose()
 
