@@ -68,6 +68,17 @@ async def test_ai_call_health_returns_503_when_runtime_task_failed() -> None:
         "runtime": "failed",
         "errorCode": "runtime_task_exited",
     }
+
+
+@pytest.mark.anyio
+async def test_ai_call_health_keeps_ok_contract_when_runtime_not_configured() -> None:
+    module = import_module("app.services.ai_call.runtime_control.health")
+    health_type = getattr(module, "RuntimeWorkerHealth", None)
+    assert health_type is not None, "RuntimeWorkerHealth is not implemented"
+
+    response = await ai_call_health(health_type())
+
+    assert response == {"status": "ok"}
 ```
 
 - [ ] **步骤 2：运行测试验证因功能缺失而失败**
@@ -409,8 +420,7 @@ uv run pytest tests/test_ai_call_runtime_health.py tests/test_ai_call_runtime_li
 uv run pytest \
   tests/test_ai_call_runtime_owner_repository.py \
   tests/test_ai_call_runtime_lifecycle.py \
-  tests/test_ai_call_runtime_health.py \
-  tests/test_main.py -q
+  tests/test_ai_call_runtime_health.py -q
 uv run ruff check \
   app/services/ai_call/runtime_control/health.py \
   app/services/ai_call/runtime_control/runtime_service.py \
