@@ -123,9 +123,12 @@ git commit -m "feat(ai-call): 建立转人工媒体生命周期账本"
 
 - 创建：`app/services/ai_call/runtime_control/handoff_repository.py`
 - 创建：`tests/test_ai_call_runtime_handoff_repository.py`
+- 修改：`app/services/ai_call/agent_console_service.py`
+- 修改：`app/api/v1/ai_call/agent_console_controller.py`
 - 修改：`app/api/v1/ai_call/controller.py`
 - 修改：`app/api/v1/ai_call/schema.py`
-- 修改：`tests/test_ai_call_phase_b1_records.py`
+- 修改：`tests/test_ai_call_agent_console_claim.py`
+- 修改：`tests/test_ai_call_agent_console_api.py`
 - 修改：`tests/postgres/test_ai_call_runtime_control_postgres.py`
 
 - [ ] **步骤 1：编写失败测试**
@@ -136,8 +139,7 @@ git commit -m "feat(ai-call): 建立转人工媒体生命周期账本"
 async def test_accept_locks_record_handoff_presence_then_appends_command(): ...
 async def test_two_agents_competing_for_one_handoff_have_one_winner(): ...
 async def test_one_agent_cannot_claim_two_handoffs(): ...
-async def test_cancel_before_connected_releases_claiming_atomically(): ...
-async def test_cancel_after_connected_creates_the_unique_end_call(): ...
+async def test_cancel_request_does_not_release_claim_before_runtime_executes(): ...
 async def test_cross_tenant_handoff_action_changes_zero_rows(): ...
 ```
 
@@ -146,7 +148,7 @@ Owner 模式 API 必须从 `AuthSchema` 读取 tenant 和坐席身份，要求 `
 - [ ] **步骤 2：确认红灯**
 
 ```bash
-uv run pytest -q tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_phase_b1_records.py -k 'owner_handoff or claiming'
+uv run pytest -q tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_agent_console_claim.py tests/test_ai_call_agent_console_api.py -k 'owner_handoff or claiming or claim_handoff_uses_payload'
 ```
 
 - [ ] **步骤 3：实现 Repository 和 API 分流**
@@ -157,21 +159,21 @@ uv run pytest -q tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_
 Record -> Handoff -> Presence -> Command
 ```
 
-`accept` 只允许 `requested -> accepted` 与 `available -> claiming`，同事务登记 `HANDOFF_ACCEPTED`。`cancel` 只允许未接通的 `requested/accepted` 进入 `canceled`；`connected/reconnecting` 调用 `request_end`。`legacy_local` 继续走现有 `AiCallHandoffService`，不得改变旧路径。
+`accept` 只允许 `requested -> accepted` 与 `available -> claiming`，同事务登记 `HANDOFF_ACCEPTED`。API 的 `cancel` 只登记 `CANCEL_HANDOFF`，不得直接释放 Presence；未接通时的 `canceled + claiming -> available`，以及 `connected/reconnecting` 转唯一 `END_CALL`，统一留给任务 4 的当前 Runtime Owner 处理。`legacy_local` 继续走现有 `AiCallHandoffService`，不得改变旧路径。
 
 - [ ] **步骤 4：运行单元和 PostgreSQL 竞争测试**
 
 ```bash
-uv run pytest -q tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_phase_b1_records.py -k 'owner_handoff or claiming'
+uv run pytest -q tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_agent_console_claim.py tests/test_ai_call_agent_console_api.py -k 'owner_handoff or claiming or claim_handoff_uses_payload'
 tools/run_ai_call_runtime_postgres_tests.sh -q tests/postgres/test_ai_call_runtime_control_postgres.py -k 'handoff and (claim or cancel or tenant)'
-uv run ruff check app/services/ai_call/runtime_control/handoff_repository.py app/api/v1/ai_call/controller.py app/api/v1/ai_call/schema.py tests/test_ai_call_runtime_handoff_repository.py
+uv run ruff check app/services/ai_call/runtime_control/handoff_repository.py app/services/ai_call/agent_console_service.py app/api/v1/ai_call/agent_console_controller.py app/api/v1/ai_call/controller.py app/api/v1/ai_call/schema.py tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_agent_console_claim.py tests/test_ai_call_agent_console_api.py
 git diff --check
 ```
 
 - [ ] **步骤 5：提交**
 
 ```bash
-git add app/services/ai_call/runtime_control/handoff_repository.py app/api/v1/ai_call/controller.py app/api/v1/ai_call/schema.py tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_phase_b1_records.py tests/postgres/test_ai_call_runtime_control_postgres.py
+git add app/services/ai_call/runtime_control/handoff_repository.py app/services/ai_call/agent_console_service.py app/api/v1/ai_call/agent_console_controller.py app/api/v1/ai_call/controller.py app/api/v1/ai_call/schema.py tests/test_ai_call_runtime_handoff_repository.py tests/test_ai_call_agent_console_claim.py tests/test_ai_call_agent_console_api.py tests/postgres/test_ai_call_runtime_control_postgres.py
 git commit -m "feat(ai-call): 原子登记转人工坐席命令"
 ```
 
