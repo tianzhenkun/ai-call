@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.services.ai_call.runtime_control.dispatcher_service import (
     DispatcherControlService,
 )
+from app.services.ai_call.runtime_control.health import default_runtime_worker_health
 from app.services.ai_call.runtime_control.owner_repository import build_worker_id
 from app.services.ai_call.runtime_control.postgres_wakeup import (
     PostgresWakeupListener,
@@ -80,6 +81,7 @@ async def start_runtime_control_lifecycle(
         ),
         scan_interval_seconds=float(settings.AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS),
         wakeup_listener=PostgresWakeupListener(session_factory.kw["bind"]),
+        health=default_runtime_worker_health,
     )
     await service.start()
     return service

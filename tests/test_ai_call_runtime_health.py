@@ -4,6 +4,7 @@ import asyncio
 import json
 from importlib import import_module
 from inspect import signature
+from types import SimpleNamespace
 
 import pytest
 
@@ -153,3 +154,43 @@ async def test_runtime_stop_does_not_report_expected_task_exit_as_failure() -> N
     assert health.snapshot().state == RuntimeTaskState.STOPPED
     assert health.snapshot().error_code is None
     assert service._supervision_task is None
+
+
+@pytest.mark.anyio
+async def test_runtime_lifecycle_injects_process_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import lifecycle
+
+    captured: dict[str, object] = {}
+
+    async def valid_database(_session_factory) -> tuple[str, str]:
+        return "runtime-test", "public"
+
+    class FakeService:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(lifecycle, "RuntimeControlService", FakeService)
+    monkeypatch.setattr(
+        lifecycle,
+        "validate_db_only_runtime_database",
+        valid_database,
+    )
+    settings = SimpleNamespace(
+        AI_CALL_RUNTIME_INSTANCE_ID="runtime-test",
+        AI_CALL_RUNTIME_CAPACITY=2,
+        AI_CALL_RUNTIME_CLEANUP_CAPACITY=1,
+        AI_CALL_RUNTIME_WORKER_LEASE_SECONDS=15,
+        AI_CALL_RUNTIME_OWNER_LEASE_SECONDS=15,
+        AI_CALL_RUNTIME_FAIL_CLOSED_MARGIN_SECONDS=3,
+        AI_CALL_RUNTIME_END_SCAN_INTERVAL_SECONDS=0.5,
+    )
+    session_factory = SimpleNamespace(kw={"bind": object()})
+
+    await lifecycle.start_runtime_control_lifecycle(settings, session_factory)
+
+    assert captured["health"] is lifecycle.default_runtime_worker_health
