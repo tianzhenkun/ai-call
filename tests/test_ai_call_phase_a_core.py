@@ -20,6 +20,7 @@ from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.service import AiCallService
 from app.config.setting import Settings
+from app.core.dependencies import get_current_user
 from app.core.logger import sanitize_log_message
 from app.plugin import init_app
 from app.services.ai_call.agent_runner import (
@@ -17269,6 +17270,7 @@ def test_session_api_returns_unified_camel_case_response() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: AiCallService(orchestrator)
+    app.dependency_overrides[get_current_user] = lambda: object()
 
     with TestClient(app) as client:
         create_response = client.post(
