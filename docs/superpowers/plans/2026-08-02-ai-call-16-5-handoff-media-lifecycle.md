@@ -60,9 +60,9 @@
 def test_handoff_media_lifecycle_models_match_postgres_contract() -> None:
     assert AiCallHandoffModel.__table__.c.media_state_version.type.python_type is int
     assert AiCallHandoffModel.__table__.c.media_state_version.default.arg == 0
-    assert AiCallRuntimeWebhookInboxModel.__table__.c.payload_json.type.python_type is str
+    assert AiCallWebhookInboxModel.__table__.c.payload_json.type.python_type is str
     assert "provider_namespace" in AiCallHandoffMediaEvidenceModel.__table__.c
-    assert "processing_generation" in AiCallRuntimeWebhookQuarantineModel.__table__.c
+    assert "processing_generation" in AiCallWebhookQuarantineModel.__table__.c
 ```
 
 PostgreSQL 测试必须执行 migration 后查询 `information_schema.columns` 和 `pg_indexes`，验证三张新表、Handoff 字段、唯一索引、认领索引和 `timestamptz`；不得用 `metadata.create_all` 代替 migration 验收。
@@ -81,24 +81,25 @@ tools/run_ai_call_runtime_postgres_tests.sh -q tests/postgres/test_ai_call_runti
 在 `ai_call_handoff` 增加：
 
 ```text
-agent_participant_identity varchar(255) null
-agent_participant_sid varchar(255) null
-agent_audio_track_sid varchar(255) null
-media_state varchar(32) not null default 'not_ready'
+participant_identity varchar(255) null
+participant_sid varchar(255) null
+track_sid varchar(255) null
+verified_at timestamptz null
+evidence_source varchar(64) null
 media_state_version bigint not null default 0
 media_invalidated_at timestamptz null
-last_media_evidence_at timestamptz null
+last_media_event_key varchar(160) null
 ```
 
 在 `ai_call_handoff_agent` 支持 `offline/available/claiming/in_call/acw`，不再由 Owner 模式写旧 `online/busy`。创建：
 
 ```text
 ai_call_handoff_media_evidence
-ai_call_runtime_webhook_inbox
-ai_call_runtime_webhook_quarantine
+ai_call_webhook_inbox
+ai_call_webhook_quarantine
 ```
 
-所有 JSON 载荷使用 `text`，所有表显式 `tenant_id`，不创建物理外键。Inbox 唯一键为 `(provider_namespace, provider_event_id)`；Evidence 唯一键为 `(tenant_id, handoff_id, provider_namespace, provider_event_id, evidence_type)`；Quarantine 对 `inbox_id` 唯一并具有独立 generation/token/lease。
+所有 JSON 载荷使用 `text`，不创建物理外键。主 Inbox 必须带非空 `tenant_id`，Provider 级 Quarantine 在关联成功前不猜租户，只保存可空的 `resolved_tenant_id/resolved_call_id`。Inbox 和 Quarantine 均按 `(provider, provider_namespace, dedupe_key)` 全局去重；Evidence 按 `(tenant_id, provider_namespace, dedupe_key)` 去重，并对 `(tenant_id, call_id, handoff_id, media_state_version)` 唯一；Quarantine 具有独立 generation/token/lease。
 
 - [ ] **步骤 4：运行测试、lint 和 diff 检查**
 
