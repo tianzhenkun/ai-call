@@ -7202,8 +7202,13 @@ async def test_outbound_db_only_two_instances_create_one_dialing_chain() -> None
         assert reservation.attempt_id == attempt.id
         assert reservation.status == "ACTIVE"
         assert record is not None and record.status == "ready"
-        assert record.callee_phone_number is None
+        expected_phone = prepare_direct_sip_phone(phone_number)
+        assert record.callee_phone_number == expected_phone.plaintext
+        assert record.callee_phone_number_masked == expected_phone.masked
+        assert record.callee_phone_number_hash == expected_phone.fingerprint
         assert command is not None and command.status == "SUCCEEDED"
+        assert command.sensitive_payload_ciphertext is None
+        assert command.payload_key_version is None
         assert len(effects) == 3
         provider_calls = provider_a.calls + provider_b.calls
         assert len(provider_calls) == 3

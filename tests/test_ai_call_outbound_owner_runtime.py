@@ -367,6 +367,9 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
     assert record.tenant_id == "tenant-a"
     assert record.entry_type == "outbound"
     assert record.runtime_control_mode == "owner_command_v1"
+    assert record.callee_phone_number == phone_number
+    assert record.callee_phone_number_masked == "138****8001"
+    assert (record.callee_phone_number_hash or "").startswith("sha256:")
     assert command is not None
     assert command.status == "PENDING"
     assert command.call_id == record.call_id == attempt.call_id
@@ -384,6 +387,8 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
         "voice": "Tina",
     }
     assert phone_number not in (command.payload_json or "")
+    assert command.sensitive_payload_ciphertext is None
+    assert command.payload_key_version is None
 
 
 @pytest.mark.anyio

@@ -208,21 +208,21 @@ def _validate_start_call_intent(request: StartCallIntent) -> None:
         request.callee_phone_number_masked,
         request.callee_phone_number_hash,
     )
-    if request.entry_type == "direct_sip":
+    if request.entry_type in {"direct_sip", "outbound"}:
         if not all(phone_fields):
             raise InvalidCommandIntentError(
-                "Direct SIP start requires complete phone metadata"
+                "SIP start requires complete phone metadata"
             )
         if (
             request.sensitive_payload_ciphertext is not None
             or request.payload_key_version is not None
         ):
             raise InvalidCommandIntentError(
-                "Direct SIP start does not accept encrypted phone payload"
+                "SIP start does not accept encrypted phone payload"
             )
         if payload_contains_phone(request.payload, request.callee_phone_number or ""):
             raise InvalidCommandIntentError(
-                "Direct SIP start payload contains restricted phone data"
+                "SIP start payload contains restricted phone data"
             )
     elif any(value is not None for value in phone_fields):
         raise InvalidCommandIntentError(

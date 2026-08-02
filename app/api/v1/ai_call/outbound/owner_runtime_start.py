@@ -9,6 +9,9 @@ from app.services.ai_call.runtime_control.command_repository import (
     RuntimeCommandRepository,
     StartCallIntent,
 )
+from app.services.ai_call.runtime_control.direct_sip_phone import (
+    prepare_direct_sip_phone,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.utils.id_util import generate_snowflake_id
 
@@ -42,6 +45,7 @@ class OwnerRuntimeOutboundStart:
         if request.line is None:
             raise ValueError("Owner Runtime 外呼缺少 SIP 线路快照")
 
+        phone = prepare_direct_sip_phone(request.phone_number)
         attempt_id = self._id_generator()
         idempotency_key = (
             f"outbound:{request.tenant_id}:{request.task_id}:"
@@ -72,6 +76,9 @@ class OwnerRuntimeOutboundStart:
                 scene_code=request.scene_code,
                 prompt_source_key=request.prompt_profile_id,
                 allocation_timeout_seconds=self._allocation_timeout_seconds,
+                callee_phone_number=phone.plaintext,
+                callee_phone_number_masked=phone.masked,
+                callee_phone_number_hash=phone.fingerprint,
             )
         )
         session.add(
