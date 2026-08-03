@@ -1004,6 +1004,14 @@ class RuntimeEffectRepository:
         elif observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE:
             effect.status = EffectStatus.FAILED
             effect.error_message = "no_resource"
+        elif (
+            effect.effect_type == "START_TRACK_EGRESS"
+            and observation.kind == ProviderObservationKind.RESOURCE_ABSENT
+            and effect.reconcile_deadline_at is not None
+            and now >= effect.reconcile_deadline_at
+        ):
+            effect.status = EffectStatus.FAILED
+            effect.error_message = "no_resource"
         elif observation.kind == ProviderObservationKind.RETRYABLE_FAILURE:
             effect.status = EffectStatus.PENDING
             effect.reconcile_after = now + observation.retry_after

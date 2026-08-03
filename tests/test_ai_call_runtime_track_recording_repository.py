@@ -16,6 +16,7 @@ from app.services.ai_call.runtime_control.customer_track import customer_track_k
 from app.services.ai_call.runtime_control.effect_repository import (
     ProviderObservation,
     ProviderObservationKind,
+    RuntimeEffectRepository,
 )
 from app.services.ai_call.runtime_control.models import AiCallRuntimeEffectModel
 from app.services.ai_call.runtime_control.track_recording_repository import (
@@ -161,6 +162,47 @@ async def test_customer_track_projection_maps_start_observation(
                 assert projected.failure_message == "provider_failure"
                 assert "secret" not in projected.failure_message
                 assert "access_key" not in projected.failure_message
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_customer_track_stable_absence_after_deadline_fails_without_verification() -> None:
+    session_maker, engine = await _session_maker()
+    try:
+        async with session_maker() as session:
+            record = _record()
+            effect = _start_effect()
+            effect.status = "APPLYING"
+            effect.provider_reference = None
+            effect.reconcile_deadline_at = NOW
+            session.add_all([record, effect])
+            await session.flush()
+
+            observation = ProviderObservation(
+                kind=ProviderObservationKind.RESOURCE_ABSENT,
+            )
+            RuntimeEffectRepository(session)._apply_create_observation(
+                effect,
+                observation,
+                NOW,
+            )
+            projected = await OwnerTrackRecordingRepository(
+                session,
+                id_generator=lambda: 20,
+            ).project(
+                record=record,
+                effect=effect,
+                source_effect=None,
+                observation=observation,
+                now=NOW,
+            )
+
+            assert effect.status == "FAILED"
+            assert effect.error_message == "no_resource"
+            assert projected is not None
+            assert projected.status == "failed"
+            assert projected.next_verify_at is None
     finally:
         await engine.dispose()
 

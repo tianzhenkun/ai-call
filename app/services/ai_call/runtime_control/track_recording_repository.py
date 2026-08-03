@@ -94,7 +94,7 @@ class OwnerTrackRecordingRepository:
                     started_at=observation.started_at or now,
                 )
                 self._session.add(track)
-            self._project_start(track, observation, now)
+            self._project_start(track, effect, observation, now)
         else:
             if track is None:
                 return None
@@ -135,6 +135,7 @@ class OwnerTrackRecordingRepository:
     def _project_start(
         self,
         track: AiCallRecordingTrackModel,
+        effect: AiCallRuntimeEffectModel,
         observation: ProviderObservation,
         now: datetime,
     ) -> None:
@@ -151,13 +152,17 @@ class OwnerTrackRecordingRepository:
             track.egress_id = observation.provider_reference
             track.failure_stage = None
             track.failure_message = None
-        elif observation.kind.value == "PERMANENT_NO_RESOURCE":
+        elif observation.kind.value == "PERMANENT_NO_RESOURCE" or (
+            observation.kind.value == "RESOURCE_ABSENT"
+            and effect.status == "FAILED"
+            and effect.error_message == "no_resource"
+        ):
             track.status = "failed"
             track.ended_at = observation.ended_at or now
             track.failure_stage = "egress_start"
             track.failure_message = _safe_failure_summary(
                 observation.failure_code,
-                default="no_resource",
+                default=effect.error_message or "no_resource",
             )
         elif track.status == "starting":
             track.failure_stage = "egress_start_uncertain"
