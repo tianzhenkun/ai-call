@@ -429,10 +429,11 @@ async def test_command_claim_reads_direct_sip_entry_from_record() -> None:
             self.execute_count += 1
             if self.execute_count == 1:
                 return SimpleNamespace(all=lambda: [candidate])
-            return SimpleNamespace(one_or_none=lambda: claimed)
-
-        async def scalar(self, _statement):
-            return "direct_sip"
+            if self.execute_count == 2:
+                return SimpleNamespace(one_or_none=lambda: claimed)
+            return SimpleNamespace(
+                one_or_none=lambda: ("direct_sip", "sip-call_101")
+            )
 
     claim = await RuntimeCommandRepository(
         _ClaimSession(),
@@ -451,3 +452,4 @@ async def test_command_claim_reads_direct_sip_entry_from_record() -> None:
 
     assert claim is not None
     assert claim.entry_type == "direct_sip"
+    assert claim.participant_identity == "sip-call_101"
