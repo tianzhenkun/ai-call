@@ -29,6 +29,7 @@ from app.services.ai_call.runtime_control.effect_repository import (
 )
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
+    AiCallRuntimeEffectDependencyModel,
     AiCallRuntimeEffectModel,
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
@@ -573,6 +574,98 @@ async def test_terminal_graph_keeps_attempted_pending_track_recoverable() -> Non
         assert claim is not None
         assert claim.effect_type == "START_TRACK_EGRESS"
         assert claim.reconcile_only is True
+    finally:
+        await engine.dispose()
+
+
+async def test_end_graph_delete_room_depends_on_main_and_customer_stops() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        _lease_value, now = await _seed_track_start(
+            session_maker,
+            answered=True,
+            terminal=True,
+            effect_status="APPLIED",
+        )
+        await _seed_end_command(session_maker, now=now)
+        async with session_maker.begin() as session:
+            session.add_all(
+                [
+                    AiCallRuntimeEffectModel(
+                        id=1,
+                        tenant_id="tenant-a",
+                        call_id="call-a",
+                        command_id=2,
+                        effect_type="CREATE_ROOM",
+                        idempotency_key="start:call-a:room",
+                        fencing_token=7,
+                        status="APPLIED",
+                        provider_reference="room-a",
+                        provider_namespace="livekit:postgres-test",
+                        provider_idempotency_key="room:call-a",
+                        resource_key="room:call-a",
+                        resource_generation=1,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRuntimeEffectModel(
+                        id=2,
+                        tenant_id="tenant-a",
+                        call_id="call-a",
+                        command_id=2,
+                        effect_type="START_EGRESS",
+                        idempotency_key="start:call-a:main",
+                        fencing_token=7,
+                        status="APPLIED",
+                        provider_reference="EG_main",
+                        provider_namespace="livekit:postgres-test",
+                        provider_idempotency_key="main:call-a",
+                        resource_key="egress:main:call-a",
+                        resource_generation=1,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                ]
+            )
+
+        async with session_maker.begin() as session:
+            snapshots = await RuntimeEffectRepository(session).register_end_graph(
+                await _end_claim(now)
+            )
+            stop_types = {
+                item.effect_type
+                for item in snapshots
+                if item.effect_type in {"STOP_EGRESS", "STOP_TRACK_EGRESS"}
+            }
+            assert stop_types == {"STOP_EGRESS", "STOP_TRACK_EGRESS"}
+
+        async with session_maker() as session:
+            delete_room = await session.scalar(
+                select(AiCallRuntimeEffectModel).where(
+                    AiCallRuntimeEffectModel.effect_type == "DELETE_ROOM"
+                )
+            )
+            assert delete_room is not None
+            prerequisites = set(
+                await session.scalars(
+                    select(
+                        AiCallRuntimeEffectDependencyModel.prerequisite_effect_id
+                    ).where(
+                        AiCallRuntimeEffectDependencyModel.effect_id == delete_room.id
+                    )
+                )
+            )
+            stop_ids = {
+                effect.id
+                for effect in await session.scalars(
+                    select(AiCallRuntimeEffectModel).where(
+                        AiCallRuntimeEffectModel.effect_type.in_(
+                            {"STOP_EGRESS", "STOP_TRACK_EGRESS"}
+                        )
+                    )
+                )
+            }
+            assert prerequisites == stop_ids
     finally:
         await engine.dispose()
 

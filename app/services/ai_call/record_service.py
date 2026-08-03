@@ -7,6 +7,9 @@ from typing import Any
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.services.ai_call.event_store import AiCallEvent
+from app.services.ai_call.runtime_control.customer_media_repository import (
+    OwnerCustomerMediaRepository,
+)
 from app.services.ai_call.session_registry import CallSessionStatus, utc_now
 
 SENSITIVE_PAYLOAD_KEYS = {
@@ -368,6 +371,12 @@ class AiCallRecordService:
         call_id: str,
     ) -> AiCallRecordModel | None:
         return await self.repository.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+
+    async def mark_owner_customer_ready(self, *, tenant_id: str, call_id: str) -> bool:
+        return await OwnerCustomerMediaRepository(self.repository.db).mark_browser_ready(
             tenant_id=tenant_id,
             call_id=call_id,
         )

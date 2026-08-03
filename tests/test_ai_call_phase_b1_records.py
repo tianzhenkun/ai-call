@@ -8445,3 +8445,69 @@ def test_dialogue_runtime_suppresses_orphan_ai_item_when_response_done_uses_fina
         ("ai", "item_ai_done", ai_text),
         ("customer", "item_customer_ok", "行。"),
     ]
+
+
+@pytest.mark.anyio
+async def test_owner_browser_ready_recording_writes_ready_without_legacy_track_start(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        tenant_id="000000",
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    record = await record_service.get_record(result.call_id)
+    assert record is not None
+    record.dialogue_persistence_status = "pending"
+    record.runtime_control_mode = "owner_command_v1"
+    await record_service.repository.db.flush()
+
+    class RecordingSpy:
+        def __init__(self) -> None:
+            self.start_calls: list[dict[str, object]] = []
+
+        async def start_session_participant_recordings(self, **kwargs: object) -> None:
+            self.start_calls.append(kwargs)
+
+    spy = RecordingSpy()
+    service.recording_service = spy
+
+    await service.report_browser_event(
+        call_id=result.call_id,
+        event_type="browser_ready",
+        timestamp=None,
+        tenant_id="000000",
+    )
+
+    assert spy.start_calls == []
+    assert record.answered_at is not None
+    assert record.status == CallSessionStatus.CONNECTED.value
+
+
+@pytest.mark.anyio
+async def test_owner_browser_ready_recording_after_terminal_barrier_updates_zero_rows(
+    b1_service,
+) -> None:
+    _service, record_service = b1_service
+    result = await record_service.create_web_record(
+        tenant_id="000000",
+        call_id="owner-ready-terminal",
+        business_id=None,
+        room_name="room-owner-ready-terminal",
+        participant_identity="browser-owner-ready-terminal",
+    )
+    result.dialogue_persistence_status = "pending"
+    result.runtime_control_mode = "owner_command_v1"
+    result.terminal_requested_at = datetime.now(timezone.utc)
+    result.status = CallSessionStatus.ENDING.value
+    await record_service.repository.db.flush()
+
+    marked = await record_service.mark_owner_customer_ready(
+        tenant_id="000000",
+        call_id=result.call_id,
+    )
+
+    assert marked is False
+    assert result.answered_at is None

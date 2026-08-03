@@ -589,7 +589,12 @@ class AiCallService:
                     code=RET.ERROR.code,
                     status_code=403,
                 )
-            if event_type == "browser_disconnect" and self.recording_service is not None:
+            owner_mode = record.runtime_control_mode == "owner_command_v1"
+            if (
+                event_type == "browser_disconnect"
+                and self.recording_service is not None
+                and not owner_mode
+            ):
                 session = await self.orchestrator.get_session(call_id)
                 if session.status in RUNNING_STATUSES:
                     try:
@@ -606,7 +611,7 @@ class AiCallService:
                             call_id,
                             str(exc),
                         )
-            elif event_type == "browser_ready":
+            elif event_type == "browser_ready" and not owner_mode:
                 await self._start_browser_ready_recording_tracks(
                     tenant_id=tenant_id,
                     call_id=call_id,
@@ -622,7 +627,13 @@ class AiCallService:
             raise self._to_custom_exception(exc) from exc
         if self.record_service is not None:
             if event_type == "browser_ready":
-                await self.record_service.mark_answered(call_id, result.timestamp)
+                if record.runtime_control_mode == "owner_command_v1":
+                    await self.record_service.mark_owner_customer_ready(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                    )
+                else:
+                    await self.record_service.mark_answered(call_id, result.timestamp)
             elif (
                 event_type == "browser_disconnect"
                 and result.payload.get("terminalSessionStatus") is None
@@ -1771,6 +1782,8 @@ class AiCallService:
         record: Any | None = None,
     ) -> None:
         if self.recording_service is None:
+            return
+        if record is not None and record.runtime_control_mode == "owner_command_v1":
             return
         tenant_id = self._require_recording_tenant(tenant_id)
         if record is None:
