@@ -4,16 +4,23 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
+from app.services.ai_call.runtime_control.command_repository import (
+    EndCallIntent,
+    RuntimeCommandRepository,
+)
 from app.services.ai_call.runtime_control.dialogue_repository import (
     OwnerDialogueFence,
     OwnerDialogueRepository,
 )
-from app.services.ai_call.runtime_control.models import AiCallRuntimeCommandModel
+from app.services.ai_call.runtime_control.models import (
+    AiCallRuntimeCommandModel,
+    AiCallRuntimeEffectModel,
+)
 from app.services.ai_call.runtime_control.owner_repository import (
     RecoveryOwnerRepository,
 )
@@ -140,6 +147,32 @@ class RecoveryControlService:
                     .limit(self._batch_size)
                 )
             ).all()
+            orphaned_candidates = (
+                await session.execute(
+                    select(
+                        AiCallRecordModel.tenant_id,
+                        AiCallRecordModel.call_id,
+                    )
+                    .where(
+                        AiCallRecordModel.runtime_control_mode == "owner_command_v1",
+                        AiCallRecordModel.terminal_requested_at.is_(None),
+                        AiCallRecordModel.runtime_owner_id.is_not(None),
+                        AiCallRecordModel.runtime_lease_expires_at <= now,
+                        AiCallRecordModel.runtime_capacity_class == "active",
+                        or_(
+                            AiCallRecordModel.status != "preparing",
+                            exists().where(
+                                AiCallRuntimeEffectModel.tenant_id
+                                == AiCallRecordModel.tenant_id,
+                                AiCallRuntimeEffectModel.call_id
+                                == AiCallRecordModel.call_id,
+                            ),
+                        ),
+                    )
+                    .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
+                    .limit(self._batch_size)
+                )
+            ).all()
 
         assigned = 0
         for tenant_id, call_id in start_candidates:
@@ -168,7 +201,68 @@ class RecoveryControlService:
                         error="recovery_owner_takeover",
                     )
                     assigned += 1
-        return assigned + await self._startup_reconcile.run_once()
+        ended = 0
+        for tenant_id, call_id in orphaned_candidates:
+            async with self._session_factory.begin() as session:
+                if await self._establish_orphaned_end(
+                    session,
+                    str(tenant_id),
+                    call_id,
+                ):
+                    ended += 1
+        return ended + assigned + await self._startup_reconcile.run_once()
+
+    async def _establish_orphaned_end(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        call_id: str,
+    ) -> bool:
+        record = await session.scalar(
+            select(AiCallRecordModel)
+            .where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            )
+            .with_for_update()
+        )
+        now = await self._database_clock(session)
+        if (
+            record is None
+            or record.runtime_control_mode != "owner_command_v1"
+            or record.terminal_requested_at is not None
+            or record.runtime_owner_id is None
+            or record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at > now
+            or record.runtime_capacity_class != "active"
+        ):
+            return False
+        has_effect = bool(
+            await session.scalar(
+                select(
+                    exists().where(
+                        AiCallRuntimeEffectModel.tenant_id == tenant_id,
+                        AiCallRuntimeEffectModel.call_id == call_id,
+                    )
+                )
+            )
+        )
+        if record.status == "preparing" and not has_effect:
+            return False
+        await RuntimeCommandRepository(
+            session,
+            database_clock=self._database_clock,
+        ).request_end(
+            EndCallIntent(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                source="runtime_recovery",
+                end_reason="owner_lost",
+                dedupe_key=f"runtime-recovery:{call_id}",
+                evidence={"reason": "owner_lease_expired"},
+            )
+        )
+        return True
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():

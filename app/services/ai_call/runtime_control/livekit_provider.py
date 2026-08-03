@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import select
 
 from app.services.ai_call.livekit_egress import LiveKitEgressNotFoundError
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
+    OwnerRuntimeDialogueBridge,
+)
+from app.services.ai_call.runtime_control.dialogue_repository import OwnerDialogueFence
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectClaim,
     ProviderObservation,
@@ -152,6 +158,15 @@ class RuntimeAgentManager(Protocol):
 
     async def stop(self, call_id: str) -> None: ...
 
+    async def finalize_dialogue(
+        self,
+        call_id: str,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult: ...
+
+    async def shutdown(self) -> None: ...
+
 
 class RuntimeSipClient(Protocol):
     async def create_participant(self, **kwargs): ...
@@ -185,7 +200,10 @@ class _OwnerAgentLocalHandle:
         self._call_id = call_id
 
     async def fail_closed(self) -> None:
-        await self._manager.stop(self._call_id)
+        await self._manager.fail_closed(self._call_id)
+
+    async def shutdown(self) -> None:
+        await self._manager.shutdown_call(self._call_id)
 
 
 class OwnerRuntimeAgentManager:
@@ -197,11 +215,14 @@ class OwnerRuntimeAgentManager:
         orchestrator: Any,
         runtime_registry: Any,
         session_factory: Any | None = None,
+        dialogue_bridge: OwnerRuntimeDialogueBridge | None = None,
     ) -> None:
         self._orchestrator = orchestrator
         self._runtime_registry = runtime_registry
         self._session_factory = session_factory
+        self._dialogue_bridge = dialogue_bridge
         self._active_identities: dict[str, str] = {}
+        self._dialogue_fences: dict[str, OwnerDialogueFence] = {}
 
     async def start(self, resource: RuntimeProviderResource) -> str:
         current_identity = self._active_identities.get(resource.call_id)
@@ -209,7 +230,15 @@ class OwnerRuntimeAgentManager:
             self._bind_sip_connected_observer(resource)
             return current_identity
         if current_identity is not None:
-            await self.stop(resource.call_id)
+            await self.fail_closed(resource.call_id)
+
+        dialogue_fence = self._dialogue_fence(resource)
+        if self._dialogue_bridge is not None:
+            if dialogue_fence is None:
+                raise RuntimeError("runtime dialogue fence is missing")
+            if not await self._dialogue_bridge.bind_call(dialogue_fence):
+                raise RuntimeError("runtime dialogue fence was rejected")
+            self._dialogue_fences[resource.call_id] = dialogue_fence
 
         session = CallSession(
             call_id=resource.call_id,
@@ -232,6 +261,11 @@ class OwnerRuntimeAgentManager:
             self._bind_sip_connected_observer(resource)
             await self._orchestrator.agent_runner.start(session)
         except BaseException:
+            if dialogue_fence is not None and self._dialogue_bridge is not None:
+                self._dialogue_bridge.mark_failed(
+                    dialogue_fence,
+                    error="agent_start_failed",
+                )
             self._active_identities.pop(resource.call_id, None)
             if self._runtime_registry.local_handles.get(resource.call_id) is handle:
                 self._runtime_registry.local_handles.pop(resource.call_id, None)
@@ -246,12 +280,77 @@ class OwnerRuntimeAgentManager:
         return call_id in self._active_identities
 
     async def stop(self, call_id: str) -> None:
+        await self._stop_agent(call_id)
+
+    async def finalize_dialogue(
+        self,
+        call_id: str,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult:
+        if call_id in self._active_identities:
+            return OwnerDialogueFinalizeResult("pending", 0, 0)
+        fence = self._dialogue_fences.pop(call_id, None)
+        if fence is None or self._dialogue_bridge is None:
+            return OwnerDialogueFinalizeResult("pending", 0, 0)
+        return await self._dialogue_bridge.finalize_call(
+            fence,
+            ended_at=ended_at,
+        )
+
+    async def fail_closed(self, call_id: str) -> None:
+        await self._stop_agent(call_id)
+        fence = self._dialogue_fences.pop(call_id, None)
+        if fence is not None and self._dialogue_bridge is not None:
+            self._dialogue_bridge.abandon_call(fence)
+
+    async def shutdown_call(self, call_id: str) -> OwnerDialogueFinalizeResult:
+        await self.stop(call_id)
+        return await self.finalize_dialogue(
+            call_id,
+            ended_at=datetime.now(timezone.utc),
+        )
+
+    async def shutdown(self) -> None:
+        call_ids = sorted(
+            set(self._active_identities) | set(self._dialogue_fences)
+        )
+        for call_id in call_ids:
+            await self.fail_closed(call_id)
+
+    async def _stop_agent(self, call_id: str) -> None:
+        try:
+            await self._orchestrator.agent_runner.stop(call_id)
+        except Exception:
+            if self._dialogue_bridge is not None:
+                fence = self._dialogue_fences.get(call_id)
+                if fence is not None:
+                    self._dialogue_bridge.mark_failed(
+                        fence,
+                        error="agent_stop_failed",
+                    )
+            raise
         self._active_identities.pop(call_id, None)
         self._runtime_registry.local_handles.pop(call_id, None)
-        with suppress(Exception):
-            await self._orchestrator.agent_runner.stop(call_id)
         self._unbind_sip_connected_observer(call_id)
         self._orchestrator.registry.discard(call_id)
+
+    @staticmethod
+    def _dialogue_fence(
+        resource: RuntimeProviderResource,
+    ) -> OwnerDialogueFence | None:
+        if (
+            resource.tenant_id is None
+            or resource.runtime_owner_id is None
+            or resource.runtime_fencing_token is None
+        ):
+            return None
+        return OwnerDialogueFence(
+            tenant_id=resource.tenant_id,
+            call_id=resource.call_id,
+            owner_id=resource.runtime_owner_id,
+            fencing_token=resource.runtime_fencing_token,
+        )
 
     def _bind_sip_connected_observer(self, resource: RuntimeProviderResource) -> None:
         if (
@@ -309,6 +408,7 @@ class LiveKitRuntimeProvider:
         agent_manager: RuntimeAgentManager,
         sip_client: RuntimeSipClient,
         egress_manager: RuntimeEgressManager,
+        dialogue_bridge: OwnerRuntimeDialogueBridge | None = None,
         provider_namespace: str = "livekit:unconfigured",
         allowed_callee_phone_number: str | None = None,
     ) -> None:
@@ -317,11 +417,32 @@ class LiveKitRuntimeProvider:
         self._agent_manager = agent_manager
         self._sip_client = sip_client
         self._egress_manager = egress_manager
+        self._dialogue_bridge = dialogue_bridge
         self.provider_namespace = provider_namespace
         self._allowed_callee_phone_number = (
             str(allowed_callee_phone_number).strip()
             if allowed_callee_phone_number is not None
             else None
+        )
+
+    async def start(self) -> None:
+        if self._dialogue_bridge is not None:
+            await self._dialogue_bridge.start()
+
+    async def stop(self) -> None:
+        await self._agent_manager.shutdown()
+        if self._dialogue_bridge is not None:
+            await self._dialogue_bridge.stop()
+
+    async def finalize_dialogue(
+        self,
+        owner_lease: Any,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult:
+        return await self._agent_manager.finalize_dialogue(
+            owner_lease.call_id,
+            ended_at=ended_at,
         )
 
     async def apply(self, effect: EffectClaim) -> ProviderObservation:
@@ -561,6 +682,8 @@ def build_livekit_runtime_provider(
         browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
     )
     orchestrator = AiCallOrchestrator.from_settings(settings)
+    dialogue_bridge = OwnerRuntimeDialogueBridge(session_factory)
+    dialogue_bridge.attach_event_store(orchestrator.event_store)
     return LiveKitRuntimeProvider(
         resolver=DatabaseRuntimeProviderResourceResolver(session_factory),
         room_manager=room_manager,
@@ -568,6 +691,7 @@ def build_livekit_runtime_provider(
             orchestrator=orchestrator,
             runtime_registry=registry,
             session_factory=session_factory,
+            dialogue_bridge=dialogue_bridge,
         ),
         sip_client=LiveKitSipClient(
             config=SipOutboundConfig.from_settings(settings),
@@ -585,6 +709,7 @@ def build_livekit_runtime_provider(
             file_type=settings.AI_CALL_RECORDING_FORMAT,
             participant_file_type=settings.AI_CALL_PARTICIPANT_RECORDING_FORMAT,
         ),
+        dialogue_bridge=dialogue_bridge,
         provider_namespace=livekit_provider_namespace(settings),
         allowed_callee_phone_number=(
             settings.AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE

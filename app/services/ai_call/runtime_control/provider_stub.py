@@ -3,8 +3,12 @@ from __future__ import annotations
 import hashlib
 from collections import deque
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from enum import StrEnum
 
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
+)
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectClaim,
     ProviderObservation,
@@ -56,6 +60,22 @@ class DeterministicWebProviderStub:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
+        self.dialogue_bridge_started = False
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def finalize_dialogue(
+        self,
+        _owner_lease: object,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult:
+        del ended_at
+        return OwnerDialogueFinalizeResult("complete", 0, 0)
 
     async def apply(self, effect: EffectClaim) -> ProviderObservation:
         self.calls.append(
@@ -115,6 +135,22 @@ class ScriptedProviderStub:
     ) -> None:
         self._script = {key: deque(values) for key, values in script.items()}
         self.calls: list[dict[str, str]] = []
+        self.dialogue_bridge_started = False
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def finalize_dialogue(
+        self,
+        _owner_lease: object,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult:
+        del ended_at
+        return OwnerDialogueFinalizeResult("complete", 0, 0)
 
     async def apply(self, effect: EffectClaim) -> ProviderObservation:
         self.calls.append(

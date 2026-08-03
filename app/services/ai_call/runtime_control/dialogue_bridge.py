@@ -174,6 +174,20 @@ class OwnerRuntimeDialogueBridge:
                 error=error,
             )
 
+    def mark_failed(self, fence: OwnerDialogueFence, *, error: str) -> None:
+        state = self._states.get(fence.call_id)
+        if state is None or state.fence != fence:
+            return
+        state.failed = True
+        state.failure_code = state.failure_code or error
+
+    def abandon_call(self, fence: OwnerDialogueFence) -> None:
+        state = self._states.get(fence.call_id)
+        if state is None or state.fence != fence:
+            return
+        self._states.pop(fence.call_id, None)
+        self._runtime_store.discard_call(fence.call_id)
+
     def _enqueue(self, snapshot: DialogueSegmentSnapshot) -> None:
         state = self._states.get(snapshot.call_id)
         if state is None:

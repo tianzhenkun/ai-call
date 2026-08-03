@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from app.common.enums import EnvironmentEnum
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
+)
 from app.services.ai_call.runtime_control.lifecycle import (
     AiCallRuntimeTimingPolicy,
     start_dispatcher_control_lifecycle,
@@ -140,6 +143,132 @@ async def test_runtime_lifecycle_uses_deterministic_offline_provider(
     assert isinstance(service.provider, DeterministicWebProviderStub)
     assert service.provider.calls == []
     assert calls == ["validate_database", "construct", "start", "stop"]
+
+
+@pytest.mark.anyio
+async def test_runtime_service_starts_provider_before_scan_and_stops_it_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import runtime_service
+
+    calls: list[str] = []
+
+    class LocalHandle:
+        async def shutdown(self) -> None:
+            calls.append("handle_shutdown")
+
+        async def fail_closed(self) -> None:
+            calls.append("handle_fail_closed")
+
+    class Provider:
+        async def start(self) -> None:
+            calls.append("provider_start")
+
+        async def stop(self) -> None:
+            calls.append("provider_stop")
+
+    class Session:
+        async def execute(self, _statement) -> None:
+            return None
+
+    class Transaction:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class SessionFactory:
+        def begin(self):
+            return Transaction()
+
+    class WorkerRepository:
+        def __init__(self, _session, **_kwargs) -> None:
+            return None
+
+        async def register(self, registration):
+            del registration
+            return SimpleNamespace(
+                worker_id="runtime-test:12345678-1234-5678-1234-567812345678"
+            )
+
+    monkeypatch.setattr(runtime_service, "WorkerRegistryRepository", WorkerRepository)
+    registry = RuntimeRegistry()
+    registry.local_handles["call-1"] = LocalHandle()
+    service = RuntimeControlService(
+        worker_id="runtime-test:12345678-1234-5678-1234-567812345678",
+        registry=registry,
+        session_factory=SessionFactory(),
+        provider=Provider(),
+    )
+
+    async def request_local_end(call_id: str, *, source: str, end_reason: str) -> bool:
+        assert call_id == "call-1"
+        assert source == "runtime_shutdown"
+        assert end_reason == "runtime_shutdown"
+        calls.append("terminal_barrier")
+        return True
+
+    monkeypatch.setattr(service, "_request_local_end", request_local_end, raising=False)
+
+    async def idle_loop() -> None:
+        calls.append("runtime_scan")
+        await service._stop_event.wait()
+
+    monkeypatch.setattr(service, "_run_loop", idle_loop)
+
+    await service.start()
+    await asyncio.sleep(0)
+    await service.stop()
+
+    assert calls == [
+        "provider_start",
+        "runtime_scan",
+        "terminal_barrier",
+        "handle_shutdown",
+        "provider_stop",
+    ]
+
+
+@pytest.mark.anyio
+async def test_runtime_task_exit_establishes_end_before_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class LocalHandle:
+        async def shutdown(self) -> None:
+            raise AssertionError("unexpected exit must fail closed")
+
+        async def fail_closed(self) -> None:
+            calls.append("handle_fail_closed")
+
+    class Provider:
+        async def stop(self) -> None:
+            calls.append("provider_stop")
+
+    registry = RuntimeRegistry()
+    registry.local_handles["call-1"] = LocalHandle()
+    registry.owner_fencing_tokens["call-1"] = 7
+    service = RuntimeControlService(
+        worker_id="runtime-test:12345678-1234-5678-1234-567812345678",
+        registry=registry,
+        session_factory=None,
+        provider=Provider(),
+    )
+
+    async def request_local_end(call_id: str, *, source: str, end_reason: str) -> bool:
+        assert call_id == "call-1"
+        assert source == "runtime_task_exit"
+        assert end_reason == "runtime_task_failed"
+        calls.append("terminal_barrier")
+        return True
+
+    monkeypatch.setattr(service, "_request_local_end", request_local_end, raising=False)
+
+    await service._fail_closed_after_runtime_exit("runtime_task_failed")
+
+    assert calls == ["terminal_barrier", "handle_fail_closed", "provider_stop"]
 
 
 @pytest.mark.anyio
@@ -301,6 +430,34 @@ async def test_media_query_timeout_before_owner_deadline_does_not_trip_watchdog(
 
     assert watchdog.creation_allowed() is True
     assert fail_closed.is_set() is False
+
+
+@pytest.mark.anyio
+async def test_fail_closed_provider_guards_dialogue_finalize_with_owner_deadline() -> None:
+    calls: list[tuple[object, object]] = []
+
+    class Provider:
+        async def finalize_dialogue(self, owner_lease, *, ended_at):
+            calls.append((owner_lease, ended_at))
+            return OwnerDialogueFinalizeResult("complete", 0, 0)
+
+    async def fail_closed() -> None:
+        raise AssertionError("valid deadline must not fail closed")
+
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+    owner_lease = SimpleNamespace(call_id="call-1")
+    ended_at = object()
+
+    result = await _FailClosedProvider(
+        Provider(), watchdog, fail_closed
+    ).finalize_dialogue(owner_lease, ended_at=ended_at)
+
+    assert result == OwnerDialogueFinalizeResult("complete", 0, 0)
+    assert calls == [(owner_lease, ended_at)]
 
 
 @pytest.mark.anyio

@@ -13,6 +13,10 @@ from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
     RuntimeCommandRepository,
 )
+from app.services.ai_call.runtime_control.dialogue_repository import (
+    OwnerDialogueFence,
+    OwnerDialogueRepository,
+)
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectSpec,
     ProviderObservationKind,
@@ -49,6 +53,7 @@ RecoveryOwnerRepositoryFactory = Callable[[AsyncSession], RecoveryOwnerRepositor
 StartReadinessRepositoryFactory = Callable[
     [AsyncSession], RuntimeStartReadinessRepository
 ]
+DialogueRepositoryFactory = Callable[[AsyncSession], OwnerDialogueRepository]
 
 
 def _connected_duration_ms(answered_at: datetime, ended_at: datetime) -> int:
@@ -152,6 +157,7 @@ class EndCallHandler:
         recovery_owner_repository_factory: RecoveryOwnerRepositoryFactory = (
             RecoveryOwnerRepository
         ),
+        dialogue_repository_factory: DialogueRepositoryFactory = OwnerDialogueRepository,
         max_effect_attempts: int = 32,
         attention_retry_after: timedelta = timedelta(seconds=30),
     ) -> None:
@@ -160,6 +166,7 @@ class EndCallHandler:
         self._effect_repository_factory = effect_repository_factory
         self._command_repository_factory = command_repository_factory
         self._recovery_owner_repository_factory = recovery_owner_repository_factory
+        self._dialogue_repository_factory = dialogue_repository_factory
         self._max_effect_attempts = max_effect_attempts
         if attention_retry_after.total_seconds() <= 0:
             raise ValueError("attention_retry_after must be positive")
@@ -192,6 +199,13 @@ class EndCallHandler:
             processed_count += 1
 
         async with self._session_factory.begin() as session:
+            ended_at = await read_database_time(session)
+        dialogue_result = await self._provider.finalize_dialogue(
+            owner_lease,
+            ended_at=ended_at,
+        )
+
+        async with self._session_factory.begin() as session:
             command_repository = self._command_repository_factory(session)
             logical_completed = await command_repository.complete(
                 command_claim,
@@ -207,7 +221,6 @@ class EndCallHandler:
                     .with_for_update()
                 )
                 if record is not None:
-                    ended_at = await read_database_time(session)
                     record.status = "completed"
                     record.ended_at = ended_at
                     if record.answered_at is not None:
@@ -215,6 +228,16 @@ class EndCallHandler:
                             record.answered_at,
                             ended_at,
                         )
+                if dialogue_result.status in {"complete", "uncertain"}:
+                    await self._dialogue_repository_factory(session).finalize(
+                        OwnerDialogueFence(
+                            tenant_id=owner_lease.tenant_id,
+                            call_id=owner_lease.call_id,
+                            owner_id=owner_lease.owner_id,
+                            fencing_token=owner_lease.fencing_token,
+                        ),
+                        status=dialogue_result.status,
+                    )
             clean = (
                 await self._effect_repository_factory(session).mark_cleanup_clean(
                     owner_lease

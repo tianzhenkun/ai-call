@@ -334,11 +334,19 @@ async def test_runtime_notification_only_triggers_existing_database_scan(
         "WorkerRegistryRepository",
         _WorkerRegistryRepository,
     )
+
+    class _Provider:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
     service = RuntimeControlService(
         worker_id=worker_id,
         registry=RuntimeRegistry(),
         session_factory=_RuntimeSessionFactory(),
-        provider=object(),
+        provider=_Provider(),
         scan_interval_seconds=30,
         wakeup_listener=listener,
     )

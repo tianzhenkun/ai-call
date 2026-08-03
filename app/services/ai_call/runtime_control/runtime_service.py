@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -15,7 +15,11 @@ from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
 from app.services.ai_call.runtime_control.command_repository import (
     CommandDecision,
+    EndCallIntent,
     RuntimeCommandRepository,
+)
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
 )
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectSpec,
@@ -47,6 +51,10 @@ from app.services.ai_call.runtime_control.types import CommandStatus
 
 
 class RuntimeProvider(Protocol):
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
     async def apply(self, effect: object) -> ProviderObservation: ...
 
     async def query_agent_media(
@@ -55,8 +63,17 @@ class RuntimeProvider(Protocol):
         participant_identity: str,
     ) -> AgentMediaObservation: ...
 
+    async def finalize_dialogue(
+        self,
+        owner_lease: OwnerLease,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult: ...
+
 
 class RuntimeLocalHandle(Protocol):
+    async def shutdown(self) -> None: ...
+
     async def fail_closed(self) -> None: ...
 
 
@@ -128,6 +145,33 @@ class _FailClosedProvider:
             raise _OwnerFailClosed("owner fail-closed deadline reached")
         return observation
 
+    async def finalize_dialogue(
+        self,
+        owner_lease: OwnerLease,
+        *,
+        ended_at: datetime,
+    ) -> OwnerDialogueFinalizeResult:
+        remaining = self._watchdog.seconds_until_hard_deadline()
+        if remaining <= 0:
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached")
+        try:
+            async with asyncio.timeout(remaining):
+                result = await self._delegate.finalize_dialogue(
+                    owner_lease,
+                    ended_at=ended_at,
+                )
+        except TimeoutError as exc:
+            if self._watchdog.creation_allowed():
+                raise
+            self._watchdog.trip()
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached") from exc
+        if self._watchdog.must_stop_media():
+            await self._fail_closed()
+            raise _OwnerFailClosed("owner fail-closed deadline reached")
+        return result
+
 
 class RuntimeControlService:
     def __init__(
@@ -166,10 +210,13 @@ class RuntimeControlService:
         self._stopping = False
 
     async def start(self) -> None:
-        session_factory, _provider = self._require_dependencies()
+        session_factory, provider = self._require_dependencies()
         self._health.mark_starting(self.worker_id)
         deployment_id, startup_id = _parse_worker_id(self.worker_id)
+        provider_started = False
         try:
+            await provider.start()
+            provider_started = True
             async with session_factory.begin() as session:
                 lease = await WorkerRegistryRepository(
                     session, lease_ttl=self._worker_lease_ttl
@@ -199,6 +246,14 @@ class RuntimeControlService:
             self._health.mark_running(self.worker_id)
         except BaseException:
             self._health.mark_failed(self.worker_id, "runtime_start_failed")
+            if provider_started:
+                try:
+                    await provider.stop()
+                except Exception as exc:
+                    log.error(
+                        "AI Call Runtime 启动回滚 Provider 失败: "
+                        f"error_type={type(exc).__name__}"
+                    )
             raise
 
     async def stop(self) -> None:
@@ -224,8 +279,18 @@ class RuntimeControlService:
             | set(self.registry.local_handles)
         )
         for call_id in call_ids:
-            await self._clear_owner_tracking(call_id)
+            terminal_established = await self._request_local_end_safely(
+                call_id,
+                source="runtime_shutdown",
+                end_reason="runtime_shutdown",
+            )
+            if terminal_established:
+                await self._shutdown_owner_tracking(call_id)
+            else:
+                await self._clear_owner_tracking(call_id)
         await self._mark_worker_draining()
+        if self._provider is not None:
+            await self._provider.stop()
         self._health.mark_stopped(self.worker_id)
 
     def _monitor_runtime_task(self, task: asyncio.Task[None]) -> None:
@@ -250,11 +315,11 @@ class RuntimeControlService:
             type(exception).__name__ if exception is not None else "none",
         )
         self._supervision_task = asyncio.create_task(
-            self._fail_closed_after_runtime_exit(),
+            self._fail_closed_after_runtime_exit(error_code),
             name=f"ai-call-runtime-supervision:{self.worker_id}",
         )
 
-    async def _fail_closed_after_runtime_exit(self) -> None:
+    async def _fail_closed_after_runtime_exit(self, error_code: str) -> None:
         call_ids = sorted(
             set(self.registry.owner_fencing_tokens)
             | set(self.registry.owner_watchdogs)
@@ -262,6 +327,11 @@ class RuntimeControlService:
             | set(self.registry.local_handles)
         )
         for call_id in call_ids:
+            await self._request_local_end_safely(
+                call_id,
+                source="runtime_task_exit",
+                end_reason=error_code,
+            )
             await self._clear_owner_tracking(call_id)
         try:
             await self._mark_worker_draining()
@@ -274,6 +344,16 @@ class RuntimeControlService:
                 self.worker_id,
                 type(exc).__name__,
             )
+        if self._provider is not None:
+            try:
+                await self._provider.stop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error(
+                    "AI Call Runtime 异常退出后关闭 Provider 失败: "
+                    f"worker_id={self.worker_id}, error_type={type(exc).__name__}"
+                )
 
     async def _mark_worker_draining(self) -> None:
         if self._session_factory is None:
@@ -522,24 +602,112 @@ class RuntimeControlService:
             timer.cancel()
         await self._fail_closed_local_handle(call_id)
 
-    async def _fail_closed_local_handle(self, call_id: str) -> None:
-        handle = self.registry.local_handles.pop(call_id, None)
+    async def _request_local_end_safely(
+        self,
+        call_id: str,
+        *,
+        source: str,
+        end_reason: str,
+    ) -> bool:
+        try:
+            return await self._request_local_end(
+                call_id,
+                source=source,
+                end_reason=end_reason,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(
+                "AI Call 本地媒体停止前建立终态屏障失败 "
+                f"call_id={call_id}, error_type={type(exc).__name__}"
+            )
+            return False
+
+    async def _request_local_end(
+        self,
+        call_id: str,
+        *,
+        source: str,
+        end_reason: str,
+    ) -> bool:
+        if self._session_factory is None:
+            return False
+        async with self._session_factory.begin() as session:
+            tenant_id = await session.scalar(
+                select(AiCallRecordModel.tenant_id).where(
+                    AiCallRecordModel.call_id == call_id,
+                    AiCallRecordModel.runtime_control_mode == "owner_command_v1",
+                )
+            )
+            if tenant_id is None:
+                return False
+            await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id=str(tenant_id),
+                    call_id=call_id,
+                    source=source,
+                    end_reason=end_reason,
+                    dedupe_key=f"{source}:{self.worker_id}:{call_id}",
+                    evidence={"workerId": self.worker_id},
+                )
+            )
+            return True
+
+    async def _fail_closed_local_handle(self, call_id: str) -> bool:
+        handle = self.registry.local_handles.get(call_id)
         if handle is None:
-            return
+            return True
         try:
             await handle.fail_closed()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error(f"AI Call 本地媒体 fail-closed 失败 call_id={call_id}: {exc!s}")
+            return False
+        if self.registry.local_handles.get(call_id) is handle:
+            self.registry.local_handles.pop(call_id, None)
+        return True
 
     async def _clear_owner_tracking(self, call_id: str) -> None:
         timer = self.registry.fail_closed_timers.pop(call_id, None)
         if timer is not None:
             timer.cancel()
+        if await self._fail_closed_local_handle(call_id):
+            self.registry.owner_watchdogs.pop(call_id, None)
+            self.registry.owner_fencing_tokens.pop(call_id, None)
+
+    async def _shutdown_owner_tracking(self, call_id: str) -> None:
+        timer = self.registry.fail_closed_timers.pop(call_id, None)
+        if timer is not None:
+            timer.cancel()
+        handle = self.registry.local_handles.get(call_id)
+        if handle is None:
+            self.registry.owner_watchdogs.pop(call_id, None)
+            self.registry.owner_fencing_tokens.pop(call_id, None)
+            return
+        try:
+            await handle.shutdown()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(
+                f"AI Call 本地媒体 shutdown 失败 call_id={call_id}: {exc!s}"
+            )
+            try:
+                await handle.fail_closed()
+            except asyncio.CancelledError:
+                raise
+            except Exception as fail_closed_exc:
+                log.error(
+                    "AI Call 本地媒体 shutdown 回退 fail-closed 失败 "
+                    f"call_id={call_id}: {fail_closed_exc!s}"
+                )
+                return
+        if self.registry.local_handles.get(call_id) is handle:
+            self.registry.local_handles.pop(call_id, None)
         self.registry.owner_watchdogs.pop(call_id, None)
         self.registry.owner_fencing_tokens.pop(call_id, None)
-        await self._fail_closed_local_handle(call_id)
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():

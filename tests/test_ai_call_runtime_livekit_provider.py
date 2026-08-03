@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
+)
+from app.services.ai_call.runtime_control.dialogue_repository import OwnerDialogueFence
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectClaim,
     ProviderObservationKind,
@@ -572,3 +576,373 @@ async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
     await manager.stop("call-1")
 
     assert "call-1" not in runner.audio_transport.observers
+
+
+@pytest.mark.anyio
+async def test_owner_agent_manager_binds_dialogue_before_agent_and_finalizes_after_stop() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        OwnerRuntimeAgentManager,
+        RuntimeProviderResource,
+    )
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeDialogueBridge:
+        async def bind_call(self, fence: OwnerDialogueFence) -> bool:
+            calls.append(("bind_dialogue", fence))
+            return True
+
+        async def finalize_call(
+            self,
+            fence: OwnerDialogueFence,
+            *,
+            ended_at: datetime,
+        ) -> OwnerDialogueFinalizeResult:
+            calls.append(("finalize_dialogue", (fence, ended_at)))
+            return OwnerDialogueFinalizeResult("complete", 1, 0)
+
+        def abandon_call(self, fence: OwnerDialogueFence) -> None:
+            calls.append(("abandon_dialogue", fence))
+
+    class FakeAudioTransport:
+        def bind_sip_connected_observer(self, _call_id, _observer) -> None:
+            return None
+
+        def unbind_sip_connected_observer(self, _call_id) -> None:
+            return None
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.audio_transport = FakeAudioTransport()
+
+        async def start(self, _session) -> None:
+            calls.append(("start_agent", None))
+
+        async def stop(self, _call_id: str) -> None:
+            calls.append(("stop_agent", None))
+
+    resource = RuntimeProviderResource(
+        call_id="call-1",
+        room_name="ai-call-call-1",
+        customer_participant_identity="sip-call-1",
+        agent_participant_identity="agent-call-1-g7",
+        tenant_id="tenant-a",
+        runtime_owner_id="runtime-1",
+        runtime_fencing_token=7,
+    )
+    runtime_registry = RuntimeRegistry()
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=SimpleNamespace(
+            registry=InMemorySessionRegistry(),
+            agent_runner=FakeRunner(),
+            _build_effective_config=lambda _voice, _prompt: {},
+        ),
+        runtime_registry=runtime_registry,
+        session_factory=object(),
+        dialogue_bridge=FakeDialogueBridge(),
+    )
+
+    await manager.start(resource)
+    await runtime_registry.local_handles[resource.call_id].shutdown()
+
+    assert [name for name, _value in calls] == [
+        "bind_dialogue",
+        "start_agent",
+        "stop_agent",
+        "finalize_dialogue",
+    ]
+
+
+@pytest.mark.anyio
+async def test_owner_agent_manager_refuses_dialogue_complete_while_agent_is_active() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        OwnerRuntimeAgentManager,
+        RuntimeProviderResource,
+    )
+
+    finalized: list[OwnerDialogueFence] = []
+
+    class FakeDialogueBridge:
+        async def bind_call(self, _fence: OwnerDialogueFence) -> bool:
+            return True
+
+        async def finalize_call(
+            self,
+            fence: OwnerDialogueFence,
+            *,
+            ended_at: datetime,
+        ) -> OwnerDialogueFinalizeResult:
+            del ended_at
+            finalized.append(fence)
+            return OwnerDialogueFinalizeResult("complete", 0, 0)
+
+        def abandon_call(self, _fence: OwnerDialogueFence) -> None:
+            return None
+
+    class FakeAudioTransport:
+        def bind_sip_connected_observer(self, _call_id, _observer) -> None:
+            return None
+
+        def unbind_sip_connected_observer(self, _call_id) -> None:
+            return None
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.audio_transport = FakeAudioTransport()
+
+        async def start(self, _session) -> None:
+            return None
+
+        async def stop(self, _call_id: str) -> None:
+            return None
+
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=SimpleNamespace(
+            registry=InMemorySessionRegistry(),
+            agent_runner=FakeRunner(),
+            _build_effective_config=lambda _voice, _prompt: {},
+        ),
+        runtime_registry=RuntimeRegistry(),
+        session_factory=object(),
+        dialogue_bridge=FakeDialogueBridge(),
+    )
+    resource = RuntimeProviderResource(
+        call_id="call-1",
+        room_name="ai-call-call-1",
+        customer_participant_identity="sip-call-1",
+        agent_participant_identity="agent-call-1-g7",
+        tenant_id="tenant-a",
+        runtime_owner_id="runtime-1",
+        runtime_fencing_token=7,
+    )
+    ended_at = datetime(2026, 8, 3, 8, tzinfo=timezone.utc)
+
+    await manager.start(resource)
+    before_stop = await manager.finalize_dialogue("call-1", ended_at=ended_at)
+    await manager.stop("call-1")
+    after_stop = await manager.finalize_dialogue("call-1", ended_at=ended_at)
+
+    assert before_stop.status == "pending"
+    assert after_stop.status == "complete"
+    assert finalized == [OwnerDialogueFence("tenant-a", "call-1", "runtime-1", 7)]
+
+
+@pytest.mark.anyio
+async def test_owner_agent_stop_failure_keeps_handle_for_retry_before_finalize() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        OwnerRuntimeAgentManager,
+        RuntimeProviderResource,
+    )
+
+    failed: list[tuple[OwnerDialogueFence, str]] = []
+    finalized_statuses: list[str] = []
+
+    class FakeDialogueBridge:
+        async def bind_call(self, _fence: OwnerDialogueFence) -> bool:
+            return True
+
+        def mark_failed(self, fence: OwnerDialogueFence, *, error: str) -> None:
+            failed.append((fence, error))
+
+        async def finalize_call(
+            self,
+            _fence: OwnerDialogueFence,
+            *,
+            ended_at: datetime,
+        ) -> OwnerDialogueFinalizeResult:
+            del ended_at
+            status = "uncertain" if failed else "complete"
+            finalized_statuses.append(status)
+            return OwnerDialogueFinalizeResult(status, 0, 0)
+
+        def abandon_call(self, _fence: OwnerDialogueFence) -> None:
+            return None
+
+    class FakeAudioTransport:
+        def bind_sip_connected_observer(self, _call_id, _observer) -> None:
+            return None
+
+        def unbind_sip_connected_observer(self, _call_id) -> None:
+            return None
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.audio_transport = FakeAudioTransport()
+            self.stop_attempts = 0
+
+        async def start(self, _session) -> None:
+            return None
+
+        async def stop(self, _call_id: str) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeError("runner stop failed")
+
+    runtime_registry = RuntimeRegistry()
+    runner = FakeRunner()
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=SimpleNamespace(
+            registry=InMemorySessionRegistry(),
+            agent_runner=runner,
+            _build_effective_config=lambda _voice, _prompt: {},
+        ),
+        runtime_registry=runtime_registry,
+        session_factory=object(),
+        dialogue_bridge=FakeDialogueBridge(),
+    )
+    resource = RuntimeProviderResource(
+        call_id="call-1",
+        room_name="ai-call-call-1",
+        customer_participant_identity="sip-call-1",
+        agent_participant_identity="agent-call-1-g7",
+        tenant_id="tenant-a",
+        runtime_owner_id="runtime-1",
+        runtime_fencing_token=7,
+    )
+
+    await manager.start(resource)
+    handle = runtime_registry.local_handles[resource.call_id]
+    with pytest.raises(RuntimeError, match="runner stop failed"):
+        await handle.shutdown()
+    assert await manager.exists(resource.call_id) is True
+    assert runtime_registry.local_handles[resource.call_id] is handle
+    assert finalized_statuses == []
+
+    await handle.shutdown()
+
+    assert finalized_statuses == ["uncertain"]
+    assert runner.stop_attempts == 2
+    assert resource.call_id not in runtime_registry.local_handles
+    assert failed == [
+        (
+            OwnerDialogueFence("tenant-a", "call-1", "runtime-1", 7),
+            "agent_stop_failed",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_owner_agent_fail_closed_abandons_dialogue_without_complete() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        OwnerRuntimeAgentManager,
+        RuntimeProviderResource,
+    )
+
+    finalized: list[OwnerDialogueFence] = []
+    abandoned: list[OwnerDialogueFence] = []
+
+    class FakeDialogueBridge:
+        async def bind_call(self, _fence: OwnerDialogueFence) -> bool:
+            return True
+
+        async def finalize_call(
+            self,
+            fence: OwnerDialogueFence,
+            *,
+            ended_at: datetime,
+        ) -> OwnerDialogueFinalizeResult:
+            del ended_at
+            finalized.append(fence)
+            return OwnerDialogueFinalizeResult("complete", 0, 0)
+
+        def abandon_call(self, fence: OwnerDialogueFence) -> None:
+            abandoned.append(fence)
+
+    class FakeAudioTransport:
+        def bind_sip_connected_observer(self, _call_id, _observer) -> None:
+            return None
+
+        def unbind_sip_connected_observer(self, _call_id) -> None:
+            return None
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.audio_transport = FakeAudioTransport()
+
+        async def start(self, _session) -> None:
+            return None
+
+        async def stop(self, _call_id: str) -> None:
+            return None
+
+    registry = RuntimeRegistry()
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=SimpleNamespace(
+            registry=InMemorySessionRegistry(),
+            agent_runner=FakeRunner(),
+            _build_effective_config=lambda _voice, _prompt: {},
+        ),
+        runtime_registry=registry,
+        session_factory=object(),
+        dialogue_bridge=FakeDialogueBridge(),
+    )
+    resource = RuntimeProviderResource(
+        call_id="call-1",
+        room_name="ai-call-call-1",
+        customer_participant_identity="sip-call-1",
+        agent_participant_identity="agent-call-1-g7",
+        tenant_id="tenant-a",
+        runtime_owner_id="runtime-1",
+        runtime_fencing_token=7,
+    )
+
+    await manager.start(resource)
+    await registry.local_handles[resource.call_id].fail_closed()
+
+    assert finalized == []
+    assert abandoned == [OwnerDialogueFence("tenant-a", "call-1", "runtime-1", 7)]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_owns_bridge_lifecycle_and_dialogue_finalization() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeDialogueBridge:
+        async def start(self) -> None:
+            calls.append(("start_bridge", None))
+
+        async def stop(self) -> None:
+            calls.append(("stop_bridge", None))
+
+    class FinalizingAgentManager(FakeAgentManager):
+        async def finalize_dialogue(
+            self,
+            call_id: str,
+            *,
+            ended_at: datetime,
+        ) -> OwnerDialogueFinalizeResult:
+            calls.append(("finalize_dialogue", (call_id, ended_at)))
+            return OwnerDialogueFinalizeResult("complete", 2, 0)
+
+        async def shutdown(self) -> None:
+            calls.append(("shutdown_agents", None))
+
+    bridge = FakeDialogueBridge()
+    provider = LiveKitRuntimeProvider(
+        resolver=FakeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FinalizingAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=FakeEgressManager(),
+        dialogue_bridge=bridge,
+    )
+    ended_at = datetime(2026, 8, 3, 9, tzinfo=timezone.utc)
+
+    await provider.start()
+    result = await provider.finalize_dialogue(
+        SimpleNamespace(call_id="call-1"),
+        ended_at=ended_at,
+    )
+    await provider.stop()
+
+    assert result == OwnerDialogueFinalizeResult("complete", 2, 0)
+    assert calls == [
+        ("start_bridge", None),
+        ("finalize_dialogue", ("call-1", ended_at)),
+        ("shutdown_agents", None),
+        ("stop_bridge", None),
+    ]

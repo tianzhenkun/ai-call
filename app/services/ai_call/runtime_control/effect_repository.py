@@ -561,6 +561,11 @@ class RuntimeEffectRepository:
             or record.terminal_requested_at is None
         ):
             return False
+        if (
+            record.runtime_control_mode == "owner_command_v1"
+            and record.dialogue_persistence_status == "pending"
+        ):
+            return False
         worker = await self._session.scalar(
             select(AiCallRuntimeWorkerModel)
             .where(AiCallRuntimeWorkerModel.worker_id == owner_lease.owner_id)

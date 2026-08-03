@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.ai_call.runtime_control.command_repository import CommandClaim
+from app.services.ai_call.runtime_control.dialogue_bridge import (
+    OwnerDialogueFinalizeResult,
+)
 from app.services.ai_call.runtime_control.effect_repository import (
     EffectClaim,
     EffectSpec,
@@ -148,6 +151,15 @@ class _FakeCommandRepository:
 
     async def complete(self, claim, decision):
         self.decisions.append(decision)
+        return True
+
+
+class _FakeDialogueRepository:
+    def __init__(self) -> None:
+        self.finalized = []
+
+    async def finalize(self, fence, *, status, error=None):
+        self.finalized.append((fence, status, error))
         return True
 
 
@@ -442,11 +454,44 @@ async def test_end_handler_persists_connected_duration(
         effect_repository_factory=lambda session: _FakeEffectRepository([], clean=True),
         command_repository_factory=lambda session: _FakeCommandRepository(),
         recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
+        dialogue_repository_factory=lambda session: _FakeDialogueRepository(),
     ).handle(_command_claim("END_CALL"), _owner_lease())
 
     assert result.logical_end_completed is True
     assert factory.session.record.ended_at == ended_at
     assert factory.session.record.duration_ms == 127_096
+
+
+@pytest.mark.anyio
+async def test_end_handler_fences_stub_empty_dialogue_before_cleanup() -> None:
+    factory = _FakeSessionFactory()
+    dialogue_repository = _FakeDialogueRepository()
+    provider = ScriptedProviderStub({})
+
+    result = await EndCallHandler(
+        factory,
+        provider,
+        effect_repository_factory=lambda session: _FakeEffectRepository([], clean=True),
+        command_repository_factory=lambda session: _FakeCommandRepository(),
+        recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
+        dialogue_repository_factory=lambda session: dialogue_repository,
+    ).handle(_command_claim("END_CALL"), _owner_lease())
+
+    assert result.resource_cleanup_status == "clean"
+    assert provider.dialogue_bridge_started is False
+    assert len(dialogue_repository.finalized) == 1
+    fence, status, error = dialogue_repository.finalized[0]
+    assert (fence.tenant_id, fence.call_id, fence.owner_id, fence.fencing_token) == (
+        "tenant-a",
+        "call-a",
+        "runtime-a",
+        1,
+    )
+    assert (status, error) == ("complete", None)
+    assert await provider.finalize_dialogue(
+        _owner_lease(),
+        ended_at=datetime.now(timezone.utc),
+    ) == OwnerDialogueFinalizeResult("complete", 0, 0)
 
 
 @pytest.mark.anyio
@@ -473,6 +518,7 @@ async def test_end_handler_separates_logical_end_from_cleanup_status() -> None:
         effect_repository_factory=lambda session: effect_repository,
         command_repository_factory=lambda session: command_repository,
         recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
+        dialogue_repository_factory=lambda session: _FakeDialogueRepository(),
     ).handle(_command_claim("END_CALL"), _owner_lease())
 
     assert result.logical_end_completed is True

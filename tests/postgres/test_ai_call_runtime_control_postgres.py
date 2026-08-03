@@ -52,6 +52,10 @@ from app.services.ai_call.runtime_control.command_repository import (
     StartCallIntent,
     TerminalBarrierError,
 )
+from app.services.ai_call.runtime_control.dialogue_repository import (
+    OwnerDialogueFence,
+    OwnerDialogueRepository,
+)
 from app.services.ai_call.runtime_control.direct_sip_phone import (
     prepare_direct_sip_phone,
 )
@@ -168,6 +172,21 @@ def _direct_sip_intent(
         callee_phone_number=phone.plaintext,
         callee_phone_number_masked=phone.masked,
         callee_phone_number_hash=phone.fingerprint,
+    )
+
+
+async def _finalize_owner_dialogue_for_cleanup(
+    session: AsyncSession,
+    lease: OwnerLease,
+) -> None:
+    assert await OwnerDialogueRepository(session).finalize(
+        OwnerDialogueFence(
+            tenant_id=lease.tenant_id,
+            call_id=lease.call_id,
+            owner_id=lease.owner_id,
+            fencing_token=lease.fencing_token,
+        ),
+        status="complete",
     )
 
 
@@ -2436,6 +2455,75 @@ async def test_runtime_owner_records_sip_connected_once_and_rejects_stale_or_ter
         await engine.dispose()
 
 
+async def test_cleanup_clean_rejects_pending_owner_dialogue_until_finalized() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            now = await read_database_time(session)
+            session.add_all(
+                (
+                    AiCallRuntimeWorkerModel(
+                        worker_id="runtime-dialogue-gate",
+                        status="READY",
+                        capacity=1,
+                        cleanup_capacity=1,
+                        active_call_count=1,
+                        active_cleanup_count=0,
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(minutes=1),
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRecordModel(
+                        id=9102,
+                        tenant_id="tenant-a",
+                        call_id="call-dialogue-gate",
+                        entry_type="outbound",
+                        room_name="room-call-dialogue-gate",
+                        participant_identity="sip-call-dialogue-gate",
+                        status="completed",
+                        started_at=now - timedelta(minutes=1),
+                        ended_at=now,
+                        terminal_requested_at=now,
+                        runtime_control_mode="owner_command_v1",
+                        runtime_owner_id="runtime-dialogue-gate",
+                        runtime_fencing_token=9,
+                        runtime_lease_expires_at=now + timedelta(minutes=1),
+                        runtime_capacity_class="active",
+                        dialogue_persistence_status="pending",
+                    ),
+                )
+            )
+
+        lease = OwnerLease(
+            tenant_id="tenant-a",
+            call_id="call-dialogue-gate",
+            owner_id="runtime-dialogue-gate",
+            fencing_token=9,
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            capacity_class="active",
+        )
+        async with factory.begin() as session:
+            assert await RuntimeEffectRepository(session).mark_cleanup_clean(lease) is False
+
+        async with factory.begin() as session:
+            record = await session.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == "call-dialogue-gate"
+                )
+            )
+            assert record is not None
+            record.dialogue_persistence_status = "complete"
+            record.dialogue_persistence_completed_at = await read_database_time(session)
+
+        async with factory.begin() as session:
+            assert await RuntimeEffectRepository(session).mark_cleanup_clean(lease) is True
+    finally:
+        await engine.dispose()
+
+
 async def test_dispatcher_atomically_reserves_runtime_and_sip_line_capacity() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)
@@ -2730,6 +2818,7 @@ async def test_sip_reservation_follows_effect_lifecycle_and_rejects_stale_token(
                 )
                 == "RELEASED"
             )
+            await _finalize_owner_dialogue_for_cleanup(session, lease)
             assert await effects.mark_cleanup_clean(lease)
             assert (
                 await session.scalar(
@@ -2963,6 +3052,114 @@ async def test_concurrent_recovery_scans_assign_expired_cleanup_owner_once() -> 
             by_worker = {row.worker_id: row for row in counts}
             assert by_worker[old_worker.worker_id].active_call_count == 0
             assert by_worker[new_worker.worker_id].active_cleanup_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_recovery_establishes_end_for_expired_owner_before_dialogue_takeover() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory.begin() as session:
+            commands = RuntimeCommandRepository(session)
+            start = await commands.create_start_call(
+                StartCallIntent(
+                    tenant_id="tenant-a",
+                    entry_type="web",
+                    idempotency_key="start:orphaned-connected-runtime",
+                    payload={"business_id": "orphaned-connected-runtime"},
+                )
+            )
+            old_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-orphaned-old",
+                    startup_id=UUID("13131313-1313-4313-8313-131313131313"),
+                    capacity=1,
+                    cleanup_capacity=1,
+                )
+            )
+            lease = await DispatcherOwnerRepository(session).assign_initial_owner(
+                "tenant-a", start.call_id
+            )
+            assert lease is not None
+            start_claim = await commands.claim_next_for_owner(lease)
+            assert start_claim is not None
+            await RuntimeEffectRepository(session).register(
+                start_claim,
+                EffectSpec(
+                    effect_type="CREATE_ROOM",
+                    idempotency_key="effect:create-room:orphaned-connected-runtime",
+                    provider_namespace="stub:orphaned-connected-runtime",
+                    provider_idempotency_key="room:orphaned-connected-runtime",
+                    resource_key="room:orphaned-connected-runtime",
+                    resource_generation=lease.fencing_token,
+                ),
+            )
+            await session.execute(
+                text(
+                    "update ai_call_record set status='connected', "
+                    "runtime_lease_expires_at=clock_timestamp() - interval '1 second' "
+                    "where call_id=:call_id"
+                ).bindparams(call_id=start.call_id)
+            )
+            await session.execute(
+                text(
+                    "update ai_call_runtime_worker set lease_expires_at="
+                    "clock_timestamp() - interval '1 second' where worker_id=:worker_id"
+                ).bindparams(worker_id=old_worker.worker_id)
+            )
+            recovery_worker = await WorkerRegistryRepository(session).register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-orphaned-recovery",
+                    startup_id=UUID("14141414-1414-4414-8414-141414141414"),
+                    capacity=0,
+                    cleanup_capacity=1,
+                )
+            )
+
+        assert await RecoveryControlService(factory).run_once() == 1
+        async with factory() as session:
+            after_end = (
+                await session.execute(
+                    text(
+                        "select terminal_requested_at, dialogue_persistence_status, "
+                        "runtime_owner_id from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert after_end.terminal_requested_at is not None
+            assert after_end.dialogue_persistence_status == "pending"
+            assert after_end.runtime_owner_id == old_worker.worker_id
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AiCallRuntimeCommandModel)
+                    .where(
+                        AiCallRuntimeCommandModel.call_id == start.call_id,
+                        AiCallRuntimeCommandModel.command_type == "END_CALL",
+                    )
+                )
+                == 1
+            )
+
+        assert await RecoveryControlService(factory).run_once() == 1
+        async with factory() as session:
+            recovered = (
+                await session.execute(
+                    text(
+                        "select runtime_owner_id, runtime_capacity_class, "
+                        "dialogue_persistence_status, dialogue_persistence_error "
+                        "from ai_call_record where call_id=:call_id"
+                    ).bindparams(call_id=start.call_id)
+                )
+            ).one()
+            assert tuple(recovered) == (
+                recovery_worker.worker_id,
+                "cleanup",
+                "uncertain",
+                "recovery_owner_takeover",
+            )
     finally:
         await engine.dispose()
 
@@ -4396,6 +4593,7 @@ async def test_effect_registration_is_authorized_but_later_claim_is_command_inde
                 delete_room,
                 ProviderObservation(kind=ProviderObservationKind.TERMINAL_CONFIRMED),
             )
+            await _finalize_owner_dialogue_for_cleanup(session, lease)
             assert await effects.mark_cleanup_clean(lease)
 
         async with factory() as session:
@@ -4553,6 +4751,7 @@ async def test_effect_quiet_gate_and_stale_token_prevent_early_cleanup() -> None
                 second_absence,
                 ProviderObservation(kind=ProviderObservationKind.RESOURCE_ABSENT),
             )
+            await _finalize_owner_dialogue_for_cleanup(session, lease)
             assert await effects.mark_cleanup_clean(lease)
 
         async with factory() as session:
