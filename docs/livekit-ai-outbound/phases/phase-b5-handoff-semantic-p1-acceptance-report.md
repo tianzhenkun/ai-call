@@ -1,10 +1,10 @@
 # Phase B5：转人工后语义分析 P1 验收报告
 
-最后更新：2026-07-10
+最后更新：2026-08-04
 
 ## 1. 验收结论
 
-当前 `19012` 本地 Web/LAN 验证链路下，转人工后语义分析 P1 已完成，可进入联调和试运行。
+当前 `19012` 本地 Web/LAN 验证链路与 `19011` 正式任务本地 SIP 链路下，转人工后语义分析 P1 已完成，可进入联调和试运行。
 
 本轮已确认：
 
@@ -14,6 +14,7 @@
 4. 客户事实只从 `role=user`、`speaker_type=customer` 的客户文本中提取。
 5. `record_only`、低置信 ASR、冲突来源和坐席轨道串音不会进入强总结。
 6. 最新真实转人工样本的 semantic acceptance 和 timeline audit 均通过。
+7. `19011` 正式业务任务已补证任务执行、SIP 接通、自动转人工、坐席接入、主录音、客户/人工分轨、离线 ASR 和语义分析完整闭环。
 
 本结论不等同于商用最终发布完成。商用发布前仍建议补最小回归样本集、验收报告归档和产品展示口径。
 
@@ -27,11 +28,12 @@
 4. 人工阶段客户文本进入客户事实候选。
 5. 坐席文本、AI 文本、低置信转写和 `record_only` 的采信边界。
 6. 五字段 `analysis_result` 输出：`summary`、`feedback_type`、`key_points`、`time_hint`、`tags`。
+7. `19011` 正式外呼任务经本地 LiveKit SIP、FreeSWITCH 和 Linphone 完成转人工后的录音、转写与语义闭环。
 
 本轮不覆盖：
 
-1. SIP 真实线路转人工后语义验收。
-2. 多坐席排队、技能组、正式坐席工作台。
+1. 公网运营商或生产 Provider 的真实号码转人工后语义验收。
+2. 多坐席排队、技能组和商用坐席运营能力。
 3. 商用并发压测、弱网和长时间稳定性。
 4. 大规模语义样本评测集。
 5. 面向业务后台的最终展示交互。
@@ -142,6 +144,70 @@ Handoff：
 
 判定：通过。话题漂移不会被强行解释为业务需求；坐席轨道污染不会进入客户事实。
 
+### 4.3 正式任务本地 SIP 转人工闭环样本
+
+该样本通过正式业务入口创建任务并立即执行，链路为 `19011 AI Call -> LiveKit SIP -> FreeSWITCH -> Linphone`，不是通话测试台或 Stub。
+
+| 项 | 值 |
+| --- | --- |
+| task_id | `342733715933970432` |
+| target_id | `342733715959136256` |
+| attempt_id | `342733717548777472` |
+| call_id | `call_342733717557166080` |
+| task status | `COMPLETED`，1/1 完成，1/1 接通，0 失败 |
+| call status | `completed` |
+| end_reason | `agent_completed` |
+| duration_ms | `218254` |
+| dialogue_persistence_status | `complete` |
+| resource_cleanup_status | `clean` |
+
+Handoff：
+
+| 项 | 值 |
+| --- | --- |
+| handoff_id | `handoff_342733998902689792` |
+| status | `completed` |
+| request_reason | `customer_request` |
+| human_agent_identity | `agent-admin` |
+| requested_at | `2026-08-03 18:22:33.028439+00` |
+| accepted_at | `2026-08-03 18:22:49.157078+00` |
+| connected_at | `2026-08-03 18:22:50.200053+00` |
+| ended_at | `2026-08-03 18:25:09.196884+00` |
+| end_reason | `agent_completed` |
+
+录音与对象访问：
+
+| role | format | status | oss_id | duration_ms | 可解析时长 |
+| --- | --- | --- | --- | ---: | ---: |
+| `main` | MP3 | `completed` | `342734671916515328` | 222443 | 222.537 秒 |
+| `customer` | OGG/Opus | `completed` | `342734693504598016` | 222414 | 213.894 秒 |
+| `human_agent` | OGG/Opus | `completed` | `342734656254984192` | 139007 | 138.763 秒 |
+
+三份对象均可通过 OSS 读取并由 `ffprobe` 解析；主录音为 MP3 44.1kHz 双声道，两条分轨为 Opus 48kHz 双声道。
+
+对话分段：
+
+| speaker_type | source | segment_status | count |
+| --- | --- | --- | ---: |
+| `ai` | `qwen_realtime` | `final` | 1 |
+| `ai` | `qwen_realtime` | `interrupted` | 5 |
+| `customer` | `qwen_realtime` | `final` | 7 |
+| `customer` | `offline_asr` | `final` | 11 |
+| `human_agent` | `offline_asr` | `final` | 13 |
+
+语义结果：
+
+| 项 | 值 |
+| --- | --- |
+| analysis_status | `2`（`SUCCEEDED`） |
+| customer_intent | `neutral` |
+| follow_up_suggested | `false` |
+| follow_up_consent | `missing` |
+| analysis_retry_count | `0` |
+| tags | `转人工意愿明确`、`意向弱`、`转写噪声高`、`无强业务事实`、`低信息密度`、`转写噪声风险` |
+
+判定：通过。正式任务只拨打一个目标；客户说“转人工”后坐席成功接入同一通话，客户与人工分轨均完成并产出离线 ASR，语义分析成功，任务、通话、转人工、录音和资源清理均正常终止。
+
 ## 5. 自动化验证
 
 本轮已执行：
@@ -206,7 +272,7 @@ P1 后续进入联调/试运行前，可暂不补大规模语义标签体系。
 1. 最小回归样本集：10-20 条即可，覆盖未接通、坐席报价、客户价格/试用、弱反馈、时间承诺、串音、话题漂移。
 2. 产品展示口径：明确正常结果、低置信结果、未接通人工、人工阶段无转写时的前端展示。
 3. 存量 snapshot 刷新策略：对 `storedDiffersFromRebuilt=true` 的历史样本统一重跑或标记为旧口径。
-4. SIP 真实线路样本：Web/LAN 通过后，再用真实 SIP 链路补转人工后语义验收。
+4. 公网 Provider 样本：本地 SIP 正式任务链路已通过，生产前仍需用受控真实号码补运营商线路验收。
 
 ## 8. 阶段判断
 
