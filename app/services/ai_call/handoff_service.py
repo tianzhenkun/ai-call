@@ -306,7 +306,7 @@ class AiCallHandoffService:
         for handoff in active_rows:
             target_status = (
                 HANDOFF_STATUS_COMPLETED
-                if handoff.status == HANDOFF_STATUS_CONNECTED
+                if handoff.connected_at is not None
                 else HANDOFF_STATUS_CANCELED
             )
             finalized.append(

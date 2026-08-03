@@ -5001,6 +5001,53 @@ async def test_event_persistence_worker_closes_record_on_model_error(
 
 
 @pytest.mark.anyio
+async def test_event_persistence_worker_completes_connected_reconnecting_handoff(
+    b1_service,
+) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+    )
+    now = datetime.now(timezone.utc)
+    async with b1_service.session_maker.begin() as db:
+        db.add(
+            AiCallHandoffModel(
+                id=999_999,
+                tenant_id="000000",
+                handoff_id="handoff-terminal-reconnect",
+                call_id=result.call_id,
+                room_name=result.room_name,
+                scene_code="default",
+                status="reconnecting",
+                request_source="customer",
+                requested_at=now,
+                connected_at=now,
+                reconnect_expires_at=now + timedelta(seconds=15),
+            )
+        )
+
+    service.orchestrator.event_store.append(
+        call_id=result.call_id,
+        type="session_completed",
+        source="orchestrator",
+        payload={"endReason": "sip_participant_left"},
+    )
+    await b1_service.flush_events()
+
+    async with b1_service.session_maker() as db:
+        handoff = await db.scalar(
+            select(AiCallHandoffModel).where(
+                AiCallHandoffModel.handoff_id == "handoff-terminal-reconnect"
+            )
+        )
+        assert handoff is not None
+        assert handoff.status == "completed"
+        assert handoff.end_reason == "sip_participant_left"
+
+
+@pytest.mark.anyio
 async def test_runtime_event_worker_persists_without_legacy_terminal_projection(
     b1_service,
 ) -> None:

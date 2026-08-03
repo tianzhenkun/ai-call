@@ -9,6 +9,7 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.config.setting import settings
 from app.core.logger import log
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
+from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.livekit_egress import LiveKitEgressManager
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
@@ -186,20 +187,25 @@ class AiCallEventPersistenceWorker:
             if event.type in TERMINAL_RECORD_EVENT_TYPES:
                 terminal_by_call[event.call_id] = event
         for event in terminal_by_call.values():
+            end_reason = self._end_reason(event, default="unknown")
             if event.type == "session_completed":
                 await service.complete_session(
                     event.call_id,
-                    end_reason=self._end_reason(event, default="unknown"),
+                    end_reason=end_reason,
                     ended_at=event.timestamp,
                 )
-                continue
-            await service.fail_session(
-                event.call_id,
-                end_reason=self._end_reason(event, default=event.type),
-                failure_stage=self._failure_stage(event),
-                failure_message=self._failure_message(event),
-                ended_at=event.timestamp,
-            )
+            else:
+                end_reason = self._end_reason(event, default=event.type)
+                await service.fail_session(
+                    event.call_id,
+                    end_reason=end_reason,
+                    failure_stage=self._failure_stage(event),
+                    failure_message=self._failure_message(event),
+                    ended_at=event.timestamp,
+                )
+            await AiCallHandoffService(
+                service.repository
+            ).finalize_active_for_call(event.call_id, end_reason=end_reason)
         return set(terminal_by_call)
 
     async def _stop_terminal_recordings(self, call_ids: set[str]) -> None:
