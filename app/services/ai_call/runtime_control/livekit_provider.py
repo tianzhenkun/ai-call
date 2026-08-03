@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from sqlalchemy import select
 
 from app.services.ai_call.livekit_egress import LiveKitEgressNotFoundError
+from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
     OwnerRuntimeDialogueBridge,
@@ -39,6 +40,7 @@ class RuntimeProviderResource:
     tenant_id: str | None = None
     runtime_owner_id: str | None = None
     runtime_fencing_token: int | None = None
+    egress_scope: str | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -101,9 +103,34 @@ class DatabaseRuntimeProviderResourceResolver:
             voice = self._payload_voice(
                 getattr(command, "payload_json", None) if command is not None else None
             )
+            egress_scope = "main"
+            track_effect = current_effect
+            if claim.effect_type in {"START_TRACK_EGRESS", "STOP_TRACK_EGRESS"}:
+                egress_scope = "participant"
+                track_effect = source_effect or current_effect
+                identity = str(record.participant_identity or "")
+                _, provider_key, resource_key = customer_track_keys(
+                    str(record.call_id), identity
+                )
+                if (
+                    track_effect.effect_type != "START_TRACK_EGRESS"
+                    or track_effect.provider_idempotency_key != provider_key
+                    or track_effect.resource_key != resource_key
+                    or track_effect.resource_generation != 1
+                    or current_effect.resource_key != resource_key
+                    or current_effect.resource_generation != 1
+                ):
+                    raise ProviderPreconditionError(
+                        "customer_track_resource_mismatch"
+                    )
             resource_generation = int(current_effect.resource_generation)
+            reference_effect = (
+                track_effect
+                if egress_scope == "participant"
+                else source_effect or current_effect
+            )
             egress_id = str(
-                getattr(source_effect or current_effect, "provider_reference", "")
+                getattr(reference_effect, "provider_reference", "")
                 or ""
             ) or None
             return RuntimeProviderResource(
@@ -123,6 +150,7 @@ class DatabaseRuntimeProviderResourceResolver:
                 tenant_id=claim.tenant_id,
                 runtime_owner_id=claim.processing_owner_id,
                 runtime_fencing_token=claim.processing_fencing_token,
+                egress_scope=egress_scope,
             )
 
     @staticmethod
@@ -177,7 +205,17 @@ class RuntimeSipClient(Protocol):
 class RuntimeEgressManager(Protocol):
     def build_object_name(self, call_id: str) -> str: ...
 
+    def build_participant_object_name(
+        self,
+        *,
+        call_id: str,
+        track_role: str,
+        participant_identity: str,
+    ) -> str: ...
+
     async def start_room_audio_recording(self, **kwargs): ...
+
+    async def start_participant_audio_recording(self, **kwargs): ...
 
     async def stop_egress(self, egress_id: str): ...
 
@@ -466,6 +504,10 @@ class LiveKitRuntimeProvider:
                 return await self._apply_start_egress(effect, resource)
             if effect.effect_type == "STOP_EGRESS":
                 return await self._apply_stop_egress(effect, resource)
+            if effect.effect_type == "START_TRACK_EGRESS":
+                return await self._apply_start_track_egress(effect, resource)
+            if effect.effect_type == "STOP_TRACK_EGRESS":
+                return await self._apply_stop_track_egress(effect, resource)
             if not effect.reconcile_only:
                 provider_reference = await self._mutate(effect, resource)
             else:
@@ -476,6 +518,7 @@ class LiveKitRuntimeProvider:
                 "HANGUP_SIP",
                 "DISCONNECT_AGENT_PARTICIPANT",
                 "STOP_EGRESS",
+                "STOP_TRACK_EGRESS",
                 "DELETE_ROOM",
             }:
                 return ProviderObservation(
@@ -705,17 +748,171 @@ class LiveKitRuntimeProvider:
             ),
         )
 
+    async def _apply_start_track_egress(
+        self,
+        effect: EffectClaim,
+        resource: RuntimeProviderResource,
+    ) -> ProviderObservation:
+        object_name = self._egress_manager.build_participant_object_name(
+            call_id=resource.call_id,
+            track_role="customer",
+            participant_identity=resource.customer_participant_identity,
+        )
+        if effect.reconcile_only:
+            fact = (
+                await self._egress_manager.get_egress(resource.egress_id)
+                if resource.egress_id
+                else await self._egress_manager.find_room_audio_recording(
+                    resource.room_name,
+                    object_name,
+                )
+            )
+            if fact is None:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_ABSENT,
+                    object_name=object_name,
+                )
+            return self._egress_fact_observation(
+                fact,
+                kind=ProviderObservationKind.RESOURCE_PRESENT,
+                fallback_object_name=object_name,
+            )
+
+        oss_config = self._oss_config_provider()
+        if not oss_config:
+            return ProviderObservation(
+                kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                object_name=object_name,
+                failure_code="oss_config_missing",
+                error_message="oss_config_missing",
+            )
+        try:
+            result = await self._egress_manager.start_participant_audio_recording(
+                room_name=resource.room_name,
+                call_id=resource.call_id,
+                track_role="customer",
+                participant_identity=resource.customer_participant_identity,
+                oss_config=oss_config,
+            )
+        except TimeoutError:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=object_name,
+                failure_code="egress_start_timeout",
+                error_message="egress_start_timeout",
+            )
+        egress_id = str(getattr(result, "egress_id", "") or "")
+        result_object_name = str(getattr(result, "object_name", "") or object_name)
+        if not egress_id:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=result_object_name,
+                failure_code="provider_reference_missing",
+                error_message="provider_reference_missing",
+            )
+        fact = await self._egress_manager.get_egress(egress_id)
+        if fact is None:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                provider_reference=egress_id,
+                provider_status=str(getattr(result, "status", "") or "") or None,
+                object_name=result_object_name,
+                started_at=getattr(result, "started_at", None),
+                failure_code="egress_start_unconfirmed",
+                error_message="egress_start_unconfirmed",
+            )
+        return self._egress_fact_observation(
+            fact,
+            kind=ProviderObservationKind.RESOURCE_PRESENT,
+            fallback_object_name=result_object_name,
+        )
+
+    async def _apply_stop_track_egress(
+        self,
+        effect: EffectClaim,
+        resource: RuntimeProviderResource,
+    ) -> ProviderObservation:
+        object_name = self._egress_manager.build_participant_object_name(
+            call_id=resource.call_id,
+            track_role="customer",
+            participant_identity=resource.customer_participant_identity,
+        )
+        egress_id = resource.egress_id
+        if not egress_id:
+            fact = await self._egress_manager.find_room_audio_recording(
+                resource.room_name,
+                object_name,
+            )
+            if fact is None:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_ABSENT,
+                    object_name=object_name,
+                )
+            egress_id = str(getattr(fact, "egress_id", "") or "") or None
+        if not egress_id:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=object_name,
+                failure_code="provider_reference_missing",
+                error_message="provider_reference_missing",
+            )
+
+        stop_fact = None
+        if not effect.reconcile_only:
+            try:
+                stop_fact = await self._egress_manager.stop_egress(egress_id)
+            except TimeoutError:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.UNCERTAIN,
+                    provider_reference=egress_id,
+                    object_name=object_name,
+                    failure_code="egress_stop_timeout",
+                    error_message="egress_stop_timeout",
+                )
+        fact = await self._egress_manager.get_egress(egress_id)
+        if fact is None:
+            stop_status = str(getattr(stop_fact, "status", "") or "").upper()
+            if stop_fact is not None:
+                return self._egress_fact_observation(
+                    stop_fact,
+                    kind=(
+                        ProviderObservationKind.TERMINAL_CONFIRMED
+                        if stop_status in _TERMINAL_EGRESS_STATUSES
+                        else ProviderObservationKind.ACCEPTED
+                    ),
+                    fallback_object_name=object_name,
+                )
+            return ProviderObservation(
+                kind=ProviderObservationKind.TERMINAL_CONFIRMED,
+                provider_reference=egress_id,
+                object_name=object_name,
+            )
+        status = str(getattr(fact, "status", "") or "").upper()
+        return self._egress_fact_observation(
+            fact,
+            kind=(
+                ProviderObservationKind.TERMINAL_CONFIRMED
+                if status in _TERMINAL_EGRESS_STATUSES
+                else ProviderObservationKind.ACCEPTED
+            ),
+            fallback_object_name=object_name,
+        )
+
     @staticmethod
     def _egress_fact_observation(
         fact: object,
         *,
         kind: ProviderObservationKind,
+        fallback_object_name: str | None = None,
     ) -> ProviderObservation:
         return ProviderObservation(
             kind=kind,
             provider_reference=str(getattr(fact, "egress_id", "") or "") or None,
             provider_status=str(getattr(fact, "status", "") or "") or None,
-            object_name=str(getattr(fact, "object_name", "") or "") or None,
+            object_name=(
+                str(getattr(fact, "object_name", "") or "")
+                or fallback_object_name
+            ),
             started_at=getattr(fact, "started_at", None),
             ended_at=getattr(fact, "ended_at", None),
             duration_ms=getattr(fact, "duration_ms", None),

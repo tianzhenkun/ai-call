@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
 )
@@ -36,6 +37,20 @@ def _effect(effect_type: str, *, reconcile_only: bool = False) -> EffectClaim:
         provider_namespace="livekit:test",
         resource_key=f"{effect_type.lower()}:call-1:g7",
         reservation_token="reservation-1",
+    )
+
+
+def _customer_track_effect(
+    effect_type: str,
+    *,
+    reconcile_only: bool = False,
+) -> EffectClaim:
+    _, _, resource_key = customer_track_keys("call-1", "sip-call-1")
+    return replace(
+        _effect(effect_type, reconcile_only=reconcile_only),
+        effect_id=202,
+        resource_key=resource_key,
+        source_create_effect_id=101 if effect_type == "STOP_TRACK_EGRESS" else None,
     )
 
 
@@ -158,6 +173,7 @@ class FakeEgressManager:
 class RecordingEgressManager:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, object]] = []
+        self.participant_start_calls: list[dict[str, object]] = []
         self.stop_calls: list[str] = []
         self.query_calls: list[str] = []
         self.find_calls: list[tuple[str, str]] = []
@@ -165,6 +181,7 @@ class RecordingEgressManager:
         self.query_observation = None
         self.find_observation = None
         self.stop_result = SimpleNamespace(egress_id="EG_main", status="EGRESS_ACTIVE")
+        self.participant_start_error: Exception | None = None
 
     def build_object_name(self, call_id: str) -> str:
         return f"ai-call/recordings/{call_id}.ogg"
@@ -176,6 +193,30 @@ class RecordingEgressManager:
         return SimpleNamespace(
             egress_id="EG_main",
             object_name=self.build_object_name(str(kwargs["call_id"])),
+            status="EGRESS_ACTIVE",
+            started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        )
+
+    def build_participant_object_name(
+        self,
+        *,
+        call_id: str,
+        track_role: str,
+        participant_identity: str,
+    ) -> str:
+        return f"ai-call/recordings/tracks/{call_id}/{track_role}-{participant_identity}.ogg"
+
+    async def start_participant_audio_recording(self, **kwargs):
+        self.participant_start_calls.append(kwargs)
+        if self.participant_start_error is not None:
+            raise self.participant_start_error
+        return SimpleNamespace(
+            egress_id="EG_customer",
+            object_name=self.build_participant_object_name(
+                call_id=str(kwargs["call_id"]),
+                track_role=str(kwargs["track_role"]),
+                participant_identity=str(kwargs["participant_identity"]),
+            ),
             status="EGRESS_ACTIVE",
             started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
         )
@@ -199,6 +240,7 @@ def _provider(
     agent_manager=None,
     sip_client=None,
     egress_manager=None,
+    oss_config_provider=None,
 ):
     from app.services.ai_call.runtime_control.livekit_provider import (
         LiveKitRuntimeProvider,
@@ -210,6 +252,7 @@ def _provider(
         agent_manager=agent_manager or FakeAgentManager(),
         sip_client=sip_client or FakeSipClient(),
         egress_manager=egress_manager or FakeEgressManager(),
+        oss_config_provider=oss_config_provider,
     )
 
 
@@ -438,6 +481,173 @@ async def test_livekit_provider_starts_main_egress_with_active_oss_config() -> N
         }
     ]
     assert manager.query_calls == ["EG_main"]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_starts_customer_track_with_participant_identity() -> None:
+    manager = RecordingEgressManager()
+    manager.query_observation = SimpleNamespace(
+        egress_id="EG_customer",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+    provider = _provider(
+        egress_manager=manager,
+        oss_config_provider=lambda: {"bucket_name": "recordings"},
+    )
+
+    observation = await provider.apply(
+        _customer_track_effect("START_TRACK_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.RESOURCE_PRESENT
+    assert observation.provider_reference == "EG_customer"
+    assert manager.participant_start_calls == [
+        {
+            "room_name": "ai-call-call-1",
+            "call_id": "call-1",
+            "track_role": "customer",
+            "participant_identity": "sip-call-1",
+            "oss_config": {"bucket_name": "recordings"},
+        }
+    ]
+    assert manager.start_calls == []
+    assert manager.query_calls == ["EG_customer"]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_does_not_start_customer_track_without_oss_config() -> None:
+    manager = RecordingEgressManager()
+    provider = _provider(egress_manager=manager)
+
+    observation = await provider.apply(
+        _customer_track_effect("START_TRACK_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.PERMANENT_NO_RESOURCE
+    assert observation.failure_code == "oss_config_missing"
+    assert manager.participant_start_calls == []
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_customer_track_timeout_recovery_never_restarts() -> None:
+    class MissingEgressResolver(FakeResolver):
+        async def resolve(self, effect):
+            return replace(await super().resolve(effect), egress_id=None)
+
+    manager = RecordingEgressManager()
+    manager.participant_start_error = TimeoutError("response lost")
+    manager.find_observation = SimpleNamespace(
+        egress_id="EG_late_customer",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    provider = LiveKitRuntimeProvider(
+        resolver=MissingEgressResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+        oss_config_provider=lambda: {"bucket_name": "recordings"},
+    )
+
+    first = await provider.apply(_customer_track_effect("START_TRACK_EGRESS"))
+    recovered = await provider.apply(
+        _customer_track_effect("START_TRACK_EGRESS", reconcile_only=True)
+    )
+
+    assert first.kind is ProviderObservationKind.UNCERTAIN
+    assert first.failure_code == "egress_start_timeout"
+    assert recovered.kind is ProviderObservationKind.RESOURCE_PRESENT
+    assert recovered.provider_reference == "EG_late_customer"
+    assert len(manager.participant_start_calls) == 1
+    assert manager.find_calls == [
+        (
+            "ai-call-call-1",
+            "ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_customer_track_stop_without_reference_finds_then_stops() -> None:
+    class MissingEgressResolver(FakeResolver):
+        async def resolve(self, effect):
+            return replace(await super().resolve(effect), egress_id=None)
+
+    manager = RecordingEgressManager()
+    manager.find_observation = SimpleNamespace(
+        egress_id="EG_customer",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        started_at=None,
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    provider = LiveKitRuntimeProvider(
+        resolver=MissingEgressResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+    )
+
+    observation = await provider.apply(
+        _customer_track_effect("STOP_TRACK_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.ACCEPTED
+    assert manager.find_calls == [
+        (
+            "ai-call-call-1",
+            "ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        )
+    ]
+    assert manager.stop_calls == ["EG_customer"]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_customer_track_stop_terminal_is_confirmed() -> None:
+    manager = RecordingEgressManager()
+    manager.stop_result = SimpleNamespace(
+        egress_id="EG_customer", status="EGRESS_COMPLETE"
+    )
+    manager.query_observation = SimpleNamespace(
+        egress_id="EG_customer",
+        status="EGRESS_COMPLETE",
+        object_name="ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg",
+        started_at=None,
+        ended_at=datetime(2026, 8, 3, 9, 1, tzinfo=timezone.utc),
+        duration_ms=60_000,
+        file_size=1024,
+    )
+
+    observation = await _provider(egress_manager=manager).apply(
+        _customer_track_effect("STOP_TRACK_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.TERMINAL_CONFIRMED
+    assert observation.object_name == (
+        "ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg"
+    )
+    assert observation.duration_ms == 60_000
 
 
 @pytest.mark.anyio
@@ -689,6 +899,139 @@ async def test_resource_resolver_uses_effect_generation_and_source_reference() -
     assert resource.egress_id == "EG_1"
     assert resource.voice == "Cherry"
     assert resource.callee_phone_number == "19900001001"
+
+
+@pytest.mark.anyio
+async def test_resource_resolver_validates_customer_track_scope_and_source_reference() -> None:
+    from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+
+    _, provider_key, resource_key = customer_track_keys("call-1", "sip-call-1")
+    rows = {
+        AiCallRecordModel: SimpleNamespace(
+            tenant_id="tenant-a",
+            call_id="call-1",
+            room_name="ai-call-call-1",
+            participant_identity="sip-call-1",
+            callee_phone_number="19900001001",
+        ),
+        AiCallRuntimeCommandModel: SimpleNamespace(payload_json=None),
+    }
+    effects = iter(
+        (
+            SimpleNamespace(
+                id=202,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                command_id=77,
+                effect_type="STOP_TRACK_EGRESS",
+                provider_namespace="livekit:test",
+                provider_idempotency_key="destroy:customer",
+                resource_key=resource_key,
+                resource_generation=1,
+                provider_reference=None,
+            ),
+            SimpleNamespace(
+                id=101,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                effect_type="START_TRACK_EGRESS",
+                provider_namespace="livekit:test",
+                provider_idempotency_key=provider_key,
+                resource_key=resource_key,
+                resource_generation=1,
+                provider_reference="EG_customer",
+            ),
+        )
+    )
+
+    class FakeSession:
+        async def scalar(self, statement):
+            entity = statement.column_descriptions[0]["entity"]
+            if entity is AiCallRuntimeEffectModel:
+                return next(effects)
+            return rows.get(entity)
+
+    class SessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    resolver = DatabaseRuntimeProviderResourceResolver(lambda: SessionContext())
+    resource = await resolver.resolve(
+        _customer_track_effect("STOP_TRACK_EGRESS")
+    )
+
+    assert resource.egress_scope == "participant"
+    assert resource.customer_participant_identity == "sip-call-1"
+    assert resource.egress_id == "EG_customer"
+
+
+@pytest.mark.anyio
+async def test_resource_resolver_rejects_customer_track_key_mismatch() -> None:
+    from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+        ProviderPreconditionError,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+
+    _, provider_key, _resource_key = customer_track_keys("call-1", "sip-call-1")
+    rows = {
+        AiCallRecordModel: SimpleNamespace(
+            tenant_id="tenant-a",
+            call_id="call-1",
+            room_name="ai-call-call-1",
+            participant_identity="sip-call-1",
+            callee_phone_number="19900001001",
+        ),
+        AiCallRuntimeCommandModel: SimpleNamespace(payload_json=None),
+    }
+    effects = iter(
+        (
+            SimpleNamespace(
+                id=202,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                command_id=77,
+                effect_type="START_TRACK_EGRESS",
+                provider_namespace="livekit:test",
+                provider_idempotency_key=provider_key,
+                resource_key="wrong-resource",
+                resource_generation=1,
+                provider_reference=None,
+            ),
+        )
+    )
+
+    class FakeSession:
+        async def scalar(self, statement):
+            entity = statement.column_descriptions[0]["entity"]
+            if entity is AiCallRuntimeEffectModel:
+                return next(effects)
+            return rows.get(entity)
+
+    class SessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    resolver = DatabaseRuntimeProviderResourceResolver(lambda: SessionContext())
+    with pytest.raises(ProviderPreconditionError, match="customer_track_resource_mismatch"):
+        await resolver.resolve(_customer_track_effect("START_TRACK_EGRESS"))
 
 
 @pytest.mark.anyio
