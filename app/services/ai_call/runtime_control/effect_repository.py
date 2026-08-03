@@ -22,6 +22,9 @@ from app.services.ai_call.runtime_control.models import (
     AiCallSipLineReservationModel,
 )
 from app.services.ai_call.runtime_control.owner_repository import OwnerLease
+from app.services.ai_call.runtime_control.recording_repository import (
+    OwnerRecordingRepository,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
 from app.utils.id_util import generate_snowflake_id
@@ -64,6 +67,13 @@ class ProviderObservationKind(StrEnum):
 class ProviderObservation:
     kind: ProviderObservationKind
     provider_reference: str | None = None
+    provider_status: str | None = None
+    object_name: str | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    file_size: int | None = None
+    failure_code: str | None = None
     error_message: str | None = None
     retry_after: timedelta = timedelta(0)
 
@@ -129,6 +139,7 @@ class RuntimeEffectRepository:
         processing_lease_ttl: timedelta = timedelta(seconds=30),
         required_absence_observations: int = 2,
         database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
+        recording_repository: OwnerRecordingRepository | None = None,
     ) -> None:
         if required_absence_observations < 1:
             raise ValueError("required_absence_observations must be positive")
@@ -138,6 +149,10 @@ class RuntimeEffectRepository:
         self._processing_lease_ttl = processing_lease_ttl
         self._required_absence_observations = required_absence_observations
         self._database_clock = database_clock
+        self._recording_repository = recording_repository or OwnerRecordingRepository(
+            session,
+            id_generator=id_generator,
+        )
 
     async def register(
         self,
@@ -493,6 +508,7 @@ class RuntimeEffectRepository:
         if record.runtime_lease_expires_at <= now or effect.processing_expires_at <= now:
             return False
 
+        source = None
         if effect.effect_type in CREATE_EFFECT_TYPES:
             self._apply_create_observation(effect, observation, now)
         else:
@@ -501,6 +517,13 @@ class RuntimeEffectRepository:
                 raise EffectRegistrationError("destroy effect has no source create effect")
             self._apply_destroy_observation(effect, source, observation, now)
         self._apply_reservation_observation(reservation, effect, observation, now)
+        await self._recording_repository.project(
+            record=record,
+            effect=effect,
+            source_effect=source,
+            observation=observation,
+            now=now,
+        )
         await self._session.flush()
         return True
 
