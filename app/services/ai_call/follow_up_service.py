@@ -124,7 +124,7 @@ class AiCallFollowUpService:
                 ),
                 owner_agent_identity=profile.agent_identity,
                 status="pending",
-                follow_up_reason=handoff.request_message or "人工通话后续跟进",
+                follow_up_reason="人工通话后续跟进",
                 customer_callback_at=payload.customer_callback_at,
                 summary=payload.summary,
                 closed_reason=None,

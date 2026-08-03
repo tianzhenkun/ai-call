@@ -453,6 +453,7 @@ async def test_submit_acw_creates_one_owned_follow_up_and_releases_agent(session
         assert acw.summary is None
         assert follow_up is not None
         assert follow_up.owner_agent_identity == "agent-20"
+        assert follow_up.follow_up_reason == "人工通话后续跟进"
         assert follow_up.customer_callback_at is None
 
         presence = (
