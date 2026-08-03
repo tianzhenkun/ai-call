@@ -350,7 +350,7 @@ async def test_api_role_does_not_start_ai_call_workers_or_require_redis(
     [
         (
             "runtime",
-            {"_start_ai_call_runtime_control"},
+            {"_start_ai_call_event_worker", "_start_ai_call_runtime_control"},
             False,
         ),
         (

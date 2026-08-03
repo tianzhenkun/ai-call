@@ -288,6 +288,34 @@ def test_livekit_owner_provider_routes_final_customer_speech_to_handoff_worker()
     worker.detach_all()
 
 
+def test_livekit_owner_provider_attaches_event_persistence_worker() -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_event_persistence
+    from app.config.setting import settings
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        build_livekit_runtime_provider,
+    )
+
+    class EventWorker:
+        def __init__(self) -> None:
+            self.stores = []
+
+        def attach_event_store(self, event_store) -> None:
+            self.stores.append(event_store)
+
+    worker = EventWorker()
+    configure_ai_call_event_persistence(worker)
+    try:
+        provider = build_livekit_runtime_provider(
+            settings=settings,
+            session_factory=object(),
+            registry=RuntimeRegistry(),
+        )
+    finally:
+        configure_ai_call_event_persistence(None)
+
+    assert provider._agent_manager._orchestrator.event_store in worker.stores
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("effect_type", "expected_kind"),

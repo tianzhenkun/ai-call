@@ -107,6 +107,9 @@ async def _start_ai_call_role_workers(
     handles = AiCallRoleWorkerHandles()
     try:
         if ProcessRole.RUNTIME in roles:
+            handles.event_worker = await _start_ai_call_event_worker(
+                project_terminal_records=False,
+            )
             handles.runtime_control = await _start_ai_call_runtime_control()
         if ProcessRole.DISPATCHER in roles:
             handles.dispatcher_control = await _start_ai_call_dispatcher_control()
@@ -702,14 +705,17 @@ async def _stop_ai_call_linphone_test_worker(worker) -> None:
     log.info("✅ AI Call 本机 Linphone 测试恢复 worker 已关闭")
 
 
-async def _start_ai_call_event_worker():
+async def _start_ai_call_event_worker(*, project_terminal_records: bool = True):
     if not settings.SQL_DB_ENABLE:
         return None
     from app.api.v1.ai_call.service import configure_ai_call_event_persistence
     from app.core.database import async_db_session
     from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
 
-    worker = AiCallEventPersistenceWorker(async_db_session)
+    worker = AiCallEventPersistenceWorker(
+        async_db_session,
+        project_terminal_records=project_terminal_records,
+    )
     await worker.start()
     configure_ai_call_event_persistence(worker)
     log.info("✅ AI Call 事件后台持久化 worker 已启动")

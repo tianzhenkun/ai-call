@@ -1051,6 +1051,7 @@ def build_livekit_runtime_provider(
     from app.api.v1.ai_call.crud import AiCallRecordRepository
     from app.api.v1.ai_call.service import (
         AiCallService,
+        attach_ai_call_event_persistence,
         build_ai_call_handoff_exception_manager,
     )
     from app.api.v1.system.oss.service import OssService
@@ -1078,6 +1079,7 @@ def build_livekit_runtime_provider(
         browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
     )
     orchestrator = AiCallOrchestrator.from_settings(settings)
+    attach_ai_call_event_persistence(orchestrator.event_store)
     dialogue_bridge = OwnerRuntimeDialogueBridge(session_factory)
     dialogue_bridge.attach_event_store(orchestrator.event_store)
     handoff_trigger_worker = None

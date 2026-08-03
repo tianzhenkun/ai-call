@@ -5001,6 +5001,45 @@ async def test_event_persistence_worker_closes_record_on_model_error(
 
 
 @pytest.mark.anyio
+async def test_runtime_event_worker_persists_without_legacy_terminal_projection(
+    b1_service,
+) -> None:
+    service, record_service = b1_service
+    b1_service.event_worker.detach_all()
+    worker = AiCallEventPersistenceWorker(
+        b1_service.event_worker.session_factory,
+        project_terminal_records=False,
+    )
+    worker.attach_event_store(service.orchestrator.event_store)
+    await worker.start()
+    try:
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        service.orchestrator.event_store.append(
+            call_id=result.call_id,
+            type="model_error",
+            source="provider",
+            payload={"message": "owner runtime error"},
+        )
+        await worker.flush_pending()
+
+        events = await record_service.list_events(
+            result.call_id,
+            event_type="model_error",
+        )
+        async with worker.session_factory() as db:
+            record = await AiCallRecordRepository(db).get_record(result.call_id)
+        assert len(events) == 1
+        assert record is not None
+        assert record.ended_at is None
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.anyio
 async def test_event_worker_queue_full_does_not_block_runtime_path(b1_service) -> None:
     service, _record_service = b1_service
     b1_service.event_worker.detach_all()

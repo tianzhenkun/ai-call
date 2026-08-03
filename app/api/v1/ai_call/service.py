@@ -22,7 +22,7 @@ from app.services.ai_call.dialogue_service import (
     AiCallDialogueRuntimeStore,
     AiCallDialogueService,
 )
-from app.services.ai_call.event_store import AiCallEvent
+from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.handoff_exception_manager import AiCallHandoffExceptionManager
 from app.services.ai_call.handoff_service import AiCallHandoffService
@@ -2066,6 +2066,11 @@ def configure_ai_call_event_persistence(
     _default_event_persistence_worker = worker
     if worker is not None and _default_orchestrator is not None:
         worker.attach_event_store(_default_orchestrator.event_store)
+
+
+def attach_ai_call_event_persistence(event_store: InMemoryEventStore) -> None:
+    if _default_event_persistence_worker is not None:
+        _default_event_persistence_worker.attach_event_store(event_store)
 
 
 def configure_ai_call_dialogue_persistence(

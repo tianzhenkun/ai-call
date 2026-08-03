@@ -33,11 +33,13 @@ class AiCallEventPersistenceWorker:
         batch_size: int = 100,
         flush_interval_seconds: float = 0.2,
         max_retries: int = 2,
+        project_terminal_records: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.batch_size = max(1, batch_size)
         self.flush_interval_seconds = max(0.05, flush_interval_seconds)
         self.max_retries = max(0, max_retries)
+        self.project_terminal_records = project_terminal_records
         self.queue: asyncio.Queue[QueuedAiCallEvent] = asyncio.Queue(maxsize=queue_max_size)
         self.dropped_count = 0
         self.failed_count = 0
@@ -132,7 +134,11 @@ class AiCallEventPersistenceWorker:
                 async with db.begin():
                     service = AiCallRecordService(AiCallRecordRepository(db))
                     persisted = await service.mirror_runtime_events(events)
-                    terminal_call_ids = await self._mirror_terminal_records(service, events)
+                    if self.project_terminal_records:
+                        terminal_call_ids = await self._mirror_terminal_records(
+                            service,
+                            events,
+                        )
                     self.persisted_count += len(persisted)
             if terminal_call_ids:
                 await self._stop_terminal_recordings(terminal_call_ids)
