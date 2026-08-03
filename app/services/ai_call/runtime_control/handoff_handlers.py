@@ -301,12 +301,16 @@ class _HandoffStateRepository:
             return HandoffHandlerResult(False, False)
         record, handoff, presence, command = rows
         now = await self._database_clock(self._session)
+        media_state_matches = (handoff.status, presence.status) in {
+            ("accepted", "claiming"),
+            ("connected", "in_call"),
+            ("reconnecting", "reconnecting"),
+        }
         valid = (
             self._runtime_claim_matches(record, command, claim, lease, now)
             and record.terminal_requested_at is None
-            and handoff.status == "accepted"
             and self._presence_matches(presence, handoff)
-            and presence.status == "claiming"
+            and media_state_matches
         )
         if not valid:
             return HandoffHandlerResult(False, False)

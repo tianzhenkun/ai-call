@@ -230,7 +230,7 @@ async def test_token_handoff_endpoints_await_rich_payload(
 
 
 @pytest.mark.anyio
-async def test_claim_handoff_uses_payload_built_before_transaction_commit(
+async def test_owner_claim_handoff_returns_seat_token_after_acceptance(
     db_session,
     monkeypatch,
 ) -> None:
@@ -284,7 +284,7 @@ async def test_claim_handoff_uses_payload_built_before_transaction_commit(
     assert body["data"]["commandId"] == "202"
     assert body["data"]["commandSeq"] == "2"
     assert body["data"]["commandStatus"] == "PENDING"
-    assert "seat_token" not in body["data"]
+    assert body["data"]["seat_token"] == {"participant_token": "test-token"}
 
 
 @pytest.mark.anyio

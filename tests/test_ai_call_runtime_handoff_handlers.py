@@ -456,6 +456,32 @@ async def test_handoff_accepted_handler_only_completes_valid_claim(
 
 
 @pytest.mark.anyio
+async def test_handoff_accepted_handler_completes_after_media_ready_race(
+    handoff_handler_session_factory,
+) -> None:
+    from app.services.ai_call.runtime_control.handoff_handlers import (
+        HandoffAcceptedHandler,
+    )
+
+    claim = await _seed_command(
+        handoff_handler_session_factory,
+        command_type="HANDOFF_ACCEPTED",
+        handoff_status="connected",
+        presence_status="in_call",
+    )
+    result = await HandoffAcceptedHandler(
+        handoff_handler_session_factory,
+        database_clock=_constant_time,
+    ).handle(claim, _lease())
+
+    async with handoff_handler_session_factory() as session:
+        command = await session.get(AiCallRuntimeCommandModel, claim.command_id)
+    assert result.command_completed is True
+    assert result.state_changed is False
+    assert command.status == "SUCCEEDED"
+
+
+@pytest.mark.anyio
 async def test_cancel_before_connected_releases_claiming_presence(
     handoff_handler_session_factory,
 ) -> None:

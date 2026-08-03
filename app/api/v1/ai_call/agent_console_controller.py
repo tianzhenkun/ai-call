@@ -368,6 +368,7 @@ async def claim_handoff_controller(
         "commandId": str(claim_result.command.command_id),
         "commandSeq": str(claim_result.command.command_seq),
         "commandStatus": claim_result.command.command_status,
+        "seat_token": _issue_handoff_token(auth, handoff),
     }
     return SuccessResponse(
         data=data,
