@@ -18,6 +18,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     EndCallIntent,
     RuntimeCommandRepository,
 )
+from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
 )
@@ -534,6 +535,7 @@ class RuntimeControlService:
                 main_recording_enabled=bool(
                     getattr(provider, "main_recording_enabled", False)
                 ),
+                participant_identity=command_claim.participant_identity,
             )
             try:
                 await StartCallHandler(session_factory, guarded_provider).handle(
@@ -770,6 +772,7 @@ def _default_start_specs(
     entry_type: str,
     provider_namespace: str | None = None,
     main_recording_enabled: bool = False,
+    participant_identity: str | None = None,
 ) -> list[EffectSpec]:
     if entry_type not in {"web", "direct_sip", "outbound"}:
         raise ValueError(f"unsupported owner command entry: {entry_type}")
@@ -809,6 +812,9 @@ def _default_start_specs(
             )
         )
     if main_recording_enabled:
+        track_idempotency_key, track_provider_key, track_resource_key = (
+            customer_track_keys(call_id, participant_identity or "")
+        )
         specs.append(
             EffectSpec(
                 effect_type="START_EGRESS",
@@ -816,6 +822,16 @@ def _default_start_specs(
                 provider_namespace=namespace,
                 provider_idempotency_key=f"egress:main:{call_id}",
                 resource_key=f"egress:main:{call_id}",
+                resource_generation=1,
+            )
+        )
+        specs.append(
+            EffectSpec(
+                effect_type="START_TRACK_EGRESS",
+                idempotency_key=track_idempotency_key,
+                provider_namespace=namespace,
+                provider_idempotency_key=track_provider_key,
+                resource_key=track_resource_key,
                 resource_generation=1,
             )
         )

@@ -260,7 +260,12 @@ async def test_deterministic_web_provider_stub_confirms_destroy(
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "effect_type",
-    ["CREATE_SIP_PARTICIPANT", "START_EGRESS", "UNKNOWN_EFFECT"],
+    [
+        "CREATE_SIP_PARTICIPANT",
+        "START_EGRESS",
+        "START_TRACK_EGRESS",
+        "UNKNOWN_EFFECT",
+    ],
 )
 async def test_deterministic_web_provider_stub_rejects_non_web_effects(
     effect_type: str,
@@ -323,11 +328,11 @@ async def test_outbound_start_specs_use_only_db_stub_resource_facts() -> None:
     assert "13800138001" not in repr(stub.calls)
 
 
-def test_db_only_stubs_never_enable_main_recording_effect() -> None:
+def test_db_only_stubs_never_enable_recording_effects() -> None:
     assert DeterministicWebProviderStub().main_recording_enabled is False
     assert DeterministicDbOnlyProviderStub().main_recording_enabled is False
     assert ScriptedProviderStub({}).main_recording_enabled is False
-    assert "START_EGRESS" not in {
+    assert {
         spec.effect_type
         for spec in _default_start_specs(
             "call-a",
@@ -335,7 +340,7 @@ def test_db_only_stubs_never_enable_main_recording_effect() -> None:
             "runtime-a",
             entry_type="outbound",
         )
-    }
+    }.isdisjoint({"START_EGRESS", "START_TRACK_EGRESS"})
 
 
 @pytest.mark.anyio

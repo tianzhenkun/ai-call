@@ -14,6 +14,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.services.ai_call.runtime_control.command_repository import CommandClaim
+from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectDependencyModel,
@@ -35,14 +36,18 @@ CREATE_EFFECT_TYPES = frozenset(
         "CREATE_SIP_PARTICIPANT",
         "ATTACH_AGENT_PARTICIPANT",
         "START_EGRESS",
+        "START_TRACK_EGRESS",
     }
 )
-AUXILIARY_START_EFFECT_TYPES = frozenset({"START_EGRESS"})
+AUXILIARY_START_EFFECT_TYPES = frozenset(
+    {"START_EGRESS", "START_TRACK_EGRESS"}
+)
 DESTROY_EFFECT_TYPES = frozenset(
     {
         "HANGUP_SIP",
         "DISCONNECT_AGENT_PARTICIPANT",
         "STOP_EGRESS",
+        "STOP_TRACK_EGRESS",
         "DELETE_ROOM",
     }
 )
@@ -51,6 +56,7 @@ _DESTROY_FOR_CREATE = {
     "CREATE_SIP_PARTICIPANT": "HANGUP_SIP",
     "ATTACH_AGENT_PARTICIPANT": "DISCONNECT_AGENT_PARTICIPANT",
     "START_EGRESS": "STOP_EGRESS",
+    "START_TRACK_EGRESS": "STOP_TRACK_EGRESS",
 }
 
 
@@ -247,6 +253,17 @@ class RuntimeEffectRepository:
     ) -> list[EffectSnapshot]:
         if command_claim.command_type != "END_CALL":
             raise EffectRegistrationError("destroy graph requires an END_CALL claim")
+        record, command = await self._authorize_first_registration(command_claim)
+        now = await self._database_clock(self._session)
+        if record.terminal_requested_at is None:
+            raise EffectRegistrationError("destroy graph requires a terminal barrier")
+        if (
+            record.runtime_lease_expires_at is None
+            or record.runtime_lease_expires_at <= now
+            or command.processing_expires_at is None
+            or command.processing_expires_at <= now
+        ):
+            raise EffectRegistrationError("command claim is expired")
         creates = list(
             (
                 await self._session.scalars(
@@ -257,9 +274,24 @@ class RuntimeEffectRepository:
                         AiCallRuntimeEffectModel.effect_type.in_(CREATE_EFFECT_TYPES),
                     )
                     .order_by(AiCallRuntimeEffectModel.id)
+                    .with_for_update()
                 )
             ).all()
         )
+        for create in creates:
+            if (
+                create.effect_type == "START_TRACK_EGRESS"
+                and create.status == EffectStatus.PENDING
+                and create.attempt_count == 0
+                and create.processing_owner_id is None
+                and create.processing_fencing_token is None
+                and create.processing_token is None
+                and create.processing_expires_at is None
+            ):
+                create.status = EffectStatus.FAILED
+                create.error_message = "no_resource"
+                create.reconcile_after = None
+                create.updated_at = now
         non_room: list[EffectSnapshot] = []
         room_creates: list[AiCallRuntimeEffectModel] = []
         for create in creates:
@@ -308,6 +340,18 @@ class RuntimeEffectRepository:
                     AiCallRuntimeEffectModel.id,
                     AiCallRuntimeEffectModel.effect_type,
                     AiCallRuntimeEffectModel.status,
+                    AiCallRuntimeEffectModel.resource_key,
+                    AiCallRecordModel.participant_identity,
+                    AiCallRecordModel.answered_at,
+                    AiCallRecordModel.terminal_requested_at,
+                )
+                .join(
+                    AiCallRecordModel,
+                    and_(
+                        AiCallRecordModel.tenant_id
+                        == AiCallRuntimeEffectModel.tenant_id,
+                        AiCallRecordModel.call_id == AiCallRuntimeEffectModel.call_id,
+                    ),
                 )
                 .where(
                     AiCallRuntimeEffectModel.tenant_id == owner_lease.tenant_id,
@@ -323,6 +367,40 @@ class RuntimeEffectRepository:
         ).all()
         prerequisite = aliased(AiCallRuntimeEffectModel)
         for candidate in candidates:
+            claim_gate = []
+            if (
+                candidate.effect_type == "START_TRACK_EGRESS"
+                and candidate.status == EffectStatus.PENDING
+            ):
+                participant_identity = str(candidate.participant_identity or "")
+                if (
+                    candidate.answered_at is None
+                    or candidate.terminal_requested_at is not None
+                ):
+                    continue
+                try:
+                    expected_resource_key = customer_track_keys(
+                        owner_lease.call_id,
+                        participant_identity,
+                    )[2]
+                except ValueError:
+                    continue
+                if candidate.resource_key != expected_resource_key:
+                    continue
+                claim_gate.extend(
+                    (
+                        AiCallRuntimeEffectModel.resource_key
+                        == expected_resource_key,
+                        exists().where(
+                            AiCallRecordModel.tenant_id == owner_lease.tenant_id,
+                            AiCallRecordModel.call_id == owner_lease.call_id,
+                            AiCallRecordModel.participant_identity
+                            == participant_identity,
+                            AiCallRecordModel.answered_at.is_not(None),
+                            AiCallRecordModel.terminal_requested_at.is_(None),
+                        ),
+                    )
+                )
             token = self._processing_token_generator()
             owner_valid = exists().where(
                 AiCallRecordModel.tenant_id == owner_lease.tenant_id,
@@ -372,6 +450,7 @@ class RuntimeEffectRepository:
                         eligible_status,
                         owner_valid,
                         ~unmet_dependency,
+                        *claim_gate,
                     )
                     .values(
                         status=EffectStatus.APPLYING,

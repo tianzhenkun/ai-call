@@ -81,6 +81,7 @@ def test_main_egress_spec_is_stable_across_owner_fencing() -> None:
         entry_type="web",
         provider_namespace="livekit:isolated-test",
         main_recording_enabled=True,
+        participant_identity="customer-a",
     )
     takeover = _default_start_specs(
         "call-a",
@@ -89,6 +90,7 @@ def test_main_egress_spec_is_stable_across_owner_fencing() -> None:
         entry_type="web",
         provider_namespace="livekit:isolated-test",
         main_recording_enabled=True,
+        participant_identity="customer-a",
     )
 
     first_egress = next(spec for spec in first if spec.effect_type == "START_EGRESS")
@@ -100,6 +102,43 @@ def test_main_egress_spec_is_stable_across_owner_fencing() -> None:
     assert first_egress.provider_idempotency_key == "egress:main:call-a"
     assert first_egress.resource_key == "egress:main:call-a"
     assert first_egress.resource_generation == 1
+
+
+def test_recording_capability_registers_main_and_customer_track_only() -> None:
+    specs = _default_start_specs(
+        "call-a",
+        _lease(fencing_token=7),
+        "runtime-a",
+        entry_type="outbound",
+        provider_namespace="livekit:isolated-test",
+        main_recording_enabled=True,
+        participant_identity="customer-a",
+    )
+
+    recording_specs = [
+        spec
+        for spec in specs
+        if spec.effect_type in {"START_EGRESS", "START_TRACK_EGRESS"}
+    ]
+    assert [spec.effect_type for spec in recording_specs] == [
+        "START_EGRESS",
+        "START_TRACK_EGRESS",
+    ]
+    track = recording_specs[-1]
+    assert track.resource_generation == 1
+    assert "customer" in track.resource_key
+
+
+def test_recording_capability_requires_customer_identity() -> None:
+    with pytest.raises(ValueError, match="participant_identity"):
+        _default_start_specs(
+            "call-a",
+            _lease(),
+            "runtime-a",
+            entry_type="web",
+            provider_namespace="livekit:isolated-test",
+            main_recording_enabled=True,
+        )
 
 
 def test_runtime_services_do_not_share_local_registry() -> None:

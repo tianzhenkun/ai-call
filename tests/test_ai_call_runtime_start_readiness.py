@@ -188,6 +188,41 @@ def test_auxiliary_egress_failure_does_not_block_required_start_readiness() -> N
     assert readiness.applied_effect_count == 2
 
 
+def test_auxiliary_customer_track_failure_does_not_block_start_readiness() -> None:
+    specs = [
+        _spec("CREATE_ROOM", "room-key"),
+        _spec("ATTACH_AGENT_PARTICIPANT", "agent-key"),
+        EffectSpec(
+            effect_type="START_TRACK_EGRESS",
+            idempotency_key="track-key",
+            provider_namespace="livekit:test",
+            provider_idempotency_key="egress:ctr:call-a:digest",
+            resource_key="egress:track:call-a:customer:digest",
+            resource_generation=1,
+        ),
+    ]
+
+    readiness = build_stub_start_readiness(
+        call_id="call-a",
+        fencing_token=7,
+        specs=specs,
+        effects=[
+            _effect("CREATE_ROOM", "room-key"),
+            _effect("ATTACH_AGENT_PARTICIPANT", "agent-key"),
+            _effect(
+                "START_TRACK_EGRESS",
+                "track-key",
+                generation=1,
+                status="FAILED",
+                provider_reference=None,
+            ),
+        ],
+    )
+
+    assert readiness is not None
+    assert readiness.applied_effect_count == 2
+
+
 @pytest.mark.anyio
 async def test_stub_readiness_persistence_rejects_preview_entry(
     monkeypatch: pytest.MonkeyPatch,

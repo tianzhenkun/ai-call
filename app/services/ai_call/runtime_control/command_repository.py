@@ -166,6 +166,7 @@ class CommandClaim:
     payload_json: str | None
     attempt_count: int
     entry_type: str = "web"
+    participant_identity: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,14 +780,20 @@ class RuntimeCommandRepository:
                 )
             ).one_or_none()
             if row is not None:
-                entry_type = await self._session.scalar(
-                    select(AiCallRecordModel.entry_type).where(
-                        AiCallRecordModel.tenant_id == lease.tenant_id,
-                        AiCallRecordModel.call_id == lease.call_id,
+                record_identity = (
+                    await self._session.execute(
+                        select(
+                            AiCallRecordModel.entry_type,
+                            AiCallRecordModel.participant_identity,
+                        ).where(
+                            AiCallRecordModel.tenant_id == lease.tenant_id,
+                            AiCallRecordModel.call_id == lease.call_id,
+                        )
                     )
-                )
-                if entry_type is None:
+                ).one_or_none()
+                if record_identity is None:
                     return None
+                entry_type, participant_identity = record_identity
                 return CommandClaim(
                     command_id=row.id,
                     tenant_id=row.tenant_id,
@@ -800,6 +807,7 @@ class RuntimeCommandRepository:
                     payload_json=row.payload_json,
                     attempt_count=row.attempt_count,
                     entry_type=str(entry_type),
+                    participant_identity=str(participant_identity or ""),
                 )
         return None
 
