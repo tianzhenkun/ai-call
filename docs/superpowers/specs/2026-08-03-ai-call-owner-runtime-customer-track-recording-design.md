@@ -3,7 +3,7 @@
 ## 1. 状态与目标
 
 - 日期：2026-08-03
-- 状态：对话方案已批准，待书面复核
+- 状态：已批准，待实施
 - 上位合同：`2026-07-31-ai-call-single-owner-runtime-command-design.md`
 - 前置设计：`2026-08-03-ai-call-owner-runtime-main-recording-design.md`
 - 前置实现：Owner Command、Effect/Recovery、真实 LiveKit Runtime Provider、混合主录音
@@ -64,7 +64,7 @@ Participant 分轨。PostgreSQL 继续是唯一事实源，浏览器事件、SIP
 | `CTR-05` | 同一租户、call、角色和 Participant identity 只允许一个逻辑客户分轨及一个稳定创建 Effect；Owner 接管不得按新 fencing 再登记一份。 |
 | `CTR-06` | `START_TRACK_EGRESS` 结果不确定时进入 reconcile-only，通过持久化 Egress 引用或稳定资源键查询；不得盲目再次调用 Start。 |
 | `CTR-07` | Effect submit 与 Track 投影共用一个事务；旧 Owner、过期 fencing、失效租约或错误 processing token 的提交必须整体影响 0 行。 |
-| `CTR-08` | 每个已登记客户 Start 必须生成一个 Stop；从未创建、创建不确定和正常录音三种情况都必须由 Stop 查询收口，不能从 END 图中省略。 |
+| `CTR-08` | 每个已登记客户 Start 必须生成一个 Stop；从未领取的 `PENDING` Start 在 END 图登记事务中先收口为 `FAILED(no_resource)`，创建不确定和正常录音仍由 Stop 查询收口，三种情况都不能从 END 图中省略。 |
 | `CTR-09` | `DELETE_ROOM` 只有在客户 `STOP_TRACK_EGRESS` 与其他全部非 Room 销毁 Effect 均 `APPLIED` 后才能执行。缺失 prerequisite 必须 fail closed。 |
 | `CTR-10` | 客户分轨是辅助能力，其启动失败不得把已满足 Room、Agent 和必要 SIP 的 `START_CALL` 判失败。 |
 | `CTR-11` | `STOP_TRACK_EGRESS APPLIED` 只证明 Provider 资源终态或不存在；Track `completed` 仍必须由独立 OSS 对象验证证明。 |
@@ -189,12 +189,14 @@ closed。
 
 ### 6.1 Effect 预登记
 
-真实 LiveKit Provider 在 `AI_CALL_RECORDING_ENABLED=true` 时同时声明 main recording 和
-customer track recording 能力。`_default_start_specs` 登记主录音以及一条客户分轨 Start；
-二者都是 auxiliary spec，不进入 Room、Agent 和必要 SIP 的强制 readiness 计数。
+真实 LiveKit Provider 在 `AI_CALL_RECORDING_ENABLED=true` 时使用现有单一 recording
+capability；Runtime 据此同时登记主录音和一条客户分轨 Start，不增加第二个分轨开关或可
+独立漂移的 capability。二者都是 auxiliary spec，不进入 Room、Agent 和必要 SIP 的强制
+readiness 计数。
 
-Provider Stub 的两项能力均为 false，因此 DB-only Dispatcher/Runtime/Recovery 测试不会
-登记录音 Effect、创建 Track，或初始化 LiveKit/OSS 客户端。
+Provider Stub 的单一录音 capability 固定为 false，因此 DB-only
+Dispatcher/Runtime/Recovery 测试不会登记录音 Effect、创建 Track，或初始化 LiveKit/OSS
+客户端。
 
 ### 6.2 数据库 claim gate
 
@@ -244,7 +246,10 @@ Provider 超时、引用缺失或查询不可证明时提交 `RECONCILE_REQUIRED
 1. `START_TRACK_EGRESS` 加入创建 Effect 类型，规范映射到
    `STOP_TRACK_EGRESS`；Stop 使用 execution phase 10。
 2. `register_end_graph()` 必须从全部已登记客户 Start 生成 Stop，无论 Start 当前是
-   `PENDING`、`APPLYING`、`RECONCILE_REQUIRED`、`APPLIED` 或 `FAILED`。
+   `PENDING`、`APPLYING`、`RECONCILE_REQUIRED`、`APPLIED` 或 `FAILED`。若 Start 仍为
+   从未领取、无 processing token 的 `PENDING`，END 图登记事务先将其写为
+   `FAILED(no_resource)`；这是“从未发生外部调用”的数据库证明，使 create quiet gate 可以
+   收口。已进入 `APPLYING` 或 reconcile 的 Start 禁止走该捷径。
 3. `DELETE_ROOM` 继续使用 execution phase 20，并以所有非 Room destroy Effect 为完整
    prerequisite；客户 Stop 缺失、未终态或依赖行缺失时均不可 claim。
 4. END 到达后：
