@@ -125,6 +125,32 @@ def test_dialogue_query_keeps_realtime_and_hides_nearby_offline_conflict() -> No
     ]
 
 
+def test_dialogue_query_keeps_later_offline_customer_after_unbounded_realtime_segment() -> None:
+    stale_realtime = _segment(
+        segment_no=1,
+        source="qwen_realtime",
+        text="转人工。",
+        started_ms=1000,
+        ended_ms=180000,
+    )
+    later_offline = _segment(
+        segment_no=2,
+        source="offline_asr",
+        text="好的，可以。",
+        started_ms=60000,
+        ended_ms=61000,
+    )
+
+    rows = AiCallDialogueService._canonical_segments(
+        [stale_realtime, later_offline]
+    )
+
+    assert [(row.source, row.segment_text) for row in rows] == [
+        ("qwen_realtime", "转人工。"),
+        ("offline_asr", "好的，可以。"),
+    ]
+
+
 def test_semantic_snapshot_marks_nearby_cross_source_conflict() -> None:
     offline = _segment(
         segment_no=1,

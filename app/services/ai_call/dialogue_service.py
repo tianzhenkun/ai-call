@@ -1462,7 +1462,10 @@ class AiCallDialogueService:
             candidate.source == QWEN_REALTIME_SOURCE
             and candidate.speaker_type == "customer"
             and (
-                AiCallDialogueService._time_ranges_overlap(row, candidate)
+                (
+                    candidate.audio_end_ms is not None
+                    and AiCallDialogueService._time_ranges_overlap(row, candidate)
+                )
                 or is_cross_source_customer_transcript_conflict(
                     source=row.source,
                     speaker_type=row.speaker_type,
