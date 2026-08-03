@@ -617,12 +617,32 @@ class AiCallService:
                     call_id=call_id,
                     record=record,
                 )
-            result = await self.orchestrator.report_browser_event(
-                call_id=call_id,
-                event_type=event_type,
-                timestamp=timestamp,
-                payload=payload,
-            )
+            if owner_mode and event_type == "browser_ready":
+                reported_at = timestamp or datetime.now(timezone.utc)
+                event_payload = dict(payload or {})
+                event_payload["reportedAt"] = reported_at.isoformat()
+                event = self.orchestrator.event_store.append(
+                    call_id=call_id,
+                    type=event_type,
+                    source="browser",
+                    payload=event_payload,
+                    timestamp=reported_at,
+                )
+                result = BrowserEventReportResult(
+                    event_id=event.event_id,
+                    call_id=event.call_id,
+                    type=event.type,
+                    timestamp=event.timestamp,
+                    source=event.source,
+                    payload=event.payload,
+                )
+            else:
+                result = await self.orchestrator.report_browser_event(
+                    call_id=call_id,
+                    event_type=event_type,
+                    timestamp=timestamp,
+                    payload=payload,
+                )
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
         if self.record_service is not None:

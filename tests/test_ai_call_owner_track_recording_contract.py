@@ -16,6 +16,7 @@ from app.api.v1.ai_call.model import AiCallRecordingTrackModel
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
+from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.offline_asr_service import AiCallOfflineAsrService
 from app.services.ai_call.recording_service import AiCallRecordingService
 from app.services.ai_call.session_registry import CallSessionStatus
@@ -146,6 +147,46 @@ async def test_browser_event_rejects_missing_tenant_before_side_effects() -> Non
 
     record_service.get_record_for_tenant.assert_not_awaited()
     orchestrator.report_browser_event.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_owner_browser_ready_does_not_route_through_legacy_orchestrator() -> None:
+    orchestrator = SimpleNamespace(
+        event_store=InMemoryEventStore(),
+        report_browser_event=AsyncMock(),
+    )
+    record_service = SimpleNamespace(
+        repository=None,
+        get_record_for_tenant=AsyncMock(
+            return_value=SimpleNamespace(
+                tenant_id="tenant-a",
+                call_id="owner-call",
+                runtime_control_mode="owner_command_v1",
+            )
+        ),
+        mark_owner_customer_ready=AsyncMock(return_value=True),
+    )
+    service = AiCallService(orchestrator, record_service=record_service)
+
+    result = await service.report_browser_event(
+        call_id="owner-call",
+        event_type="browser_ready",
+        timestamp=NOW,
+        payload={"source": "browser"},
+        tenant_id="tenant-a",
+    )
+
+    assert result.call_id == "owner-call"
+    assert result.type == "browser_ready"
+    assert result.source == "browser"
+    assert result.timestamp == NOW
+    assert result.payload["source"] == "browser"
+    assert result.payload["reportedAt"] == NOW.isoformat()
+    orchestrator.report_browser_event.assert_not_awaited()
+    record_service.mark_owner_customer_ready.assert_awaited_once_with(
+        tenant_id="tenant-a",
+        call_id="owner-call",
+    )
 
 
 @pytest.mark.anyio
