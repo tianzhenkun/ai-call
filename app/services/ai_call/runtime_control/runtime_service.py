@@ -51,6 +51,8 @@ from app.services.ai_call.runtime_control.types import CommandStatus
 
 
 class RuntimeProvider(Protocol):
+    main_recording_enabled: bool
+
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
@@ -99,6 +101,10 @@ class _FailClosedProvider:
         self._delegate = delegate
         self._watchdog = watchdog
         self._fail_closed = fail_closed
+
+    @property
+    def main_recording_enabled(self) -> bool:
+        return bool(getattr(self._delegate, "main_recording_enabled", False))
 
     async def apply(self, effect: object) -> ProviderObservation:
         remaining = self._watchdog.seconds_until_hard_deadline()
@@ -525,6 +531,9 @@ class RuntimeControlService:
                 self.worker_id,
                 entry_type=command_claim.entry_type,
                 provider_namespace=getattr(provider, "provider_namespace", None),
+                main_recording_enabled=bool(
+                    getattr(provider, "main_recording_enabled", False)
+                ),
             )
             try:
                 await StartCallHandler(session_factory, guarded_provider).handle(
@@ -760,6 +769,7 @@ def _default_start_specs(
     *,
     entry_type: str,
     provider_namespace: str | None = None,
+    main_recording_enabled: bool = False,
 ) -> list[EffectSpec]:
     if entry_type not in {"web", "direct_sip", "outbound"}:
         raise ValueError(f"unsupported owner command entry: {entry_type}")
@@ -796,6 +806,17 @@ def _default_start_specs(
                 ),
                 resource_key=f"sip:{call_id}:g{lease.fencing_token}",
                 resource_generation=lease.fencing_token,
+            )
+        )
+    if main_recording_enabled:
+        specs.append(
+            EffectSpec(
+                effect_type="START_EGRESS",
+                idempotency_key=f"start:{call_id}:start-main-egress",
+                provider_namespace=namespace,
+                provider_idempotency_key=f"egress:main:{call_id}",
+                resource_key=f"egress:main:{call_id}",
+                resource_generation=1,
             )
         )
     return specs

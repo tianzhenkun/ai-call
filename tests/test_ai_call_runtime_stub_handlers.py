@@ -323,6 +323,21 @@ async def test_outbound_start_specs_use_only_db_stub_resource_facts() -> None:
     assert "13800138001" not in repr(stub.calls)
 
 
+def test_db_only_stubs_never_enable_main_recording_effect() -> None:
+    assert DeterministicWebProviderStub().main_recording_enabled is False
+    assert DeterministicDbOnlyProviderStub().main_recording_enabled is False
+    assert ScriptedProviderStub({}).main_recording_enabled is False
+    assert "START_EGRESS" not in {
+        spec.effect_type
+        for spec in _default_start_specs(
+            "call-a",
+            _owner_lease(),
+            "runtime-a",
+            entry_type="outbound",
+        )
+    }
+
+
 @pytest.mark.anyio
 async def test_start_handler_commits_before_stub_and_completes_after_effects() -> None:
     factory = _FakeSessionFactory()

@@ -12,7 +12,10 @@ from app.services.ai_call.runtime_control.command_repository import (
     EndCallIntent,
     RuntimeCommandRepository,
 )
-from app.services.ai_call.runtime_control.effect_repository import CREATE_EFFECT_TYPES
+from app.services.ai_call.runtime_control.effect_repository import (
+    AUXILIARY_START_EFFECT_TYPES,
+    CREATE_EFFECT_TYPES,
+)
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
@@ -31,9 +34,19 @@ class StartupReconcileDecision(StrEnum):
 
 
 def decide_startup_reconcile(
-    effects: Iterable[tuple[str, str | None]],
+    effects: Iterable[
+        tuple[str, str | None] | tuple[str, str, str | None]
+    ],
 ) -> StartupReconcileDecision:
-    observations = tuple(effects)
+    observations: list[tuple[str, str | None]] = []
+    for observation in effects:
+        if len(observation) == 3:
+            effect_type, status, error = observation
+            if effect_type in AUXILIARY_START_EFFECT_TYPES:
+                continue
+            observations.append((status, error))
+        else:
+            observations.append(observation)
     if any(status == EffectStatus.APPLIED for status, _error in observations):
         return StartupReconcileDecision.RESOURCE_PRESENT
     if observations and all(
@@ -150,7 +163,8 @@ class StartupReconcileService:
             ).all()
         )
         decision = decide_startup_reconcile(
-            (effect.status, effect.error_message) for effect in effects
+            (effect.effect_type, effect.status, effect.error_message)
+            for effect in effects
         )
         reservation_present = bool(
             await session.scalar(

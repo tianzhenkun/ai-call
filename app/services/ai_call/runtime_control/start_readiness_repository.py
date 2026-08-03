@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.services.ai_call.runtime_control.command_repository import CommandClaim
 from app.services.ai_call.runtime_control.effect_repository import (
+    AUXILIARY_START_EFFECT_TYPES,
     CREATE_EFFECT_TYPES,
     EffectSpec,
 )
@@ -40,13 +41,16 @@ def build_stub_start_readiness(
     specs: Sequence[EffectSpec],
     effects: Sequence[object],
 ) -> StubStartReadiness | None:
-    if not specs:
+    required_specs = [
+        spec for spec in specs if spec.effect_type not in AUXILIARY_START_EFFECT_TYPES
+    ]
+    if not required_specs:
         return None
     effects_by_key = {
         str(getattr(effect, "idempotency_key", "")): effect for effect in effects
     }
     matched: dict[str, object] = {}
-    for spec in specs:
+    for spec in required_specs:
         effect = effects_by_key.get(spec.idempotency_key)
         if (
             effect is None
@@ -69,7 +73,7 @@ def build_stub_start_readiness(
     if not agent_reference:
         return None
     return StubStartReadiness(
-        applied_effect_count=len(specs),
+        applied_effect_count=len(required_specs),
         agent_participant_identity=f"agent-{call_id}-g{fencing_token}",
         agent_participant_sid=agent_reference,
         agent_audio_track_sid=f"stub-track-{call_id}-g{fencing_token}",
@@ -90,7 +94,11 @@ class RuntimeStartReadinessRepository:
             raise StartReadinessRejected("readiness inspection requires START_CALL")
         if not specs:
             return None
-        idempotency_keys = {spec.idempotency_key for spec in specs}
+        idempotency_keys = {
+            spec.idempotency_key
+            for spec in specs
+            if spec.effect_type not in AUXILIARY_START_EFFECT_TYPES
+        }
         effects = list(
             (
                 await self._session.scalars(

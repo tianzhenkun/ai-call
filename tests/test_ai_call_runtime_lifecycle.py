@@ -73,6 +73,35 @@ def test_start_specs_use_real_provider_namespace_when_configured() -> None:
     }
 
 
+def test_main_egress_spec_is_stable_across_owner_fencing() -> None:
+    first = _default_start_specs(
+        "call-a",
+        _lease(fencing_token=7),
+        "runtime-a",
+        entry_type="web",
+        provider_namespace="livekit:isolated-test",
+        main_recording_enabled=True,
+    )
+    takeover = _default_start_specs(
+        "call-a",
+        _lease(fencing_token=8),
+        "runtime-b",
+        entry_type="web",
+        provider_namespace="livekit:isolated-test",
+        main_recording_enabled=True,
+    )
+
+    first_egress = next(spec for spec in first if spec.effect_type == "START_EGRESS")
+    takeover_egress = next(
+        spec for spec in takeover if spec.effect_type == "START_EGRESS"
+    )
+    assert first_egress == takeover_egress
+    assert first_egress.idempotency_key == "start:call-a:start-main-egress"
+    assert first_egress.provider_idempotency_key == "egress:main:call-a"
+    assert first_egress.resource_key == "egress:main:call-a"
+    assert first_egress.resource_generation == 1
+
+
 def test_runtime_services_do_not_share_local_registry() -> None:
     runtime_a = RuntimeControlService(
         worker_id="pod-a:12345678-1234-5678-1234-567812345678",

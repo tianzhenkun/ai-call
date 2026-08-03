@@ -37,6 +37,7 @@ CREATE_EFFECT_TYPES = frozenset(
         "START_EGRESS",
     }
 )
+AUXILIARY_START_EFFECT_TYPES = frozenset({"START_EGRESS"})
 DESTROY_EFFECT_TYPES = frozenset(
     {
         "HANGUP_SIP",

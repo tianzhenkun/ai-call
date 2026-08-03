@@ -45,6 +45,8 @@ _OBSERVATION_MAPPING = {
 class DeterministicWebProviderStub:
     """Deterministic DB-only Web provider; never performs network or SDK calls."""
 
+    main_recording_enabled = False
+
     _CREATE_EFFECT_TYPES = frozenset(
         {
             "CREATE_ROOM",
@@ -125,6 +127,8 @@ class DeterministicDbOnlyProviderStub(DeterministicWebProviderStub):
 
 class ScriptedProviderStub:
     """In-memory Provider fact source; never performs network or SDK calls."""
+
+    main_recording_enabled = False
 
     def __init__(
         self,

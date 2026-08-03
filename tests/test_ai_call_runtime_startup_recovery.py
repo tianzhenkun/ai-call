@@ -36,6 +36,19 @@ def test_startup_reconcile_decision_is_resource_present_if_any_create_applied() 
     )
 
 
+def test_startup_reconcile_ignores_auxiliary_egress_fact() -> None:
+    assert (
+        decide_startup_reconcile(
+            (
+                ("CREATE_ROOM", EffectStatus.FAILED, "no_resource"),
+                ("ATTACH_AGENT_PARTICIPANT", EffectStatus.FAILED, "no_resource"),
+                ("START_EGRESS", EffectStatus.APPLIED, None),
+            )
+        )
+        == StartupReconcileDecision.NO_RESOURCE
+    )
+
+
 @pytest.mark.parametrize(
     "effects",
     [

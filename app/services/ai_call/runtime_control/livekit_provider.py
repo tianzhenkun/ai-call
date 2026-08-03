@@ -411,6 +411,7 @@ class LiveKitRuntimeProvider:
         dialogue_bridge: OwnerRuntimeDialogueBridge | None = None,
         provider_namespace: str = "livekit:unconfigured",
         allowed_callee_phone_number: str | None = None,
+        main_recording_enabled: bool = False,
     ) -> None:
         self._resolver = resolver
         self._room_manager = room_manager
@@ -419,6 +420,7 @@ class LiveKitRuntimeProvider:
         self._egress_manager = egress_manager
         self._dialogue_bridge = dialogue_bridge
         self.provider_namespace = provider_namespace
+        self.main_recording_enabled = main_recording_enabled
         self._allowed_callee_phone_number = (
             str(allowed_callee_phone_number).strip()
             if allowed_callee_phone_number is not None
@@ -714,4 +716,5 @@ def build_livekit_runtime_provider(
         allowed_callee_phone_number=(
             settings.AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE
         ),
+        main_recording_enabled=bool(settings.AI_CALL_RECORDING_ENABLED),
     )
