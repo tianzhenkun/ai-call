@@ -42,6 +42,17 @@ class LiveKitEgressStopResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class LiveKitEgressObservation:
+    egress_id: str
+    status: str
+    object_name: str | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    file_size: int | None = None
+
+
 class LiveKitEgressManager:
     """LiveKit Egress Twirp 控制器。"""
 
@@ -152,7 +163,7 @@ class LiveKitEgressManager:
             error=str(data.get("error") or "") or None,
         )
 
-    async def get_egress_status(self, egress_id: str) -> str | None:
+    async def get_egress(self, egress_id: str) -> LiveKitEgressObservation | None:
         try:
             data = await self._post_egress(
                 "ListEgress",
@@ -167,8 +178,38 @@ class LiveKitEgressManager:
             if not isinstance(item, dict):
                 continue
             if str(item.get("egress_id") or "") == egress_id:
-                return str(item.get("status") or "")
+                return self._egress_observation(item)
         return None
+
+    async def find_room_audio_recording(
+        self,
+        room_name: str,
+        object_name: str,
+    ) -> LiveKitEgressObservation | None:
+        try:
+            data = await self._post_egress(
+                "ListEgress",
+                {"room_name": room_name},
+            )
+        except LiveKitEgressNotFoundError:
+            return None
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("ListEgress response is missing items")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_room = str(item.get("room_name") or "")
+            if item_room and item_room != room_name:
+                continue
+            observation = self._egress_observation(item)
+            if observation.object_name == object_name:
+                return observation
+        return None
+
+    async def get_egress_status(self, egress_id: str) -> str | None:
+        observation = await self.get_egress(egress_id)
+        return observation.status if observation is not None else None
 
     def build_object_name(self, call_id: str) -> str:
         suffix = self.file_type.lower()
@@ -370,6 +411,23 @@ class LiveKitEgressManager:
             first = file_results[0]
             return first if isinstance(first, dict) else {}
         return {}
+
+    @classmethod
+    def _egress_observation(cls, data: dict) -> LiveKitEgressObservation:
+        file_result = cls._first_file_result(data)
+        return LiveKitEgressObservation(
+            egress_id=str(data.get("egress_id") or ""),
+            status=str(data.get("status") or ""),
+            object_name=cls._file_object_name(file_result),
+            started_at=cls._nanos_to_datetime(data.get("started_at")),
+            ended_at=cls._nanos_to_datetime(data.get("ended_at")),
+            duration_ms=(
+                cls._nanos_to_millis(file_result.get("duration"))
+                if file_result
+                else None
+            ),
+            file_size=cls._safe_int(file_result.get("size")) if file_result else None,
+        )
 
     @staticmethod
     def _file_object_name(file_result: dict) -> str | None:

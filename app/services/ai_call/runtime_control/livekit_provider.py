@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -101,9 +102,10 @@ class DatabaseRuntimeProviderResourceResolver:
                 getattr(command, "payload_json", None) if command is not None else None
             )
             resource_generation = int(current_effect.resource_generation)
-            egress_id = (
-                str(getattr(source_effect, "provider_reference", "") or "") or None
-            )
+            egress_id = str(
+                getattr(source_effect or current_effect, "provider_reference", "")
+                or ""
+            ) or None
             return RuntimeProviderResource(
                 call_id=str(record.call_id),
                 room_name=str(record.room_name),
@@ -173,7 +175,15 @@ class RuntimeSipClient(Protocol):
 
 
 class RuntimeEgressManager(Protocol):
+    def build_object_name(self, call_id: str) -> str: ...
+
+    async def start_room_audio_recording(self, **kwargs): ...
+
     async def stop_egress(self, egress_id: str): ...
+
+    async def get_egress(self, egress_id: str): ...
+
+    async def find_room_audio_recording(self, room_name: str, object_name: str): ...
 
     async def get_egress_status(self, egress_id: str) -> str | None: ...
 
@@ -412,6 +422,7 @@ class LiveKitRuntimeProvider:
         provider_namespace: str = "livekit:unconfigured",
         allowed_callee_phone_number: str | None = None,
         main_recording_enabled: bool = False,
+        oss_config_provider: Callable[[], dict | None] | None = None,
     ) -> None:
         self._resolver = resolver
         self._room_manager = room_manager
@@ -421,6 +432,7 @@ class LiveKitRuntimeProvider:
         self._dialogue_bridge = dialogue_bridge
         self.provider_namespace = provider_namespace
         self.main_recording_enabled = main_recording_enabled
+        self._oss_config_provider = oss_config_provider or (lambda: None)
         self._allowed_callee_phone_number = (
             str(allowed_callee_phone_number).strip()
             if allowed_callee_phone_number is not None
@@ -450,6 +462,10 @@ class LiveKitRuntimeProvider:
     async def apply(self, effect: EffectClaim) -> ProviderObservation:
         try:
             resource = await self._resolver.resolve(effect)
+            if effect.effect_type == "START_EGRESS":
+                return await self._apply_start_egress(effect, resource)
+            if effect.effect_type == "STOP_EGRESS":
+                return await self._apply_stop_egress(effect, resource)
             if not effect.reconcile_only:
                 provider_reference = await self._mutate(effect, resource)
             else:
@@ -484,6 +500,7 @@ class LiveKitRuntimeProvider:
         except ProviderPreconditionError as exc:
             return ProviderObservation(
                 kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                failure_code=str(exc),
                 error_message=str(exc),
             )
 
@@ -553,6 +570,157 @@ class LiveKitRuntimeProvider:
             await self._room_manager.delete_room(resource.room_name)
             return None
         raise LookupError(f"unsupported LiveKit effect type {effect.effect_type}")
+
+    async def _apply_start_egress(
+        self,
+        effect: EffectClaim,
+        resource: RuntimeProviderResource,
+    ) -> ProviderObservation:
+        object_name = self._egress_manager.build_object_name(resource.call_id)
+        if effect.reconcile_only:
+            fact = (
+                await self._egress_manager.get_egress(resource.egress_id)
+                if resource.egress_id
+                else await self._egress_manager.find_room_audio_recording(
+                    resource.room_name,
+                    object_name,
+                )
+            )
+            if fact is None:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_ABSENT,
+                    object_name=object_name,
+                )
+            return self._egress_fact_observation(
+                fact,
+                kind=ProviderObservationKind.RESOURCE_PRESENT,
+            )
+
+        oss_config = self._oss_config_provider()
+        if not oss_config:
+            return ProviderObservation(
+                kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                object_name=object_name,
+                failure_code="oss_config_missing",
+                error_message="oss_config_missing",
+            )
+        try:
+            result = await self._egress_manager.start_room_audio_recording(
+                room_name=resource.room_name,
+                call_id=resource.call_id,
+                oss_config=oss_config,
+            )
+        except TimeoutError:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=object_name,
+                failure_code="egress_start_timeout",
+                error_message="egress_start_timeout",
+            )
+        egress_id = str(getattr(result, "egress_id", "") or "")
+        if not egress_id:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=object_name,
+                failure_code="provider_reference_missing",
+                error_message="provider_reference_missing",
+            )
+        fact = await self._egress_manager.get_egress(egress_id)
+        if fact is None:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                provider_reference=egress_id,
+                provider_status=str(getattr(result, "status", "") or "") or None,
+                object_name=str(getattr(result, "object_name", "") or object_name),
+                started_at=getattr(result, "started_at", None),
+                failure_code="egress_start_unconfirmed",
+                error_message="egress_start_unconfirmed",
+            )
+        return self._egress_fact_observation(
+            fact,
+            kind=ProviderObservationKind.RESOURCE_PRESENT,
+        )
+
+    async def _apply_stop_egress(
+        self,
+        effect: EffectClaim,
+        resource: RuntimeProviderResource,
+    ) -> ProviderObservation:
+        object_name = self._egress_manager.build_object_name(resource.call_id)
+        egress_id = resource.egress_id
+        if not egress_id:
+            fact = await self._egress_manager.find_room_audio_recording(
+                resource.room_name,
+                object_name,
+            )
+            if fact is None:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.RESOURCE_ABSENT,
+                    object_name=object_name,
+                )
+            egress_id = str(getattr(fact, "egress_id", "") or "") or None
+        if not egress_id:
+            return ProviderObservation(
+                kind=ProviderObservationKind.UNCERTAIN,
+                object_name=object_name,
+                failure_code="provider_reference_missing",
+                error_message="provider_reference_missing",
+            )
+        stop_fact = None
+        if not effect.reconcile_only:
+            try:
+                stop_fact = await self._egress_manager.stop_egress(egress_id)
+            except TimeoutError:
+                return ProviderObservation(
+                    kind=ProviderObservationKind.UNCERTAIN,
+                    provider_reference=egress_id,
+                    object_name=object_name,
+                    failure_code="egress_stop_timeout",
+                    error_message="egress_stop_timeout",
+                )
+        fact = await self._egress_manager.get_egress(egress_id)
+        if fact is None:
+            stop_status = str(getattr(stop_fact, "status", "") or "").upper()
+            if stop_fact is not None:
+                return self._egress_fact_observation(
+                    stop_fact,
+                    kind=(
+                        ProviderObservationKind.TERMINAL_CONFIRMED
+                        if stop_status in _TERMINAL_EGRESS_STATUSES
+                        else ProviderObservationKind.ACCEPTED
+                    ),
+                )
+            return ProviderObservation(
+                kind=ProviderObservationKind.TERMINAL_CONFIRMED,
+                provider_reference=egress_id,
+                object_name=object_name,
+            )
+        status = str(getattr(fact, "status", "") or "").upper()
+        return self._egress_fact_observation(
+            fact,
+            kind=(
+                ProviderObservationKind.TERMINAL_CONFIRMED
+                if status in _TERMINAL_EGRESS_STATUSES
+                else ProviderObservationKind.ACCEPTED
+            ),
+        )
+
+    @staticmethod
+    def _egress_fact_observation(
+        fact: object,
+        *,
+        kind: ProviderObservationKind,
+    ) -> ProviderObservation:
+        return ProviderObservation(
+            kind=kind,
+            provider_reference=str(getattr(fact, "egress_id", "") or "") or None,
+            provider_status=str(getattr(fact, "status", "") or "") or None,
+            object_name=str(getattr(fact, "object_name", "") or "") or None,
+            started_at=getattr(fact, "started_at", None),
+            ended_at=getattr(fact, "ended_at", None),
+            duration_ms=getattr(fact, "duration_ms", None),
+            file_size=getattr(fact, "file_size", None),
+        )
 
     async def _observe(
         self,
@@ -669,6 +837,7 @@ def build_livekit_runtime_provider(
     session_factory: Any,
     registry: Any,
 ) -> LiveKitRuntimeProvider:
+    from app.api.v1.system.oss.service import OssService
     from app.services.ai_call.livekit_egress import LiveKitEgressManager
     from app.services.ai_call.livekit_room import LiveKitRoomManager
     from app.services.ai_call.livekit_sip import LiveKitSipClient, SipOutboundConfig
@@ -717,4 +886,5 @@ def build_livekit_runtime_provider(
             settings.AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE
         ),
         main_recording_enabled=bool(settings.AI_CALL_RECORDING_ENABLED),
+        oss_config_provider=OssService.active_config,
     )

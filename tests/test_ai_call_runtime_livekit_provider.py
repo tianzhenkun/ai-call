@@ -135,6 +135,63 @@ class FakeEgressManager:
         self.calls.append(f"query:{egress_id}")
         return self.status
 
+    async def get_egress(self, egress_id: str):
+        self.calls.append(f"query:{egress_id}")
+        return SimpleNamespace(
+            egress_id=egress_id,
+            status=self.status,
+            object_name=None,
+            started_at=None,
+            ended_at=None,
+            duration_ms=None,
+            file_size=None,
+        )
+
+    def build_object_name(self, call_id: str) -> str:
+        return f"ai-call/recordings/{call_id}.ogg"
+
+    async def find_room_audio_recording(self, room_name: str, object_name: str):
+        _ = (room_name, object_name)
+        return None
+
+
+class RecordingEgressManager:
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, object]] = []
+        self.stop_calls: list[str] = []
+        self.query_calls: list[str] = []
+        self.find_calls: list[tuple[str, str]] = []
+        self.start_error: Exception | None = None
+        self.query_observation = None
+        self.find_observation = None
+        self.stop_result = SimpleNamespace(egress_id="EG_main", status="EGRESS_ACTIVE")
+
+    def build_object_name(self, call_id: str) -> str:
+        return f"ai-call/recordings/{call_id}.ogg"
+
+    async def start_room_audio_recording(self, **kwargs):
+        self.start_calls.append(kwargs)
+        if self.start_error is not None:
+            raise self.start_error
+        return SimpleNamespace(
+            egress_id="EG_main",
+            object_name=self.build_object_name(str(kwargs["call_id"])),
+            status="EGRESS_ACTIVE",
+            started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        )
+
+    async def stop_egress(self, egress_id: str):
+        self.stop_calls.append(egress_id)
+        return self.stop_result
+
+    async def get_egress(self, egress_id: str):
+        self.query_calls.append(egress_id)
+        return self.query_observation
+
+    async def find_room_audio_recording(self, room_name: str, object_name: str):
+        self.find_calls.append((room_name, object_name))
+        return self.find_observation
+
 
 def _provider(
     *,
@@ -303,7 +360,7 @@ async def test_livekit_provider_reconcile_only_reports_missing_create_resource()
 
 
 @pytest.mark.anyio
-async def test_livekit_provider_missing_egress_reference_is_uncertain() -> None:
+async def test_livekit_provider_missing_egress_reference_queries_stable_key() -> None:
     class MissingEgressResolver(FakeResolver):
         async def resolve(self, effect):
             resource = await super().resolve(effect)
@@ -323,8 +380,7 @@ async def test_livekit_provider_missing_egress_reference_is_uncertain() -> None:
 
     observation = await provider.apply(_effect("STOP_EGRESS"))
 
-    assert observation.kind == ProviderObservationKind.UNCERTAIN
-    assert observation.error_message == "provider_reference_missing"
+    assert observation.kind == ProviderObservationKind.RESOURCE_ABSENT
 
 
 @pytest.mark.anyio
@@ -340,6 +396,213 @@ async def test_livekit_provider_maps_egress_404_to_terminal_confirmation() -> No
     ).apply(_effect("STOP_EGRESS"))
 
     assert observation.kind == ProviderObservationKind.TERMINAL_CONFIRMED
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_starts_main_egress_with_active_oss_config() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    manager = RecordingEgressManager()
+    manager.query_observation = SimpleNamespace(
+        egress_id="EG_main",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/call-1.ogg",
+        started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+    provider = LiveKitRuntimeProvider(
+        resolver=FakeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+        main_recording_enabled=True,
+        oss_config_provider=lambda: {"bucket_name": "recordings"},
+    )
+
+    observation = await provider.apply(_effect("START_EGRESS"))
+
+    assert observation.kind is ProviderObservationKind.RESOURCE_PRESENT
+    assert observation.provider_reference == "EG_main"
+    assert observation.object_name == "ai-call/recordings/call-1.ogg"
+    assert observation.provider_status == "EGRESS_ACTIVE"
+    assert manager.start_calls == [
+        {
+            "room_name": "ai-call-call-1",
+            "call_id": "call-1",
+            "oss_config": {"bucket_name": "recordings"},
+        }
+    ]
+    assert manager.query_calls == ["EG_main"]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_does_not_start_egress_without_oss_config() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    manager = RecordingEgressManager()
+    provider = LiveKitRuntimeProvider(
+        resolver=FakeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+        main_recording_enabled=True,
+        oss_config_provider=lambda: None,
+    )
+
+    observation = await provider.apply(_effect("START_EGRESS"))
+
+    assert observation.kind is ProviderObservationKind.PERMANENT_NO_RESOURCE
+    assert observation.failure_code == "oss_config_missing"
+    assert manager.start_calls == []
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_start_timeout_recovery_never_restarts_egress() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    manager = RecordingEgressManager()
+    manager.start_error = TimeoutError("response lost")
+    provider = LiveKitRuntimeProvider(
+        resolver=FakeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+        main_recording_enabled=True,
+        oss_config_provider=lambda: {"bucket_name": "recordings"},
+    )
+
+    first = await provider.apply(_effect("START_EGRESS"))
+    second = await provider.apply(_effect("START_EGRESS", reconcile_only=True))
+    third = await provider.apply(_effect("START_EGRESS", reconcile_only=True))
+
+    assert first.kind is ProviderObservationKind.UNCERTAIN
+    assert first.failure_code == "egress_start_timeout"
+    assert first.error_message == "egress_start_timeout"
+    assert second.kind is ProviderObservationKind.RESOURCE_ABSENT
+    assert third.kind is ProviderObservationKind.RESOURCE_ABSENT
+    assert len(manager.start_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_recovers_lost_start_response_by_stable_object() -> None:
+    class MissingEgressResolver(FakeResolver):
+        async def resolve(self, effect):
+            return replace(await super().resolve(effect), egress_id=None)
+
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    manager = RecordingEgressManager()
+    manager.start_error = TimeoutError("response lost")
+    manager.find_observation = SimpleNamespace(
+        egress_id="EG_late",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/call-1.ogg",
+        started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+    provider = LiveKitRuntimeProvider(
+        resolver=MissingEgressResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=FakeSipClient(),
+        egress_manager=manager,
+        main_recording_enabled=True,
+        oss_config_provider=lambda: {"bucket_name": "recordings"},
+    )
+
+    assert (
+        await provider.apply(_effect("START_EGRESS"))
+    ).kind is ProviderObservationKind.UNCERTAIN
+    recovered = await provider.apply(_effect("START_EGRESS", reconcile_only=True))
+
+    assert recovered.kind is ProviderObservationKind.RESOURCE_PRESENT
+    assert recovered.provider_reference == "EG_late"
+    assert len(manager.start_calls) == 1
+    assert manager.find_calls == [
+        ("ai-call-call-1", "ai-call/recordings/call-1.ogg")
+    ]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_stop_accepted_stays_non_terminal() -> None:
+    manager = RecordingEgressManager()
+    manager.stop_result = SimpleNamespace(egress_id="EG_1", status="EGRESS_ACTIVE")
+    manager.query_observation = SimpleNamespace(
+        egress_id="EG_1",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/call-1.ogg",
+        started_at=None,
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+
+    observation = await _provider(egress_manager=manager).apply(
+        _effect("STOP_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.ACCEPTED
+    assert manager.stop_calls == ["EG_1"]
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_stop_response_active_stays_non_terminal_when_query_empty() -> None:
+    manager = RecordingEgressManager()
+    manager.stop_result = SimpleNamespace(
+        egress_id="EG_1",
+        status="EGRESS_ACTIVE",
+        object_name="ai-call/recordings/call-1.ogg",
+        started_at=None,
+        ended_at=None,
+        duration_ms=None,
+        file_size=None,
+    )
+
+    observation = await _provider(egress_manager=manager).apply(
+        _effect("STOP_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.ACCEPTED
+    assert observation.provider_status == "EGRESS_ACTIVE"
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_stop_terminal_returns_recording_metadata() -> None:
+    manager = RecordingEgressManager()
+    manager.stop_result = SimpleNamespace(egress_id="EG_1", status="EGRESS_COMPLETE")
+    manager.query_observation = SimpleNamespace(
+        egress_id="EG_1",
+        status="EGRESS_COMPLETE",
+        object_name="ai-call/recordings/call-1.ogg",
+        started_at=datetime(2026, 8, 3, 9, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 8, 3, 9, 1, tzinfo=timezone.utc),
+        duration_ms=60_000,
+        file_size=1024,
+    )
+
+    observation = await _provider(egress_manager=manager).apply(
+        _effect("STOP_EGRESS")
+    )
+
+    assert observation.kind is ProviderObservationKind.TERMINAL_CONFIRMED
+    assert observation.object_name == "ai-call/recordings/call-1.ogg"
+    assert observation.duration_ms == 60_000
+    assert observation.file_size == 1024
 
 
 @pytest.mark.anyio

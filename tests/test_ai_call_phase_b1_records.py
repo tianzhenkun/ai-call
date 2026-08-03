@@ -976,6 +976,75 @@ async def test_livekit_egress_uses_track_egress_for_participant_audio() -> None:
     assert "file_type" not in manager.calls[1][1]["file"]
 
 
+@pytest.mark.anyio
+async def test_livekit_egress_queries_exact_stable_recording_object() -> None:
+    class QueryingEgressManager(LiveKitEgressManager):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.calls: list[tuple[str, dict]] = []
+
+        async def _post_egress(
+            self,
+            method: str,
+            payload: dict,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict:
+            _ = timeout_seconds
+            self.calls.append((method, payload))
+            return {
+                "items": [
+                    {
+                        "egress_id": "EG_wrong",
+                        "room_name": "room_format",
+                        "status": "EGRESS_COMPLETE",
+                        "file_results": [
+                            {"filename": "ai-call/recordings/other.ogg"}
+                        ],
+                    },
+                    {
+                        "egress_id": "EG_target",
+                        "room_name": "room_format",
+                        "status": "EGRESS_COMPLETE",
+                        "started_at": 1_000_000_000,
+                        "ended_at": 61_000_000_000,
+                        "file_results": [
+                            {
+                                "filename": "ai-call/recordings/call_format.ogg",
+                                "duration": 60_000_000_000,
+                                "size": 1024,
+                            }
+                        ],
+                    },
+                ]
+            }
+
+    manager = QueryingEgressManager(
+        livekit_url="ws://livekit.test",
+        api_key="key",
+        api_secret="secret",
+        timeout_seconds=1,
+        object_prefix="ai-call/recordings",
+        file_type="OGG",
+    )
+
+    by_id = await manager.get_egress("EG_target")
+    by_object = await manager.find_room_audio_recording(
+        "room_format",
+        "ai-call/recordings/call_format.ogg",
+    )
+
+    assert by_id == by_object
+    assert by_object is not None
+    assert by_object.egress_id == "EG_target"
+    assert by_object.duration_ms == 60_000
+    assert by_object.file_size == 1024
+    assert manager.calls == [
+        ("ListEgress", {"egress_id": "EG_target"}),
+        ("ListEgress", {"room_name": "room_format"}),
+    ]
+
+
 def test_livekit_egress_selects_first_audio_track_when_source_is_numeric() -> None:
     assert LiveKitEgressManager._select_audio_track([
         {"sid": "TR_video", "type": 1, "source": 1},
