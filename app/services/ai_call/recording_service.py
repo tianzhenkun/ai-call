@@ -731,6 +731,9 @@ class AiCallRecordingService:
                 now=now,
                 limit=remaining_limit,
                 claim_ttl=self._VERIFY_CLAIM_TTL,
+                terminal_recovery_deadline=timedelta(
+                    seconds=self.verify_deadline_seconds,
+                ),
             )
             if remaining_limit > 0
             else []

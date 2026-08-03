@@ -829,19 +829,36 @@ class AiCallRecordRepository:
         now: datetime,
         limit: int,
         claim_ttl: timedelta,
+        terminal_recovery_deadline: timedelta | None = None,
     ) -> list[RecordingTrackVerificationClaim]:
         claim_token = now + claim_ttl
+        due = and_(
+            AiCallRecordingTrackModel.status == "verifying",
+            or_(
+                AiCallRecordingTrackModel.next_verify_at.is_(None),
+                AiCallRecordingTrackModel.next_verify_at <= now,
+            ),
+        )
+        if terminal_recovery_deadline is not None:
+            due = or_(
+                due,
+                and_(
+                    AiCallRecordingTrackModel.status.in_(("recording", "stopping")),
+                    select(AiCallRecordModel.id)
+                    .where(
+                        AiCallRecordModel.tenant_id
+                        == AiCallRecordingTrackModel.tenant_id,
+                        AiCallRecordModel.call_id == AiCallRecordingTrackModel.call_id,
+                        AiCallRecordModel.status.in_(("completed", "failed")),
+                    )
+                    .exists(),
+                ),
+            )
         tracks = list(
             (
                 await self.db.scalars(
                     select(AiCallRecordingTrackModel)
-                    .where(
-                        AiCallRecordingTrackModel.status == "verifying",
-                        or_(
-                            AiCallRecordingTrackModel.next_verify_at.is_(None),
-                            AiCallRecordingTrackModel.next_verify_at <= now,
-                        ),
-                    )
+                    .where(due)
                     .order_by(
                         asc(AiCallRecordingTrackModel.next_verify_at),
                         asc(AiCallRecordingTrackModel.id),
@@ -852,6 +869,12 @@ class AiCallRecordRepository:
             ).all()
         )
         for track in tracks:
+            if track.status != "verifying":
+                track.status = "verifying"
+                track.stop_requested_at = track.stop_requested_at or now
+                track.verify_deadline_at = (
+                    track.verify_deadline_at or now + terminal_recovery_deadline
+                )
             track.next_verify_at = claim_token
         await self.db.flush()
         return [

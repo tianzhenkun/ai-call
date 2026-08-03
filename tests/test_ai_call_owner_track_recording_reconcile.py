@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallRecordingTrackModel
+from app.api.v1.ai_call.model import AiCallRecordingTrackModel, AiCallRecordModel
 from app.api.v1.system.oss.service import OssService
 from app.core.base_model import MappedBase
 from app.services.ai_call.recording_service import (
@@ -27,12 +27,26 @@ OSS_CONFIG = {
 }
 
 
-async def _database(*, deadline_at: datetime):
+async def _database(*, deadline_at: datetime, track_status: str = "verifying"):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker.begin() as db:
+        db.add(
+            AiCallRecordModel(
+                id=2,
+                tenant_id="tenant-a",
+                call_id="call-a",
+                entry_type="web",
+                room_name="room-a",
+                participant_identity="customer-a",
+                status="completed",
+                started_at=NOW - timedelta(minutes=1),
+                ended_at=NOW,
+                runtime_control_mode="owner_command_v1",
+            )
+        )
         db.add(
             AiCallRecordingTrackModel(
                 id=1,
@@ -41,7 +55,7 @@ async def _database(*, deadline_at: datetime):
                 room_name="room-a",
                 track_role="customer",
                 participant_identity="customer-a",
-                status="verifying",
+                status=track_status,
                 object_name="ai-call/recordings/tracks/call-a/customer-a.ogg",
                 started_at=NOW - timedelta(minutes=1),
                 ended_at=NOW,
@@ -104,6 +118,36 @@ async def test_track_reconcile_uses_claim_cas_for_completion(monkeypatch) -> Non
         assert track.oss_id == 101
     egress.start_room_audio_recording.assert_not_awaited()
     egress.stop_egress.assert_not_awaited()
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_terminal_call_recovers_track_left_recording(monkeypatch) -> None:
+    engine, session_maker = await _database(
+        deadline_at=NOW + timedelta(minutes=15),
+        track_status="recording",
+    )
+    monkeypatch.setattr(OssService, "_active_config", OSS_CONFIG)
+    monkeypatch.setattr(
+        OssService,
+        "resolve_existing_object_size",
+        staticmethod(AsyncMock(return_value=935_281)),
+    )
+
+    async with session_maker.begin() as db:
+        service = AiCallRecordingService(
+            AiCallRecordRepository(db),
+            enabled=True,
+        )
+        service._register_recording_object = AsyncMock(return_value=103)
+        assert await service.reconcile_due_recordings() == {"call-a"}
+
+    async with session_maker() as db:
+        track = await db.get(AiCallRecordingTrackModel, 1)
+        assert track is not None
+        assert track.status == "completed"
+        assert track.oss_id == 103
 
     await engine.dispose()
 
