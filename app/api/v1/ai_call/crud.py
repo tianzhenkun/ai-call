@@ -48,6 +48,7 @@ class AiCallRecordRepository:
     async def create_record(
         self,
         *,
+        tenant_id: str | None = None,
         call_id: str,
         business_type: str | None,
         business_id: str | None,
@@ -63,6 +64,7 @@ class AiCallRecordRepository:
     ) -> AiCallRecordModel:
         record = AiCallRecordModel(
             id=generate_snowflake_id(),
+            tenant_id=tenant_id,
             call_id=call_id,
             business_type=business_type,
             business_id=business_id,
@@ -561,6 +563,7 @@ class AiCallRecordRepository:
     async def create_recording(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         status: str,
@@ -569,6 +572,7 @@ class AiCallRecordRepository:
     ) -> AiCallRecordingModel:
         recording = AiCallRecordingModel(
             id=generate_snowflake_id(),
+            tenant_id=tenant_id,
             call_id=call_id,
             room_name=room_name,
             status=status,
@@ -580,18 +584,31 @@ class AiCallRecordRepository:
         await self.db.refresh(recording)
         return recording
 
-    async def get_recording(self, call_id: str) -> AiCallRecordingModel | None:
+    async def get_recording(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallRecordingModel | None:
         result = await self.db.execute(
-            select(AiCallRecordingModel).where(AiCallRecordingModel.call_id == call_id)
+            select(AiCallRecordingModel).where(
+                AiCallRecordingModel.tenant_id == tenant_id,
+                AiCallRecordingModel.call_id == call_id,
+            )
         )
         return result.scalar_one_or_none()
 
     async def update_recording(
         self,
+        *,
+        tenant_id: str,
         call_id: str,
         **values,
     ) -> AiCallRecordingModel | None:
-        recording = await self.get_recording(call_id)
+        recording = await self.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         if recording is None:
             return None
         for key, value in values.items():

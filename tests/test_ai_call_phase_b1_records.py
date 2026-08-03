@@ -5029,17 +5029,18 @@ async def test_recording_closure_starts_stops_and_registers_oss(monkeypatch) -> 
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert recording["status"] == "recording"
         assert recording["egressId"] == f"EG_{result.call_id}"
 
         await service.end_session(result.call_id)
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         assert completed["ossId"].isdigit()
@@ -5116,6 +5117,7 @@ async def test_recording_stop_releases_sqlite_write_lock_before_egress_io(
             db.add(
                 AiCallRecordModel(
                     id=1,
+                    tenant_id="000000",
                     call_id=call_id,
                     business_type=None,
                     business_id=None,
@@ -5130,6 +5132,7 @@ async def test_recording_stop_releases_sqlite_write_lock_before_egress_io(
                 db.add(
                     AiCallRecordingModel(
                         id=2,
+                        tenant_id="000000",
                         call_id=call_id,
                         room_name=f"ai-call-{call_id}",
                         status="recording",
@@ -5166,7 +5169,9 @@ async def test_recording_stop_releases_sqlite_write_lock_before_egress_io(
                 participant_recording_enabled=True,
                 stop_session_factory=session_maker,
             )
-            stop_task = asyncio.create_task(service.stop_for_session(call_id))
+            stop_task = asyncio.create_task(
+                service.stop_for_session(tenant_id="000000", call_id=call_id)
+            )
             await asyncio.wait_for(fake_egress.stop_started.wait(), timeout=0.5)
 
             async with session_maker() as concurrent_db:
@@ -5240,6 +5245,7 @@ async def test_isolated_recording_stop_timeout_commits_verifying_state(
             db.add(
                 AiCallRecordModel(
                     id=1,
+                    tenant_id="000000",
                     call_id=call_id,
                     business_type=None,
                     business_id=None,
@@ -5254,6 +5260,7 @@ async def test_isolated_recording_stop_timeout_commits_verifying_state(
                 db.add(
                     AiCallRecordingModel(
                         id=2,
+                        tenant_id="000000",
                         call_id=call_id,
                         room_name=f"ai-call-{call_id}",
                         status="recording",
@@ -5288,7 +5295,7 @@ async def test_isolated_recording_stop_timeout_commits_verifying_state(
                 participant_recording_enabled=True,
                 stop_session_factory=session_maker,
             )
-            await service.stop_for_session(call_id)
+            await service.stop_for_session(tenant_id="000000", call_id=call_id)
 
         async with session_maker() as db:
             if recording_kind == "main":
@@ -5351,11 +5358,12 @@ async def test_participant_recording_closure_records_customer_and_ai_tracks(monk
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert recording["tracks"] == []
         assert fake_egress.started_participants == []
@@ -5365,7 +5373,7 @@ async def test_participant_recording_closure_records_customer_and_ai_tracks(monk
             event_type="browser_ready",
             timestamp=None,
         )
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert [track["trackRole"] for track in recording["tracks"]] == ["customer", "ai"]
         assert fake_egress.started_participants == [
@@ -5374,7 +5382,7 @@ async def test_participant_recording_closure_records_customer_and_ai_tracks(monk
         ]
 
         await service.end_session(result.call_id)
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         assert {track["status"] for track in completed["tracks"]} == {"completed"}
@@ -5433,6 +5441,7 @@ async def test_participant_recording_retries_until_participant_ready(monkeypatch
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5443,7 +5452,7 @@ async def test_participant_recording_retries_until_participant_ready(monkeypatch
             timestamp=None,
         )
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert {track["status"] for track in recording["tracks"]} == {"recording"}
         assert (
@@ -5494,6 +5503,7 @@ async def test_handoff_connected_starts_human_agent_participant_recording(monkey
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5519,12 +5529,12 @@ async def test_handoff_connected_starts_human_agent_participant_recording(monkey
         )
         human_participant_identity = accepted["seatToken"]["participantIdentity"]
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert not [track for track in recording["tracks"] if track["trackRole"] == "human_agent"]
 
         await service.mark_handoff_connected(handoff["handoffId"])
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         human_tracks = [
             track for track in recording["tracks"] if track["trackRole"] == "human_agent"
@@ -5537,7 +5547,7 @@ async def test_handoff_connected_starts_human_agent_participant_recording(monkey
             handoff_id=handoff["handoffId"],
             reason="agent_completed",
         )
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert {track["trackRole"] for track in completed["tracks"]} == {
             "customer",
@@ -5589,6 +5599,7 @@ async def test_offline_asr_persists_split_track_dialogue_segments(monkeypatch) -
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5633,7 +5644,7 @@ async def test_offline_asr_persists_split_track_dialogue_segments(monkeypatch) -
         assert rows["rows"][1]["text"] == "客户需要转人工"
         assert rows["rows"][1]["audioStartMs"] == 100
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert {job["status"] for job in recording["asrJobs"]} == {"completed"}
         assert {job["segmentCount"] for job in recording["asrJobs"]} == {1}
@@ -5682,6 +5693,7 @@ async def test_offline_asr_persists_human_agent_track_dialogue_segments(monkeypa
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5729,7 +5741,7 @@ async def test_offline_asr_persists_human_agent_track_dialogue_segments(monkeypa
             ("offline_asr", "human_agent", "您好，我帮您接入人工"),
         ]
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert {job["status"] for job in recording["asrJobs"]} == {"completed"}
         assert {job["trackRole"] for job in recording["asrJobs"]} == {
@@ -5779,6 +5791,7 @@ async def test_offline_asr_skips_duplicate_realtime_customer_segment(monkeypatch
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5822,7 +5835,7 @@ async def test_offline_asr_skips_duplicate_realtime_customer_segment(monkeypatch
         assert rows["rows"][0]["source"] == "qwen_realtime"
         assert rows["rows"][0]["text"] == "客户需要转人工"
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert len(recording["asrJobs"]) == 1
         assert recording["asrJobs"][0]["trackRole"] == "customer"
@@ -5890,13 +5903,17 @@ async def test_end_session_does_not_enqueue_offline_asr_while_recording_verifies
             )
 
             result = await service.create_web_session(
+                tenant_id="000000",
                 voice=None,
                 prompt=None,
                 business_id=None,
             )
             await service.end_session(result.call_id)
 
-            recording = await service.get_recording(result.call_id)
+            recording = await service.get_recording(
+                tenant_id="000000",
+                call_id=result.call_id,
+            )
             assert recording is not None
             assert recording["status"] == "verifying"
             assert worker.call_ids == []
@@ -5956,6 +5973,7 @@ async def test_recording_reconcile_worker_enqueues_asr_after_verification(
             ),
         )
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -5978,7 +5996,7 @@ async def test_recording_reconcile_worker_enqueues_asr_after_verification(
 
     async with session_maker() as db:
         service = AiCallRecordingService(AiCallRecordRepository(db), enabled=True)
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         assert recording.status == "completed"
         assert recording.oss_id is not None
@@ -6033,13 +6051,14 @@ async def test_recording_registers_head_object_size_when_egress_size_is_zero(mon
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         oss_row = await db.execute(
             text("select ext1 from sys_oss where oss_id = :oss_id"),
@@ -6090,6 +6109,7 @@ async def test_browser_disconnect_stops_recording_before_room_delete(monkeypatch
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -6105,7 +6125,7 @@ async def test_browser_disconnect_stops_recording_before_room_delete(monkeypatch
             timestamp=None,
         )
 
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         assert fake_egress.stopped == [f"EG_{result.call_id}"]
@@ -6153,13 +6173,14 @@ async def test_recording_stop_failed_status_marks_recording_failed(monkeypatch) 
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        failed = await service.get_recording(result.call_id)
+        failed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert failed is not None
         assert failed["status"] == "failed"
         assert failed["failureStage"] == "egress_stop"
@@ -6221,13 +6242,14 @@ async def test_recording_stop_timeout_enters_verifying_then_reconciles(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        pending = await service.get_recording(result.call_id)
+        pending = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert pending is not None
         assert pending["status"] == "verifying"
         assert pending["ossId"] is None
@@ -6239,7 +6261,7 @@ async def test_recording_stop_timeout_enters_verifying_then_reconciles(
         ready_call_ids = await recording_service.reconcile_due_recordings()
         assert ready_call_ids == {result.call_id}
 
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         assert completed["failureStage"] is None
@@ -6314,13 +6336,14 @@ async def test_recording_stop_already_completed_recovers_from_oss(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         assert completed["failureStage"] is None
@@ -6389,13 +6412,14 @@ async def test_recording_stop_non_timeout_exception_does_not_recover_from_oss(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        failed = await service.get_recording(result.call_id)
+        failed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert failed is not None
         assert failed["status"] == "failed"
         assert failed["failureStage"] == "egress_stop"
@@ -6455,6 +6479,7 @@ async def test_recording_verification_deadline_marks_missing_object_failed(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -6463,7 +6488,8 @@ async def test_recording_verification_deadline_marks_missing_object_failed(
 
         expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         await repository.update_recording(
-            result.call_id,
+            tenant_id="000000",
+            call_id=result.call_id,
             next_verify_at=expired_at,
             verify_deadline_at=expired_at,
         )
@@ -6471,7 +6497,7 @@ async def test_recording_verification_deadline_marks_missing_object_failed(
         ready_call_ids = await recording_service.reconcile_due_recordings()
         assert ready_call_ids == {result.call_id}
 
-        failed = await service.get_recording(result.call_id)
+        failed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert failed is not None
         assert failed["status"] == "failed"
         assert failed["failureStage"] == "oss_missing"
@@ -6534,6 +6560,7 @@ async def test_participant_stop_timeout_enters_verifying_then_reconciles(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -6545,7 +6572,7 @@ async def test_participant_stop_timeout_enters_verifying_then_reconciles(
         )
         await service.end_session(result.call_id)
 
-        pending = await service.get_recording(result.call_id)
+        pending = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert pending is not None
         tracks = {track["trackRole"]: track for track in pending["tracks"]}
         assert tracks["customer"]["status"] == "completed"
@@ -6556,7 +6583,7 @@ async def test_participant_stop_timeout_enters_verifying_then_reconciles(
         ready_call_ids = await recording_service.reconcile_due_recordings()
         assert ready_call_ids == {result.call_id}
 
-        completed = await service.get_recording(result.call_id)
+        completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert completed is not None
         assert completed["status"] == "completed"
         tracks = {track["trackRole"]: track for track in completed["tracks"]}
@@ -6633,6 +6660,7 @@ async def test_participant_stop_already_completed_recovers_from_oss(
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
@@ -6644,7 +6672,7 @@ async def test_participant_stop_already_completed_recovers_from_oss(
         )
         await service.end_session(result.call_id)
 
-        recording = await service.get_recording(result.call_id)
+        recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
         tracks = {track["trackRole"]: track for track in recording["tracks"]}
         assert tracks["customer"]["status"] == "completed"
@@ -6712,13 +6740,14 @@ async def test_recording_oss_register_failure_keeps_object_name(monkeypatch) -> 
         )
 
         result = await service.create_web_session(
+            tenant_id="000000",
             voice=None,
             prompt=None,
             business_id=None,
         )
         await service.end_session(result.call_id)
 
-        failed = await service.get_recording(result.call_id)
+        failed = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert failed is not None
         assert failed["status"] == "failed"
         assert failed["failureStage"] == "oss_register"
@@ -6757,6 +6786,7 @@ async def test_dialogue_preview_keeps_partial_in_memory_and_persists_final() -> 
         )
         try:
             result = await service.create_web_session(
+                tenant_id="000000",
                 voice=None,
                 prompt=None,
                 business_id=None,

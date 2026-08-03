@@ -203,8 +203,23 @@ class AiCallEventPersistenceWorker:
                     async with db.begin():
                         repository = AiCallRecordRepository(db)
                         recording_service = self._build_recording_service(repository)
-                        await recording_service.stop_for_session(call_id)
-                        ready_for_asr = await recording_service.is_ready_for_offline_asr(call_id)
+                        record = await repository.get_record(call_id)
+                        tenant_id = str(record.tenant_id or "").strip() if record else ""
+                        if not tenant_id:
+                            raise RuntimeError(
+                                "terminal recording cleanup missing tenant context: "
+                                f"call_id={call_id}"
+                            )
+                        await recording_service.stop_for_session(
+                            tenant_id=tenant_id,
+                            call_id=call_id,
+                        )
+                        ready_for_asr = (
+                            await recording_service.is_ready_for_offline_asr(
+                                tenant_id=tenant_id,
+                                call_id=call_id,
+                            )
+                        )
                     from app.api.v1.ai_call.service import enqueue_ai_call_offline_asr
 
                     if ready_for_asr:

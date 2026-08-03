@@ -145,6 +145,7 @@ class FakeRecordService:
 
     def __init__(self) -> None:
         self.created_sip_records: list[dict[str, object]] = []
+        self.tenant_by_call: dict[str, str | None] = {}
         self.status_updates: list[tuple[str, str]] = []
         self.answered_updates: list[tuple[str, object]] = []
         self.completed_sessions: list[dict[str, object]] = []
@@ -157,6 +158,7 @@ class FakeRecordService:
     async def create_sip_record(
         self,
         *,
+        tenant_id: str | None = None,
         call_id: str,
         business_id: str | None,
         room_name: str,
@@ -165,6 +167,7 @@ class FakeRecordService:
         callee_phone_number_hash: str | None = None,
         callee_phone_number_masked: str | None = None,
     ) -> None:
+        self.tenant_by_call[call_id] = tenant_id
         self.created_sip_records.append({
             "call_id": call_id,
             "business_type": business_type,
@@ -247,6 +250,7 @@ class FakeRecordService:
             CallSessionStatus.CREATED.value,
         )
         return SimpleNamespace(
+            tenant_id=self.tenant_by_call.get(call_id),
             call_id=call_id,
             room_name=row["room_name"],
             participant_identity=row["participant_identity"],
@@ -268,11 +272,13 @@ class FakeRecordingService:
     async def start_for_session(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         customer_participant_identity: str | None = None,
         ai_participant_identity: str | None = None,
     ) -> None:
+        _ = tenant_id
         self.started_sessions.append({
             "call_id": call_id,
             "room_name": room_name,
@@ -295,11 +301,12 @@ class FakeRecordingService:
             "ai_participant_identity": ai_participant_identity,
         })
 
-    async def stop_for_session(self, call_id: str) -> None:
+    async def stop_for_session(self, *, tenant_id: str, call_id: str) -> None:
+        _ = tenant_id
         self.stopped_call_ids.append(call_id)
 
-    async def is_ready_for_offline_asr(self, call_id: str) -> bool:
-        _ = call_id
+    async def is_ready_for_offline_asr(self, *, tenant_id: str, call_id: str) -> bool:
+        _ = (tenant_id, call_id)
         return True
 
 
@@ -1049,6 +1056,7 @@ async def test_create_sip_session_starts_customer_and_ai_participant_recordings(
     service.recording_service = recording_service
 
     result = await service.create_sip_session(
+        tenant_id="000000",
         callee_phone_number="13800000000",
         voice=None,
         business_id="geo_task_001",
@@ -1088,6 +1096,7 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
     service.recording_service = recording_service
 
     result = await service.create_sip_session(
+        tenant_id="000000",
         callee_phone_number="13800000000",
         voice=None,
         business_id="geo_task_001",
@@ -1141,6 +1150,7 @@ async def test_livekit_sip_participant_left_ends_persisted_session_without_local
     service.recording_service = recording_service
 
     result = await service.create_sip_session(
+        tenant_id="000000",
         callee_phone_number="13800000000",
         voice=None,
         business_id="geo_task_001",

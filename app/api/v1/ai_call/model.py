@@ -325,11 +325,25 @@ class AiCallRecordingModel(MappedBase):
 
     __tablename__ = "ai_call_recording"
     __table_args__ = (
-        UniqueConstraint("call_id", name="uk_ai_call_recording_call_id"),
-        Index("idx_ai_call_recording_status_started", "status", "started_at"),
-        Index("idx_ai_call_recording_egress_id", "egress_id"),
-        Index("idx_ai_call_recording_oss_id", "oss_id"),
-        Index("idx_ai_call_recording_verify_due", "status", "next_verify_at"),
+        UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            name="uk_ai_call_recording_tenant_call",
+        ),
+        Index(
+            "idx_ai_call_recording_tenant_started",
+            "tenant_id",
+            "status",
+            "started_at",
+        ),
+        Index("idx_ai_call_recording_tenant_egress", "tenant_id", "egress_id"),
+        Index("idx_ai_call_recording_tenant_oss", "tenant_id", "oss_id"),
+        Index(
+            "idx_ai_call_recording_tenant_verify_due",
+            "tenant_id",
+            "status",
+            "next_verify_at",
+        ),
         {"comment": "AI Call 通话录音表"},
     )
     __permission_strategy__ = None
@@ -340,6 +354,7 @@ class AiCallRecordingModel(MappedBase):
         autoincrement=False,
         comment="雪花主键",
     )
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
     call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
     room_name: Mapped[str] = mapped_column(String(128), nullable=False, comment="LiveKit Room")
     status: Mapped[str] = mapped_column(String(32), nullable=False, comment="录音状态")
@@ -347,6 +362,11 @@ class AiCallRecordingModel(MappedBase):
         String(128),
         nullable=True,
         comment="LiveKit Egress ID",
+    )
+    egress_generation: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="Owner Runtime 主录音资源代次",
     )
     oss_id: Mapped[int | None] = mapped_column(
         BigInteger,

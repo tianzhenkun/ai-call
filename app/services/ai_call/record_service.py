@@ -161,6 +161,7 @@ class AiCallRecordService:
     async def create_web_record(
         self,
         *,
+        tenant_id: str | None = None,
         call_id: str,
         business_id: str | None,
         room_name: str,
@@ -169,6 +170,7 @@ class AiCallRecordService:
         business_type: str | None = None,
     ) -> AiCallRecordModel:
         return await self.repository.create_record(
+            tenant_id=tenant_id,
             call_id=call_id,
             business_type=business_type,
             business_id=business_id,
@@ -182,6 +184,7 @@ class AiCallRecordService:
     async def create_sip_record(
         self,
         *,
+        tenant_id: str | None = None,
         call_id: str,
         business_id: str | None,
         room_name: str,
@@ -192,6 +195,7 @@ class AiCallRecordService:
         callee_phone_number_masked: str | None = None,
     ) -> AiCallRecordModel:
         return await self.repository.create_record(
+            tenant_id=tenant_id,
             call_id=call_id,
             business_type=business_type,
             business_id=business_id,

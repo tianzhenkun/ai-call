@@ -228,12 +228,12 @@ async def create_session_controller(
         Header(alias="Idempotency-Key"),
     ] = None,
 ) -> JSONResponse:
+    tenant_id = str(
+        getattr(getattr(auth, "user", None), "tenant_id", "") or ""
+    ).strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="租户上下文缺失")
     if runtime_control_mode_for_entry(settings, "web") == "owner_command_v1":
-        tenant_id = str(
-            getattr(getattr(auth, "user", None), "tenant_id", "") or ""
-        ).strip()
-        if not tenant_id:
-            raise HTTPException(status_code=401, detail="租户上下文缺失")
         normalized_idempotency_key = str(idempotency_key or "").strip()
         if not normalized_idempotency_key:
             raise CustomException(
@@ -292,6 +292,7 @@ async def create_session_controller(
         business_id=request.business_id,
         scene_code=request.scene_code,
         business_params=request.business_params,
+        tenant_id=tenant_id,
     )
     return SuccessResponse(
         data=CreateSessionOut.model_validate(result),
@@ -667,9 +668,11 @@ async def reanalyze_record_semantic_analysis_controller(
 )
 async def get_recording_controller(
     call_id: Annotated[str, Path(alias="callId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.get_recording(call_id)
+    tenant_id, _ = _identity(auth)
+    result = await service.get_recording(tenant_id=tenant_id, call_id=call_id)
     return SuccessResponse(
         data=RecordingOut.model_validate(result) if result else None,
         msg="查询成功",

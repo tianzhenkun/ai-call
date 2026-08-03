@@ -549,7 +549,17 @@ class AiCallHandoffExceptionManager:
                     else None
                 )
                 if recording_service is not None:
-                    await recording_service.stop_for_session(call_id)
+                    record = await repository.get_record(call_id)
+                    tenant_id = str(record.tenant_id or "").strip() if record else ""
+                    if not tenant_id:
+                        raise RuntimeError(
+                            "handoff recording cleanup missing tenant context: "
+                            f"call_id={call_id}"
+                        )
+                    await recording_service.stop_for_session(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                    )
                 runtime_close_mode = await self._close_runtime_after_exception(
                     call_id=call_id,
                     room_name=room_name,

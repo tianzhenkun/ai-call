@@ -52,6 +52,7 @@ class AiCallRecordingService:
     async def start_for_session(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         customer_participant_identity: str | None = None,
@@ -63,9 +64,13 @@ class AiCallRecordingService:
         object_name = (
             self.egress_manager.build_object_name(call_id) if self.egress_manager else None
         )
-        recording = await self.repository.get_recording(call_id)
+        recording = await self.repository.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         if recording is None:
             recording = await self.repository.create_recording(
+                tenant_id=tenant_id,
                 call_id=call_id,
                 room_name=room_name,
                 status="starting",
@@ -74,7 +79,8 @@ class AiCallRecordingService:
             )
         if self.egress_manager is None:
             await self.fail_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 failure_stage="egress_config",
                 failure_message="录音组件未配置",
             )
@@ -82,7 +88,8 @@ class AiCallRecordingService:
         oss_config = OssService.active_config()
         if not oss_config:
             await self.fail_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 failure_stage="oss_config",
                 failure_message="未找到可用的OSS配置",
             )
@@ -95,7 +102,8 @@ class AiCallRecordingService:
                 oss_config=oss_config,
             )
             await self.repository.update_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 status="recording",
                 egress_id=result.egress_id or None,
                 object_name=result.object_name or recording.object_name,
@@ -111,7 +119,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.fail_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 failure_stage="egress_start",
                 failure_message="LiveKit Egress 启动失败",
             )
@@ -170,18 +179,29 @@ class AiCallRecordingService:
             handoff_id=handoff_id,
         )
 
-    async def stop_for_session(self, call_id: str) -> None:
+    async def stop_for_session(self, *, tenant_id: str, call_id: str) -> None:
         if not self.enabled:
             return
         if (
             self.stop_session_factory is not None
             and self.transaction_checkpoint is None
         ):
-            await self._stop_for_session_in_isolated_session(call_id)
+            await self._stop_for_session_in_isolated_session(
+                tenant_id=tenant_id,
+                call_id=call_id,
+            )
             return
-        await self._stop_for_session_in_current_session(call_id)
+        await self._stop_for_session_in_current_session(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
 
-    async def _stop_for_session_in_isolated_session(self, call_id: str) -> None:
+    async def _stop_for_session_in_isolated_session(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
         if self.stop_session_factory is None:
             return
         async with self.stop_session_factory() as db:
@@ -194,18 +214,29 @@ class AiCallRecordingService:
                 transaction_checkpoint=db.commit,
             )
             try:
-                await isolated_service._stop_for_session_in_current_session(call_id)
+                await isolated_service._stop_for_session_in_current_session(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                )
                 await db.commit()
             except Exception:
                 await db.rollback()
                 raise
 
-    async def _stop_for_session_in_current_session(self, call_id: str) -> None:
-        await self._stop_main_recording(call_id)
+    async def _stop_for_session_in_current_session(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
+        await self._stop_main_recording(tenant_id=tenant_id, call_id=call_id)
         await self._stop_participant_recordings(call_id)
 
-    async def _stop_main_recording(self, call_id: str) -> None:
-        recording = await self.repository.get_recording(call_id)
+    async def _stop_main_recording(self, *, tenant_id: str, call_id: str) -> None:
+        recording = await self.repository.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         if recording is None or not recording.egress_id:
             return
         if recording.status in {"completed", "failed", "verifying"}:
@@ -213,7 +244,8 @@ class AiCallRecordingService:
 
         stop_requested_at = utc_now()
         await self.repository.update_recording(
-            call_id,
+            tenant_id=tenant_id,
+            call_id=call_id,
             status="stopping",
             stop_requested_at=stop_requested_at,
         )
@@ -231,7 +263,8 @@ class AiCallRecordingService:
                     result.error,
                 )
                 await self.fail_recording(
-                    call_id,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
                     failure_stage="egress_stop",
                     failure_message="LiveKit Egress 停止失败",
                 )
@@ -283,7 +316,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.fail_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 failure_stage="egress_stop",
                 failure_message="LiveKit Egress 停止失败",
             )
@@ -302,7 +336,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.repository.update_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 status="failed",
                 object_name=object_name,
                 ended_at=ended_at,
@@ -316,7 +351,8 @@ class AiCallRecordingService:
 
         try:
             await self.repository.update_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 status="completed",
                 object_name=object_name,
                 oss_id=oss_id,
@@ -336,7 +372,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.fail_recording(
-                call_id,
+                tenant_id=tenant_id,
+                call_id=call_id,
                 failure_stage="recording_update",
                 failure_message="录音完成状态更新失败",
             )
@@ -647,22 +684,35 @@ class AiCallRecordingService:
             else []
         )
 
-        touched_call_ids: set[str] = set()
+        touched_calls: dict[str, str] = {}
         for recording in main_recordings:
             if await self._verify_main_recording(recording, now=now):
-                touched_call_ids.add(recording.call_id)
+                touched_calls[recording.call_id] = recording.tenant_id
         for track in tracks:
             if await self._verify_participant_recording(track, now=now):
-                touched_call_ids.add(track.call_id)
+                record = await self.repository.get_record(track.call_id)
+                if record is not None and record.tenant_id:
+                    touched_calls[track.call_id] = record.tenant_id
 
         ready_call_ids: set[str] = set()
-        for call_id in touched_call_ids:
-            if await self.is_ready_for_offline_asr(call_id):
+        for call_id, tenant_id in touched_calls.items():
+            if await self.is_ready_for_offline_asr(
+                tenant_id=tenant_id,
+                call_id=call_id,
+            ):
                 ready_call_ids.add(call_id)
         return ready_call_ids
 
-    async def is_ready_for_offline_asr(self, call_id: str) -> bool:
-        recording = await self.repository.get_recording(call_id)
+    async def is_ready_for_offline_asr(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> bool:
+        recording = await self.repository.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         if recording is not None and recording.status in self._VERIFY_PENDING_STATUSES:
             return False
         tracks = await self.repository.list_recording_tracks(call_id)
@@ -676,7 +726,8 @@ class AiCallRecordingService:
         stop_requested_at: datetime,
     ) -> None:
         await self.repository.update_recording(
-            recording.call_id,
+            tenant_id=recording.tenant_id,
+            call_id=recording.call_id,
             status="verifying",
             stop_requested_at=stop_requested_at,
             verify_attempts=0,
@@ -720,7 +771,8 @@ class AiCallRecordingService:
         object_name = recording.object_name
         if not object_name:
             await self.repository.update_recording(
-                recording.call_id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
                 status="failed",
                 ended_at=now,
                 verify_attempts=attempts,
@@ -746,7 +798,8 @@ class AiCallRecordingService:
         if deadline_at is not None and now >= deadline_at:
             duration_ms = self._duration_ms(recording.started_at, now)
             await self.repository.update_recording(
-                recording.call_id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
                 status="failed",
                 ended_at=now,
                 duration_ms=duration_ms,
@@ -760,7 +813,8 @@ class AiCallRecordingService:
             return True
 
         await self.repository.update_recording(
-            recording.call_id,
+            tenant_id=recording.tenant_id,
+            call_id=recording.call_id,
             status="verifying",
             verify_attempts=attempts,
             last_verify_at=now,
@@ -832,13 +886,15 @@ class AiCallRecordingService:
 
     async def fail_recording(
         self,
-        call_id: str,
         *,
+        tenant_id: str,
+        call_id: str,
         failure_stage: str,
         failure_message: str,
     ) -> AiCallRecordingModel | None:
         return await self.repository.update_recording(
-            call_id,
+            tenant_id=tenant_id,
+            call_id=call_id,
             status="failed",
             ended_at=utc_now(),
             next_verify_at=None,
@@ -851,8 +907,16 @@ class AiCallRecordingService:
         message = str(exc).lower()
         return "egress_complete" in message and "cannot be stopped" in message
 
-    async def get_recording(self, call_id: str) -> AiCallRecordingModel | None:
-        return await self.repository.get_recording(call_id)
+    async def get_recording(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallRecordingModel | None:
+        return await self.repository.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
 
     async def recording_to_dict(self, recording: AiCallRecordingModel) -> dict[str, Any]:
         play_url = await self._play_url(recording.oss_id)
@@ -984,7 +1048,8 @@ class AiCallRecordingService:
                 str(register_exc),
             )
             await self.repository.update_recording(
-                recording.call_id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
                 status="failed",
                 object_name=object_name,
                 ended_at=ended_at,
@@ -1000,7 +1065,8 @@ class AiCallRecordingService:
 
         try:
             await self.repository.update_recording(
-                recording.call_id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
                 status="completed",
                 object_name=object_name,
                 oss_id=oss_id,
@@ -1021,7 +1087,8 @@ class AiCallRecordingService:
                 str(update_exc),
             )
             await self.fail_recording(
-                recording.call_id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
                 failure_stage="recording_update",
                 failure_message="录音完成状态更新失败",
             )

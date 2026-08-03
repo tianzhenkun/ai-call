@@ -2573,16 +2573,40 @@ async def test_browser_speech_segment_is_forwarded_with_quality_payload() -> Non
 @pytest.mark.anyio
 async def test_browser_disconnect_accepts_sqlite_lock_during_recording_stop() -> None:
     class LockedRecordingService:
-        async def stop_for_session(self, call_id: str) -> None:
+        async def stop_for_session(self, *, tenant_id: str, call_id: str) -> None:
+            _ = (tenant_id, call_id)
             raise OperationalError(
                 "UPDATE ai_call_recording SET status=? WHERE ai_call_recording.id = ?",
                 {},
                 Exception("database is locked"),
             )
 
+        async def is_ready_for_offline_asr(
+            self,
+            *,
+            tenant_id: str,
+            call_id: str,
+        ) -> bool:
+            _ = (tenant_id, call_id)
+            return False
+
     orchestrator, _livekit, _agent = build_orchestrator()
     created = await orchestrator.create_web_session(voice=None, prompt=None)
-    service = AiCallService(orchestrator, recording_service=LockedRecordingService())
+
+    class RecordService:
+        repository = None
+
+        async def get_record(self, call_id: str):
+            return type("Record", (), {"tenant_id": "000000"})()
+
+        async def complete_session(self, call_id: str, **values) -> None:
+            _ = (call_id, values)
+
+    service = AiCallService(
+        orchestrator,
+        record_service=RecordService(),
+        recording_service=LockedRecordingService(),
+    )
 
     result = await service.report_browser_event(
         call_id=created.call_id,
@@ -2598,7 +2622,8 @@ async def test_browser_disconnect_accepts_sqlite_lock_during_recording_stop() ->
 @pytest.mark.anyio
 async def test_browser_disconnect_is_idempotent_after_failed_session() -> None:
     class RecordingServiceThatMustNotStop:
-        async def stop_for_session(self, call_id: str) -> None:
+        async def stop_for_session(self, *, tenant_id: str, call_id: str) -> None:
+            _ = (tenant_id, call_id)
             raise AssertionError("terminal browser disconnect should not stop recording inline")
 
     orchestrator, _livekit, _agent = build_orchestrator()
@@ -17376,7 +17401,11 @@ def test_session_api_returns_unified_camel_case_response() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: AiCallService(orchestrator)
-    app.dependency_overrides[get_current_user] = lambda: object()
+    app.dependency_overrides[get_current_user] = lambda: type(
+        "Auth",
+        (),
+        {"user": type("User", (), {"tenant_id": "000000"})()},
+    )()
 
     with TestClient(app) as client:
         create_response = client.post(

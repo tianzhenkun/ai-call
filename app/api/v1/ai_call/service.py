@@ -130,6 +130,7 @@ class AiCallService:
         business_id: str | None = None,
         scene_code: str | None = None,
         business_params: dict | None = None,
+        tenant_id: str | None = None,
     ) -> CreateSessionResult:
         self._ensure_legacy_entry_allowed("web")
         if self.record_service is None:
@@ -152,6 +153,7 @@ class AiCallService:
         room_name = f"ai-call-{call_id}"
         participant_identity = f"browser-{call_id}"
         await self.record_service.create_web_record(
+            tenant_id=tenant_id,
             call_id=call_id,
             business_id=business_id,
             room_name=room_name,
@@ -191,6 +193,7 @@ class AiCallService:
         await self.record_service.mark_status(call_id, result.status)
         if self.recording_service is not None:
             await self.recording_service.start_for_session(
+                tenant_id=self._require_recording_tenant(tenant_id),
                 call_id=result.call_id,
                 room_name=result.room_name,
                 customer_participant_identity=result.participant_identity,
@@ -210,6 +213,7 @@ class AiCallService:
         business_params: dict | None = None,
         ringing_timeout_seconds: int | None = None,
         before_sip_invite: Callable[[], Awaitable[None]] | None = None,
+        tenant_id: str | None = None,
     ) -> CreateSipSessionResult:
         self._ensure_legacy_entry_allowed("direct_sip")
         self._ensure_record_service()
@@ -234,6 +238,7 @@ class AiCallService:
         room_name = f"ai-call-{resolved_call_id}"
         participant_identity = f"sip-{resolved_call_id}"
         await self.record_service.create_sip_record(
+            tenant_id=tenant_id,
             call_id=resolved_call_id,
             business_type=business_type,
             business_id=business_id,
@@ -344,6 +349,7 @@ class AiCallService:
         )
         if self.recording_service is not None:
             await self.recording_service.start_for_session(
+                tenant_id=self._require_recording_tenant(tenant_id),
                 call_id=resolved_call_id,
                 room_name=room_name,
                 customer_participant_identity=participant_identity,
@@ -567,7 +573,10 @@ class AiCallService:
                 session = await self.orchestrator.get_session(call_id)
                 if session.status in RUNNING_STATUSES:
                     try:
-                        await self.recording_service.stop_for_session(call_id)
+                        await self.recording_service.stop_for_session(
+                            tenant_id=await self._recording_tenant_for_call(call_id),
+                            call_id=call_id,
+                        )
                     except OperationalError as exc:
                         if not _is_sqlite_database_locked(exc):
                             raise
@@ -792,7 +801,10 @@ class AiCallService:
             )
         if self.recording_service is not None:
             try:
-                await self.recording_service.stop_for_session(call_id)
+                await self.recording_service.stop_for_session(
+                    tenant_id=await self._recording_tenant_for_call(call_id),
+                    call_id=call_id,
+                )
             except Exception as exc:
                 cleanup_errors.append(
                     "recording_service.stop_for_session: "
@@ -823,7 +835,10 @@ class AiCallService:
         try:
             session = await self.orchestrator.get_session(call_id)
             if self.recording_service is not None and session.status != CallSessionStatus.COMPLETED:
-                await self.recording_service.stop_for_session(call_id)
+                await self.recording_service.stop_for_session(
+                    tenant_id=await self._recording_tenant_for_call(call_id),
+                    call_id=call_id,
+                )
             result = await self.orchestrator.end_session(call_id, end_reason=end_reason)
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
@@ -967,9 +982,12 @@ class AiCallService:
         )
         return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
 
-    async def get_recording(self, call_id: str) -> dict | None:
+    async def get_recording(self, *, tenant_id: str, call_id: str) -> dict | None:
         self._ensure_recording_service()
-        recording = await self.recording_service.get_recording(call_id)
+        recording = await self.recording_service.get_recording(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         if recording is None:
             return None
         return await self.recording_service.recording_to_dict(recording)
@@ -1675,6 +1693,29 @@ class AiCallService:
         if self.recording_service is None:
             raise CustomException(msg="通话录音服务未启用", code=RET.ERROR.code, status_code=500)
 
+    @staticmethod
+    def _require_recording_tenant(tenant_id: str | None) -> str:
+        normalized = str(tenant_id or "").strip()
+        if not normalized:
+            raise CustomException(
+                msg="通话录音缺少租户上下文",
+                code=RET.ERROR.code,
+                status_code=500,
+            )
+        return normalized
+
+    async def _recording_tenant_for_call(self, call_id: str) -> str:
+        if self.record_service is None:
+            return self._require_recording_tenant(None)
+        record = await self.record_service.get_record(call_id)
+        if record is None:
+            raise CustomException(
+                msg="通话录音对应的通话记录不存在",
+                code=RET.ERROR.code,
+                status_code=500,
+            )
+        return self._require_recording_tenant(record.tenant_id)
+
     def _ensure_dialogue_service(self) -> None:
         if self.dialogue_service is None:
             raise CustomException(msg="对话文本服务未启用", code=RET.ERROR.code, status_code=500)
@@ -1711,7 +1752,10 @@ class AiCallService:
 
     async def _enqueue_offline_asr_if_recordings_closed(self, call_id: str) -> None:
         if self.recording_service is not None:
-            if not await self.recording_service.is_ready_for_offline_asr(call_id):
+            if not await self.recording_service.is_ready_for_offline_asr(
+                tenant_id=await self._recording_tenant_for_call(call_id),
+                call_id=call_id,
+            ):
                 return
         self._enqueue_offline_asr(call_id)
 
