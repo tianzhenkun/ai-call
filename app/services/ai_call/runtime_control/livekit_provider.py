@@ -9,7 +9,10 @@ from typing import Any, Protocol
 
 from sqlalchemy import select
 
-from app.services.ai_call.livekit_egress import LiveKitEgressNotFoundError
+from app.services.ai_call.livekit_egress import (
+    LiveKitEgressAlreadyCompleteError,
+    LiveKitEgressNotFoundError,
+)
 from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
@@ -713,6 +716,8 @@ class LiveKitRuntimeProvider:
         if not effect.reconcile_only:
             try:
                 stop_fact = await self._egress_manager.stop_egress(egress_id)
+            except LiveKitEgressAlreadyCompleteError:
+                pass
             except TimeoutError:
                 return ProviderObservation(
                     kind=ProviderObservationKind.UNCERTAIN,
@@ -861,6 +866,8 @@ class LiveKitRuntimeProvider:
         if not effect.reconcile_only:
             try:
                 stop_fact = await self._egress_manager.stop_egress(egress_id)
+            except LiveKitEgressAlreadyCompleteError:
+                pass
             except TimeoutError:
                 return ProviderObservation(
                     kind=ProviderObservationKind.UNCERTAIN,

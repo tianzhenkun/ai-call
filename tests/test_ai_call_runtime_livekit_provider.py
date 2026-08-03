@@ -442,6 +442,99 @@ async def test_livekit_provider_maps_egress_404_to_terminal_confirmation() -> No
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("effect_type", ("STOP_EGRESS", "STOP_TRACK_EGRESS"))
+async def test_livekit_provider_maps_already_completed_stop_to_terminal_confirmation(
+    effect_type: str,
+) -> None:
+    from app.services.ai_call.livekit_egress import (
+        LiveKitEgressAlreadyCompleteError,
+    )
+
+    class AlreadyCompletedEgressManager(RecordingEgressManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_observation = SimpleNamespace(
+                egress_id="EG_done",
+                status="EGRESS_COMPLETE",
+                object_name=(
+                    "ai-call/recordings/call-1.ogg"
+                    if effect_type == "STOP_EGRESS"
+                    else "ai-call/recordings/tracks/call-1/customer-sip-call-1.ogg"
+                ),
+                started_at=None,
+                ended_at=datetime(2026, 8, 3, 9, 1, tzinfo=timezone.utc),
+                duration_ms=60_000,
+                file_size=1024,
+            )
+
+        async def stop_egress(self, egress_id: str):
+            self.stop_calls.append(egress_id)
+            raise LiveKitEgressAlreadyCompleteError(egress_id)
+
+    manager = AlreadyCompletedEgressManager()
+    effect = (
+        _effect(effect_type)
+        if effect_type == "STOP_EGRESS"
+        else _customer_track_effect(effect_type)
+    )
+
+    observation = await _provider(egress_manager=manager).apply(effect)
+
+    assert observation.kind is ProviderObservationKind.TERMINAL_CONFIRMED
+    assert observation.provider_reference == "EG_done"
+    assert observation.duration_ms == 60_000
+    assert manager.stop_calls == ["EG_1"]
+    assert manager.query_calls == ["EG_1"]
+
+
+@pytest.mark.anyio
+async def test_livekit_egress_stop_maps_completed_412_to_typed_error(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    from app.services.ai_call.livekit_egress import (
+        LiveKitEgressAlreadyCompleteError,
+        LiveKitEgressManager,
+    )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            _ = (args, kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            _ = args
+
+        async def post(self, url, *, headers, json):
+            _ = (url, headers, json)
+            return httpx.Response(
+                412,
+                request=httpx.Request("POST", "http://livekit.test"),
+                json={
+                    "code": "failed_precondition",
+                    "msg": "egress with status EGRESS_COMPLETE cannot be stopped",
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    manager = LiveKitEgressManager(
+        livekit_url="ws://livekit.test",
+        api_key="key",
+        api_secret="secret",
+        timeout_seconds=1,
+        object_prefix="ai-call/recordings",
+    )
+
+    with pytest.raises(LiveKitEgressAlreadyCompleteError) as exc_info:
+        await manager.stop_egress("EG_done")
+
+    assert exc_info.value.egress_id == "EG_done"
+
+
+@pytest.mark.anyio
 async def test_livekit_provider_starts_main_egress_with_active_oss_config() -> None:
     from app.services.ai_call.runtime_control.livekit_provider import (
         LiveKitRuntimeProvider,

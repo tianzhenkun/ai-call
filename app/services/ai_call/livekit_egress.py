@@ -22,6 +22,14 @@ class LiveKitEgressNotFoundError(LookupError):
     pass
 
 
+class LiveKitEgressAlreadyCompleteError(RuntimeError):
+    """StopEgress was rejected because the Egress is already terminal."""
+
+    def __init__(self, egress_id: str) -> None:
+        self.egress_id = egress_id
+        super().__init__(f"egress {egress_id} is already complete")
+
+
 @dataclass(frozen=True, slots=True)
 class LiveKitEgressStartResult:
     egress_id: str
@@ -262,6 +270,14 @@ class LiveKitEgressManager:
                 raise LiveKitEgressNotFoundError(
                     str(payload.get("egress_id") or "")
                 ) from exc
+            if (
+                method == "StopEgress"
+                and response.status_code == 412
+                and self._is_already_complete_response(response)
+            ):
+                raise LiveKitEgressAlreadyCompleteError(
+                    str(payload.get("egress_id") or "")
+                ) from exc
             raise RuntimeError(
                 self._http_error_message(method, response.status_code, response.text)
             ) from exc
@@ -336,6 +352,17 @@ class LiveKitEgressManager:
         parsed = urlparse(self.livekit_url)
         scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
         return urlunparse((scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+
+    @staticmethod
+    def _is_already_complete_response(response: httpx.Response) -> bool:
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return payload == {
+            "code": "failed_precondition",
+            "msg": "egress with status EGRESS_COMPLETE cannot be stopped",
+        }
 
     @staticmethod
     def _s3_upload_payload(oss_config: dict) -> dict:
