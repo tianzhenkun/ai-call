@@ -17404,7 +17404,7 @@ def test_session_api_returns_unified_camel_case_response() -> None:
     app.dependency_overrides[get_current_user] = lambda: type(
         "Auth",
         (),
-        {"user": type("User", (), {"tenant_id": "000000"})()},
+        {"user": type("User", (), {"tenant_id": "000000", "user_id": 1})()},
     )()
 
     with TestClient(app) as client:
@@ -17429,10 +17429,10 @@ def test_session_api_returns_unified_camel_case_response() -> None:
 
         browser_event_body = client.post(
             f"/ai-call/sessions/{call_id}/browser-events",
-            json={"type": "browser_first_audio"},
+            json={"type": "browser_ready"},
         ).json()
         assert browser_event_body["msg"] == "上报成功"
-        assert browser_event_body["data"]["type"] == "browser_first_audio"
+        assert browser_event_body["data"]["type"] == "browser_ready"
 
         end_response = client.post(f"/ai-call/sessions/{call_id}/end")
         assert end_response.status_code == 200

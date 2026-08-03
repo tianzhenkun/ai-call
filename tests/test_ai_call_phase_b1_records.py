@@ -1136,6 +1136,7 @@ async def test_end_session_updates_record_terminal_state_and_reason(b1_service) 
         call_id=result.call_id,
         event_type="browser_ready",
         timestamp=None,
+        tenant_id="000000",
     )
     await service.end_session(result.call_id)
 
@@ -1168,6 +1169,7 @@ async def test_repeated_end_session_preserves_first_terminal_reason(b1_service) 
         call_id=result.call_id,
         event_type="browser_ready",
         timestamp=None,
+        tenant_id="000000",
     )
 
     await service.end_session(result.call_id, end_reason="handoff_timeout")
@@ -1201,6 +1203,7 @@ async def test_browser_disconnect_after_runtime_terminal_preserves_terminal_reas
         call_id=result.call_id,
         event_type="browser_ready",
         timestamp=None,
+        tenant_id="000000",
     )
 
     await service.orchestrator.end_session(result.call_id, end_reason="handoff_timeout")
@@ -1230,6 +1233,7 @@ async def test_browser_disconnect_completes_record_with_disconnect_reason(b1_ser
         call_id=result.call_id,
         event_type="browser_ready",
         timestamp=None,
+        tenant_id="000000",
     )
 
     browser_event = await service.report_browser_event(
@@ -5443,6 +5447,7 @@ async def test_participant_recording_closure_records_customer_and_ai_tracks(monk
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
         assert recording is not None
@@ -5521,6 +5526,7 @@ async def test_participant_recording_retries_until_participant_ready(monkeypatch
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
 
         recording = await service.get_recording(tenant_id="000000", call_id=result.call_id)
@@ -5583,6 +5589,7 @@ async def test_handoff_connected_starts_human_agent_participant_recording(monkey
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         handoff = await service.create_handoff(
             call_id=result.call_id,
@@ -5679,6 +5686,7 @@ async def test_offline_asr_persists_split_track_dialogue_segments(monkeypatch) -
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         await service.dialogue_service.persist_snapshot(
             DialogueSegmentSnapshot(
@@ -5773,6 +5781,7 @@ async def test_offline_asr_persists_human_agent_track_dialogue_segments(monkeypa
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         handoff = await service.create_handoff(
             call_id=result.call_id,
@@ -5871,6 +5880,7 @@ async def test_offline_asr_skips_duplicate_realtime_customer_segment(monkeypatch
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         now = datetime.now(timezone.utc)
         await service.dialogue_service.persist_snapshot(
@@ -6189,6 +6199,7 @@ async def test_browser_disconnect_stops_recording_before_room_delete(monkeypatch
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         await service.report_browser_event(
             call_id=result.call_id,
@@ -6640,6 +6651,7 @@ async def test_participant_stop_timeout_enters_verifying_then_reconciles(
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         await service.end_session(result.call_id)
 
@@ -6740,6 +6752,7 @@ async def test_participant_stop_already_completed_recovers_from_oss(
             call_id=result.call_id,
             event_type="browser_ready",
             timestamp=None,
+            tenant_id="000000",
         )
         await service.end_session(result.call_id)
 

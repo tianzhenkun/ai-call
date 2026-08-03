@@ -721,18 +721,18 @@ class AiCallRecordingService:
         )
         await self._checkpoint_before_external_io()
 
-        touched_calls: dict[str, str] = {}
+        touched_calls: set[tuple[str, str]] = set()
         for recording in main_recordings:
             if await self._verify_main_recording(recording, now=now):
-                touched_calls[recording.call_id] = recording.tenant_id
+                touched_calls.add((recording.tenant_id, recording.call_id))
             await self._checkpoint_before_external_io()
         for track in tracks:
             if await self._verify_participant_recording(track, now=now):
-                touched_calls[track.call_id] = track.tenant_id
+                touched_calls.add((track.tenant_id, track.call_id))
             await self._checkpoint_before_external_io()
 
         ready_call_ids: set[str] = set()
-        for call_id, tenant_id in touched_calls.items():
+        for tenant_id, call_id in touched_calls:
             if await self.is_ready_for_offline_asr(
                 tenant_id=tenant_id,
                 call_id=call_id,

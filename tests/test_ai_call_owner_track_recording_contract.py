@@ -80,10 +80,83 @@ async def test_recording_track_tenant_browser_start_fails_closed_without_record_
         )
     )
 
-    with pytest.raises(CustomException, match="通话录音缺少租户上下文"):
-        await service._start_browser_ready_recording_tracks("call-a")
+    with pytest.raises(CustomException, match="通话录音对应的通话记录不存在"):
+        await service._start_browser_ready_recording_tracks(
+            tenant_id="tenant-a",
+            call_id="call-a",
+        )
 
     service.recording_service.start_session_participant_recordings.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_recording_track_tenant_browser_start_rejects_record_mismatch() -> None:
+    service = object.__new__(AiCallService)
+    service.recording_service = AsyncMock()
+    service.record_service = SimpleNamespace(
+        get_record=AsyncMock(
+            return_value=SimpleNamespace(
+                tenant_id="tenant-b",
+                room_name="room-b",
+                participant_identity="browser-b",
+            )
+        )
+    )
+    service.orchestrator = SimpleNamespace(
+        get_session=AsyncMock(
+            return_value=SimpleNamespace(
+                status=CallSessionStatus.CONNECTED,
+                room_name="room-a",
+            )
+        )
+    )
+
+    with pytest.raises(CustomException, match="通话录音租户上下文不匹配"):
+        await service._start_browser_ready_recording_tracks(
+            tenant_id="tenant-a",
+            call_id="shared-call",
+        )
+
+    service.recording_service.start_session_participant_recordings.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_recording_track_tenant_reconcile_checks_equal_call_ids_independently() -> None:
+    claims = [
+        ai_call_crud.RecordingTrackVerificationClaim(
+            track_id=index,
+            tenant_id=tenant_id,
+            call_id="shared-call",
+            track_role="customer",
+            participant_identity=f"customer-{tenant_id}",
+            object_name=f"tracks/{tenant_id}.mp3",
+            started_at=NOW - timedelta(minutes=1),
+            ended_at=None,
+            duration_ms=None,
+            verify_attempts=0,
+            verify_deadline_at=NOW + timedelta(minutes=15),
+            claim_token=NOW + timedelta(minutes=2),
+        )
+        for index, tenant_id in enumerate(("tenant-a", "tenant-b"), start=1)
+    ]
+    repository = SimpleNamespace(
+        claim_due_recording_verifications=AsyncMock(return_value=[]),
+        claim_due_recording_track_verifications=AsyncMock(return_value=claims),
+    )
+    service = AiCallRecordingService(
+        repository,
+        enabled=True,
+        transaction_checkpoint=AsyncMock(),
+    )
+    service._verify_participant_recording = AsyncMock(return_value=True)
+    service.is_ready_for_offline_asr = AsyncMock(return_value=True)
+
+    assert await service.reconcile_due_recordings() == {"shared-call"}
+    checked_tenants = {
+        item.kwargs["tenant_id"]
+        for item in service.is_ready_for_offline_asr.await_args_list
+    }
+    assert checked_tenants == {"tenant-a", "tenant-b"}
 
 
 @pytest.mark.anyio
@@ -188,6 +261,28 @@ async def test_recording_track_tenant_wrong_claim_token_cannot_update() -> None:
             tenant_id="tenant-a",
             track_id=track.id,
             claim_token=claims[0].claim_token + timedelta(seconds=1),
+            status="completed",
+        )
+        assert (
+            await repository.lock_due_recording_track(
+                tenant_id="tenant-a",
+                track_id=track.id,
+                claim_token=claims[0].claim_token + timedelta(seconds=1),
+            )
+            is None
+        )
+        assert (
+            await repository.lock_due_recording_track(
+                tenant_id="tenant-b",
+                track_id=track.id,
+                claim_token=claims[0].claim_token,
+            )
+            is None
+        )
+        assert not await repository.update_due_recording_track(
+            tenant_id="tenant-b",
+            track_id=track.id,
+            claim_token=claims[0].claim_token,
             status="completed",
         )
         assert (

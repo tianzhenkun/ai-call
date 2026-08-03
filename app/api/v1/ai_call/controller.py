@@ -813,7 +813,9 @@ async def report_browser_event_controller(
     call_id: Annotated[str, Path(alias="callId")],
     request: BrowserEventReportRequest,
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.report_browser_event(
         call_id=call_id,
         event_type=request.type,
@@ -823,6 +825,7 @@ async def report_browser_event_controller(
             exclude={"type", "timestamp"},
             exclude_none=True,
         ),
+        tenant_id=tenant_id,
     )
     return SuccessResponse(data=EventOut.model_validate(result), msg="上报成功")
 

@@ -568,6 +568,8 @@ class AiCallService:
         event_type: str,
         timestamp: datetime | None,
         payload: dict[str, Any] | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> BrowserEventReportResult:
         try:
             if event_type == "browser_disconnect" and self.recording_service is not None:
@@ -588,7 +590,10 @@ class AiCallService:
                             str(exc),
                         )
             elif event_type == "browser_ready":
-                await self._start_browser_ready_recording_tracks(call_id)
+                await self._start_browser_ready_recording_tracks(
+                    tenant_id=self._require_recording_tenant(tenant_id),
+                    call_id=call_id,
+                )
             result = await self.orchestrator.report_browser_event(
                 call_id=call_id,
                 event_type=event_type,
@@ -1726,26 +1731,44 @@ class AiCallService:
         if self.handoff_service is None:
             raise CustomException(msg="转人工服务未启用", code=RET.ERROR.code, status_code=500)
 
-    async def _start_browser_ready_recording_tracks(self, call_id: str) -> None:
+    async def _start_browser_ready_recording_tracks(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
         if self.recording_service is None:
             return
+        tenant_id = self._require_recording_tenant(tenant_id)
+        if self.record_service is None:
+            raise CustomException(
+                msg="通话录音对应的通话记录不存在",
+                code=RET.ERROR.code,
+                status_code=500,
+            )
+        record = await self.record_service.get_record(call_id)
+        if record is None:
+            raise CustomException(
+                msg="通话录音对应的通话记录不存在",
+                code=RET.ERROR.code,
+                status_code=500,
+            )
+        record_tenant_id = self._require_recording_tenant(record.tenant_id)
+        if record_tenant_id != tenant_id:
+            raise CustomException(
+                msg="通话录音租户上下文不匹配",
+                code=RET.ERROR.code,
+                status_code=403,
+            )
         session = await self.orchestrator.get_session(call_id)
         if session.status not in RUNNING_STATUSES:
             return
-        room_name = session.room_name
-        customer_participant_identity = f"browser-{call_id}"
-        record = None
-        if self.record_service is not None:
-            record = await self.record_service.get_record(call_id)
-            if record is not None:
-                room_name = record.room_name or room_name
-                customer_participant_identity = (
-                    record.participant_identity or customer_participant_identity
-                )
+        room_name = record.room_name or session.room_name
+        customer_participant_identity = (
+            record.participant_identity or f"browser-{call_id}"
+        )
         await self.recording_service.start_session_participant_recordings(
-            tenant_id=self._require_recording_tenant(
-                record.tenant_id if record is not None else None
-            ),
+            tenant_id=tenant_id,
             call_id=call_id,
             room_name=room_name,
             customer_participant_identity=customer_participant_identity,
