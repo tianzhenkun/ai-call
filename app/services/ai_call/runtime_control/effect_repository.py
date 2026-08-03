@@ -27,6 +27,9 @@ from app.services.ai_call.runtime_control.recording_repository import (
     OwnerRecordingRepository,
 )
 from app.services.ai_call.runtime_control.timing import read_database_time
+from app.services.ai_call.runtime_control.track_recording_repository import (
+    OwnerTrackRecordingRepository,
+)
 from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
 from app.utils.id_util import generate_snowflake_id
 
@@ -147,6 +150,7 @@ class RuntimeEffectRepository:
         required_absence_observations: int = 2,
         database_clock: Callable[[AsyncSession], Awaitable[datetime]] = read_database_time,
         recording_repository: OwnerRecordingRepository | None = None,
+        track_recording_repository: OwnerTrackRecordingRepository | None = None,
     ) -> None:
         if required_absence_observations < 1:
             raise ValueError("required_absence_observations must be positive")
@@ -159,6 +163,13 @@ class RuntimeEffectRepository:
         self._recording_repository = recording_repository or OwnerRecordingRepository(
             session,
             id_generator=id_generator,
+        )
+        self._track_recording_repository = (
+            track_recording_repository
+            or OwnerTrackRecordingRepository(
+                session,
+                id_generator=id_generator,
+            )
         )
 
     async def register(
@@ -619,6 +630,13 @@ class RuntimeEffectRepository:
             self._apply_destroy_observation(effect, source, observation, now)
         self._apply_reservation_observation(reservation, effect, observation, now)
         await self._recording_repository.project(
+            record=record,
+            effect=effect,
+            source_effect=source,
+            observation=observation,
+            now=now,
+        )
+        await self._track_recording_repository.project(
             record=record,
             effect=effect,
             source_effect=source,

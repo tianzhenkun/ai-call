@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,12 +12,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallRecordingTrackModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallRecordingModel,
+    AiCallRecordingTrackModel,
+    AiCallRecordModel,
+)
 from app.core.base_model import MappedBase
 from app.services.ai_call.runtime_control.command_repository import CommandClaim
 from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.effect_repository import (
+    EffectClaim,
     EffectRegistrationError,
+    ProviderObservation,
+    ProviderObservationKind,
     RuntimeEffectRepository,
 )
 from app.services.ai_call.runtime_control.models import (
@@ -266,6 +274,133 @@ async def _seed_track_start(
             )
         )
     return _lease(now), now
+
+
+async def _seed_track_submit(
+    session_maker: async_sessionmaker,
+) -> tuple[EffectClaim, datetime]:
+    _lease_value, now = await _seed_track_start(
+        session_maker,
+        answered=True,
+        effect_status="APPLYING",
+        attempt_count=1,
+    )
+    async with session_maker.begin() as session:
+        session.add(
+            AiCallRecordingModel(
+                id=30,
+                tenant_id="tenant-a",
+                call_id="call-a",
+                room_name="room-a",
+                status="recording",
+                egress_id="EG_main",
+                egress_generation=1,
+                object_name="main/call-a.ogg",
+                started_at=now,
+            )
+        )
+    _, _provider_key, resource_key = customer_track_keys("call-a", "customer-a")
+    return (
+        EffectClaim(
+            effect_id=10,
+            tenant_id="tenant-a",
+            call_id="call-a",
+            effect_type="START_TRACK_EGRESS",
+            processing_owner_id="runtime-a",
+            processing_fencing_token=7,
+            processing_token="existing-token",
+            processing_expires_at=now + timedelta(minutes=5),
+            source_create_effect_id=None,
+            create_protection_deadline_at=None,
+            attempt_count=1,
+            reconcile_only=False,
+            provider_namespace="livekit:postgres-test",
+            resource_key=resource_key,
+        ),
+        now,
+    )
+
+
+def _customer_track_present() -> ProviderObservation:
+    return ProviderObservation(
+        kind=ProviderObservationKind.RESOURCE_PRESENT,
+        provider_reference="EG_customer",
+        object_name="tracks/call-a/customer-customer-a.ogg",
+    )
+
+
+async def test_customer_track_effect_and_projection_commit_atomically() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        claim, _now = await _seed_track_submit(session_maker)
+        async with session_maker.begin() as session:
+            assert await RuntimeEffectRepository(session).submit(
+                claim, _customer_track_present()
+            )
+
+        async with session_maker() as session:
+            effect = await session.get(AiCallRuntimeEffectModel, claim.effect_id)
+            track = await session.scalar(select(AiCallRecordingTrackModel))
+            main = await session.scalar(select(AiCallRecordingModel))
+            assert effect is not None and effect.status == "APPLIED"
+            assert track is not None
+            assert track.status == "recording"
+            assert track.egress_id == "EG_customer"
+            assert main is not None and main.egress_id == "EG_main"
+    finally:
+        await engine.dispose()
+
+
+async def test_customer_track_projection_exception_rolls_back_effect() -> None:
+    class RaisingProjection:
+        async def project(self, **_kwargs: object) -> None:
+            raise RuntimeError("track projection failed")
+
+    engine, session_maker = await _reset_database()
+    try:
+        claim, _now = await _seed_track_submit(session_maker)
+        with pytest.raises(RuntimeError, match="track projection failed"):
+            async with session_maker.begin() as session:
+                await RuntimeEffectRepository(
+                    session,
+                    track_recording_repository=RaisingProjection(),
+                ).submit(claim, _customer_track_present())
+
+        async with session_maker() as session:
+            effect = await session.get(AiCallRuntimeEffectModel, claim.effect_id)
+            track_count = await session.scalar(
+                select(func.count()).select_from(AiCallRecordingTrackModel)
+            )
+            assert effect is not None and effect.status == "APPLYING"
+            assert track_count == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_stale_customer_track_submit_updates_zero_rows() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        claim, _now = await _seed_track_submit(session_maker)
+        stale_claim = replace(claim, processing_owner_id="runtime-old")
+        async with session_maker.begin() as session:
+            assert not await RuntimeEffectRepository(session).submit(
+                stale_claim,
+                _customer_track_present(),
+            )
+
+        async with session_maker() as session:
+            track_count = await session.scalar(
+                select(func.count()).select_from(AiCallRecordingTrackModel)
+            )
+            effect_status = await session.scalar(
+                select(AiCallRuntimeEffectModel.status).where(
+                    AiCallRuntimeEffectModel.id == claim.effect_id
+                )
+            )
+            assert track_count == 0
+            assert effect_status == "APPLYING"
+    finally:
+        await engine.dispose()
 
 
 async def test_track_claim_requires_answered_and_matching_identity() -> None:
