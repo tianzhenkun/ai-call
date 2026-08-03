@@ -341,6 +341,8 @@ class RuntimeEffectRepository:
                     AiCallRuntimeEffectModel.effect_type,
                     AiCallRuntimeEffectModel.status,
                     AiCallRuntimeEffectModel.resource_key,
+                    AiCallRuntimeEffectModel.resource_generation,
+                    AiCallRuntimeEffectModel.attempt_count,
                     AiCallRecordModel.participant_identity,
                     AiCallRecordModel.answered_at,
                     AiCallRecordModel.terminal_requested_at,
@@ -368,14 +370,14 @@ class RuntimeEffectRepository:
         prerequisite = aliased(AiCallRuntimeEffectModel)
         for candidate in candidates:
             claim_gate = []
-            if (
-                candidate.effect_type == "START_TRACK_EGRESS"
-                and candidate.status == EffectStatus.PENDING
-            ):
+            if candidate.effect_type == "START_TRACK_EGRESS":
                 participant_identity = str(candidate.participant_identity or "")
-                if (
-                    candidate.answered_at is None
-                    or candidate.terminal_requested_at is not None
+                first_attempt = (
+                    candidate.status == EffectStatus.PENDING
+                    and candidate.attempt_count == 0
+                )
+                if candidate.answered_at is None or (
+                    first_attempt and candidate.terminal_requested_at is not None
                 ):
                     continue
                 try:
@@ -385,20 +387,27 @@ class RuntimeEffectRepository:
                     )[2]
                 except ValueError:
                     continue
-                if candidate.resource_key != expected_resource_key:
+                if (
+                    candidate.resource_key != expected_resource_key
+                    or candidate.resource_generation != 1
+                ):
                     continue
+                record_gate = [
+                    AiCallRecordModel.tenant_id == owner_lease.tenant_id,
+                    AiCallRecordModel.call_id == owner_lease.call_id,
+                    AiCallRecordModel.participant_identity == participant_identity,
+                    AiCallRecordModel.answered_at.is_not(None),
+                ]
+                if first_attempt:
+                    record_gate.append(
+                        AiCallRecordModel.terminal_requested_at.is_(None)
+                    )
                 claim_gate.extend(
                     (
                         AiCallRuntimeEffectModel.resource_key
                         == expected_resource_key,
-                        exists().where(
-                            AiCallRecordModel.tenant_id == owner_lease.tenant_id,
-                            AiCallRecordModel.call_id == owner_lease.call_id,
-                            AiCallRecordModel.participant_identity
-                            == participant_identity,
-                            AiCallRecordModel.answered_at.is_not(None),
-                            AiCallRecordModel.terminal_requested_at.is_(None),
-                        ),
+                        AiCallRuntimeEffectModel.resource_generation == 1,
+                        exists().where(*record_gate),
                     )
                 )
             token = self._processing_token_generator()
@@ -415,6 +424,12 @@ class RuntimeEffectRepository:
                     and_(
                         AiCallRuntimeEffectModel.effect_type.in_(CREATE_EFFECT_TYPES),
                         AiCallRuntimeEffectModel.status != EffectStatus.PENDING,
+                    ),
+                    and_(
+                        AiCallRuntimeEffectModel.effect_type
+                        == "START_TRACK_EGRESS",
+                        AiCallRuntimeEffectModel.status == EffectStatus.PENDING,
+                        AiCallRuntimeEffectModel.attempt_count > 0,
                     ),
                 ),
             )
@@ -501,7 +516,13 @@ class RuntimeEffectRepository:
                     attempt_count=row.attempt_count,
                     reconcile_only=(
                         candidate.effect_type in CREATE_EFFECT_TYPES
-                        and candidate.status != EffectStatus.PENDING
+                        and (
+                            candidate.status != EffectStatus.PENDING
+                            or (
+                                candidate.effect_type == "START_TRACK_EGRESS"
+                                and candidate.attempt_count > 0
+                            )
+                        )
                     ),
                     provider_namespace=row.provider_namespace,
                     resource_key=row.resource_key,

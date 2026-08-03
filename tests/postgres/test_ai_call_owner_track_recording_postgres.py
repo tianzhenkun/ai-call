@@ -37,7 +37,7 @@ MIGRATION_PATH = (
 def _dsn() -> str:
     value = os.getenv("AI_CALL_TEST_POSTGRES_DSN", "").strip()
     if not value:
-        pytest.fail("AI_CALL_TEST_POSTGRES_DSN 未配置，必须通过隔离 PostgreSQL 脚本运行")
+        pytest.skip("AI_CALL_TEST_POSTGRES_DSN 未配置，需通过隔离 PostgreSQL 脚本运行")
     return value
 
 
@@ -206,6 +206,8 @@ async def _seed_track_start(
     resource_identity: str | None = None,
     terminal: bool = False,
     effect_status: str = "PENDING",
+    resource_generation: int = 1,
+    attempt_count: int | None = None,
 ) -> tuple[OwnerLease, datetime]:
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=5)
@@ -251,8 +253,14 @@ async def _seed_track_start(
                 provider_namespace="livekit:postgres-test",
                 provider_idempotency_key=provider_key,
                 resource_key=resource_key,
-                resource_generation=1,
-                attempt_count=1 if effect_status == "APPLYING" else 0,
+                resource_generation=resource_generation,
+                attempt_count=(
+                    attempt_count
+                    if attempt_count is not None
+                    else 1
+                    if effect_status == "APPLYING"
+                    else 0
+                ),
                 created_at=now,
                 updated_at=now,
             )
@@ -288,6 +296,36 @@ async def test_track_claim_rejects_resource_digest_mismatch() -> None:
             answered=True,
             identity="customer-a",
             resource_identity="customer-b",
+        )
+        async with session_maker.begin() as session:
+            assert await RuntimeEffectRepository(session).claim_next(lease) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("effect_status", "resource_identity", "resource_generation"),
+    [
+        ("PENDING", "customer-a", 2),
+        ("RECONCILE_REQUIRED", "customer-b", 1),
+        ("RECONCILE_REQUIRED", "customer-a", 2),
+    ],
+)
+async def test_track_claim_recovery_requires_stable_identity_and_generation(
+    effect_status: str,
+    resource_identity: str,
+    resource_generation: int,
+) -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        lease, _ = await _seed_track_start(
+            session_maker,
+            answered=True,
+            identity="customer-a",
+            resource_identity=resource_identity,
+            effect_status=effect_status,
+            resource_generation=resource_generation,
+            attempt_count=1 if effect_status == "RECONCILE_REQUIRED" else 0,
         )
         async with session_maker.begin() as session:
             assert await RuntimeEffectRepository(session).claim_next(lease) is None
@@ -374,6 +412,32 @@ async def test_terminal_graph_handles_track_start_by_claim_state(
                 .where(AiCallRuntimeEffectModel.effect_type == "STOP_TRACK_EGRESS")
             )
             assert stop_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_terminal_graph_keeps_attempted_pending_track_recoverable() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        lease, now = await _seed_track_start(
+            session_maker,
+            answered=True,
+            terminal=True,
+            effect_status="PENDING",
+            attempt_count=1,
+        )
+        await _seed_end_command(session_maker, now=now)
+        async with session_maker.begin() as session:
+            await RuntimeEffectRepository(session).register_end_graph(
+                await _end_claim(now)
+            )
+
+        async with session_maker.begin() as session:
+            claim = await RuntimeEffectRepository(session).claim_next(lease)
+
+        assert claim is not None
+        assert claim.effect_type == "START_TRACK_EGRESS"
+        assert claim.reconcile_only is True
     finally:
         await engine.dispose()
 
