@@ -1210,9 +1210,9 @@ class AiCallRecordingService:
                 type(register_exc).__name__,
                 str(register_exc),
             )
-            await self.repository.update_recording_track(
-                tenant_id=track.tenant_id,
-                track_id=track.id,
+            await self._update_participant_recording_after_verification(
+                track,
+                verification_claim=verification_claim,
                 status="failed",
                 object_name=object_name,
                 ended_at=ended_at,
@@ -1226,9 +1226,9 @@ class AiCallRecordingService:
             )
             return True
 
-        await self.repository.update_recording_track(
-            tenant_id=track.tenant_id,
-            track_id=track.id,
+        await self._update_participant_recording_after_verification(
+            track,
+            verification_claim=verification_claim,
             status="completed",
             object_name=object_name,
             oss_id=oss_id,
@@ -1240,6 +1240,27 @@ class AiCallRecordingService:
             next_verify_at=None,
             failure_stage=None,
             failure_message=None,
+        )
+        return True
+
+    async def _update_participant_recording_after_verification(
+        self,
+        track: AiCallRecordingTrackModel,
+        *,
+        verification_claim: RecordingTrackVerificationClaim | None,
+        **values: Any,
+    ) -> bool:
+        if verification_claim is not None:
+            return await self.repository.update_due_recording_track(
+                tenant_id=verification_claim.tenant_id,
+                track_id=verification_claim.track_id,
+                claim_token=verification_claim.claim_token,
+                **values,
+            )
+        await self.repository.update_recording_track(
+            tenant_id=track.tenant_id,
+            track_id=track.id,
+            **values,
         )
         return True
 

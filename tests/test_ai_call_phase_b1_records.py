@@ -8511,3 +8511,64 @@ async def test_owner_browser_ready_recording_after_terminal_barrier_updates_zero
 
     assert marked is False
     assert result.answered_at is None
+
+
+@pytest.mark.anyio
+async def test_failed_owner_customer_track_keeps_main_recording_closed_and_asr_ready(
+    b1_service,
+) -> None:
+    _service, record_service = b1_service
+    result = await record_service.create_web_record(
+        tenant_id="000000",
+        call_id="owner-track-failed",
+        business_id=None,
+        room_name="room-owner-track-failed",
+        participant_identity="browser-owner-track-failed",
+    )
+    result.dialogue_persistence_status = "pending"
+    result.runtime_control_mode = "owner_command_v1"
+    result.status = CallSessionStatus.COMPLETED.value
+    result.terminal_requested_at = datetime.now(timezone.utc)
+    await record_service.repository.db.flush()
+    await record_service.repository.create_recording(
+        tenant_id="000000",
+        call_id=result.call_id,
+        room_name=result.room_name,
+        status="completed",
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+    )
+    await record_service.repository.create_recording_track(
+        tenant_id="000000",
+        call_id=result.call_id,
+        room_name=result.room_name,
+        track_role="customer",
+        participant_identity="browser-owner-track-failed",
+        status="failed",
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+    )
+    track = await record_service.repository.get_recording_track(
+        tenant_id="000000",
+        call_id=result.call_id,
+        track_role="customer",
+        participant_identity="browser-owner-track-failed",
+    )
+    assert track is not None
+    track.failure_stage = "oss_missing"
+    track.failure_message = "录音停止后确认超时，未发现录音文件"
+    await record_service.repository.db.flush()
+
+    recording_service = AiCallRecordingService(
+        record_service.repository,
+        enabled=True,
+    )
+    assert await recording_service.is_ready_for_offline_asr(
+        tenant_id="000000",
+        call_id=result.call_id,
+    )
+    main_recording = await record_service.repository.get_recording(
+        tenant_id="000000",
+        call_id=result.call_id,
+    )
+    assert main_recording is not None
+    assert main_recording.status == "completed"
+    assert track.failure_message is not None
