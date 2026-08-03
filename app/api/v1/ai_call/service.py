@@ -358,6 +358,7 @@ class AiCallService:
         await self.orchestrator.start_opening(resolved_call_id)
         if self.recording_service is not None:
             await self.recording_service.start_session_participant_recordings(
+                tenant_id=self._require_recording_tenant(tenant_id),
                 call_id=resolved_call_id,
                 room_name=room_name,
                 customer_participant_identity=participant_identity,
@@ -1216,6 +1217,7 @@ class AiCallService:
         )
         if self.recording_service is not None:
             await self.recording_service.start_human_agent_recording(
+                tenant_id=handoff.tenant_id,
                 call_id=handoff.call_id,
                 room_name=handoff.room_name,
                 handoff_id=handoff.handoff_id,
@@ -1732,6 +1734,7 @@ class AiCallService:
             return
         room_name = session.room_name
         customer_participant_identity = f"browser-{call_id}"
+        record = None
         if self.record_service is not None:
             record = await self.record_service.get_record(call_id)
             if record is not None:
@@ -1740,6 +1743,9 @@ class AiCallService:
                     record.participant_identity or customer_participant_identity
                 )
         await self.recording_service.start_session_participant_recordings(
+            tenant_id=self._require_recording_tenant(
+                record.tenant_id if record is not None else None
+            ),
             call_id=call_id,
             room_name=room_name,
             customer_participant_identity=customer_participant_identity,

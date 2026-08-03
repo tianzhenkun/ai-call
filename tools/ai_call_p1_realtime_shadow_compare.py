@@ -180,10 +180,13 @@ def _build_report_from_db(
 ) -> dict[str, Any]:
     track = conn.execute(
         """
-        select started_at
-        from ai_call_recording_track
-        where call_id = ? and track_role = 'customer'
-        order by id desc
+        select track.started_at
+        from ai_call_recording_track track
+        join ai_call_record record
+          on record.call_id = track.call_id
+         and record.tenant_id = track.tenant_id
+        where track.call_id = ? and track.track_role = 'customer'
+        order by track.id desc
         limit 1
         """,
         (call_id,),
@@ -222,7 +225,9 @@ def _recent_call_ids(conn: sqlite3.Connection, recent: int) -> list[str]:
         where r.entry_type = 'sip_outbound'
           and exists (
               select 1 from ai_call_recording_track t
-              where t.call_id = r.call_id and t.track_role = 'customer'
+              where t.call_id = r.call_id
+                and t.tenant_id = r.tenant_id
+                and t.track_role = 'customer'
           )
           and exists (
               select 1 from ai_call_asr_job j

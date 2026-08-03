@@ -5214,6 +5214,7 @@ async def test_recording_stop_releases_sqlite_write_lock_before_egress_io(
                 db.add(
                     AiCallRecordingTrackModel(
                         id=2,
+                        tenant_id="000000",
                         call_id=call_id,
                         room_name=f"ai-call-{call_id}",
                         track_role="customer",
@@ -5342,6 +5343,7 @@ async def test_isolated_recording_stop_timeout_commits_verifying_state(
                 db.add(
                     AiCallRecordingTrackModel(
                         id=2,
+                        tenant_id="000000",
                         call_id=call_id,
                         room_name=f"ai-call-{call_id}",
                         track_role="customer",

@@ -289,12 +289,14 @@ class FakeRecordingService:
     async def start_session_participant_recordings(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         customer_participant_identity: str | None = None,
         ai_participant_identity: str | None = None,
     ) -> None:
         self.started_participants.append({
+            "tenant_id": tenant_id,
             "call_id": call_id,
             "room_name": room_name,
             "customer_participant_identity": customer_participant_identity,
@@ -1074,6 +1076,7 @@ async def test_create_sip_session_starts_customer_and_ai_participant_recordings(
     ]
     assert recording_service.started_participants == [
         {
+            "tenant_id": "000000",
             "call_id": result.call_id,
             "room_name": result.room_name,
             "customer_participant_identity": result.participant_identity,

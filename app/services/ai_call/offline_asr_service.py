@@ -344,7 +344,16 @@ class AiCallOfflineAsrService:
     async def process_call(self, call_id: str) -> dict[str, int]:
         if not self.enabled:
             return {"jobs": 0, "segments": 0, "skipped": 0, "failed": 0}
-        tracks = await self.repository.list_recording_tracks(call_id)
+        record = await self.repository.get_record(call_id)
+        tenant_id = str(record.tenant_id or "").strip() if record is not None else ""
+        if not tenant_id:
+            raise RuntimeError(
+                f"offline ASR missing tenant context: call_id={call_id}"
+            )
+        tracks = await self.repository.list_recording_tracks(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         prepared_segments: list[_PreparedAsrSegment] = []
         stats = {"jobs": 0, "segments": 0, "skipped": 0, "failed": 0}
         completed_job_ids: set[int] = set()

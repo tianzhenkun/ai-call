@@ -1225,6 +1225,7 @@ async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
         db.add(
             AiCallRecordModel(
                 id=generate_snowflake_id(),
+                tenant_id="tenant-a",
                 call_id=attempt.call_id,
                 business_type="outbound_task",
                 business_id=str(task_id),
@@ -1262,6 +1263,7 @@ async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
                 db.add(
                     AiCallRecordingTrackModel(
                         id=generate_snowflake_id(),
+                        tenant_id="tenant-a",
                         call_id=attempt.call_id,
                         room_name=f"ai-call-{attempt.call_id}",
                         track_role=role,

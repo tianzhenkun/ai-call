@@ -118,6 +118,7 @@ def record(
     now = datetime.now(timezone.utc)
     return AiCallRecordModel(
         id=generate_snowflake_id(),
+        tenant_id="000000",
         call_id=call_id,
         business_type="outbound_task",
         business_id="340700000000000010",
@@ -183,6 +184,7 @@ async def add_completed_media_tracks(database, call_id: str) -> None:
             db.add(
                 AiCallRecordingTrackModel(
                     id=generate_snowflake_id(),
+                    tenant_id="000000",
                     call_id=call_id,
                     room_name=f"ai-call-{call_id}",
                     track_role=role,

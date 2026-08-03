@@ -404,6 +404,7 @@ async def media_ready_controller(
         )
     if ai_call_service.recording_service is not None:
         await ai_call_service.recording_service.start_human_agent_recording(
+            tenant_id=handoff.tenant_id,
             call_id=handoff.call_id,
             room_name=handoff.room_name,
             handoff_id=handoff.handoff_id,

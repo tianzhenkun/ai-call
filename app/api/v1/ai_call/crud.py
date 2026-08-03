@@ -54,6 +54,22 @@ class RecordingVerificationClaim:
     claim_token: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class RecordingTrackVerificationClaim:
+    track_id: int
+    tenant_id: str
+    call_id: str
+    track_role: str
+    participant_identity: str
+    object_name: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    duration_ms: int | None
+    verify_attempts: int
+    verify_deadline_at: datetime | None
+    claim_token: datetime
+
+
 class AiCallRecordRepository:
     """AI Call B1 专用持久化仓储。"""
 
@@ -636,6 +652,7 @@ class AiCallRecordRepository:
     async def create_recording_track(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         track_role: str,
@@ -647,6 +664,7 @@ class AiCallRecordRepository:
     ) -> AiCallRecordingTrackModel:
         track = AiCallRecordingTrackModel(
             id=generate_snowflake_id(),
+            tenant_id=tenant_id,
             call_id=call_id,
             room_name=room_name,
             track_role=track_role,
@@ -664,12 +682,14 @@ class AiCallRecordRepository:
     async def get_recording_track(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         track_role: str,
         participant_identity: str,
     ) -> AiCallRecordingTrackModel | None:
         result = await self.db.execute(
             select(AiCallRecordingTrackModel).where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
                 AiCallRecordingTrackModel.call_id == call_id,
                 AiCallRecordingTrackModel.track_role == track_role,
                 AiCallRecordingTrackModel.participant_identity == participant_identity,
@@ -677,10 +697,18 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
-    async def list_recording_tracks(self, call_id: str) -> list[AiCallRecordingTrackModel]:
+    async def list_recording_tracks(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> list[AiCallRecordingTrackModel]:
         result = await self.db.execute(
             select(AiCallRecordingTrackModel)
-            .where(AiCallRecordingTrackModel.call_id == call_id)
+            .where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
+                AiCallRecordingTrackModel.call_id == call_id,
+            )
             .order_by(
                 asc(AiCallRecordingTrackModel.started_at),
                 asc(AiCallRecordingTrackModel.id),
@@ -781,36 +809,67 @@ class AiCallRecordRepository:
             .with_for_update()
         )
 
-    async def list_due_recording_track_verifications(
+    async def claim_due_recording_track_verifications(
         self,
         *,
         now: datetime,
         limit: int,
-    ) -> list[AiCallRecordingTrackModel]:
-        result = await self.db.execute(
-            select(AiCallRecordingTrackModel)
-            .where(
-                AiCallRecordingTrackModel.status == "verifying",
-                or_(
-                    AiCallRecordingTrackModel.next_verify_at.is_(None),
-                    AiCallRecordingTrackModel.next_verify_at <= now,
-                ),
-            )
-            .order_by(
-                asc(AiCallRecordingTrackModel.next_verify_at),
-                asc(AiCallRecordingTrackModel.id),
-            )
-            .limit(max(1, limit))
+        claim_ttl: timedelta,
+    ) -> list[RecordingTrackVerificationClaim]:
+        claim_token = now + claim_ttl
+        tracks = list(
+            (
+                await self.db.scalars(
+                    select(AiCallRecordingTrackModel)
+                    .where(
+                        AiCallRecordingTrackModel.status == "verifying",
+                        or_(
+                            AiCallRecordingTrackModel.next_verify_at.is_(None),
+                            AiCallRecordingTrackModel.next_verify_at <= now,
+                        ),
+                    )
+                    .order_by(
+                        asc(AiCallRecordingTrackModel.next_verify_at),
+                        asc(AiCallRecordingTrackModel.id),
+                    )
+                    .limit(max(1, limit))
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
         )
-        return list(result.scalars().all())
+        for track in tracks:
+            track.next_verify_at = claim_token
+        await self.db.flush()
+        return [
+            RecordingTrackVerificationClaim(
+                track_id=track.id,
+                tenant_id=track.tenant_id,
+                call_id=track.call_id,
+                track_role=track.track_role,
+                participant_identity=track.participant_identity,
+                object_name=track.object_name,
+                started_at=track.started_at,
+                ended_at=track.ended_at,
+                duration_ms=track.duration_ms,
+                verify_attempts=int(track.verify_attempts or 0),
+                verify_deadline_at=track.verify_deadline_at,
+                claim_token=claim_token,
+            )
+            for track in tracks
+        ]
 
     async def update_recording_track(
         self,
+        *,
+        tenant_id: str,
         track_id: int,
         **values,
     ) -> AiCallRecordingTrackModel | None:
         result = await self.db.execute(
-            select(AiCallRecordingTrackModel).where(AiCallRecordingTrackModel.id == track_id)
+            select(AiCallRecordingTrackModel).where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
+                AiCallRecordingTrackModel.id == track_id,
+            )
         )
         track = result.scalar_one_or_none()
         if track is None:
@@ -821,6 +880,52 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(track)
         return track
+
+    async def update_due_recording_track(
+        self,
+        *,
+        tenant_id: str,
+        track_id: int,
+        claim_token: datetime,
+        **values,
+    ) -> bool:
+        safe_values = {
+            key: value
+            for key, value in values.items()
+            if hasattr(AiCallRecordingTrackModel, key)
+        }
+        if not safe_values:
+            return False
+        result = await self.db.execute(
+            update(AiCallRecordingTrackModel)
+            .where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
+                AiCallRecordingTrackModel.id == track_id,
+                AiCallRecordingTrackModel.status == "verifying",
+                AiCallRecordingTrackModel.next_verify_at == claim_token,
+            )
+            .values(**safe_values)
+        )
+        await self.db.flush()
+        return result.rowcount == 1
+
+    async def lock_due_recording_track(
+        self,
+        *,
+        tenant_id: str,
+        track_id: int,
+        claim_token: datetime,
+    ) -> AiCallRecordingTrackModel | None:
+        return await self.db.scalar(
+            select(AiCallRecordingTrackModel)
+            .where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
+                AiCallRecordingTrackModel.id == track_id,
+                AiCallRecordingTrackModel.status == "verifying",
+                AiCallRecordingTrackModel.next_verify_at == claim_token,
+            )
+            .with_for_update()
+        )
 
     async def get_asr_job(
         self,

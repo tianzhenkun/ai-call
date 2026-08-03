@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from tools.ai_call_p1_realtime_shadow_compare import build_comparison_report
+import inspect
+
+from tools.ai_call_p1_realtime_shadow_compare import (
+    _build_report_from_db,
+    _recent_call_ids,
+    build_comparison_report,
+)
+
+
+def test_realtime_shadow_compare_recording_track_queries_match_tenant() -> None:
+    report_query = inspect.getsource(_build_report_from_db).lower()
+    recent_query = inspect.getsource(_recent_call_ids).lower()
+
+    assert "record.tenant_id = track.tenant_id" in report_query
+    assert "t.tenant_id = r.tenant_id" in recent_query
 
 
 def test_realtime_shadow_compare_reports_detector_and_prestop_lag() -> None:

@@ -2823,6 +2823,7 @@ async def test_offline_asr_worker_enqueues_semantic_after_handoff_asr_snapshot_r
     async with session_maker() as db:
         repository = AiCallRecordRepository(db)
         await repository.create_record(
+            tenant_id="000000",
             call_id="call_after_handoff_asr",
             business_type=None,
             business_id=None,
@@ -2852,6 +2853,7 @@ async def test_offline_asr_worker_enqueues_semantic_after_handoff_asr_snapshot_r
             ended_at=started_at + timedelta(seconds=70),
         )
         customer_track = await repository.create_recording_track(
+            tenant_id="000000",
             call_id="call_after_handoff_asr",
             room_name="room_after_handoff_asr",
             track_role="customer",
@@ -2860,6 +2862,7 @@ async def test_offline_asr_worker_enqueues_semantic_after_handoff_asr_snapshot_r
             started_at=started_at + timedelta(seconds=30),
         )
         human_track = await repository.create_recording_track(
+            tenant_id="000000",
             call_id="call_after_handoff_asr",
             room_name="room_after_handoff_asr",
             track_role="human_agent",
@@ -2868,8 +2871,16 @@ async def test_offline_asr_worker_enqueues_semantic_after_handoff_asr_snapshot_r
             status="completed",
             started_at=started_at + timedelta(seconds=30),
         )
-        await repository.update_recording_track(customer_track.id, oss_id=101)
-        await repository.update_recording_track(human_track.id, oss_id=102)
+        await repository.update_recording_track(
+            tenant_id="000000",
+            track_id=customer_track.id,
+            oss_id=101,
+        )
+        await repository.update_recording_track(
+            tenant_id="000000",
+            track_id=human_track.id,
+            oss_id=102,
+        )
         await db.commit()
 
     assert analyzer.snapshots == []

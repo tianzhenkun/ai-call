@@ -293,6 +293,7 @@ async def test_media_ready_stops_waiting_tone_and_starts_human_recording(
     monkeypatch,
 ) -> None:
     handoff = SimpleNamespace(
+        tenant_id="000000",
         handoff_id="handoff-1",
         call_id="call-1",
         room_name="room-1",
@@ -346,6 +347,7 @@ async def test_media_ready_stops_waiting_tone_and_starts_human_recording(
         reason="media_ready",
     )
     recording_service.start_human_agent_recording.assert_awaited_once_with(
+        tenant_id="000000",
         call_id="call-1",
         room_name="room-1",
         handoff_id="handoff-1",

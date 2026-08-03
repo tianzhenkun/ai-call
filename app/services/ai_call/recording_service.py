@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.crud import (
     AiCallRecordRepository,
+    RecordingTrackVerificationClaim,
     RecordingVerificationClaim,
 )
 from app.api.v1.ai_call.model import (
@@ -139,6 +140,7 @@ class AiCallRecordingService:
     async def start_session_participant_recordings(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         customer_participant_identity: str | None = None,
@@ -152,6 +154,7 @@ class AiCallRecordingService:
         if not oss_config:
             return
         await self._start_initial_participant_recordings(
+            tenant_id=tenant_id,
             call_id=call_id,
             room_name=room_name,
             customer_participant_identity=customer_participant_identity,
@@ -162,6 +165,7 @@ class AiCallRecordingService:
     async def start_human_agent_recording(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         handoff_id: str,
@@ -175,6 +179,7 @@ class AiCallRecordingService:
         if not oss_config:
             return
         await self._start_participant_recording(
+            tenant_id=tenant_id,
             call_id=call_id,
             room_name=room_name,
             track_role="human_agent",
@@ -234,7 +239,10 @@ class AiCallRecordingService:
         call_id: str,
     ) -> None:
         await self._stop_main_recording(tenant_id=tenant_id, call_id=call_id)
-        await self._stop_participant_recordings(call_id)
+        await self._stop_participant_recordings(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
 
     async def _stop_main_recording(self, *, tenant_id: str, call_id: str) -> None:
         recording = await self.repository.get_recording(
@@ -385,6 +393,7 @@ class AiCallRecordingService:
     async def _start_initial_participant_recordings(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         customer_participant_identity: str | None,
@@ -398,6 +407,7 @@ class AiCallRecordingService:
             if not participant_identity:
                 continue
             await self._start_participant_recording(
+                tenant_id=tenant_id,
                 call_id=call_id,
                 room_name=room_name,
                 track_role=track_role,
@@ -408,6 +418,7 @@ class AiCallRecordingService:
     async def _start_participant_recording(
         self,
         *,
+        tenant_id: str,
         call_id: str,
         room_name: str,
         track_role: str,
@@ -418,6 +429,7 @@ class AiCallRecordingService:
         if self.egress_manager is None:
             return None
         existing = await self.repository.get_recording_track(
+            tenant_id=tenant_id,
             call_id=call_id,
             track_role=track_role,
             participant_identity=participant_identity,
@@ -433,6 +445,7 @@ class AiCallRecordingService:
         )
         if existing is None:
             track = await self.repository.create_recording_track(
+                tenant_id=tenant_id,
                 call_id=call_id,
                 room_name=room_name,
                 track_role=track_role,
@@ -444,7 +457,8 @@ class AiCallRecordingService:
             )
         else:
             track = await self.repository.update_recording_track(
-                existing.id,
+                tenant_id=tenant_id,
+                track_id=existing.id,
                 status="starting",
                 egress_id=None,
                 object_name=object_name or existing.object_name,
@@ -474,7 +488,8 @@ class AiCallRecordingService:
                     oss_config=oss_config,
                 )
                 return await self.repository.update_recording_track(
-                    track.id,
+                    tenant_id=tenant_id,
+                    track_id=track.id,
                     status="recording",
                     egress_id=result.egress_id or None,
                     object_name=result.object_name or track.object_name,
@@ -501,7 +516,8 @@ class AiCallRecordingService:
             last_exc,
         )
         return await self.repository.update_recording_track(
-            track.id,
+            tenant_id=tenant_id,
+            track_id=track.id,
             status="failed",
             ended_at=utc_now(),
             failure_stage="egress_start",
@@ -522,8 +538,16 @@ class AiCallRecordingService:
         message = f"{prefix}: {detail}"
         return message[:500]
 
-    async def _stop_participant_recordings(self, call_id: str) -> None:
-        tracks = await self.repository.list_recording_tracks(call_id)
+    async def _stop_participant_recordings(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
+        tracks = await self.repository.list_recording_tracks(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         for track in tracks:
             await self._stop_participant_recording(track)
 
@@ -535,7 +559,8 @@ class AiCallRecordingService:
 
         stop_requested_at = utc_now()
         await self.repository.update_recording_track(
-            track.id,
+            tenant_id=track.tenant_id,
+            track_id=track.id,
             status="stopping",
             stop_requested_at=stop_requested_at,
         )
@@ -556,7 +581,8 @@ class AiCallRecordingService:
                     result.error,
                 )
                 await self.repository.update_recording_track(
-                    track.id,
+                    tenant_id=track.tenant_id,
+                    track_id=track.id,
                     status="failed",
                     ended_at=utc_now(),
                     failure_stage="egress_stop",
@@ -619,7 +645,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.repository.update_recording_track(
-                track.id,
+                tenant_id=track.tenant_id,
+                track_id=track.id,
                 status="failed",
                 ended_at=utc_now(),
                 failure_stage="egress_stop",
@@ -643,7 +670,8 @@ class AiCallRecordingService:
                 str(exc),
             )
             await self.repository.update_recording_track(
-                track.id,
+                tenant_id=track.tenant_id,
+                track_id=track.id,
                 status="failed",
                 object_name=object_name,
                 ended_at=ended_at,
@@ -656,7 +684,8 @@ class AiCallRecordingService:
             return
 
         await self.repository.update_recording_track(
-            track.id,
+            tenant_id=track.tenant_id,
+            track_id=track.id,
             status="completed",
             object_name=object_name,
             oss_id=oss_id,
@@ -682,13 +711,15 @@ class AiCallRecordingService:
         await self._checkpoint_before_external_io()
         remaining_limit = safe_limit - len(main_recordings)
         tracks = (
-            await self.repository.list_due_recording_track_verifications(
+            await self.repository.claim_due_recording_track_verifications(
                 now=now,
                 limit=remaining_limit,
+                claim_ttl=self._VERIFY_CLAIM_TTL,
             )
             if remaining_limit > 0
             else []
         )
+        await self._checkpoint_before_external_io()
 
         touched_calls: dict[str, str] = {}
         for recording in main_recordings:
@@ -697,9 +728,8 @@ class AiCallRecordingService:
             await self._checkpoint_before_external_io()
         for track in tracks:
             if await self._verify_participant_recording(track, now=now):
-                record = await self.repository.get_record(track.call_id)
-                if record is not None and record.tenant_id:
-                    touched_calls[track.call_id] = record.tenant_id
+                touched_calls[track.call_id] = track.tenant_id
+            await self._checkpoint_before_external_io()
 
         ready_call_ids: set[str] = set()
         for call_id, tenant_id in touched_calls.items():
@@ -722,7 +752,10 @@ class AiCallRecordingService:
         )
         if recording is not None and recording.status in self._VERIFY_PENDING_STATUSES:
             return False
-        tracks = await self.repository.list_recording_tracks(call_id)
+        tracks = await self.repository.list_recording_tracks(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
         return not any(track.status in self._VERIFY_PENDING_STATUSES for track in tracks)
 
     async def _mark_main_recording_verifying(
@@ -754,7 +787,8 @@ class AiCallRecordingService:
         stop_requested_at: datetime,
     ) -> None:
         await self.repository.update_recording_track(
-            track.id,
+            tenant_id=track.tenant_id,
+            track_id=track.id,
             status="verifying",
             stop_requested_at=stop_requested_at,
             verify_attempts=0,
@@ -832,17 +866,17 @@ class AiCallRecordingService:
 
     async def _verify_participant_recording(
         self,
-        track: AiCallRecordingTrackModel,
+        track: RecordingTrackVerificationClaim,
         *,
         now: datetime,
     ) -> bool:
-        if track.status != "verifying":
-            return False
         attempts = int(track.verify_attempts or 0) + 1
         object_name = track.object_name
         if not object_name:
-            await self.repository.update_recording_track(
-                track.id,
+            return await self.repository.update_due_recording_track(
+                tenant_id=track.tenant_id,
+                track_id=track.track_id,
+                claim_token=track.claim_token,
                 status="failed",
                 ended_at=now,
                 verify_attempts=attempts,
@@ -852,7 +886,6 @@ class AiCallRecordingService:
                 failure_stage="recording_object",
                 failure_message="分轨录音对象名为空，无法确认停止结果",
             )
-            return True
 
         file_size = await self._resolve_existing_recording_object_size(object_name)
         if file_size is not None:
@@ -862,13 +895,16 @@ class AiCallRecordingService:
                 file_size=file_size,
                 verify_attempts=attempts,
                 verified_at=now,
+                verification_claim=track,
             )
 
         deadline_at = self._aware_datetime(track.verify_deadline_at)
         if deadline_at is not None and now >= deadline_at:
             duration_ms = self._duration_ms(track.started_at, now)
-            await self.repository.update_recording_track(
-                track.id,
+            return await self.repository.update_due_recording_track(
+                tenant_id=track.tenant_id,
+                track_id=track.track_id,
+                claim_token=track.claim_token,
                 status="failed",
                 ended_at=now,
                 duration_ms=duration_ms,
@@ -879,10 +915,11 @@ class AiCallRecordingService:
                 failure_stage="oss_missing",
                 failure_message="分轨录音停止后确认超时，未发现录音文件",
             )
-            return True
 
-        await self.repository.update_recording_track(
-            track.id,
+        await self.repository.update_due_recording_track(
+            tenant_id=track.tenant_id,
+            track_id=track.track_id,
+            claim_token=track.claim_token,
             status="verifying",
             verify_attempts=attempts,
             last_verify_at=now,
@@ -927,7 +964,10 @@ class AiCallRecordingService:
 
     async def recording_to_dict(self, recording: AiCallRecordingModel) -> dict[str, Any]:
         play_url = await self._play_url(recording.oss_id)
-        tracks = await self.repository.list_recording_tracks(recording.call_id)
+        tracks = await self.repository.list_recording_tracks(
+            tenant_id=recording.tenant_id,
+            call_id=recording.call_id,
+        )
         asr_jobs = await self.repository.list_asr_jobs(recording.call_id)
         return {
             "id": str(recording.id),
@@ -1116,13 +1156,23 @@ class AiCallRecordingService:
 
     async def _complete_participant_recording_from_existing_object(
         self,
-        track: AiCallRecordingTrackModel,
+        track: AiCallRecordingTrackModel | RecordingTrackVerificationClaim,
         exc: Exception,
         *,
         file_size: int | None = None,
         verify_attempts: int | None = None,
         verified_at: datetime | None = None,
+        verification_claim: RecordingTrackVerificationClaim | None = None,
     ) -> bool:
+        if verification_claim is not None:
+            locked = await self.repository.lock_due_recording_track(
+                tenant_id=verification_claim.tenant_id,
+                track_id=verification_claim.track_id,
+                claim_token=verification_claim.claim_token,
+            )
+            if locked is None:
+                return False
+            track = locked
         object_name = track.object_name
         if not object_name:
             return False
@@ -1158,7 +1208,8 @@ class AiCallRecordingService:
                 str(register_exc),
             )
             await self.repository.update_recording_track(
-                track.id,
+                tenant_id=track.tenant_id,
+                track_id=track.id,
                 status="failed",
                 object_name=object_name,
                 ended_at=ended_at,
@@ -1173,7 +1224,8 @@ class AiCallRecordingService:
             return True
 
         await self.repository.update_recording_track(
-            track.id,
+            tenant_id=track.tenant_id,
+            track_id=track.id,
             status="completed",
             object_name=object_name,
             oss_id=oss_id,
