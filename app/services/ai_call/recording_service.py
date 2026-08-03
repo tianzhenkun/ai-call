@@ -188,7 +188,13 @@ class AiCallRecordingService:
             handoff_id=handoff_id,
         )
 
-    async def stop_for_session(self, *, tenant_id: str, call_id: str) -> None:
+    async def stop_for_session(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        track_role: str | None = None,
+    ) -> None:
         if not self.enabled:
             return
         if (
@@ -198,11 +204,13 @@ class AiCallRecordingService:
             await self._stop_for_session_in_isolated_session(
                 tenant_id=tenant_id,
                 call_id=call_id,
+                track_role=track_role,
             )
             return
         await self._stop_for_session_in_current_session(
             tenant_id=tenant_id,
             call_id=call_id,
+            track_role=track_role,
         )
 
     async def _stop_for_session_in_isolated_session(
@@ -210,6 +218,7 @@ class AiCallRecordingService:
         *,
         tenant_id: str,
         call_id: str,
+        track_role: str | None = None,
     ) -> None:
         if self.stop_session_factory is None:
             return
@@ -226,6 +235,7 @@ class AiCallRecordingService:
                 await isolated_service._stop_for_session_in_current_session(
                     tenant_id=tenant_id,
                     call_id=call_id,
+                    track_role=track_role,
                 )
                 await db.commit()
             except Exception:
@@ -237,11 +247,14 @@ class AiCallRecordingService:
         *,
         tenant_id: str,
         call_id: str,
+        track_role: str | None = None,
     ) -> None:
-        await self._stop_main_recording(tenant_id=tenant_id, call_id=call_id)
+        if track_role is None:
+            await self._stop_main_recording(tenant_id=tenant_id, call_id=call_id)
         await self._stop_participant_recordings(
             tenant_id=tenant_id,
             call_id=call_id,
+            track_role=track_role,
         )
 
     async def _stop_main_recording(self, *, tenant_id: str, call_id: str) -> None:
@@ -543,12 +556,15 @@ class AiCallRecordingService:
         *,
         tenant_id: str,
         call_id: str,
+        track_role: str | None = None,
     ) -> None:
         tracks = await self.repository.list_recording_tracks(
             tenant_id=tenant_id,
             call_id=call_id,
         )
         for track in tracks:
+            if track_role is not None and track.track_role != track_role:
+                continue
             await self._stop_participant_recording(track)
 
     async def _stop_participant_recording(self, track: AiCallRecordingTrackModel) -> None:

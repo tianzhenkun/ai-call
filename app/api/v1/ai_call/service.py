@@ -1900,6 +1900,36 @@ class AiCallService:
         call_id: str,
         end_reason: str | None,
     ) -> None:
+        if self.record_service is not None:
+            record = await self.record_service.get_record(call_id)
+            if record is not None and record.runtime_control_mode == "owner_command_v1":
+                if self.recording_service is not None:
+                    try:
+                        await self.recording_service.stop_for_session(
+                            tenant_id=record.tenant_id,
+                            call_id=call_id,
+                            track_role="human_agent",
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "AI Call Owner 人工分轨停止失败，继续结束通话: "
+                            f"callId={call_id}, errorType={type(exc).__name__}, "
+                            f"message={exc!s}"
+                        )
+                reason = end_reason or "agent_completed"
+                await RuntimeCommandRepository(
+                    self.record_service.repository.db
+                ).request_end(
+                    EndCallIntent(
+                        tenant_id=record.tenant_id,
+                        call_id=call_id,
+                        source="agent_console",
+                        end_reason=reason,
+                        dedupe_key=f"agent_handoff_complete:{call_id}",
+                        event_at=datetime.now(timezone.utc),
+                    )
+                )
+                return
         try:
             session = await self.orchestrator.get_session(call_id)
         except AiCallError:

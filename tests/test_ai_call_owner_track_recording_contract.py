@@ -249,6 +249,94 @@ async def test_owner_browser_disconnect_requests_end_without_legacy_completion(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    "recording_stop_error",
+    (None, RuntimeError("recording stop failed")),
+)
+async def test_owner_handoff_completion_stops_human_track_and_requests_end(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_stop_error: Exception | None,
+) -> None:
+    from app.api.v1.ai_call import service as ai_call_service_module
+
+    end_requests = []
+
+    class FakeRuntimeCommandRepository:
+        def __init__(self, db) -> None:
+            self.db = db
+
+        async def request_end(self, request) -> None:
+            end_requests.append(request)
+
+    monkeypatch.setattr(
+        ai_call_service_module,
+        "RuntimeCommandRepository",
+        FakeRuntimeCommandRepository,
+    )
+
+    orchestrator = SimpleNamespace(get_session=AsyncMock())
+    record_service = SimpleNamespace(
+        repository=SimpleNamespace(db=object()),
+        get_record=AsyncMock(
+            return_value=SimpleNamespace(
+                tenant_id="tenant-a",
+                call_id="owner-call",
+                runtime_control_mode="owner_command_v1",
+            )
+        ),
+    )
+    recording_service = SimpleNamespace(
+        stop_for_session=AsyncMock(side_effect=recording_stop_error),
+    )
+    service = AiCallService(
+        orchestrator,
+        record_service=record_service,
+        recording_service=recording_service,
+    )
+
+    await service.end_running_session_after_handoff(
+        "owner-call",
+        "agent_completed",
+    )
+
+    recording_service.stop_for_session.assert_awaited_once_with(
+        tenant_id="tenant-a",
+        call_id="owner-call",
+        track_role="human_agent",
+    )
+    orchestrator.get_session.assert_not_awaited()
+    assert len(end_requests) == 1
+    assert end_requests[0].tenant_id == "tenant-a"
+    assert end_requests[0].call_id == "owner-call"
+    assert end_requests[0].source == "agent_console"
+    assert end_requests[0].end_reason == "agent_completed"
+    assert end_requests[0].dedupe_key == "agent_handoff_complete:owner-call"
+
+
+@pytest.mark.anyio
+async def test_recording_stop_can_target_only_human_agent_tracks() -> None:
+    customer_track = SimpleNamespace(track_role="customer")
+    human_track = SimpleNamespace(track_role="human_agent")
+    repository = SimpleNamespace(
+        list_recording_tracks=AsyncMock(
+            return_value=[customer_track, human_track],
+        )
+    )
+    service = AiCallRecordingService(repository, enabled=True)
+    service._stop_main_recording = AsyncMock()
+    service._stop_participant_recording = AsyncMock()
+
+    await service.stop_for_session(
+        tenant_id="tenant-a",
+        call_id="owner-call",
+        track_role="human_agent",
+    )
+
+    service._stop_main_recording.assert_not_awaited()
+    service._stop_participant_recording.assert_awaited_once_with(human_track)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     "event_type",
     ("browser_first_audio", "browser_audio_input_diagnostics"),
 )
