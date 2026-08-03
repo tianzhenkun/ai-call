@@ -190,6 +190,64 @@ async def test_owner_browser_ready_does_not_route_through_legacy_orchestrator() 
 
 
 @pytest.mark.anyio
+async def test_owner_browser_disconnect_requests_end_without_legacy_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.ai_call import service as ai_call_service_module
+
+    end_requests = []
+
+    class FakeRuntimeCommandRepository:
+        def __init__(self, db) -> None:
+            self.db = db
+
+        async def request_end(self, request) -> None:
+            end_requests.append(request)
+
+    monkeypatch.setattr(
+        ai_call_service_module,
+        "RuntimeCommandRepository",
+        FakeRuntimeCommandRepository,
+    )
+
+    orchestrator = SimpleNamespace(
+        event_store=InMemoryEventStore(),
+        report_browser_event=AsyncMock(),
+    )
+    record_service = SimpleNamespace(
+        repository=SimpleNamespace(db=object()),
+        get_record_for_tenant=AsyncMock(
+            return_value=SimpleNamespace(
+                tenant_id="tenant-a",
+                call_id="owner-call",
+                runtime_control_mode="owner_command_v1",
+            )
+        ),
+        complete_session=AsyncMock(),
+    )
+    service = AiCallService(orchestrator, record_service=record_service)
+
+    result = await service.report_browser_event(
+        call_id="owner-call",
+        event_type="browser_disconnect",
+        timestamp=NOW,
+        tenant_id="tenant-a",
+    )
+
+    assert result.type == "browser_disconnect"
+    assert result.source == "browser"
+    assert result.timestamp == NOW
+    orchestrator.report_browser_event.assert_not_awaited()
+    record_service.complete_session.assert_not_awaited()
+    assert len(end_requests) == 1
+    assert end_requests[0].tenant_id == "tenant-a"
+    assert end_requests[0].call_id == "owner-call"
+    assert end_requests[0].source == "browser_client"
+    assert end_requests[0].end_reason == "browser_disconnect"
+    assert end_requests[0].dedupe_key == "browser_disconnect:owner-call"
+
+
+@pytest.mark.anyio
 async def test_recording_track_tenant_browser_start_fails_closed_without_record_service() -> None:
     service = object.__new__(AiCallService)
     service.recording_service = AsyncMock()

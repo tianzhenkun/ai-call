@@ -60,6 +60,10 @@ from app.services.ai_call.prompt_config import (
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
 from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
+from app.services.ai_call.runtime_control.command_repository import (
+    EndCallIntent,
+    RuntimeCommandRepository,
+)
 from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 from app.services.ai_call.semantic_analysis import (
     AiCallSemanticAnalysisService,
@@ -617,7 +621,10 @@ class AiCallService:
                     call_id=call_id,
                     record=record,
                 )
-            if owner_mode and event_type == "browser_ready":
+            if owner_mode and event_type in {
+                "browser_ready",
+                "browser_disconnect",
+            }:
                 reported_at = timestamp or datetime.now(timezone.utc)
                 event_payload = dict(payload or {})
                 event_payload["reportedAt"] = reported_at.isoformat()
@@ -654,6 +661,25 @@ class AiCallService:
                     )
                 else:
                     await self.record_service.mark_answered(call_id, result.timestamp)
+            elif event_type == "browser_disconnect" and record.runtime_control_mode == (
+                "owner_command_v1"
+            ):
+                await RuntimeCommandRepository(
+                    self.record_service.repository.db
+                ).request_end(
+                    EndCallIntent(
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                        source="browser_client",
+                        end_reason="browser_disconnect",
+                        dedupe_key=f"browser_disconnect:{call_id}",
+                        event_at=result.timestamp,
+                        evidence={
+                            "eventId": result.event_id,
+                            "eventType": result.type,
+                        },
+                    )
+                )
             elif (
                 event_type == "browser_disconnect"
                 and result.payload.get("terminalSessionStatus") is None
