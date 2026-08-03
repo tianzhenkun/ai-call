@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -100,4 +100,68 @@ async def test_main_recording_repository_never_crosses_tenants() -> None:
 
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_due_recording_claim_and_update_require_tenant_id_and_claim_token() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        db.add(
+            AiCallRecordingModel(
+                id=1,
+                tenant_id="tenant-a",
+                call_id="call-a",
+                room_name="room-a",
+                status="verifying",
+                object_name="ai-call/main/call-a.ogg",
+                started_at=now - timedelta(minutes=1),
+                next_verify_at=now,
+                verify_deadline_at=now + timedelta(minutes=15),
+            )
+        )
+        await db.flush()
+
+        claims = await repository.claim_due_recording_verifications(
+            now=now,
+            limit=10,
+            claim_ttl=timedelta(seconds=30),
+        )
+
+        assert len(claims) == 1
+        claim = claims[0]
+        assert claim.tenant_id == "tenant-a"
+        assert claim.recording_id == 1
+        assert not await repository.update_due_recording(
+            tenant_id="tenant-b",
+            recording_id=1,
+            claim_token=claim.claim_token,
+            status="completed",
+        )
+        assert not await repository.update_due_recording(
+            tenant_id="tenant-a",
+            recording_id=1,
+            claim_token=now,
+            status="completed",
+        )
+        assert await repository.update_due_recording(
+            tenant_id="tenant-a",
+            recording_id=1,
+            claim_token=claim.claim_token,
+            status="completed",
+            next_verify_at=None,
+        )
+        assert not await repository.update_due_recording(
+            tenant_id="tenant-a",
+            recording_id=1,
+            claim_token=claim.claim_token,
+            status="failed",
+        )
+
     await engine.dispose()

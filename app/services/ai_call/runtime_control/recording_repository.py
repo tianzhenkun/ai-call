@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -32,9 +32,11 @@ class OwnerRecordingRepository:
         session: AsyncSession,
         *,
         id_generator: Callable[[], int] = generate_snowflake_id,
+        verify_deadline: timedelta = timedelta(minutes=15),
     ) -> None:
         self._session = session
         self._id_generator = id_generator
+        self._verify_deadline = verify_deadline
 
     async def project(
         self,
@@ -129,8 +131,8 @@ class OwnerRecordingRepository:
             )
         return recording
 
-    @staticmethod
     def _project_stop(
+        self,
         *,
         recording: AiCallRecordingModel,
         effect: AiCallRuntimeEffectModel,
@@ -152,6 +154,9 @@ class OwnerRecordingRepository:
             recording.duration_ms = observation.duration_ms
             recording.verify_attempts = 0
             recording.next_verify_at = now
+            recording.verify_deadline_at = (
+                recording.verify_deadline_at or now + self._verify_deadline
+            )
             recording.failure_stage = None
             recording.failure_message = None
         elif recording.status in {"starting", "recording", "stopping"}:

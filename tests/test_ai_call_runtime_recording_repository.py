@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -136,6 +136,9 @@ async def test_owner_recording_projection_maps_provider_observation(
         assert projected is not None
         assert projected.status == expected_status
         assert projected.egress_generation == 1
+        if expected_status == "verifying":
+            assert projected.next_verify_at == NOW
+            assert projected.verify_deadline_at == NOW + timedelta(minutes=15)
 
     await engine.dispose()
 

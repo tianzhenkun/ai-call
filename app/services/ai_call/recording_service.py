@@ -8,7 +8,10 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.crud import (
+    AiCallRecordRepository,
+    RecordingVerificationClaim,
+)
 from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallRecordingModel,
@@ -29,6 +32,7 @@ class AiCallRecordingService:
 
     _PARTICIPANT_EGRESS_RETRY_DELAYS_SECONDS = (0.0, 0.5, 1.0, 2.0)
     _VERIFY_PENDING_STATUSES = frozenset({"starting", "recording", "stopping", "verifying"})
+    _VERIFY_CLAIM_TTL = timedelta(minutes=2)
 
     def __init__(
         self,
@@ -670,10 +674,12 @@ class AiCallRecordingService:
             return set()
         now = utc_now()
         safe_limit = max(1, limit)
-        main_recordings = await self.repository.list_due_recording_verifications(
+        main_recordings = await self.repository.claim_due_recording_verifications(
             now=now,
             limit=safe_limit,
+            claim_ttl=self._VERIFY_CLAIM_TTL,
         )
+        await self._checkpoint_before_external_io()
         remaining_limit = safe_limit - len(main_recordings)
         tracks = (
             await self.repository.list_due_recording_track_verifications(
@@ -688,6 +694,7 @@ class AiCallRecordingService:
         for recording in main_recordings:
             if await self._verify_main_recording(recording, now=now):
                 touched_calls[recording.call_id] = recording.tenant_id
+            await self._checkpoint_before_external_io()
         for track in tracks:
             if await self._verify_participant_recording(track, now=now):
                 record = await self.repository.get_record(track.call_id)
@@ -761,18 +768,17 @@ class AiCallRecordingService:
 
     async def _verify_main_recording(
         self,
-        recording: AiCallRecordingModel,
+        recording: RecordingVerificationClaim,
         *,
         now: datetime,
     ) -> bool:
-        if recording.status != "verifying":
-            return False
         attempts = int(recording.verify_attempts or 0) + 1
         object_name = recording.object_name
         if not object_name:
-            await self.repository.update_recording(
+            return await self.repository.update_due_recording(
                 tenant_id=recording.tenant_id,
-                call_id=recording.call_id,
+                recording_id=recording.recording_id,
+                claim_token=recording.claim_token,
                 status="failed",
                 ended_at=now,
                 verify_attempts=attempts,
@@ -782,7 +788,6 @@ class AiCallRecordingService:
                 failure_stage="recording_object",
                 failure_message="录音对象名为空，无法确认停止结果",
             )
-            return True
 
         file_size = await self._resolve_existing_recording_object_size(object_name)
         if file_size is not None:
@@ -792,14 +797,16 @@ class AiCallRecordingService:
                 file_size=file_size,
                 verify_attempts=attempts,
                 verified_at=now,
+                verification_claim=recording,
             )
 
         deadline_at = self._aware_datetime(recording.verify_deadline_at)
         if deadline_at is not None and now >= deadline_at:
             duration_ms = self._duration_ms(recording.started_at, now)
-            await self.repository.update_recording(
+            return await self.repository.update_due_recording(
                 tenant_id=recording.tenant_id,
-                call_id=recording.call_id,
+                recording_id=recording.recording_id,
+                claim_token=recording.claim_token,
                 status="failed",
                 ended_at=now,
                 duration_ms=duration_ms,
@@ -810,11 +817,11 @@ class AiCallRecordingService:
                 failure_stage="oss_missing",
                 failure_message="录音停止后确认超时，未发现录音文件",
             )
-            return True
 
-        await self.repository.update_recording(
+        await self.repository.update_due_recording(
             tenant_id=recording.tenant_id,
-            call_id=recording.call_id,
+            recording_id=recording.recording_id,
+            claim_token=recording.claim_token,
             status="verifying",
             verify_attempts=attempts,
             last_verify_at=now,
@@ -1011,13 +1018,23 @@ class AiCallRecordingService:
 
     async def _complete_main_recording_from_existing_object(
         self,
-        recording: AiCallRecordingModel,
+        recording: AiCallRecordingModel | RecordingVerificationClaim,
         exc: Exception,
         *,
         file_size: int | None = None,
         verify_attempts: int | None = None,
         verified_at: datetime | None = None,
+        verification_claim: RecordingVerificationClaim | None = None,
     ) -> bool:
+        if verification_claim is not None:
+            locked = await self.repository.lock_due_recording(
+                tenant_id=verification_claim.tenant_id,
+                recording_id=verification_claim.recording_id,
+                claim_token=verification_claim.claim_token,
+            )
+            if locked is None:
+                return False
+            recording = locked
         object_name = recording.object_name
         if not object_name:
             return False
@@ -1026,8 +1043,11 @@ class AiCallRecordingService:
         if file_size is None:
             return False
 
-        ended_at = verified_at or utc_now()
-        duration_ms = self._duration_ms(recording.started_at, ended_at)
+        ended_at = recording.ended_at or verified_at or utc_now()
+        duration_ms = recording.duration_ms or self._duration_ms(
+            recording.started_at,
+            ended_at,
+        )
         log.info(
             "AI Call 录音停止结果不确定，已通过OSS回查恢复完成状态: "
             "callId={}, objectName={}, fileSize={}, errorType={}",
@@ -1056,7 +1076,7 @@ class AiCallRecordingService:
                 duration_ms=duration_ms,
                 verify_attempts=verify_attempts,
                 last_verify_at=ended_at,
-                last_verify_error=str(register_exc)[:500],
+                last_verify_error="录音文件索引登记失败",
                 next_verify_at=None,
                 failure_stage="oss_register",
                 failure_message="录音文件索引登记失败",
@@ -1325,12 +1345,18 @@ class AiCallRecordingReconcileWorker:
         if not self.enabled:
             return set()
         async with self.session_factory() as db:
-            async with db.begin():
+            try:
                 repository = AiCallRecordRepository(db)
                 service = self.service_factory(repository)
+                if service.transaction_checkpoint is None:
+                    service.transaction_checkpoint = db.commit
                 ready_call_ids = await service.reconcile_due_recordings(
                     limit=self.batch_size,
                 )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
             for call_id in sorted(ready_call_ids):
                 if self.on_call_ready_for_asr is not None:
                     self.on_call_ready_for_asr(call_id)

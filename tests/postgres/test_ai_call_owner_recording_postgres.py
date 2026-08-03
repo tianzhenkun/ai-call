@@ -19,7 +19,12 @@ from app.services.ai_call.runtime_control.effect_repository import (
     ProviderObservationKind,
     RuntimeEffectRepository,
 )
-from app.services.ai_call.runtime_control.models import AiCallRuntimeEffectModel
+from app.services.ai_call.runtime_control.models import (
+    AiCallRuntimeEffectDependencyModel,
+    AiCallRuntimeEffectModel,
+    AiCallRuntimeWorkerModel,
+)
+from app.services.ai_call.runtime_control.owner_repository import OwnerLease
 
 pytestmark = pytest.mark.anyio
 
@@ -294,5 +299,151 @@ async def test_recording_projection_is_invisible_to_other_tenant() -> None:
             assert effect_status == "APPLIED"
             assert tenant_a_count == 1
             assert tenant_b_count == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_stop_egress_gates_delete_room_but_not_long_oss_verification() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        start_claim = await _seed_claim(session_maker)
+        async with session_maker.begin() as session:
+            assert await RuntimeEffectRepository(session).submit(start_claim, _present())
+
+        now = datetime.now(timezone.utc)
+        lease = OwnerLease(
+            tenant_id="tenant-a",
+            call_id="call-a",
+            owner_id="runtime-a",
+            fencing_token=7,
+            lease_expires_at=now + timedelta(minutes=5),
+            capacity_class="active",
+        )
+        async with session_maker.begin() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            assert record is not None
+            record.status = "completed"
+            record.terminal_requested_at = now
+            record.runtime_capacity_class = "active"
+            record.dialogue_persistence_status = "complete"
+            record.dialogue_persistence_completed_at = now
+            session.add(
+                AiCallRuntimeWorkerModel(
+                    worker_id="runtime-a",
+                    status="READY",
+                    capacity=1,
+                    cleanup_capacity=1,
+                    active_call_count=1,
+                    active_cleanup_count=0,
+                    heartbeat_at=now,
+                    lease_expires_at=now + timedelta(minutes=5),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add_all(
+                [
+                    AiCallRuntimeEffectModel(
+                        id=11,
+                        tenant_id="tenant-a",
+                        call_id="call-a",
+                        command_id=3,
+                        effect_type="STOP_EGRESS",
+                        idempotency_key="end:call-a:STOP_EGRESS:10",
+                        fencing_token=7,
+                        status="PENDING",
+                        provider_namespace="livekit:postgres-test",
+                        provider_idempotency_key="destroy:egress-main-call-a",
+                        resource_key="egress:main:call-a",
+                        resource_generation=1,
+                        source_create_effect_id=10,
+                        execution_phase=10,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRuntimeEffectModel(
+                        id=12,
+                        tenant_id="tenant-a",
+                        call_id="call-a",
+                        command_id=2,
+                        effect_type="CREATE_ROOM",
+                        idempotency_key="start:call-a:create-room",
+                        fencing_token=7,
+                        status="APPLIED",
+                        provider_namespace="livekit:postgres-test",
+                        provider_idempotency_key="room:call-a",
+                        resource_key="room:call-a:g1",
+                        resource_generation=7,
+                        provider_reference="room-a",
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRuntimeEffectModel(
+                        id=13,
+                        tenant_id="tenant-a",
+                        call_id="call-a",
+                        command_id=3,
+                        effect_type="DELETE_ROOM",
+                        idempotency_key="end:call-a:DELETE_ROOM:12",
+                        fencing_token=7,
+                        status="PENDING",
+                        provider_namespace="livekit:postgres-test",
+                        provider_idempotency_key="destroy:room-call-a",
+                        resource_key="room:call-a:g1",
+                        resource_generation=7,
+                        source_create_effect_id=12,
+                        execution_phase=20,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    AiCallRuntimeEffectDependencyModel(
+                        id=14,
+                        tenant_id="tenant-a",
+                        effect_id=13,
+                        prerequisite_effect_id=11,
+                        required_status="APPLIED",
+                        created_at=now,
+                    ),
+                ]
+            )
+
+        async with session_maker.begin() as session:
+            effects = RuntimeEffectRepository(session)
+            stop = await effects.claim_next(lease)
+            assert stop is not None and stop.effect_type == "STOP_EGRESS"
+            assert await effects.claim_next(lease) is None
+            assert await effects.submit(
+                stop,
+                ProviderObservation(
+                    kind=ProviderObservationKind.TERMINAL_CONFIRMED,
+                    provider_reference="EG_main",
+                    provider_status="EGRESS_COMPLETE",
+                    object_name="ai-call/main/call-a.ogg",
+                    ended_at=now,
+                    duration_ms=60_000,
+                ),
+            )
+            recording = await session.scalar(select(AiCallRecordingModel))
+            assert recording is not None
+            assert recording.status == "verifying"
+            assert recording.next_verify_at is not None
+            assert recording.verify_deadline_at is not None
+
+            delete_room = await effects.claim_next(lease)
+            assert delete_room is not None and delete_room.effect_type == "DELETE_ROOM"
+            assert await effects.submit(
+                delete_room,
+                ProviderObservation(kind=ProviderObservationKind.TERMINAL_CONFIRMED),
+            )
+            assert await effects.mark_cleanup_clean(lease)
+
+        async with session_maker() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            recording = await session.scalar(select(AiCallRecordingModel))
+            assert record is not None
+            assert record.runtime_owner_id is None
+            assert record.runtime_capacity_class == "none"
+            assert record.resource_cleanup_status == "clean"
+            assert recording is not None and recording.status == "verifying"
     finally:
         await engine.dispose()

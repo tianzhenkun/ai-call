@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Select, and_, asc, desc, func, or_, select, update
@@ -37,6 +38,20 @@ SEMANTIC_ANALYSIS_STATUS_SUCCEEDED = "2"
 SEMANTIC_ANALYSIS_STATUS_FAILED = "3"
 SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT = "4"
 DEFAULT_TENANT_ID = "000000"
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingVerificationClaim:
+    recording_id: int
+    tenant_id: str
+    call_id: str
+    object_name: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    duration_ms: int | None
+    verify_attempts: int
+    verify_deadline_at: datetime | None
+    claim_token: datetime
 
 
 class AiCallRecordRepository:
@@ -673,28 +688,98 @@ class AiCallRecordRepository:
         )
         return list(result.scalars().all())
 
-    async def list_due_recording_verifications(
+    async def claim_due_recording_verifications(
         self,
         *,
         now: datetime,
         limit: int,
-    ) -> list[AiCallRecordingModel]:
+        claim_ttl: timedelta,
+    ) -> list[RecordingVerificationClaim]:
+        claim_token = now + claim_ttl
+        recordings = list(
+            (
+                await self.db.scalars(
+                    select(AiCallRecordingModel)
+                    .where(
+                        AiCallRecordingModel.status == "verifying",
+                        or_(
+                            AiCallRecordingModel.next_verify_at.is_(None),
+                            AiCallRecordingModel.next_verify_at <= now,
+                        ),
+                    )
+                    .order_by(
+                        asc(AiCallRecordingModel.next_verify_at),
+                        asc(AiCallRecordingModel.id),
+                    )
+                    .limit(max(1, limit))
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+        )
+        for recording in recordings:
+            recording.next_verify_at = claim_token
+        await self.db.flush()
+        return [
+            RecordingVerificationClaim(
+                recording_id=recording.id,
+                tenant_id=recording.tenant_id,
+                call_id=recording.call_id,
+                object_name=recording.object_name,
+                started_at=recording.started_at,
+                ended_at=recording.ended_at,
+                duration_ms=recording.duration_ms,
+                verify_attempts=int(recording.verify_attempts or 0),
+                verify_deadline_at=recording.verify_deadline_at,
+                claim_token=claim_token,
+            )
+            for recording in recordings
+        ]
+
+    async def update_due_recording(
+        self,
+        *,
+        tenant_id: str,
+        recording_id: int,
+        claim_token: datetime,
+        **values,
+    ) -> bool:
+        safe_values = {
+            key: value
+            for key, value in values.items()
+            if hasattr(AiCallRecordingModel, key)
+        }
+        if not safe_values:
+            return False
         result = await self.db.execute(
+            update(AiCallRecordingModel)
+            .where(
+                AiCallRecordingModel.id == recording_id,
+                AiCallRecordingModel.tenant_id == tenant_id,
+                AiCallRecordingModel.status == "verifying",
+                AiCallRecordingModel.next_verify_at == claim_token,
+            )
+            .values(**safe_values)
+        )
+        await self.db.flush()
+        return result.rowcount == 1
+
+    async def lock_due_recording(
+        self,
+        *,
+        tenant_id: str,
+        recording_id: int,
+        claim_token: datetime,
+    ) -> AiCallRecordingModel | None:
+        return await self.db.scalar(
             select(AiCallRecordingModel)
             .where(
+                AiCallRecordingModel.id == recording_id,
+                AiCallRecordingModel.tenant_id == tenant_id,
                 AiCallRecordingModel.status == "verifying",
-                or_(
-                    AiCallRecordingModel.next_verify_at.is_(None),
-                    AiCallRecordingModel.next_verify_at <= now,
-                ),
+                AiCallRecordingModel.next_verify_at == claim_token,
             )
-            .order_by(
-                asc(AiCallRecordingModel.next_verify_at),
-                asc(AiCallRecordingModel.id),
-            )
-            .limit(max(1, limit))
+            .with_for_update()
         )
-        return list(result.scalars().all())
 
     async def list_due_recording_track_verifications(
         self,
