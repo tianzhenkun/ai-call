@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import status
+from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1171,15 +1172,23 @@ class AiCallService:
                 publish_agent_console_event,
             )
 
-            await publish_agent_console_event(
-                handoff.tenant_id,
-                "handoff.requested",
-                {
-                    "handoff_id": handoff.handoff_id,
-                    "call_id": handoff.call_id,
-                    "scene_code": handoff.scene_code,
-                    "status": handoff.status,
-                },
+            payload = {
+                "handoff_id": handoff.handoff_id,
+                "call_id": handoff.call_id,
+                "scene_code": handoff.scene_code,
+                "status": handoff.status,
+            }
+            event.listen(
+                self.handoff_service.repository.db.sync_session,
+                "after_commit",
+                lambda _session: asyncio.create_task(
+                    publish_agent_console_event(
+                        handoff.tenant_id,
+                        "handoff.requested",
+                        payload,
+                    )
+                ),
+                once=True,
             )
         return self.handoff_service.handoff_to_dict(handoff)
 

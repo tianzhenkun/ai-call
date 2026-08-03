@@ -1621,6 +1621,60 @@ async def test_create_handoff_persists_record_and_suspends_agent(b1_service) -> 
 
 
 @pytest.mark.anyio
+async def test_handoff_requested_event_is_published_after_commit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'handoff-after-commit.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        service = AiCallService(
+            build_b1_orchestrator(),
+            AiCallRecordService(repository),
+            handoff_service=AiCallHandoffService(repository),
+        )
+        result = await service.create_web_session(
+            voice=None,
+            prompt=None,
+            business_id=None,
+        )
+        await db.commit()
+
+        committed_when_published: list[bool] = []
+
+        async def capture_requested_event(_tenant_id, _event_type, payload):
+            async with session_maker() as read_db:
+                handoff = await AiCallRecordRepository(read_db).get_handoff_by_id(
+                    payload["handoff_id"]
+                )
+            committed_when_published.append(handoff is not None)
+
+        monkeypatch.setattr(
+            "app.services.ai_call.agent_console_reconciler.publish_agent_console_event",
+            capture_requested_event,
+        )
+
+        async with db.begin():
+            await service.create_handoff(
+                call_id=result.call_id,
+                source="customer",
+                reason="customer_request",
+                request_message="转人工",
+            )
+
+        await wait_until(lambda: bool(committed_when_published))
+        assert committed_when_published == [True]
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_duplicate_handoff_request_returns_active_one(b1_service) -> None:
     service, _record_service = b1_service
     result = await service.create_web_session(
