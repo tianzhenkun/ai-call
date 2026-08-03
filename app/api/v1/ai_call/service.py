@@ -624,6 +624,8 @@ class AiCallService:
             if owner_mode and event_type in {
                 "browser_ready",
                 "browser_disconnect",
+                "browser_first_audio",
+                "browser_audio_input_diagnostics",
             }:
                 reported_at = timestamp or datetime.now(timezone.utc)
                 event_payload = dict(payload or {})

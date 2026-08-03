@@ -248,6 +248,46 @@ async def test_owner_browser_disconnect_requests_end_without_legacy_completion(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "event_type",
+    ("browser_first_audio", "browser_audio_input_diagnostics"),
+)
+async def test_owner_browser_diagnostics_do_not_route_through_legacy_orchestrator(
+    event_type: str,
+) -> None:
+    orchestrator = SimpleNamespace(
+        event_store=InMemoryEventStore(),
+        report_browser_event=AsyncMock(),
+    )
+    record_service = SimpleNamespace(
+        repository=None,
+        get_record_for_tenant=AsyncMock(
+            return_value=SimpleNamespace(
+                tenant_id="tenant-a",
+                call_id="owner-call",
+                runtime_control_mode="owner_command_v1",
+            )
+        ),
+    )
+    service = AiCallService(orchestrator, record_service=record_service)
+
+    result = await service.report_browser_event(
+        call_id="owner-call",
+        event_type=event_type,
+        timestamp=NOW,
+        payload={"source": "browser"},
+        tenant_id="tenant-a",
+    )
+
+    assert result.call_id == "owner-call"
+    assert result.type == event_type
+    assert result.source == "browser"
+    assert result.timestamp == NOW
+    assert result.payload["reportedAt"] == NOW.isoformat()
+    orchestrator.report_browser_event.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_recording_track_tenant_browser_start_fails_closed_without_record_service() -> None:
     service = object.__new__(AiCallService)
     service.recording_service = AsyncMock()
