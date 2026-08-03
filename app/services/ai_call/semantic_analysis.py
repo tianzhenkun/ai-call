@@ -1622,8 +1622,8 @@ class AiCallSemanticAnalysisService:
         now: datetime | None = None,
         force: bool = False,
     ) -> AiCallSemanticAnalysisModel:
+        record = await self.repository.get_record(call_id)
         if scene_code is None:
-            record = await self.repository.get_record(call_id)
             if record is not None:
                 scene_code = record.scene_code
         analysis = await self.repository.ensure_semantic_analysis_record(
@@ -1639,7 +1639,15 @@ class AiCallSemanticAnalysisService:
             return analysis
 
         rows = await self.repository.list_dialogue_segments(call_id)
-        asr_jobs = await self.repository.list_asr_jobs(call_id)
+        tenant_id = str(record.tenant_id or "").strip() if record is not None else ""
+        asr_jobs = (
+            await self.repository.list_asr_jobs(
+                tenant_id=tenant_id,
+                call_id=call_id,
+            )
+            if tenant_id
+            else []
+        )
         handoffs = await self.repository.list_handoffs(call_id)
         snapshot = self.transcript_builder.build(
             call_id=call_id,

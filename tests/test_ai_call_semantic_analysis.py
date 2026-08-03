@@ -2246,9 +2246,31 @@ async def test_semantic_analysis_snapshot_records_asr_timeout_fallback_reason() 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with session_maker() as db:
         repository = AiCallRecordRepository(db)
+        started_at = datetime(2026, 7, 2, 10, 0, tzinfo=timezone.utc)
+        await repository.create_record(
+            tenant_id="000000",
+            call_id="call_semantic_asr_timeout",
+            business_type=None,
+            business_id=None,
+            scene_code="intro_geo",
+            entry_type="web",
+            room_name="room-semantic-asr-timeout",
+            participant_identity="browser-call",
+            status="completed",
+            started_at=started_at,
+        )
+        track = await repository.create_recording_track(
+            tenant_id="000000",
+            call_id="call_semantic_asr_timeout",
+            room_name="room-semantic-asr-timeout",
+            track_role="customer",
+            participant_identity="browser-call",
+            status="completed",
+            started_at=started_at,
+        )
         job = await repository.create_asr_job(
             call_id="call_semantic_asr_timeout",
-            track_id=1001,
+            track_id=track.id,
             track_role="customer",
             participant_identity="browser-call",
             provider="dashscope_paraformer",

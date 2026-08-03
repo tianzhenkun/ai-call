@@ -17410,9 +17410,10 @@ async def test_realtime_agent_runner_skips_model_handoff_prompt_before_stop() ->
 
 def test_session_api_returns_unified_camel_case_response() -> None:
     orchestrator, _livekit, _agent = build_orchestrator()
+    service = AiCallService(orchestrator)
     app = FastAPI()
     app.include_router(AiCallRouter)
-    app.dependency_overrides[get_ai_call_service] = lambda: AiCallService(orchestrator)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
     app.dependency_overrides[get_current_user] = lambda: type(
         "Auth",
         (),
@@ -17439,12 +17440,23 @@ def test_session_api_returns_unified_camel_case_response() -> None:
         events_body = client.get(f"/ai-call/sessions/{call_id}/events").json()
         assert events_body["data"]["total"] == 6
 
+        class BrowserRecordService:
+            async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
+                _ = (tenant_id, call_id)
+                return object()
+
+            async def mark_answered(self, call_id: str, answered_at: datetime) -> None:
+                _ = (call_id, answered_at)
+
+        service.record_service = BrowserRecordService()
+
         browser_event_body = client.post(
             f"/ai-call/sessions/{call_id}/browser-events",
             json={"type": "browser_ready"},
         ).json()
         assert browser_event_body["msg"] == "上报成功"
         assert browser_event_body["data"]["type"] == "browser_ready"
+        service.record_service = None
 
         end_response = client.post(f"/ai-call/sessions/{call_id}/end")
         assert end_response.status_code == 200
