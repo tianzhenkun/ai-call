@@ -256,6 +256,38 @@ def _provider(
     )
 
 
+def test_livekit_owner_provider_routes_final_customer_speech_to_handoff_worker() -> None:
+    from app.config.setting import settings
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        build_livekit_runtime_provider,
+    )
+
+    runtime_settings = settings.model_copy(
+        update={"AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED": True}
+    )
+    provider = build_livekit_runtime_provider(
+        settings=runtime_settings,
+        session_factory=object(),
+        registry=RuntimeRegistry(),
+    )
+    worker = provider._handoff_trigger_worker
+    assert worker is not None
+    owner_orchestrator = provider._agent_manager._orchestrator
+    handoff_service = worker.trigger_service.service_factory(object())
+    assert handoff_service.orchestrator is owner_orchestrator
+    assert handoff_service.handoff_exception_manager.orchestrator is owner_orchestrator
+
+    owner_orchestrator.event_store.append(
+        "call-owner",
+        "user_transcript_done",
+        "provider",
+        {"transcript": "转人工"},
+    )
+
+    assert worker.queue.qsize() == 1
+    worker.detach_all()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("effect_type", "expected_kind"),
@@ -1607,6 +1639,16 @@ async def test_livekit_provider_owns_bridge_lifecycle_and_dialogue_finalization(
         async def stop(self) -> None:
             calls.append(("stop_bridge", None))
 
+    class FakeHandoffTriggerWorker:
+        async def start(self) -> None:
+            calls.append(("start_handoff_trigger", None))
+
+        def detach_all(self) -> None:
+            calls.append(("detach_handoff_trigger", None))
+
+        async def stop(self) -> None:
+            calls.append(("stop_handoff_trigger", None))
+
     class FinalizingAgentManager(FakeAgentManager):
         async def finalize_dialogue(
             self,
@@ -1621,6 +1663,7 @@ async def test_livekit_provider_owns_bridge_lifecycle_and_dialogue_finalization(
             calls.append(("shutdown_agents", None))
 
     bridge = FakeDialogueBridge()
+    handoff_trigger_worker = FakeHandoffTriggerWorker()
     provider = LiveKitRuntimeProvider(
         resolver=FakeResolver(),
         room_manager=FakeRoomManager(),
@@ -1628,6 +1671,7 @@ async def test_livekit_provider_owns_bridge_lifecycle_and_dialogue_finalization(
         sip_client=FakeSipClient(),
         egress_manager=FakeEgressManager(),
         dialogue_bridge=bridge,
+        handoff_trigger_worker=handoff_trigger_worker,
     )
     ended_at = datetime(2026, 8, 3, 9, tzinfo=timezone.utc)
 
@@ -1640,8 +1684,11 @@ async def test_livekit_provider_owns_bridge_lifecycle_and_dialogue_finalization(
 
     assert result == OwnerDialogueFinalizeResult("complete", 2, 0)
     assert calls == [
+        ("start_handoff_trigger", None),
         ("start_bridge", None),
         ("finalize_dialogue", ("call-1", ended_at)),
+        ("detach_handoff_trigger", None),
+        ("stop_handoff_trigger", None),
         ("shutdown_agents", None),
         ("stop_bridge", None),
     ]

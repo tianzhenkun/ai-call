@@ -2302,59 +2302,67 @@ def _ensure_default_handoff_exception_manager(
 ) -> AiCallHandoffExceptionManager:
     global _default_handoff_exception_manager
     if _default_handoff_exception_manager is None:
-        prompt_player = LiveKitSystemPromptPlayer(
-            livekit_url=settings.LIVEKIT_URL,
-            api_key=settings.LIVEKIT_API_KEY,
-            api_secret=settings.LIVEKIT_API_SECRET,
-        )
-        _default_handoff_exception_manager = AiCallHandoffExceptionManager(
-            orchestrator=orchestrator,
-            session_factory=async_db_session,
-            recording_service_factory=_build_recording_service,
-            system_prompt_player=prompt_player,
-            timeout_seconds=settings.AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS,
-            exception_close_enabled=settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED,
-            waiting_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH
-            ),
-            waiting_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_WAITING_PROMPT_TEXT
-            ),
-            busy_waiting_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_AUDIO_PATH
-            ),
-            busy_waiting_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT
-            ),
-            waiting_tone_enabled=settings.AI_CALL_HANDOFF_WAITING_TONE_ENABLED,
-            waiting_tone_audio_path=settings.AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH,
-            waiting_tone_interval_seconds=settings.AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS,
-            unavailable_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH
-            ),
-            unavailable_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT
-            ),
-            no_online_agent_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_AUDIO_PATH
-            ),
-            no_online_agent_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_TEXT
-            ),
-            busy_timeout_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_AUDIO_PATH
-            ),
-            busy_timeout_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT
-            ),
-            service_unavailable_prompt_audio_path=_strip_or_none(
-                settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_AUDIO_PATH
-            ),
-            service_unavailable_prompt_text=_strip_or_none(
-                settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_TEXT
-            ),
+        _default_handoff_exception_manager = build_ai_call_handoff_exception_manager(
+            orchestrator,
+            async_db_session,
         )
     return _default_handoff_exception_manager
+
+
+def build_ai_call_handoff_exception_manager(
+    orchestrator: AiCallOrchestrator,
+    session_factory,
+) -> AiCallHandoffExceptionManager:
+    prompt_player = LiveKitSystemPromptPlayer(
+        livekit_url=settings.LIVEKIT_URL,
+        api_key=settings.LIVEKIT_API_KEY,
+        api_secret=settings.LIVEKIT_API_SECRET,
+    )
+    return AiCallHandoffExceptionManager(
+        orchestrator=orchestrator,
+        session_factory=session_factory,
+        recording_service_factory=_build_recording_service,
+        system_prompt_player=prompt_player,
+        timeout_seconds=settings.AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS,
+        exception_close_enabled=settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED,
+        waiting_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH
+        ),
+        waiting_prompt_text=_strip_or_none(settings.AI_CALL_HANDOFF_WAITING_PROMPT_TEXT),
+        busy_waiting_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_AUDIO_PATH
+        ),
+        busy_waiting_prompt_text=_strip_or_none(
+            settings.AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT
+        ),
+        waiting_tone_enabled=settings.AI_CALL_HANDOFF_WAITING_TONE_ENABLED,
+        waiting_tone_audio_path=settings.AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH,
+        waiting_tone_interval_seconds=settings.AI_CALL_HANDOFF_WAITING_TONE_INTERVAL_SECONDS,
+        unavailable_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_AUDIO_PATH
+        ),
+        unavailable_prompt_text=_strip_or_none(
+            settings.AI_CALL_HANDOFF_UNAVAILABLE_PROMPT_TEXT
+        ),
+        no_online_agent_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_AUDIO_PATH
+        ),
+        no_online_agent_prompt_text=_strip_or_none(
+            settings.AI_CALL_HANDOFF_NO_ONLINE_AGENT_PROMPT_TEXT
+        ),
+        busy_timeout_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_AUDIO_PATH
+        ),
+        busy_timeout_prompt_text=_strip_or_none(
+            settings.AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT
+        ),
+        service_unavailable_prompt_audio_path=_strip_or_none(
+            settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_AUDIO_PATH
+        ),
+        service_unavailable_prompt_text=_strip_or_none(
+            settings.AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_TEXT
+        ),
+    )
 
 
 def _strip_or_none(value) -> str | None:

@@ -460,6 +460,7 @@ class LiveKitRuntimeProvider:
         sip_client: RuntimeSipClient,
         egress_manager: RuntimeEgressManager,
         dialogue_bridge: OwnerRuntimeDialogueBridge | None = None,
+        handoff_trigger_worker: Any | None = None,
         provider_namespace: str = "livekit:unconfigured",
         allowed_callee_phone_number: str | None = None,
         main_recording_enabled: bool = False,
@@ -471,6 +472,7 @@ class LiveKitRuntimeProvider:
         self._sip_client = sip_client
         self._egress_manager = egress_manager
         self._dialogue_bridge = dialogue_bridge
+        self._handoff_trigger_worker = handoff_trigger_worker
         self.provider_namespace = provider_namespace
         self.main_recording_enabled = main_recording_enabled
         self._oss_config_provider = oss_config_provider or (lambda: None)
@@ -481,10 +483,15 @@ class LiveKitRuntimeProvider:
         )
 
     async def start(self) -> None:
+        if self._handoff_trigger_worker is not None:
+            await self._handoff_trigger_worker.start()
         if self._dialogue_bridge is not None:
             await self._dialogue_bridge.start()
 
     async def stop(self) -> None:
+        if self._handoff_trigger_worker is not None:
+            self._handoff_trigger_worker.detach_all()
+            await self._handoff_trigger_worker.stop()
         await self._agent_manager.shutdown()
         if self._dialogue_bridge is not None:
             await self._dialogue_bridge.stop()
@@ -1041,7 +1048,21 @@ def build_livekit_runtime_provider(
     session_factory: Any,
     registry: Any,
 ) -> LiveKitRuntimeProvider:
+    from app.api.v1.ai_call.crud import AiCallRecordRepository
+    from app.api.v1.ai_call.service import (
+        AiCallService,
+        build_ai_call_handoff_exception_manager,
+    )
     from app.api.v1.system.oss.service import OssService
+    from app.services.ai_call.handoff_availability_service import (
+        AiCallHandoffAvailabilityService,
+    )
+    from app.services.ai_call.handoff_service import AiCallHandoffService
+    from app.services.ai_call.handoff_trigger_service import (
+        AiCallHandoffTriggerService,
+        AiCallHandoffTriggerWorker,
+        build_default_handoff_intent_classifier,
+    )
     from app.services.ai_call.livekit_egress import LiveKitEgressManager
     from app.services.ai_call.livekit_room import LiveKitRoomManager
     from app.services.ai_call.livekit_sip import LiveKitSipClient, SipOutboundConfig
@@ -1059,6 +1080,44 @@ def build_livekit_runtime_provider(
     orchestrator = AiCallOrchestrator.from_settings(settings)
     dialogue_bridge = OwnerRuntimeDialogueBridge(session_factory)
     dialogue_bridge.attach_event_store(orchestrator.event_store)
+    handoff_trigger_worker = None
+    if settings.AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED:
+        exception_manager = build_ai_call_handoff_exception_manager(
+            orchestrator,
+            session_factory,
+        )
+
+        def service_factory(db):
+            repository = AiCallRecordRepository(db)
+            return AiCallService(
+                orchestrator,
+                handoff_service=AiCallHandoffService(
+                    repository,
+                    request_timeout_seconds=settings.AI_CALL_HANDOFF_TOTAL_WAIT_SECONDS,
+                ),
+                handoff_exception_manager=exception_manager,
+            )
+
+        trigger_service = AiCallHandoffTriggerService(
+            session_factory,
+            service_factory,
+            build_default_handoff_intent_classifier(
+                base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+                api_key=settings.EFFECTIVE_LLM_API_KEY,
+                model=settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus",
+                timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
+            ),
+            enabled=True,
+            customer_intent_enabled=settings.AI_CALL_HANDOFF_CUSTOMER_INTENT_ENABLED,
+            threshold=settings.AI_CALL_HANDOFF_INTENT_THRESHOLD,
+            timeout_seconds=settings.AI_CALL_HANDOFF_INTENT_TIMEOUT_SECONDS,
+            availability_service_factory=AiCallHandoffAvailabilityService,
+        )
+        handoff_trigger_worker = AiCallHandoffTriggerWorker(
+            trigger_service,
+            transcript_trigger_enabled=True,
+        )
+        handoff_trigger_worker.attach_event_store(orchestrator.event_store)
     return LiveKitRuntimeProvider(
         resolver=DatabaseRuntimeProviderResourceResolver(session_factory),
         room_manager=room_manager,
@@ -1085,6 +1144,7 @@ def build_livekit_runtime_provider(
             participant_file_type=settings.AI_CALL_PARTICIPANT_RECORDING_FORMAT,
         ),
         dialogue_bridge=dialogue_bridge,
+        handoff_trigger_worker=handoff_trigger_worker,
         provider_namespace=livekit_provider_namespace(settings),
         allowed_callee_phone_number=(
             settings.AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE
