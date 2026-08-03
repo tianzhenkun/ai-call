@@ -2596,7 +2596,8 @@ async def test_browser_disconnect_accepts_sqlite_lock_during_recording_stop() ->
     class RecordService:
         repository = None
 
-        async def get_record(self, call_id: str):
+        async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
+            _ = (tenant_id, call_id)
             return type("Record", (), {"tenant_id": "000000"})()
 
         async def complete_session(self, call_id: str, **values) -> None:
@@ -2612,6 +2613,7 @@ async def test_browser_disconnect_accepts_sqlite_lock_during_recording_stop() ->
         call_id=created.call_id,
         event_type="browser_disconnect",
         timestamp=None,
+        tenant_id="000000",
     )
 
     assert result.type == "browser_disconnect"
@@ -2629,8 +2631,17 @@ async def test_browser_disconnect_is_idempotent_after_failed_session() -> None:
     orchestrator, _livekit, _agent = build_orchestrator()
     created = await orchestrator.create_web_session(voice=None, prompt=None)
     orchestrator.registry.transition(created.call_id, CallSessionStatus.FAILED)
+
+    class RecordService:
+        repository = None
+
+        async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
+            _ = (tenant_id, call_id)
+            return type("Record", (), {"tenant_id": "000000"})()
+
     service = AiCallService(
         orchestrator,
+        record_service=RecordService(),
         recording_service=RecordingServiceThatMustNotStop(),
     )
 
@@ -2638,6 +2649,7 @@ async def test_browser_disconnect_is_idempotent_after_failed_session() -> None:
         call_id=created.call_id,
         event_type="browser_disconnect",
         timestamp=None,
+        tenant_id="000000",
     )
 
     assert result.type == "browser_disconnect"

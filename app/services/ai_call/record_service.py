@@ -361,6 +361,17 @@ class AiCallRecordService:
     async def get_record(self, call_id: str) -> AiCallRecordModel | None:
         return await self.repository.get_record(call_id)
 
+    async def get_record_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallRecordModel | None:
+        return await self.repository.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+
     async def list_records(
         self,
         *,

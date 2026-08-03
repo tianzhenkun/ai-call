@@ -1127,6 +1127,7 @@ async def test_call_end_interrupted_runtime_event_is_persisted(b1_service) -> No
 async def test_end_session_updates_record_terminal_state_and_reason(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
+        tenant_id="000000",
         voice=None,
         prompt=None,
         business_id=None,
@@ -1161,6 +1162,7 @@ async def test_end_session_updates_record_terminal_state_and_reason(b1_service) 
 async def test_repeated_end_session_preserves_first_terminal_reason(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
+        tenant_id="000000",
         voice=None,
         prompt=None,
         business_id=None,
@@ -1195,6 +1197,7 @@ async def test_browser_disconnect_after_runtime_terminal_preserves_terminal_reas
 ) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
+        tenant_id="000000",
         voice=None,
         prompt=None,
         business_id=None,
@@ -1211,6 +1214,7 @@ async def test_browser_disconnect_after_runtime_terminal_preserves_terminal_reas
         call_id=result.call_id,
         event_type="browser_disconnect",
         timestamp=None,
+        tenant_id="000000",
     )
     await b1_service.flush_events()
 
@@ -1225,6 +1229,7 @@ async def test_browser_disconnect_after_runtime_terminal_preserves_terminal_reas
 async def test_browser_disconnect_completes_record_with_disconnect_reason(b1_service) -> None:
     service, record_service = b1_service
     result = await service.create_web_session(
+        tenant_id="000000",
         voice=None,
         prompt=None,
         business_id=None,
@@ -1240,6 +1245,7 @@ async def test_browser_disconnect_completes_record_with_disconnect_reason(b1_ser
         call_id=result.call_id,
         event_type="browser_disconnect",
         timestamp=None,
+        tenant_id="000000",
     )
 
     assert browser_event.type == "browser_disconnect"
@@ -6205,6 +6211,7 @@ async def test_browser_disconnect_stops_recording_before_room_delete(monkeypatch
             call_id=result.call_id,
             event_type="browser_disconnect",
             timestamp=None,
+            tenant_id="000000",
         )
 
         completed = await service.get_recording(tenant_id="000000", call_id=result.call_id)

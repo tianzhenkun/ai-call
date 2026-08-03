@@ -469,6 +469,12 @@ class AiCallRecordingTrackModel(MappedBase):
             "status",
             "next_verify_at",
         ),
+        Index(
+            "idx_ai_call_recording_track_verify_due",
+            "status",
+            "next_verify_at",
+            "id",
+        ),
         {"comment": "AI Call 分参与方录音明细表"},
     )
     __permission_strategy__ = None

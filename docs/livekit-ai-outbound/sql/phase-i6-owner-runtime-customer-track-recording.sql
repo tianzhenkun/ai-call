@@ -81,4 +81,7 @@ create index if not exists idx_ai_call_recording_track_tenant_oss
 create index if not exists idx_ai_call_recording_track_tenant_verify_due
     on ai_call_recording_track (tenant_id, status, next_verify_at);
 
+create index if not exists idx_ai_call_recording_track_verify_due
+    on ai_call_recording_track (status, next_verify_at, id);
+
 commit;

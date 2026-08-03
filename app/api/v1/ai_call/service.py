@@ -572,12 +572,29 @@ class AiCallService:
         tenant_id: str | None = None,
     ) -> BrowserEventReportResult:
         try:
+            tenant_id = self._require_browser_event_tenant(tenant_id)
+            if self.record_service is None:
+                raise CustomException(
+                    msg="通话事件租户上下文不匹配",
+                    code=RET.ERROR.code,
+                    status_code=403,
+                )
+            record = await self.record_service.get_record_for_tenant(
+                tenant_id=tenant_id,
+                call_id=call_id,
+            )
+            if record is None:
+                raise CustomException(
+                    msg="通话事件租户上下文不匹配",
+                    code=RET.ERROR.code,
+                    status_code=403,
+                )
             if event_type == "browser_disconnect" and self.recording_service is not None:
                 session = await self.orchestrator.get_session(call_id)
                 if session.status in RUNNING_STATUSES:
                     try:
                         await self.recording_service.stop_for_session(
-                            tenant_id=await self._recording_tenant_for_call(call_id),
+                            tenant_id=tenant_id,
                             call_id=call_id,
                         )
                     except OperationalError as exc:
@@ -591,8 +608,9 @@ class AiCallService:
                         )
             elif event_type == "browser_ready":
                 await self._start_browser_ready_recording_tracks(
-                    tenant_id=self._require_recording_tenant(tenant_id),
+                    tenant_id=tenant_id,
                     call_id=call_id,
+                    record=record,
                 )
             result = await self.orchestrator.report_browser_event(
                 call_id=call_id,
@@ -618,7 +636,10 @@ class AiCallService:
                     call_id,
                     end_reason="browser_disconnect",
                 )
-                await self._enqueue_offline_asr_if_recordings_closed(call_id)
+                await self._enqueue_offline_asr_if_recordings_closed(
+                    call_id,
+                    tenant_id=tenant_id,
+                )
         return result
 
     async def handle_livekit_webhook_event(
@@ -1711,6 +1732,17 @@ class AiCallService:
             )
         return normalized
 
+    @staticmethod
+    def _require_browser_event_tenant(tenant_id: str | None) -> str:
+        normalized = str(tenant_id or "").strip()
+        if not normalized:
+            raise CustomException(
+                msg="通话事件缺少租户上下文",
+                code=RET.ERROR.code,
+                status_code=403,
+            )
+        return normalized
+
     async def _recording_tenant_for_call(self, call_id: str) -> str:
         if self.record_service is None:
             return self._require_recording_tenant(None)
@@ -1736,23 +1768,28 @@ class AiCallService:
         *,
         tenant_id: str,
         call_id: str,
+        record: Any | None = None,
     ) -> None:
         if self.recording_service is None:
             return
         tenant_id = self._require_recording_tenant(tenant_id)
-        if self.record_service is None:
-            raise CustomException(
-                msg="通话录音对应的通话记录不存在",
-                code=RET.ERROR.code,
-                status_code=500,
-            )
-        record = await self.record_service.get_record(call_id)
         if record is None:
-            raise CustomException(
-                msg="通话录音对应的通话记录不存在",
-                code=RET.ERROR.code,
-                status_code=500,
+            if self.record_service is None:
+                raise CustomException(
+                    msg="通话录音对应的通话记录不存在",
+                    code=RET.ERROR.code,
+                    status_code=500,
+                )
+            record = await self.record_service.get_record_for_tenant(
+                tenant_id=tenant_id,
+                call_id=call_id,
             )
+            if record is None:
+                raise CustomException(
+                    msg="通话录音对应的通话记录不存在",
+                    code=RET.ERROR.code,
+                    status_code=500,
+                )
         record_tenant_id = self._require_recording_tenant(record.tenant_id)
         if record_tenant_id != tenant_id:
             raise CustomException(
@@ -1779,10 +1816,19 @@ class AiCallService:
     def _enqueue_offline_asr(call_id: str) -> None:
         enqueue_ai_call_offline_asr(call_id)
 
-    async def _enqueue_offline_asr_if_recordings_closed(self, call_id: str) -> None:
+    async def _enqueue_offline_asr_if_recordings_closed(
+        self,
+        call_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> None:
         if self.recording_service is not None:
             if not await self.recording_service.is_ready_for_offline_asr(
-                tenant_id=await self._recording_tenant_for_call(call_id),
+                tenant_id=(
+                    self._require_recording_tenant(tenant_id)
+                    if tenant_id is not None
+                    else await self._recording_tenant_for_call(call_id)
+                ),
                 call_id=call_id,
             ):
                 return

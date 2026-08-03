@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 
+import tools.ai_call_p1_realtime_shadow_compare as compare_tool
 from tools.ai_call_p1_realtime_shadow_compare import (
     _build_report_from_db,
     _recent_call_ids,
@@ -15,6 +17,66 @@ def test_realtime_shadow_compare_recording_track_queries_match_tenant() -> None:
 
     assert "record.tenant_id = track.tenant_id" in report_query
     assert "t.tenant_id = r.tenant_id" in recent_query
+
+
+def test_realtime_shadow_compare_asr_job_uses_selected_tenant_track(monkeypatch) -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        create table ai_call_record (
+            id integer primary key,
+            tenant_id text not null,
+            call_id text not null
+        );
+        create table ai_call_recording_track (
+            id integer primary key,
+            tenant_id text not null,
+            call_id text not null,
+            track_role text not null,
+            started_at text not null
+        );
+        create table ai_call_asr_job (
+            id integer primary key,
+            call_id text not null,
+            track_id integer not null,
+            track_role text not null,
+            status text not null,
+            transcription_url text
+        );
+        insert into ai_call_record values (1, 'tenant-a', 'shared-call');
+        insert into ai_call_record values (2, 'tenant-b', 'shared-call');
+        insert into ai_call_recording_track
+            values (20, 'tenant-a', 'shared-call', 'customer', '2026-07-03T09:00:00Z');
+        insert into ai_call_recording_track
+            values (10, 'tenant-b', 'shared-call', 'customer', '2026-07-03T09:00:00Z');
+        insert into ai_call_asr_job
+            values (100, 'shared-call', 20, 'customer', 'completed',
+                    'https://asr.test/tenant-a.json');
+        insert into ai_call_asr_job
+            values (200, 'shared-call', 10, 'customer', 'completed',
+                    'https://asr.test/tenant-b.json');
+        """
+    )
+    fetched_urls: list[str] = []
+
+    def fake_asr_sentences(url: str) -> list[dict]:
+        fetched_urls.append(url)
+        return []
+
+    monkeypatch.setattr(compare_tool, "_asr_sentences_from_url", fake_asr_sentences)
+    monkeypatch.setattr(compare_tool, "_ai_segments_for_call", lambda *_: [])
+    monkeypatch.setattr(compare_tool, "_events_for_call", lambda *_: [])
+
+    compare_tool._build_report_from_db(
+        conn=conn,
+        call_id="shared-call",
+        max_detection_lag_ms=500,
+        max_pre_stop_latency_ms=800,
+    )
+
+    assert fetched_urls == ["https://asr.test/tenant-a.json"]
+    conn.close()
 
 
 def test_realtime_shadow_compare_reports_detector_and_prestop_lag() -> None:

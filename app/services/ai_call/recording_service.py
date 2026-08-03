@@ -968,7 +968,10 @@ class AiCallRecordingService:
             tenant_id=recording.tenant_id,
             call_id=recording.call_id,
         )
-        asr_jobs = await self.repository.list_asr_jobs(recording.call_id)
+        asr_jobs = await self.repository.list_asr_jobs(
+            tenant_id=recording.tenant_id,
+            call_id=recording.call_id,
+        )
         return {
             "id": str(recording.id),
             "callId": recording.call_id,

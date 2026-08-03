@@ -120,6 +120,20 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_record_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallRecordModel | None:
+        result = await self.db.execute(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def list_records_by_call_ids(
         self,
         call_ids: list[str],
@@ -998,10 +1012,23 @@ class AiCallRecordRepository:
         await self.db.refresh(job)
         return job
 
-    async def list_asr_jobs(self, call_id: str) -> list[AiCallAsrJobModel]:
+    async def list_asr_jobs(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> list[AiCallAsrJobModel]:
         result = await self.db.execute(
             select(AiCallAsrJobModel)
-            .where(AiCallAsrJobModel.call_id == call_id)
+            .join(
+                AiCallRecordingTrackModel,
+                AiCallRecordingTrackModel.id == AiCallAsrJobModel.track_id,
+            )
+            .where(
+                AiCallRecordingTrackModel.tenant_id == tenant_id,
+                AiCallRecordingTrackModel.call_id == call_id,
+                AiCallAsrJobModel.call_id == call_id,
+            )
             .order_by(
                 asc(AiCallAsrJobModel.submitted_at),
                 asc(AiCallAsrJobModel.id),

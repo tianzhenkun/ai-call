@@ -180,7 +180,7 @@ def _build_report_from_db(
 ) -> dict[str, Any]:
     track = conn.execute(
         """
-        select track.started_at
+        select track.id, track.started_at
         from ai_call_recording_track track
         join ai_call_record record
           on record.call_id = track.call_id
@@ -197,11 +197,11 @@ def _build_report_from_db(
         """
         select transcription_url
         from ai_call_asr_job
-        where call_id = ? and track_role = 'customer' and status = 'completed'
+        where track_id = ? and track_role = 'customer' and status = 'completed'
         order by id desc
         limit 1
         """,
-        (call_id,),
+        (track["id"],),
     ).fetchone()
     if asr_job is None or not asr_job["transcription_url"]:
         raise RuntimeError(f"{call_id}: missing completed customer ASR job")
@@ -230,7 +230,12 @@ def _recent_call_ids(conn: sqlite3.Connection, recent: int) -> list[str]:
                 and t.track_role = 'customer'
           )
           and exists (
-              select 1 from ai_call_asr_job j
+              select 1
+              from ai_call_asr_job j
+              join ai_call_recording_track t
+                on t.id = j.track_id
+               and t.tenant_id = r.tenant_id
+               and t.call_id = r.call_id
               where j.call_id = r.call_id
                 and j.track_role = 'customer'
                 and j.status = 'completed'

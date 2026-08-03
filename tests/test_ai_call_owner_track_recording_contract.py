@@ -46,6 +46,16 @@ def test_recording_track_tenant_model_and_migration_contract() -> None:
     ) in unique_columns
     assert ("call_id", "track_role", "participant_identity") not in unique_columns
 
+    indexes = {
+        index.name: tuple(column.name for column in index.columns)
+        for index in table.indexes
+    }
+    assert indexes["idx_ai_call_recording_track_verify_due"] == (
+        "status",
+        "next_verify_at",
+        "id",
+    )
+
     migration = MIGRATION_PATH.read_text(encoding="utf-8").lower()
     assert "ai_call_recording_track_tenant_backfill_failed" in migration
     assert "alter column tenant_id set not null" in migration
@@ -54,6 +64,8 @@ def test_recording_track_tenant_model_and_migration_contract() -> None:
     assert ") <> 1" in migration
     assert "nullif(btrim(track.tenant_id), '') is null" in migration
     assert "track.tenant_id is distinct from record.tenant_id" in migration
+    assert "idx_ai_call_recording_track_verify_due" in migration
+    assert "on ai_call_recording_track (status, next_verify_at, id)" in migration
 
 
 def test_recording_track_tenant_participant_start_requires_explicit_context() -> None:
@@ -64,6 +76,76 @@ def test_recording_track_tenant_participant_start_requires_explicit_context() ->
         parameters = inspect.signature(method).parameters
         assert "tenant_id" in parameters
         assert parameters["tenant_id"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    list_asr_parameters = inspect.signature(
+        AiCallRecordRepository.list_asr_jobs
+    ).parameters
+    assert list_asr_parameters["tenant_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert list_asr_parameters["call_id"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("event_type", ["browser_disconnect", "browser_first_audio"])
+async def test_browser_event_rejects_cross_tenant_before_side_effects(
+    event_type: str,
+) -> None:
+    orchestrator = SimpleNamespace(
+        get_session=AsyncMock(),
+        report_browser_event=AsyncMock(),
+    )
+    record_service = SimpleNamespace(
+        repository=None,
+        get_record_for_tenant=AsyncMock(return_value=None),
+        get_record=AsyncMock(
+            return_value=SimpleNamespace(tenant_id="tenant-a", call_id="shared-call")
+        ),
+        mark_answered=AsyncMock(),
+        complete_session=AsyncMock(),
+    )
+    recording_service = SimpleNamespace(
+        stop_for_session=AsyncMock(),
+        start_session_participant_recordings=AsyncMock(),
+    )
+    service = AiCallService(
+        orchestrator,
+        record_service=record_service,
+        recording_service=recording_service,
+    )
+
+    with pytest.raises(CustomException, match="通话事件租户上下文不匹配"):
+        await service.report_browser_event(
+            call_id="shared-call",
+            event_type=event_type,
+            timestamp=None,
+            tenant_id="tenant-b",
+        )
+
+    orchestrator.get_session.assert_not_awaited()
+    orchestrator.report_browser_event.assert_not_awaited()
+    recording_service.stop_for_session.assert_not_awaited()
+    recording_service.start_session_participant_recordings.assert_not_awaited()
+    record_service.mark_answered.assert_not_awaited()
+    record_service.complete_session.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_browser_event_rejects_missing_tenant_before_side_effects() -> None:
+    orchestrator = SimpleNamespace(report_browser_event=AsyncMock())
+    record_service = SimpleNamespace(
+        repository=None,
+        get_record_for_tenant=AsyncMock(),
+    )
+    service = AiCallService(orchestrator, record_service=record_service)
+
+    with pytest.raises(CustomException, match="通话事件缺少租户上下文"):
+        await service.report_browser_event(
+            call_id="call-a",
+            event_type="browser_first_audio",
+            timestamp=None,
+        )
+
+    record_service.get_record_for_tenant.assert_not_awaited()
+    orchestrator.report_browser_event.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -94,7 +176,7 @@ async def test_recording_track_tenant_browser_start_rejects_record_mismatch() ->
     service = object.__new__(AiCallService)
     service.recording_service = AsyncMock()
     service.record_service = SimpleNamespace(
-        get_record=AsyncMock(
+        get_record_for_tenant=AsyncMock(
             return_value=SimpleNamespace(
                 tenant_id="tenant-b",
                 room_name="room-b",
@@ -157,6 +239,64 @@ async def test_recording_track_tenant_reconcile_checks_equal_call_ids_independen
         for item in service.is_ready_for_offline_asr.await_args_list
     }
     assert checked_tenants == {"tenant-a", "tenant-b"}
+
+
+@pytest.mark.anyio
+async def test_recording_detail_asr_jobs_are_scoped_through_tenant_tracks() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_maker.begin() as db:
+        repository = AiCallRecordRepository(db)
+        recordings = {}
+        for tenant_id in ("tenant-a", "tenant-b"):
+            recordings[tenant_id] = await repository.create_recording(
+                tenant_id=tenant_id,
+                call_id="shared-call",
+                room_name=f"room-{tenant_id}",
+                status="completed",
+                started_at=NOW - timedelta(minutes=1),
+            )
+            track = await repository.create_recording_track(
+                tenant_id=tenant_id,
+                call_id="shared-call",
+                room_name=f"room-{tenant_id}",
+                track_role="customer",
+                participant_identity=f"customer-{tenant_id}",
+                status="completed",
+                started_at=NOW - timedelta(minutes=1),
+            )
+            job = await repository.create_asr_job(
+                call_id="shared-call",
+                track_id=track.id,
+                track_role="customer",
+                participant_identity=track.participant_identity,
+                provider="test",
+                model="test-model",
+                status="completed",
+                source_url=f"https://source.test/{tenant_id}.ogg",
+                submitted_at=NOW,
+            )
+            await repository.update_asr_job(
+                job.id,
+                transcription_url=f"https://asr.test/{tenant_id}.json",
+            )
+
+        detail = await AiCallRecordingService(
+            repository,
+            enabled=True,
+        ).recording_to_dict(recordings["tenant-a"])
+
+        assert [job["sourceUrl"] for job in detail["asrJobs"]] == [
+            "https://source.test/tenant-a.ogg"
+        ]
+        assert [job["transcriptionUrl"] for job in detail["asrJobs"]] == [
+            "https://asr.test/tenant-a.json"
+        ]
+
+    await engine.dispose()
 
 
 @pytest.mark.anyio
