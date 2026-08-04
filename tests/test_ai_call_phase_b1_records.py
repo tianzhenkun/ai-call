@@ -19,6 +19,7 @@ from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
+    AiCallAfterCallWorkModel,
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallAsrJobModel,
@@ -1342,6 +1343,80 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+@pytest.mark.anyio
+async def test_record_detail_returns_seat_after_call_disposition(b1_service) -> None:
+    service, record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+        tenant_id="000000",
+    )
+    record = await record_service.get_record(result.call_id)
+    assert record is not None
+    now = datetime(2026, 8, 4, 8, 6, tzinfo=timezone.utc)
+    handoff_id = "handoff-record-detail-seat-disposition"
+
+    async with b1_service.session_maker() as db:
+        db.add_all([
+            AiCallAfterCallWorkModel(
+                id=324800000000000201,
+                work_id="work-record-detail-seat-disposition",
+                tenant_id=record.tenant_id,
+                call_id=result.call_id,
+                handoff_id=handoff_id,
+                agent_identity="agent-admin",
+                disposition_code="follow_up_required",
+                summary="请继续跟进试用方案",
+                needs_follow_up=True,
+                submitted_at=now,
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallFollowUpTaskModel(
+                id=324800000000000202,
+                tenant_id=record.tenant_id,
+                source_type="after_call_work",
+                source_key=f"handoff:{handoff_id}",
+                source_call_id=result.call_id,
+                source_handoff_id=handoff_id,
+                scene_code="intro_geo",
+                business_type=None,
+                business_id=None,
+                contact_ref="record-detail-seat-disposition",
+                masked_contact="138****0000",
+                owner_agent_identity="agent-admin",
+                status="pending",
+                follow_up_reason="人工通话后续跟进",
+                customer_callback_at=None,
+                summary="请继续跟进试用方案",
+                closed_reason=None,
+                closed_remark=None,
+                completed_at=None,
+                closed_at=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
+        await db.commit()
+
+    response = RecordDetailOut.model_validate(
+        await service.get_record_detail(result.call_id)
+    ).model_dump(mode="json", by_alias=True)
+
+    after_call_work = response["afterCallWork"]
+    assert after_call_work["agentIdentity"] == "agent-admin"
+    assert after_call_work["dispositionCode"] == "follow_up_required"
+    assert after_call_work["summary"] == "请继续跟进试用方案"
+    assert after_call_work["needsFollowUp"] is True
+    assert after_call_work["submittedAt"].startswith("2026-08-04T08:06:00")
+    assert response["followUp"] == {
+        "id": "324800000000000202",
+        "status": "pending",
+        "reason": "人工通话后续跟进",
+    }
 
 
 @pytest.mark.anyio

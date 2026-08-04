@@ -11,6 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import (
+    AiCallAfterCallWorkModel,
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
@@ -130,6 +131,20 @@ class AiCallRecordRepository:
             select(AiCallRecordModel).where(
                 AiCallRecordModel.tenant_id == tenant_id,
                 AiCallRecordModel.call_id == call_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_after_call_work(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallAfterCallWorkModel | None:
+        result = await self.db.execute(
+            select(AiCallAfterCallWorkModel).where(
+                AiCallAfterCallWorkModel.tenant_id == tenant_id,
+                AiCallAfterCallWorkModel.call_id == call_id,
             )
         )
         return result.scalar_one_or_none()

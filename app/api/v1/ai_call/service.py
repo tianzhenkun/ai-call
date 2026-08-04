@@ -1006,10 +1006,38 @@ class AiCallService:
             raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
         last_event = await self.record_service.get_last_event(call_id)
         execution_config = await self.record_service.get_execution_config(record)
+        after_call_work = None
+        follow_up = None
+        if record.tenant_id:
+            work = await self.record_service.repository.get_after_call_work(
+                tenant_id=record.tenant_id,
+                call_id=call_id,
+            )
+            if work is not None:
+                after_call_work = {
+                    "agentIdentity": work.agent_identity,
+                    "dispositionCode": work.disposition_code,
+                    "summary": work.summary,
+                    "needsFollowUp": work.needs_follow_up,
+                    "submittedAt": work.submitted_at,
+                }
+                task = await self.record_service.repository.get_follow_up_by_source(
+                    tenant_id=record.tenant_id,
+                    source_type="after_call_work",
+                    source_key=f"handoff:{work.handoff_id}",
+                )
+                if task is not None:
+                    follow_up = {
+                        "id": str(task.id),
+                        "status": task.status,
+                        "reason": task.follow_up_reason,
+                    }
         return {
             "record": self.record_service.record_to_dict(record),
             "lastEvent": self.record_service.event_to_dict(last_event) if last_event else None,
             "executionConfig": execution_config,
+            "afterCallWork": after_call_work,
+            "followUp": follow_up,
         }
 
     async def list_record_events(

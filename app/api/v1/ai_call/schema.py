@@ -373,10 +373,26 @@ class RecordExecutionConfigOut(AiCallBaseSchema):
     rule_name: str | None = None
 
 
+class RecordAfterCallWorkOut(AiCallBaseSchema):
+    agent_identity: str
+    disposition_code: str
+    summary: str | None = None
+    needs_follow_up: bool
+    submitted_at: datetime
+
+
+class RecordFollowUpOut(AiCallBaseSchema):
+    id: str
+    status: str
+    reason: str
+
+
 class RecordDetailOut(AiCallBaseSchema):
     record: RecordOut
     last_event: RecordEventOut | None = None
     execution_config: RecordExecutionConfigOut | None = None
+    after_call_work: RecordAfterCallWorkOut | None = None
+    follow_up: RecordFollowUpOut | None = None
 
 
 class RecordEventListOut(AiCallBaseSchema):
