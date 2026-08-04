@@ -140,6 +140,13 @@ docker port ai-call-ed81-owner-19011-postgres 5432/tcp
 
 当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库。数据库密码只保存在本地安全配置中，不写入本文或提交。
 
+仓库内统一使用下面的受控启动入口。`--check` 只核对环境，不修改或重启服务；直接运行脚本时，如果 19011 已被占用会拒绝重复启动，不会终止现有进程：
+
+```bash
+tools/start_ai_call_19011.sh --check
+tools/start_ai_call_19011.sh
+```
+
 `ENVIRONMENT=dev` 不能省略。配置加载器会根据 `ENVIRONMENT` 选择 `env/.env.dev`；如果重启时漏掉它，进程会使用默认配置，`AI_CALL_SIP_OUTBOUND_ENABLED` 会回落为 `false`，页面会报 `SIP 真实外呼未启用`。
 
 `ROOT_PATH` 在 19011 本地直连测试时应显式置空。否则 FastAPI 会按默认 `/ai-call-api/v1` root path 提供静态资源，客户页需要通过 `/ai-call-api/v1/static/ai-call/customer.html` 访问；本地拨测统一使用裸路径：
