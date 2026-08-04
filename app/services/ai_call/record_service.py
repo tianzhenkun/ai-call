@@ -236,13 +236,23 @@ class AiCallRecordService:
         self,
         record: AiCallRecordModel,
     ) -> dict[str, str | None] | None:
-        if record.business_type != "outbound_task" or not record.business_id:
+        if not record.business_id:
             return None
         try:
-            task_id = int(record.business_id)
+            business_id = int(record.business_id)
         except (TypeError, ValueError):
             return None
-        snapshot_json = await self.repository.get_outbound_task_config_snapshot(task_id)
+        if record.business_type == "outbound_task":
+            snapshot_json = await self.repository.get_outbound_task_config_snapshot(
+                business_id
+            )
+        elif record.business_type == "outbound_attempt":
+            snapshot_json = await self.repository.get_outbound_attempt_task_config_snapshot(
+                business_id,
+                tenant_id=record.tenant_id,
+            )
+        else:
+            return None
         try:
             snapshot = json.loads(snapshot_json or "")
             prompt = snapshot["prompt"]
@@ -258,7 +268,9 @@ class AiCallRecordService:
             "promptName": _optional_text(prompt.get("name")),
             "sceneCode": _optional_text(prompt.get("sceneCode")),
             "voice": _optional_text(voice.get("voice")),
-            "voiceName": _optional_text(voice.get("displayName")),
+            "voiceName": _optional_text(
+                voice.get("voiceName") or voice.get("displayName")
+            ),
             "ruleName": _optional_text(rule.get("ruleName")),
         }
         return result if any(result.values()) else None

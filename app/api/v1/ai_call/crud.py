@@ -256,6 +256,27 @@ class AiCallRecordRepository:
             )
         )
 
+    async def get_outbound_attempt_task_config_snapshot(
+        self,
+        attempt_id: int,
+        *,
+        tenant_id: str | None = None,
+    ) -> str | None:
+        statement = (
+            select(AiCallOutboundTaskModel.config_snapshot_json)
+            .join(
+                AiCallOutboundAttemptModel,
+                AiCallOutboundAttemptModel.task_id == AiCallOutboundTaskModel.id,
+            )
+            .where(AiCallOutboundAttemptModel.id == attempt_id)
+        )
+        if tenant_id:
+            statement = statement.where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+            )
+        return await self.db.scalar(statement)
+
     async def get_outbound_attempt_by_call_id(
         self,
         call_id: str,

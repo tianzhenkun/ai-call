@@ -33,7 +33,10 @@ from app.api.v1.ai_call.model import (
     AiCallRecordModel,
     AiCallVoiceProfileModel,
 )
-from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTaskModel,
+)
 from app.api.v1.ai_call.schema import HandoffListOut, RecordDetailOut
 from app.api.v1.ai_call.service import AiCallService, configure_ai_call_offline_asr
 from app.api.v1.system.oss.service import OssService
@@ -1433,7 +1436,7 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
         },
         "voice": {
             "voice": "Cherry",
-            "displayName": "芊悦",
+            "voiceName": "芊悦",
         },
         "rule": {
             "ruleName": "冻结规则",
@@ -1505,6 +1508,37 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
         "voiceName": "芊悦",
         "ruleName": "冻结规则",
     }
+
+    attempt_id = 324800000000000104
+    attempt_call_id = "call_outbound_attempt_frozen_config"
+    async with b1_service.session_maker() as db:
+        db.add(
+            AiCallOutboundAttemptModel(
+                id=attempt_id,
+                tenant_id="000000",
+                task_id=task_id,
+                target_id=324800000000000105,
+                attempt_no=1,
+                call_id=attempt_call_id,
+                status="COMPLETED",
+                call_result="connected",
+                started_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await db.commit()
+
+    await b1_service.record_service.create_sip_record(
+        call_id=attempt_call_id,
+        business_type="outbound_attempt",
+        business_id=str(attempt_id),
+        room_name="room-outbound-attempt-frozen-config",
+        participant_identity="sip-outbound-attempt-frozen-config",
+        started_at=now,
+    )
+    attempt_detail = await b1_service.service.get_record_detail(attempt_call_id)
+    assert attempt_detail["executionConfig"] == response["executionConfig"]
 
 
 @pytest.mark.anyio
