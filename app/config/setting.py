@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     POOL_SIZE: int = 10  # 连接池大小
     MAX_OVERFLOW: int = 20  # 最大溢出连接数
     POOL_TIMEOUT: int = 30  # 连接超时时间(秒)
+    DATABASE_COMMAND_TIMEOUT: int = 30  # 数据库命令超时时间(秒)
     POOL_RECYCLE: int = 1800  # 连接回收时间(秒)
     POOL_USE_LIFO: bool = True  # 是否使用LIFO连接池
     POOL_PRE_PING: bool = True  # 是否开启连接预检

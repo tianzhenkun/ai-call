@@ -98,6 +98,11 @@ def create_async_engine_and_session(
                 max_overflow=settings.MAX_OVERFLOW,
                 pool_timeout=settings.POOL_TIMEOUT,
                 pool_use_lifo=settings.POOL_USE_LIFO,
+                connect_args=(
+                    {"command_timeout": settings.DATABASE_COMMAND_TIMEOUT}
+                    if settings.DATABASE_TYPE == "postgres"
+                    else {}
+                ),
             )
     except Exception as e:
         log.error(f"❌ 数据库连接失败 {e}")
