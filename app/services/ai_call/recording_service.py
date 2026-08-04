@@ -1203,8 +1203,25 @@ class AiCallRecordingService:
         if file_size is None:
             return False
 
-        ended_at = verified_at or utc_now()
-        duration_ms = self._duration_ms(track.started_at, ended_at)
+        reconciled_at = verified_at or utc_now()
+        record = (
+            await self.repository.get_record_for_tenant(
+                tenant_id=track.tenant_id,
+                call_id=track.call_id,
+            )
+            if track.ended_at is None
+            else None
+        )
+        ended_at = (
+            track.ended_at
+            or (record.ended_at if record else None)
+            or reconciled_at
+        )
+        duration_ms = (
+            track.duration_ms
+            if track.duration_ms is not None
+            else self._duration_ms(track.started_at, ended_at)
+        )
         log.info(
             "AI Call 分轨录音停止结果不确定，已通过OSS回查恢复完成状态: "
             "callId={}, trackRole={}, participantIdentity={}, objectName={}, "
@@ -1237,7 +1254,7 @@ class AiCallRecordingService:
                 ended_at=ended_at,
                 duration_ms=duration_ms,
                 verify_attempts=verify_attempts,
-                last_verify_at=ended_at,
+                last_verify_at=reconciled_at,
                 last_verify_error=str(register_exc)[:500],
                 next_verify_at=None,
                 failure_stage="oss_register",
@@ -1254,7 +1271,7 @@ class AiCallRecordingService:
             ended_at=ended_at,
             duration_ms=duration_ms,
             verify_attempts=verify_attempts,
-            last_verify_at=ended_at,
+            last_verify_at=reconciled_at,
             last_verify_error=None,
             next_verify_at=None,
             failure_stage=None,

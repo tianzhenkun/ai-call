@@ -27,7 +27,12 @@ OSS_CONFIG = {
 }
 
 
-async def _database(*, deadline_at: datetime, track_status: str = "verifying"):
+async def _database(
+    *,
+    deadline_at: datetime,
+    track_status: str = "verifying",
+    track_ended_at: datetime | None = NOW,
+):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
@@ -58,7 +63,7 @@ async def _database(*, deadline_at: datetime, track_status: str = "verifying"):
                 status=track_status,
                 object_name="ai-call/recordings/tracks/call-a/customer-a.ogg",
                 started_at=NOW - timedelta(minutes=1),
-                ended_at=NOW,
+                ended_at=track_ended_at,
                 stop_requested_at=NOW,
                 verify_attempts=0,
                 next_verify_at=NOW,
@@ -127,6 +132,7 @@ async def test_terminal_call_recovers_track_left_recording(monkeypatch) -> None:
     engine, session_maker = await _database(
         deadline_at=NOW + timedelta(minutes=15),
         track_status="recording",
+        track_ended_at=None,
     )
     monkeypatch.setattr(OssService, "_active_config", OSS_CONFIG)
     monkeypatch.setattr(
@@ -148,6 +154,8 @@ async def test_terminal_call_recovers_track_left_recording(monkeypatch) -> None:
         assert track is not None
         assert track.status == "completed"
         assert track.oss_id == 103
+        assert track.ended_at == NOW.replace(tzinfo=None)
+        assert track.duration_ms == 60_000
 
     await engine.dispose()
 
