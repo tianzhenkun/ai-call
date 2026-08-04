@@ -248,6 +248,8 @@ class AiCallDialogueRuntimeStore:
             self._finalize_interrupted_ai_pending(event)
         elif event.type == "interrupt_confirmed":
             self._finalize_pending(event.call_id, "ai", event.timestamp, "interrupted")
+        elif event.type == "handoff_requested":
+            self._finalize_pending(event.call_id, "customer", event.timestamp, "final")
         elif event.type in {"session_completed", "session_failed"}:
             self._finalize_all_pending(event.call_id, event.timestamp)
 

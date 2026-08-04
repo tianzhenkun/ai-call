@@ -8009,6 +8009,52 @@ async def test_dialogue_query_hides_unplayed_interrupted_ai_segment() -> None:
     await engine.dispose()
 
 
+def test_dialogue_runtime_finalizes_customer_segment_when_handoff_is_requested() -> None:
+    runtime_store = AiCallDialogueRuntimeStore()
+    event_store = InMemoryEventStore()
+    runtime_store.attach_event_store(event_store)
+    persisted: list[DialogueSegmentSnapshot] = []
+    runtime_store.add_persist_listener(persisted.append)
+    call_id = "call_handoff_customer_segment"
+    started_at = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
+    handoff_at = started_at + timedelta(milliseconds=380)
+
+    event_store.append(
+        call_id=call_id,
+        type="user_speech_started",
+        source="provider",
+        payload={"item_id": "item_handoff"},
+        timestamp=started_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="user_transcript_delta",
+        source="provider",
+        payload={"item_id": "item_handoff", "stash": "转人工。"},
+        timestamp=started_at + timedelta(milliseconds=370),
+    )
+    event_store.append(
+        call_id=call_id,
+        type="handoff_requested",
+        source="handoff",
+        payload={"handoffId": "handoff_1"},
+        timestamp=handoff_at,
+    )
+    event_store.append(
+        call_id=call_id,
+        type="session_completed",
+        source="orchestrator",
+        payload={},
+        timestamp=started_at + timedelta(seconds=104),
+    )
+
+    assert len(persisted) == 1
+    assert persisted[0].text == "转人工。"
+    assert persisted[0].segment_status == "final"
+    assert persisted[0].ended_at == handoff_at
+    assert persisted[0].duration_ms == 380
+
+
 def test_dialogue_runtime_merges_adjacent_customer_fragments() -> None:
     runtime_store = AiCallDialogueRuntimeStore()
     event_store = InMemoryEventStore()
