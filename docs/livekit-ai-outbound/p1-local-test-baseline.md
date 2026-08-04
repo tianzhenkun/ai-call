@@ -129,9 +129,7 @@ DATABASE_PORT=<ai-call-ed81-owner-19011-postgres 当前映射端口>
 DATABASE_NAME=ai_call_owner_19011
 DATABASE_USER=ai_call_owner_19011
 DATABASE_PASSWORD=<本地安全配置，不提交>
-REDIS_HOST=127.0.0.1
-REDIS_PORT=<codex-ruoyi-redis-6379 当前映射端口>
-REDIS_PASSWORD=<从本地 Redis 容器读取，不提交>
+REDIS_ENABLE=false
 ROOT_PATH=
 ```
 
@@ -141,7 +139,7 @@ ROOT_PATH=
 docker port ai-call-ed81-owner-19011-postgres 5432/tcp
 ```
 
-当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库；应用 Redis 使用本机容器 `codex-ruoyi-redis-6379`。数据库和 Redis 密码由启动脚本从对应本地容器读取，不写入本文或提交。
+当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库。数据库密码由启动脚本从本地容器读取，不写入本文或提交。19011 本地联调不依赖共享 Redis，避免其它环境的认证和状态影响启动。
 
 仓库内统一使用下面的受控启动入口。`--check` 只核对环境，不修改或重启服务；直接运行脚本时，如果 19011 已被占用会拒绝重复启动，不会终止现有进程：
 
@@ -151,6 +149,8 @@ tools/start_ai_call_19011.sh
 ```
 
 `ENVIRONMENT=dev` 不能省略。配置加载器会根据 `ENVIRONMENT` 选择 `env/.env.dev`；如果重启时漏掉它，进程会使用默认配置，`AI_CALL_SIP_OUTBOUND_ENABLED` 会回落为 `false`，页面会报 `SIP 真实外呼未启用`。
+
+启动入口为 Uvicorn 设置 10 秒 graceful shutdown 上限，避免 SSE 等长连接让重启无限等待；超过上限时 Uvicorn 会取消剩余请求并继续退出。
 
 `ROOT_PATH` 在 19011 本地直连测试时应显式置空。否则 FastAPI 会按默认 `/ai-call-api/v1` root path 提供静态资源，客户页需要通过 `/ai-call-api/v1/static/ai-call/customer.html` 访问；本地拨测统一使用裸路径：
 
