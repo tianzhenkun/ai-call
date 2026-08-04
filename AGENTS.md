@@ -15,13 +15,17 @@
 - 19011 用于 P1 SIP barge-in 本地联调。
 - 19012 用于语义分析测试；除非用户明确要求，不要停 19012。
 - 19011 必须使用隔离 LiveKit 栈，不要让 19011 和 19012 共用 LiveKit webhook、SIP service 或 Redis 状态。
-- 19011 本地测试默认使用 SQLite，本地库为 `/tmp/ai_call_ed81_local.db`。不要误连线上业务数据库。
-- 如果需要重启 19011，优先确认启动环境变量里包含：
+- 19011 的数据库类型、容器名和动态端口属于易变运行态，必须以 `p1-local-test-baseline.md` 和现场核对为准；不要回退到历史 SQLite，也不要误连线上业务数据库。
+- 如果需要重启 19011，优先按基线确认启动环境变量里包含：
 
 ```text
 SERVER_PORT=19011
-DATABASE_TYPE=sqlite
-DATABASE_NAME=/tmp/ai_call_ed81_local
+DATABASE_TYPE
+DATABASE_HOST
+DATABASE_PORT
+DATABASE_NAME
+DATABASE_USERNAME
+DATABASE_PASSWORD
 ```
 
 ## SIP / Linphone 链路
@@ -35,7 +39,7 @@ DATABASE_NAME=/tmp/ai_call_ed81_local
 
 - 不要提交 `.env.dev`、`*.local.yaml`、本地 SQLite 数据库、录音文件、OSS access_key/secret_key、LiveKit API secret、DashScope API key。
 - 文档中需要说明配置时，只写配置项名称和用途，不写真实密钥。
-- 本地 SQLite 可以包含 active OSS 配置用于录音上传；这不等于可以写线上业务数据库。
+- 19011 的隔离本地数据库可以包含 active OSS 配置用于录音上传；这不等于可以写线上业务数据库。
 
 ## 通话分析原则
 

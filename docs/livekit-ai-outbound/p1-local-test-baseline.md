@@ -108,8 +108,8 @@ LIVEKIT_URL=http://127.0.0.1:7890
 SIP_PROXY=freeswitch-local:5089
 SIP_SIGNALING_PORT=15180
 SIP_RTP_RANGE=18384-18484
-SIP_PUBLIC_IP=192.168.0.101
-SIP_EXTERNAL_RTP_IP=192.168.0.101
+SIP_PUBLIC_IP=192.168.0.111
+SIP_EXTERNAL_RTP_IP=192.168.0.111
 LIVEKIT_RTC_TCP_PORT=7891
 LIVEKIT_ICE_UDP_RANGE=51000-51100
 ```
@@ -123,10 +123,22 @@ LIVEKIT_ICE_UDP_RANGE=51000-51100
 ```text
 ENVIRONMENT=dev
 SERVER_PORT=19011
-DATABASE_TYPE=sqlite
-DATABASE_NAME=/tmp/ai_call_ed81_local
+DATABASE_TYPE=postgres
+DATABASE_HOST=127.0.0.1
+DATABASE_PORT=<ai-call-ed81-owner-19011-postgres 当前映射端口>
+DATABASE_NAME=ai_call_owner_19011
+DATABASE_USERNAME=ai_call_owner_19011
+DATABASE_PASSWORD=<本地安全配置，不提交>
 ROOT_PATH=
 ```
+
+`DATABASE_PORT` 是容器启动时动态映射的，不要把当前端口固化到启动脚本。每次重启前用下面命令读取：
+
+```bash
+docker port ai-call-ed81-owner-19011-postgres 5432/tcp
+```
+
+当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库。数据库密码只保存在本地安全配置中，不写入本文或提交。
 
 `ENVIRONMENT=dev` 不能省略。配置加载器会根据 `ENVIRONMENT` 选择 `env/.env.dev`；如果重启时漏掉它，进程会使用默认配置，`AI_CALL_SIP_OUTBOUND_ENABLED` 会回落为 `false`，页面会报 `SIP 真实外呼未启用`。
 
@@ -136,13 +148,7 @@ ROOT_PATH=
 http://127.0.0.1:19011/static/ai-call/customer.html
 ```
 
-代码里的 SQLite DSN 会拼成：
-
-```text
-sqlite+aiosqlite:////tmp/ai_call_ed81_local.db
-```
-
-因此只用 `python main.py --env dev` 但没带这些环境变量时，可能不会连到这份本地库。
+因此只用 `python main.py --env dev` 但没带这些环境变量时，可能连到错误数据库或直接启动失败。
 
 当前服务进程可用下面命令确认：
 
@@ -153,19 +159,22 @@ ps -p <pid> -o pid,ppid,etime,command
 
 ## 本地数据库配置
 
-当前本地 SQLite 文件存在：
+当前 19011 的权威数据库是隔离 PostgreSQL：
+
+```text
+container=ai-call-ed81-owner-19011-postgres
+database=ai_call_owner_19011
+user=ai_call_owner_19011
+```
+
+下面两份 SQLite 文件可能仍存在，但只是历史联调遗留，不是当前 19011 的运行数据库；重启时不要再指向它们：
 
 ```text
 /tmp/ai_call_ed81_local.db
-```
-
-仓库里还有一份本地副本：
-
-```text
 local_db/ai_call_ed81_local.copy.db
 ```
 
-`/tmp/ai_call_ed81_local.db` 当前包含 P1 联调需要的核心表：
+当前 PostgreSQL 包含 P1 联调需要的核心表：
 
 ```text
 ai_call_record
@@ -187,7 +196,7 @@ domain=https://oss.lingchen-ai.com
 status=0
 ```
 
-这条配置在本地 SQLite 里，录音上传会使用它。它会连接远端 OSS，但不会写线上业务数据库。注意不要泄露 `access_key` / `secret_key`。
+这条配置在隔离 PostgreSQL 里，录音上传会使用它。它会连接远端 OSS，但不会写线上业务数据库。注意不要泄露 `access_key` / `secret_key`。
 
 当前外呼统一使用运行时全局打断开关，不再按业务场景单独授权：
 
@@ -206,7 +215,9 @@ AI_CALL_SIP_BARGE_IN_FAST_STOP_ENABLED=true
 ```bash
 docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' | grep -E '19011|freeswitch'
 lsof -nP -iTCP:19011 -sTCP:LISTEN
-sqlite3 /tmp/ai_call_ed81_local.db "select count(*) from sys_oss_config where status='0';"
+docker port ai-call-ed81-owner-19011-postgres 5432/tcp
+docker exec ai-call-ed81-owner-19011-postgres pg_isready -U ai_call_owner_19011 -d ai_call_owner_19011
+docker exec ai-call-ed81-owner-19011-postgres psql -U ai_call_owner_19011 -d ai_call_owner_19011 -Atc "select count(*) from sys_oss_config where status='0';"
 docker exec sip_realtime_freeswitch fs_cli -x 'sofia status profile internal reg'
 ```
 
@@ -215,7 +226,7 @@ docker exec sip_realtime_freeswitch fs_cli -x 'sofia status profile internal reg
 - 19011 LiveKit / SIP / Egress / Redis 都在
 - `sip_realtime_freeswitch` 在
 - 19011 API 在监听
-- 本地 SQLite 有 active OSS 配置
+- 隔离 PostgreSQL 可连接且有 active OSS 配置
 - 新建通话的 `effectiveConfig.bargeInEnabled=true`
 - Linphone 注册 `1000@当前本机 IP` 且 Reachable
 
