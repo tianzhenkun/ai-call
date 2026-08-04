@@ -432,7 +432,6 @@ class AiCallSemanticAnalysisWorker:
                 call_id=job.call_id,
                 scene_code=job.scene_code,
                 reference_date=self.reference_date_factory(),
-                now=datetime.now(timezone.utc),
             )
             await db.commit()
 

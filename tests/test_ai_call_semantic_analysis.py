@@ -2736,6 +2736,8 @@ async def test_semantic_analysis_worker_consumes_queue_and_marks_success(tmp_pat
         assert analysis.analysis_status == module.ANALYSIS_STATUS_SUCCEEDED
         assert analysis.analysis_result_dict["summary"] == "客户下午方便继续沟通。"
         assert analysis.transcript_snapshot_dict["metadata"]["fallback_to_realtime"] is True
+        assert analysis.created_at <= analysis.analysis_started_at
+        assert analysis.analysis_started_at < analysis.analysis_finished_at
     assert analyzer.snapshots[0]["scene_code"] == "intro_geo"
 
     async with engine.begin() as conn:
