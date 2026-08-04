@@ -7,7 +7,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallRecordingModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallRecordingModel,
+    AiCallRecordingTrackModel,
+    AiCallRecordModel,
+)
 from app.api.v1.system.oss.model import OssModel
 from app.api.v1.system.oss.service import OssService
 from app.core.base_model import MappedBase
@@ -126,6 +130,45 @@ async def test_owner_recording_object_late_retries_then_completes_once(
         assert record.runtime_owner_id is None
         assert record.runtime_capacity_class == "none"
         assert record.resource_cleanup_status == "clean"
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_completed_owner_recordings_recover_missed_offline_asr_enqueue() -> None:
+    engine, session_maker = await _database(deadline_at=NOW + timedelta(minutes=15))
+    async with session_maker.begin() as db:
+        recording = await db.get(AiCallRecordingModel, 2)
+        assert recording is not None
+        recording.status = "completed"
+        recording.oss_id = 10
+        recording.next_verify_at = None
+        db.add(
+            AiCallRecordingTrackModel(
+                id=3,
+                tenant_id="tenant-a",
+                call_id="call-a",
+                room_name="room-a",
+                track_role="customer",
+                participant_identity="customer-a",
+                status="completed",
+                oss_id=11,
+                object_name="ai-call/recordings/tracks/call-a/customer.ogg",
+                started_at=NOW - timedelta(minutes=1),
+                ended_at=NOW,
+                duration_ms=55_000,
+            )
+        )
+
+    ready_for_asr: list[str] = []
+    worker = AiCallRecordingReconcileWorker(
+        session_maker,
+        lambda repository: AiCallRecordingService(repository, enabled=True),
+        on_call_ready_for_asr=ready_for_asr.append,
+    )
+
+    assert await worker.flush_once() == {"call-a"}
+    assert ready_for_asr == ["call-a"]
 
     await engine.dispose()
 

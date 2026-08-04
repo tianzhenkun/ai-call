@@ -1465,6 +1465,12 @@ class AiCallRecordingReconcileWorker:
                 ready_call_ids = await service.reconcile_due_recordings(
                     limit=self.batch_size,
                 )
+                if self.on_call_ready_for_asr is not None:
+                    ready_call_ids.update(
+                        await repository.list_post_call_recovery_candidates(
+                            limit=self.batch_size
+                        )
+                    )
                 await db.commit()
             except Exception:
                 await db.rollback()

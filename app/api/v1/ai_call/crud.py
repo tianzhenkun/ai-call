@@ -1059,6 +1059,72 @@ class AiCallRecordRepository:
         )
         return list(result.scalars().all())
 
+    async def list_post_call_recovery_candidates(self, *, limit: int) -> list[str]:
+        pending_recording = (
+            select(AiCallRecordingModel.id)
+            .where(
+                AiCallRecordingModel.tenant_id == AiCallRecordModel.tenant_id,
+                AiCallRecordingModel.call_id == AiCallRecordModel.call_id,
+                AiCallRecordingModel.status.in_(
+                    ("starting", "recording", "stopping", "verifying")
+                ),
+            )
+            .exists()
+        )
+        pending_track = (
+            select(AiCallRecordingTrackModel.id)
+            .where(
+                AiCallRecordingTrackModel.tenant_id == AiCallRecordModel.tenant_id,
+                AiCallRecordingTrackModel.call_id == AiCallRecordModel.call_id,
+                AiCallRecordingTrackModel.status.in_(
+                    ("starting", "recording", "stopping", "verifying")
+                ),
+            )
+            .exists()
+        )
+        completed_track = (
+            select(AiCallRecordingTrackModel.id)
+            .where(
+                AiCallRecordingTrackModel.tenant_id == AiCallRecordModel.tenant_id,
+                AiCallRecordingTrackModel.call_id == AiCallRecordModel.call_id,
+                AiCallRecordingTrackModel.status == "completed",
+                AiCallRecordingTrackModel.oss_id.is_not(None),
+            )
+            .exists()
+        )
+        active_asr = (
+            select(AiCallAsrJobModel.id)
+            .join(
+                AiCallRecordingTrackModel,
+                AiCallRecordingTrackModel.id == AiCallAsrJobModel.track_id,
+            )
+            .where(
+                AiCallRecordingTrackModel.tenant_id == AiCallRecordModel.tenant_id,
+                AiCallRecordingTrackModel.call_id == AiCallRecordModel.call_id,
+                AiCallAsrJobModel.status.in_(("pending", "running")),
+            )
+            .exists()
+        )
+        missing_analysis = ~(
+            select(AiCallSemanticAnalysisModel.id)
+            .where(AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id)
+            .exists()
+        )
+        result = await self.db.execute(
+            select(AiCallRecordModel.call_id)
+            .where(
+                AiCallRecordModel.status.in_(("completed", "failed")),
+                ~pending_recording,
+                ~pending_track,
+                completed_track,
+                missing_analysis,
+                ~active_asr,
+            )
+            .order_by(asc(AiCallRecordModel.ended_at), asc(AiCallRecordModel.id))
+            .limit(max(1, limit))
+        )
+        return list(result.scalars().all())
+
     async def next_dialogue_segment_no(self, call_id: str) -> int:
         result = await self.db.execute(
             select(func.max(AiCallDialogueSegmentModel.segment_no)).where(
