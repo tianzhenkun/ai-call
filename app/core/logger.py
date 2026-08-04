@@ -14,10 +14,20 @@ _logger_handlers = []
 
 SENSITIVE_LOGGER_NAMES = ("websockets", "httpcore", "httpx", "livekit")
 BEARER_TOKEN_PATTERN = re.compile(r"(Authorization:\s*Bearer\s+)[^\s'\"]+", re.IGNORECASE)
+SIGNED_URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+\?[^\s'\"<>]+", re.IGNORECASE)
+SIGNED_QUERY_KEYS = ("signature=", "ossaccesskeyid=", "x-amz-signature=")
+
+
+def _redact_signed_url(match: re.Match[str]) -> str:
+    url = match.group(0)
+    if not any(key in url.lower() for key in SIGNED_QUERY_KEYS):
+        return url
+    return f"{url.split('?', 1)[0]}?<redacted>"
 
 
 def sanitize_log_message(message: str) -> str:
-    return BEARER_TOKEN_PATTERN.sub(r"\1<redacted>", message)
+    message = BEARER_TOKEN_PATTERN.sub(r"\1<redacted>", message)
+    return SIGNED_URL_PATTERN.sub(_redact_signed_url, message)
 
 
 class InterceptHandler(logging.Handler):
