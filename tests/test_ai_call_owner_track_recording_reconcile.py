@@ -10,6 +10,7 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallRecordingTrackModel, AiCallRecordModel
 from app.api.v1.system.oss.service import OssService
 from app.core.base_model import MappedBase
+from app.services.ai_call import recording_service as recording_service_module
 from app.services.ai_call.recording_service import (
     AiCallRecordingReconcileWorker,
     AiCallRecordingService,
@@ -83,6 +84,12 @@ def _worker(session_maker, *, service_factory=None):
 
 @pytest.mark.anyio
 async def test_track_reconcile_uses_claim_cas_for_completion(monkeypatch) -> None:
+    info_messages: list[str] = []
+    monkeypatch.setattr(
+        recording_service_module.log,
+        "info",
+        lambda message, *args: info_messages.append(message.format(*args)),
+    )
     engine, session_maker = await _database(deadline_at=NOW + timedelta(minutes=15))
     monkeypatch.setattr(OssService, "_active_config", OSS_CONFIG)
     register = AsyncMock(return_value=101)
@@ -123,6 +130,8 @@ async def test_track_reconcile_uses_claim_cas_for_completion(monkeypatch) -> Non
         assert track.oss_id == 101
     egress.start_room_audio_recording.assert_not_awaited()
     egress.stop_egress.assert_not_awaited()
+    assert any("已通过OSS回查确认完成状态" in message for message in info_messages)
+    assert all("停止结果不确定" not in message for message in info_messages)
 
     await engine.dispose()
 

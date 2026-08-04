@@ -15,6 +15,7 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.system.oss.model import OssModel
 from app.api.v1.system.oss.service import OssService
 from app.core.base_model import MappedBase
+from app.services.ai_call import recording_service as recording_service_module
 from app.services.ai_call.recording_service import (
     AiCallRecordingReconcileWorker,
     AiCallRecordingService,
@@ -93,6 +94,12 @@ def _worker(session_maker) -> AiCallRecordingReconcileWorker:
 async def test_owner_recording_object_late_retries_then_completes_once(
     monkeypatch,
 ) -> None:
+    info_messages: list[str] = []
+    monkeypatch.setattr(
+        recording_service_module.log,
+        "info",
+        lambda message, *args: info_messages.append(message.format(*args)),
+    )
     engine, session_maker = await _database(deadline_at=NOW + timedelta(minutes=15))
     monkeypatch.setattr(OssService, "_active_config", OSS_CONFIG)
     observations = iter((None, 4096))
@@ -130,6 +137,9 @@ async def test_owner_recording_object_late_retries_then_completes_once(
         assert record.runtime_owner_id is None
         assert record.runtime_capacity_class == "none"
         assert record.resource_cleanup_status == "clean"
+
+    assert any("已通过OSS回查确认完成状态" in message for message in info_messages)
+    assert all("停止结果不确定" not in message for message in info_messages)
 
     await engine.dispose()
 

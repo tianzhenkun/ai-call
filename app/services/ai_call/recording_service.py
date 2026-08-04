@@ -1111,7 +1111,7 @@ class AiCallRecordingService:
             ended_at,
         )
         log.info(
-            "AI Call 录音停止结果不确定，已通过OSS回查恢复完成状态: "
+            "AI Call 录音已通过OSS回查确认完成状态: "
             "callId={}, objectName={}, fileSize={}, errorType={}",
             recording.call_id,
             object_name,
@@ -1223,7 +1223,7 @@ class AiCallRecordingService:
             else self._duration_ms(track.started_at, ended_at)
         )
         log.info(
-            "AI Call 分轨录音停止结果不确定，已通过OSS回查恢复完成状态: "
+            "AI Call 分轨录音已通过OSS回查确认完成状态: "
             "callId={}, trackRole={}, participantIdentity={}, objectName={}, "
             "fileSize={}, errorType={}",
             track.call_id,
