@@ -3551,6 +3551,8 @@ async def test_end_session_finalizes_active_handoff(b1_service) -> None:
         prompt=None,
         business_id=None,
     )
+    await b1_service.flush_events()
+    b1_service.event_worker.detach_all()
     handoff = await service.create_handoff(
         call_id=result.call_id,
         source="operator",
@@ -3599,6 +3601,8 @@ async def test_end_session_keeps_connected_reconnecting_handoff_in_wrap_up(
         prompt=None,
         business_id=None,
     )
+    await b1_service.flush_events()
+    b1_service.event_worker.detach_all()
     handoff = await service.create_handoff(
         call_id=result.call_id,
         source="operator",
@@ -3629,7 +3633,7 @@ async def test_end_session_keeps_connected_reconnecting_handoff_in_wrap_up(
     await service.end_session(result.call_id, end_reason="remote_hangup")
 
     history = await service.list_handoffs(result.call_id)
-    assert history["rows"][0]["status"] == "canceled"
+    assert history["rows"][0]["status"] == "completed"
     presence = await service.handoff_service.repository.get_handoff_agent(
         "agent-debug-001"
     )
@@ -5076,9 +5080,24 @@ async def test_event_persistence_worker_completes_connected_reconnecting_handoff
                 scene_code="default",
                 status="reconnecting",
                 request_source="customer",
+                human_agent_identity="agent-debug-001",
                 requested_at=now,
                 connected_at=now,
                 reconnect_expires_at=now + timedelta(seconds=15),
+            )
+        )
+        db.add(
+            AiCallHandoffAgentModel(
+                id=999_998,
+                tenant_id="000000",
+                agent_identity="agent-debug-001",
+                skill_group="default",
+                status="reconnecting",
+                active_handoff_id="handoff-terminal-reconnect",
+                active_call_id=result.call_id,
+                console_session_id="8ed3e232-907f-49cc-b365-6a9cc5c9aa0a",
+                last_seen_at=now,
+                status_updated_at=now,
             )
         )
 
@@ -5099,6 +5118,15 @@ async def test_event_persistence_worker_completes_connected_reconnecting_handoff
         assert handoff is not None
         assert handoff.status == "completed"
         assert handoff.end_reason == "sip_participant_left"
+        presence = await db.scalar(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.agent_identity == "agent-debug-001"
+            )
+        )
+        assert presence is not None
+        assert presence.status == "wrap_up_quick"
+        assert presence.active_handoff_id == handoff.handoff_id
+        assert presence.active_call_id == result.call_id
 
 
 @pytest.mark.anyio

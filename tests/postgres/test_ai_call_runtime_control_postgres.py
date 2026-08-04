@@ -4825,9 +4825,24 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
                     scene_code="default",
                     status="reconnecting",
                     request_source="customer",
+                    human_agent_identity="agent-stub-handler",
                     requested_at=now,
                     connected_at=now,
                     reconnect_expires_at=now + timedelta(seconds=15),
+                )
+            )
+            session.add(
+                AiCallHandoffAgentModel(
+                    id=generate_snowflake_id(),
+                    tenant_id="tenant-a",
+                    agent_identity="agent-stub-handler",
+                    skill_group="default",
+                    status="reconnecting",
+                    active_handoff_id="handoff-stub-handler",
+                    active_call_id=start.call_id,
+                    console_session_id="8ed3e232-907f-49cc-b365-6a9cc5c9aa0a",
+                    last_seen_at=now,
+                    status_updated_at=now,
                 )
             )
 
@@ -4928,6 +4943,15 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
             assert handoff is not None
             assert handoff.status == "completed"
             assert handoff.end_reason == "user_requested"
+            presence = await session.scalar(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-stub-handler"
+                )
+            )
+            assert presence is not None
+            assert presence.status == "wrap_up_quick"
+            assert presence.active_handoff_id == handoff.handoff_id
+            assert presence.active_call_id == start.call_id
         assert all(set(call) == {"provider_namespace", "effect_type", "resource_key"} for call in provider.calls)
     finally:
         await engine.dispose()
