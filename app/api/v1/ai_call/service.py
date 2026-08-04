@@ -68,6 +68,7 @@ from app.services.ai_call.runtime_control.command_repository import (
 from app.services.ai_call.runtime_control.roles import runtime_control_mode_for_entry
 from app.services.ai_call.semantic_analysis import (
     AiCallSemanticAnalysisService,
+    SemanticTranscriptBuilder,
     build_default_semantic_analyzer,
 )
 from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
@@ -1119,11 +1120,28 @@ class AiCallService:
         limit: int = 1000,
     ) -> dict:
         self._ensure_dialogue_service()
-        rows = await self.dialogue_service.list_persisted_segments(
-            call_id,
-            speaker_type=speaker_type,
-            limit=limit,
-        )
+        if speaker_type not in {None, "customer"}:
+            rows = await self.dialogue_service.list_persisted_segments(
+                call_id,
+                speaker_type=speaker_type,
+                limit=limit,
+            )
+        else:
+            raw_rows = await self.dialogue_service.repository.list_dialogue_segments(
+                call_id,
+                speaker_type=speaker_type,
+                limit=limit,
+            )
+            selected_customer_ids = {
+                id(row)
+                for row in SemanticTranscriptBuilder().select_customer_rows(raw_rows)
+            }
+            rows = self.dialogue_service._canonical_segments([
+                row
+                for row in raw_rows
+                if row.speaker_type != "customer" or id(row) in selected_customer_ids
+            ])
+            rows.sort(key=SemanticTranscriptBuilder._sort_key)
         return {
             "rows": [self.dialogue_service.segment_to_dict(row) for row in rows],
             "total": len(rows),

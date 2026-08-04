@@ -29,6 +29,7 @@ from app.api.v1.ai_call.model import (
 )
 from app.core.logger import log
 from app.services.ai_call.dialogue_merge import (
+    dialogue_time_ranges_touch,
     is_cross_source_customer_transcript_conflict,
 )
 from app.services.ai_call.post_call_follow_up_service import (
@@ -147,6 +148,7 @@ OFFLINE_SHORT_QUESTION_REALTIME_DIVERGENCE = (
 OFFLINE_NEARBY_TRANSCRIPT_CONFLICT = "nearby_transcript_conflict"
 HUMAN_AGENT_TRACK_CROSSTALK_SIGNAL = "human_agent_track_crosstalk"
 HUMAN_AGENT_TRACK_CUSTOMER_OVERLAP = "human_agent_track_customer_overlap"
+CROSS_SOURCE_EXACT_DUPLICATE_TIME_GAP_MS = 1500
 TRANSCRIPT_UNCERTAINTY_ANALYSIS_GUIDANCE = (
     "存在转写来源冲突、降级或补充时，不得把低置信片段当作强业务结论；"
     "应优先依据多轮一致、上下文连续的客户表达，并在摘要或标签中提示转写噪声风险。"
@@ -443,6 +445,15 @@ class AiCallSemanticAnalysisWorker:
 class SemanticTranscriptBuilder:
     """Build the audit snapshot used by post-call semantic analysis."""
 
+    def select_customer_rows(
+        self,
+        rows: list[AiCallDialogueSegmentModel],
+    ) -> list[AiCallDialogueSegmentModel]:
+        return self._select_customer_rows_with_metadata(
+            rows=rows,
+            customer_asr_jobs=[],
+        )[0]
+
     def build(
         self,
         *,
@@ -453,73 +464,24 @@ class SemanticTranscriptBuilder:
         handoffs: list[AiCallHandoffModel] | None = None,
     ) -> dict[str, Any]:
         handoff_rows = sorted(handoffs or [], key=self._handoff_sort_key)
-        offline_customer_rows = [
-            row
-            for row in rows
-            if row.speaker_type == SPEAKER_CUSTOMER and row.source == OFFLINE_ASR_SOURCE
-        ]
         customer_asr_jobs = [
             job for job in (asr_jobs or []) if job.track_role == SPEAKER_CUSTOMER
         ]
-        usable_offline_customer_rows = [
-            row for row in offline_customer_rows if self._is_usable_customer_row(row)
-        ]
-        realtime_customer_rows = [
-            row
-            for row in rows
-            if row.speaker_type == SPEAKER_CUSTOMER
-            and row.source == QWEN_REALTIME_SOURCE
-            and self._is_usable_customer_row(row)
-        ]
-        source_decisions = self._customer_source_decisions(
-            offline_rows=usable_offline_customer_rows,
-            realtime_rows=realtime_customer_rows,
+        (
+            customer_rows,
+            source_decisions,
+            excluded_offline_keys,
+            supplemental_realtime_rows,
+            fallback_to_realtime,
+            fallback_reason,
+        ) = self._select_customer_rows_with_metadata(
+            rows=rows,
+            customer_asr_jobs=customer_asr_jobs,
         )
-        excluded_offline_keys = {
-            candidate["row_key"]
-            for decision in source_decisions
-            for candidate in decision["candidate_sources"]
-            if (
-                candidate["source"] == OFFLINE_ASR_SOURCE
-                and decision["selected_source"] == QWEN_REALTIME_SOURCE
-            )
-        }
-        effective_offline_customer_rows = [
-            row
-            for row in usable_offline_customer_rows
-            if self._row_key(row) not in excluded_offline_keys
-        ]
         source_decision_by_row_key = {
             str(decision["selected_row_key"]): self._public_source_decision(decision)
             for decision in source_decisions
         }
-        quality_fallback_reason = next(
-            (
-                str(decision["fallback_reason"])
-                for decision in source_decisions
-                if decision.get("fallback_reason")
-            ),
-            None,
-        )
-
-        if effective_offline_customer_rows:
-            supplemental_realtime_rows = self._realtime_customer_supplement_rows(
-                realtime_customer_rows,
-                effective_offline_customer_rows,
-            )
-            customer_rows = [*effective_offline_customer_rows, *supplemental_realtime_rows]
-            fallback_to_realtime = quality_fallback_reason is not None
-            fallback_reason = quality_fallback_reason
-        else:
-            supplemental_realtime_rows = []
-            customer_rows = realtime_customer_rows
-            fallback_to_realtime = bool(realtime_customer_rows)
-            fallback_reason = (
-                quality_fallback_reason
-                or self._offline_fallback_reason(offline_customer_rows, customer_asr_jobs)
-                if fallback_to_realtime
-                else None
-            )
 
         ai_rows = [
             row
@@ -602,6 +564,88 @@ class SemanticTranscriptBuilder:
             "handoffs": [self._handoff_to_dict(handoff) for handoff in handoff_rows],
             "metadata": metadata,
         }
+
+    @classmethod
+    def _select_customer_rows_with_metadata(
+        cls,
+        *,
+        rows: list[AiCallDialogueSegmentModel],
+        customer_asr_jobs: list[AiCallAsrJobModel],
+    ) -> tuple[
+        list[AiCallDialogueSegmentModel],
+        list[dict[str, Any]],
+        set[str],
+        list[AiCallDialogueSegmentModel],
+        bool,
+        str | None,
+    ]:
+        offline_customer_rows = [
+            row
+            for row in rows
+            if row.speaker_type == SPEAKER_CUSTOMER and row.source == OFFLINE_ASR_SOURCE
+        ]
+        usable_offline_customer_rows = [
+            row for row in offline_customer_rows if cls._is_usable_customer_row(row)
+        ]
+        realtime_customer_rows = [
+            row
+            for row in rows
+            if row.speaker_type == SPEAKER_CUSTOMER
+            and row.source == QWEN_REALTIME_SOURCE
+            and cls._is_usable_customer_row(row)
+        ]
+        source_decisions = cls._customer_source_decisions(
+            offline_rows=usable_offline_customer_rows,
+            realtime_rows=realtime_customer_rows,
+        )
+        excluded_offline_keys = {
+            candidate["row_key"]
+            for decision in source_decisions
+            for candidate in decision["candidate_sources"]
+            if (
+                candidate["source"] == OFFLINE_ASR_SOURCE
+                and decision["selected_source"] == QWEN_REALTIME_SOURCE
+            )
+        }
+        effective_offline_customer_rows = [
+            row
+            for row in usable_offline_customer_rows
+            if cls._row_key(row) not in excluded_offline_keys
+        ]
+        quality_fallback_reason = next(
+            (
+                str(decision["fallback_reason"])
+                for decision in source_decisions
+                if decision.get("fallback_reason")
+            ),
+            None,
+        )
+        if effective_offline_customer_rows:
+            supplemental_realtime_rows = cls._realtime_customer_supplement_rows(
+                realtime_customer_rows,
+                effective_offline_customer_rows,
+            )
+            customer_rows = [*effective_offline_customer_rows, *supplemental_realtime_rows]
+            fallback_to_realtime = quality_fallback_reason is not None
+            fallback_reason = quality_fallback_reason
+        else:
+            supplemental_realtime_rows = []
+            customer_rows = realtime_customer_rows
+            fallback_to_realtime = bool(realtime_customer_rows)
+            fallback_reason = (
+                quality_fallback_reason
+                or cls._offline_fallback_reason(offline_customer_rows, customer_asr_jobs)
+                if fallback_to_realtime
+                else None
+            )
+        return (
+            customer_rows,
+            source_decisions,
+            excluded_offline_keys,
+            supplemental_realtime_rows,
+            fallback_to_realtime,
+            fallback_reason,
+        )
 
     def has_effective_user_input(self, snapshot: dict[str, Any]) -> bool:
         turns = snapshot.get("turns")
@@ -746,18 +790,36 @@ class SemanticTranscriptBuilder:
         left: AiCallDialogueSegmentModel,
         right: AiCallDialogueSegmentModel,
     ) -> bool:
-        return cls._time_ranges_overlap(left, right) or (
-            is_cross_source_customer_transcript_conflict(
-                source=left.source,
-                speaker_type=left.speaker_type,
-                text=cls._text(left),
-                started_at=left.started_at,
-                ended_at=left.ended_at,
-                candidate_source=right.source,
-                candidate_speaker_type=right.speaker_type,
-                candidate_text=cls._text(right),
-                candidate_started_at=right.started_at,
-                candidate_ended_at=right.ended_at,
+        left_text = cls._normalized_text(left)
+        right_text = cls._normalized_text(right)
+        has_nearby_containment = bool(
+            left_text
+            and right_text
+            and (left_text in right_text or right_text in left_text)
+            and dialogue_time_ranges_touch(
+                left.started_at,
+                left.ended_at,
+                right.started_at,
+                right.ended_at,
+                max_gap_ms=CROSS_SOURCE_EXACT_DUPLICATE_TIME_GAP_MS,
+            )
+        )
+        return (
+            cls._time_ranges_overlap(left, right)
+            or has_nearby_containment
+            or (
+                is_cross_source_customer_transcript_conflict(
+                    source=left.source,
+                    speaker_type=left.speaker_type,
+                    text=cls._text(left),
+                    started_at=left.started_at,
+                    ended_at=left.ended_at,
+                    candidate_source=right.source,
+                    candidate_speaker_type=right.speaker_type,
+                    candidate_text=cls._text(right),
+                    candidate_started_at=right.started_at,
+                    candidate_ended_at=right.ended_at,
+                )
             )
         )
 
@@ -1003,12 +1065,7 @@ class SemanticTranscriptBuilder:
         if not realtime_text:
             return True
         for offline_row in offline_rows:
-            offline_text = cls._normalized_text(offline_row)
-            if offline_text and (
-                realtime_text in offline_text or offline_text in realtime_text
-            ):
-                return True
-            if cls._time_ranges_overlap(realtime_row, offline_row):
+            if cls._same_cross_source_customer_utterance(realtime_row, offline_row):
                 return True
         return False
 

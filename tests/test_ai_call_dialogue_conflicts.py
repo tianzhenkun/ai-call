@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.api.v1.ai_call.model import AiCallDialogueSegmentModel
+from app.api.v1.ai_call.service import AiCallService
 from app.services.ai_call.dialogue_merge import (
     is_cross_source_customer_transcript_conflict,
 )
@@ -21,12 +22,13 @@ def _segment(
     text: str,
     started_ms: int,
     ended_ms: int,
+    speaker_type: str = "customer",
 ) -> AiCallDialogueSegmentModel:
     return AiCallDialogueSegmentModel(
         id=segment_no,
         call_id="call_transcript_conflict",
         segment_no=segment_no,
-        speaker_type="customer",
+        speaker_type=speaker_type,
         speaker_identity="sip-call_transcript_conflict",
         source=source,
         source_segment_id=f"{source}_{segment_no}",
@@ -182,3 +184,80 @@ def test_semantic_snapshot_marks_nearby_cross_source_conflict() -> None:
     )
     assert customer_turns[0]["semantic_evidence"]["source_conflict"] is True
     assert snapshot["metadata"]["offline_asr_quality_rejected_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_record_dialogue_uses_semantic_customer_selection_and_time_order() -> None:
+    opening = _segment(
+        segment_no=1,
+        source="qwen_realtime",
+        speaker_type="ai",
+        text="您好，请问现在方便沟通吗？",
+        started_ms=0,
+        ended_ms=1000,
+    )
+    realtime = _segment(
+        segment_no=2,
+        source="qwen_realtime",
+        text="啥呀。",
+        started_ms=6569,
+        ended_ms=7349,
+    )
+    reply = _segment(
+        segment_no=3,
+        source="qwen_realtime",
+        speaker_type="ai",
+        text="没关系，我简单介绍一下。",
+        started_ms=7800,
+        ended_ms=9000,
+    )
+    offline = _segment(
+        segment_no=10,
+        source="offline_asr",
+        text="啥呀。",
+        started_ms=5100,
+        ended_ms=5340,
+    )
+
+    class Repository:
+        async def list_dialogue_segments(self, *_args, **_kwargs):
+            return [opening, realtime, reply, offline]
+
+    service = AiCallService(
+        object(),
+        dialogue_service=AiCallDialogueService(Repository()),
+    )
+
+    result = await service.list_record_dialogue_segments("call_transcript_conflict")
+
+    assert [(row["source"], row["text"]) for row in result["rows"]] == [
+        ("qwen_realtime", "您好，请问现在方便沟通吗？"),
+        ("offline_asr", "啥呀。"),
+        ("qwen_realtime", "没关系，我简单介绍一下。"),
+    ]
+
+
+def test_semantic_customer_selection_keeps_distinct_repeated_text() -> None:
+    offline = _segment(
+        segment_no=1,
+        source="offline_asr",
+        text="行。",
+        started_ms=0,
+        ended_ms=400,
+    )
+    later_realtime = _segment(
+        segment_no=2,
+        source="qwen_realtime",
+        text="行。",
+        started_ms=5000,
+        ended_ms=5400,
+    )
+
+    rows = SemanticTranscriptBuilder().select_customer_rows(
+        [offline, later_realtime]
+    )
+
+    assert [(row.source, row.segment_text) for row in rows] == [
+        ("offline_asr", "行。"),
+        ("qwen_realtime", "行。"),
+    ]

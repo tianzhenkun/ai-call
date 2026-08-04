@@ -40,7 +40,7 @@ def is_duplicate_dialogue_segment(
         return False
     if normalize_dialogue_text(text) != normalize_dialogue_text(candidate_text):
         return False
-    return _time_ranges_touch(
+    return dialogue_time_ranges_touch(
         started_at,
         ended_at,
         candidate_started_at,
@@ -74,7 +74,7 @@ def is_cross_source_customer_transcript_conflict(
         return False
     if normalized in candidate_normalized or candidate_normalized in normalized:
         return False
-    if not _time_ranges_touch(
+    if not dialogue_time_ranges_touch(
         started_at,
         ended_at,
         candidate_started_at,
@@ -95,7 +95,7 @@ def is_cross_source_customer_transcript_conflict(
     )
 
 
-def _time_ranges_touch(
+def dialogue_time_ranges_touch(
     left_started_at: datetime | None,
     left_ended_at: datetime | None,
     right_started_at: datetime | None,
