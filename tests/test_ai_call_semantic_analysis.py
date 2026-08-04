@@ -628,6 +628,49 @@ def test_semantic_analysis_result_removes_assistant_only_claims() -> None:
     assert result["tags"] == ["关注准确率", "转写噪声风险"]
 
 
+def test_semantic_analysis_result_removes_assistant_only_time_hint() -> None:
+    module = _semantic_module()
+
+    result = module.enforce_semantic_evidence_on_result(
+        module.normalize_analysis_result({
+            "summary": "客户询问试用时间。",
+            "feedback_type": "中性",
+            "key_points": ["客户询问试用时间"],
+            "time_hint": {
+                "time_text": "星期10",
+                "time_value": "",
+                "original_texts": ["星期10"],
+            },
+            "tags": ["低置信时间表述"],
+        }),
+        {
+            "turns": [
+                {
+                    "seq": 1,
+                    "role": "user",
+                    "text": "什么时候呢？",
+                    "semantic_evidence": {
+                        "analysis_usage": "use_as_customer_signal",
+                        "key_point_candidate": True,
+                    },
+                },
+                {
+                    "seq": 2,
+                    "role": "assistant",
+                    "text": "星期10。",
+                },
+            ]
+        },
+    )
+
+    assert result["time_hint"] == {
+        "time_text": "",
+        "time_value": "",
+        "original_texts": [],
+    }
+    assert "转写噪声风险" in result["tags"]
+
+
 def test_semantic_analysis_result_removes_record_only_text_from_summary_and_key_points() -> None:
     module = _semantic_module()
     snapshot = _build_snapshot([

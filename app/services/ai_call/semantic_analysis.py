@@ -1783,7 +1783,7 @@ def enforce_semantic_evidence_on_result(
     )
     normalized = _remove_assistant_only_claims(normalized, snapshot)
     normalized = _remove_metadata_time_hints(normalized)
-    normalized = _remove_record_only_time_hints(normalized, snapshot)
+    normalized = _remove_unsupported_time_hints(normalized, snapshot)
     normalized = _remove_transcript_listing_summary(normalized)
     normalized = _append_transcript_quality_risk_tags(normalized, snapshot)
     normalized = _enforce_follow_up_evidence(normalized, snapshot)
@@ -1976,21 +1976,23 @@ def _remove_metadata_time_hints(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _remove_record_only_time_hints(
+def _remove_unsupported_time_hints(
     result: dict[str, Any],
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     time_hint = _normalize_time_hint(result.get("time_hint"))
     if not time_hint["time_text"] and not time_hint["original_texts"]:
         return result
-    record_only_texts = _snapshot_record_only_turn_texts(snapshot)
-    if not record_only_texts:
+    blocked_texts = _snapshot_record_only_turn_texts(snapshot)
+    for text in _snapshot_assistant_only_texts(snapshot):
+        _append_unique(blocked_texts, text)
+    if not blocked_texts:
         return result
 
     kept_original_texts = [
         original
         for original in time_hint["original_texts"]
-        if not _contains_normalized_text(original, record_only_texts)
+        if not _contains_normalized_text(original, blocked_texts)
     ]
     removed_original_texts = len(kept_original_texts) != len(time_hint["original_texts"])
     if kept_original_texts:
@@ -2004,9 +2006,9 @@ def _remove_record_only_time_hints(
             },
         }
 
-    if not removed_original_texts and not _time_text_only_appears_in_record_only_turn(
+    if not removed_original_texts and not _time_text_appears_in_blocked_turn(
         time_hint["time_text"],
-        record_only_texts,
+        blocked_texts,
     ):
         return result
 
@@ -2421,7 +2423,7 @@ def _salient_text_phrases(text: str) -> list[str]:
     values: list[str] = []
     for raw_part in re.split(r"[，。！？；,.!?;\s]+", text):
         normalized = SemanticTranscriptBuilder._normalized_text_value(raw_part)
-        if len(normalized) >= 6:
+        if len(normalized) >= 6 or TIME_HINT_PATTERN.search(raw_part):
             _append_unique(values, normalized)
             _append_assistant_phrase_variants(values, normalized)
         for marker in ("主要是", "比如", "例如", "包括"):
@@ -2561,14 +2563,14 @@ def _contains_time_hint_claim(text: str, time_text: str) -> bool:
     )
 
 
-def _time_text_only_appears_in_record_only_turn(
+def _time_text_appears_in_blocked_turn(
     time_text: str,
-    record_only_texts: list[str],
+    blocked_texts: list[str],
 ) -> bool:
     normalized_time_text = SemanticTranscriptBuilder._normalized_text_value(time_text)
     if not normalized_time_text:
         return False
-    return any(normalized_time_text in text for text in record_only_texts)
+    return any(normalized_time_text in text for text in blocked_texts)
 
 
 def _has_long_text_overlap(text: str, candidate: str) -> bool:
