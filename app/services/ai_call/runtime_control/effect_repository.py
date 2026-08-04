@@ -526,13 +526,19 @@ class RuntimeEffectRepository:
                     create_protection_deadline_at=row.create_protection_deadline_at,
                     attempt_count=row.attempt_count,
                     reconcile_only=(
-                        candidate.effect_type in CREATE_EFFECT_TYPES
-                        and (
-                            candidate.status != EffectStatus.PENDING
-                            or (
-                                candidate.effect_type == "START_TRACK_EGRESS"
-                                and candidate.attempt_count > 0
+                        (
+                            candidate.effect_type in CREATE_EFFECT_TYPES
+                            and (
+                                candidate.status != EffectStatus.PENDING
+                                or (
+                                    candidate.effect_type == "START_TRACK_EGRESS"
+                                    and candidate.attempt_count > 0
+                                )
                             )
+                        )
+                        or (
+                            candidate.effect_type in DESTROY_EFFECT_TYPES
+                            and candidate.status != EffectStatus.PENDING
                         )
                     ),
                     provider_namespace=row.provider_namespace,

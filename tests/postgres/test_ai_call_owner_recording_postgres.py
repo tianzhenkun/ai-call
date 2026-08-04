@@ -415,6 +415,20 @@ async def test_stop_egress_gates_delete_room_but_not_long_oss_verification() -> 
             assert await effects.submit(
                 stop,
                 ProviderObservation(
+                    kind=ProviderObservationKind.ACCEPTED,
+                    provider_reference="EG_main",
+                    provider_status="EGRESS_ACTIVE",
+                    object_name="ai-call/main/call-a.ogg",
+                ),
+            )
+
+            stop_reconcile = await effects.claim_next(lease)
+            assert stop_reconcile is not None
+            assert stop_reconcile.effect_type == "STOP_EGRESS"
+            assert stop_reconcile.reconcile_only is True
+            assert await effects.submit(
+                stop_reconcile,
+                ProviderObservation(
                     kind=ProviderObservationKind.TERMINAL_CONFIRMED,
                     provider_reference="EG_main",
                     provider_status="EGRESS_COMPLETE",
