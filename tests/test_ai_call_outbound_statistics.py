@@ -308,6 +308,7 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
                 _record(
                     row_id=row_id,
                     started_at=started_at,
+                    entry_type="outbound" if row_id == 1 else "sip_outbound",
                     status="running" if row_id == 8 else "completed",
                     follow_up_id=9001 if row_id == 1 else None,
                 ),

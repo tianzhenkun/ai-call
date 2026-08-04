@@ -66,7 +66,7 @@ class OutboundStatisticsRepository:
     ) -> Select:
         return statement.where(
             AiCallOutboundAttemptModel.tenant_id == tenant_id,
-            AiCallRecordModel.entry_type == "sip_outbound",
+            AiCallRecordModel.entry_type.in_(("outbound", "sip_outbound")),
             AiCallRecordModel.started_at >= started_at,
             AiCallRecordModel.started_at < ended_at,
         )
