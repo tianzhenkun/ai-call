@@ -127,8 +127,11 @@ DATABASE_TYPE=postgres
 DATABASE_HOST=127.0.0.1
 DATABASE_PORT=<ai-call-ed81-owner-19011-postgres 当前映射端口>
 DATABASE_NAME=ai_call_owner_19011
-DATABASE_USERNAME=ai_call_owner_19011
+DATABASE_USER=ai_call_owner_19011
 DATABASE_PASSWORD=<本地安全配置，不提交>
+REDIS_HOST=127.0.0.1
+REDIS_PORT=<codex-ruoyi-redis-6379 当前映射端口>
+REDIS_PASSWORD=<从本地 Redis 容器读取，不提交>
 ROOT_PATH=
 ```
 
@@ -138,7 +141,7 @@ ROOT_PATH=
 docker port ai-call-ed81-owner-19011-postgres 5432/tcp
 ```
 
-当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库。数据库密码只保存在本地安全配置中，不写入本文或提交。
+当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库；应用 Redis 使用本机容器 `codex-ruoyi-redis-6379`。数据库和 Redis 密码由启动脚本从对应本地容器读取，不写入本文或提交。
 
 仓库内统一使用下面的受控启动入口。`--check` 只核对环境，不修改或重启服务；直接运行脚本时，如果 19011 已被占用会拒绝重复启动，不会终止现有进程：
 
