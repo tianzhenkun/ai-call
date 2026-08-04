@@ -4814,6 +4814,22 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
             assert lease is not None
             start_claim = await commands.claim_next_for_owner(lease)
             assert start_claim is not None
+            now = datetime.now(timezone.utc)
+            session.add(
+                AiCallHandoffModel(
+                    id=generate_snowflake_id(),
+                    tenant_id="tenant-a",
+                    handoff_id="handoff-stub-handler",
+                    call_id=start.call_id,
+                    room_name="room-stub-handler",
+                    scene_code="default",
+                    status="reconnecting",
+                    request_source="customer",
+                    requested_at=now,
+                    connected_at=now,
+                    reconnect_expires_at=now + timedelta(seconds=15),
+                )
+            )
 
         start_result = await StartCallHandler(factory, provider).handle(
             start_claim,
@@ -4904,6 +4920,14 @@ async def test_stub_handlers_close_start_and_end_without_real_provider() -> None
                     "select count(*) from ai_call_runtime_effect where call_id=:call_id"
                 ).bindparams(call_id=start.call_id)
             ) == 4
+            handoff = await session.scalar(
+                select(AiCallHandoffModel).where(
+                    AiCallHandoffModel.handoff_id == "handoff-stub-handler"
+                )
+            )
+            assert handoff is not None
+            assert handoff.status == "completed"
+            assert handoff.end_reason == "user_requested"
         assert all(set(call) == {"provider_namespace", "effect_type", "resource_key"} for call in provider.calls)
     finally:
         await engine.dispose()

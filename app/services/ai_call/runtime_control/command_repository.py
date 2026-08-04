@@ -12,7 +12,9 @@ from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.runtime_control.direct_sip_phone import payload_contains_phone
 from app.services.ai_call.runtime_control.models import (
     AiCallEndEvidenceModel,
@@ -589,6 +591,13 @@ class RuntimeCommandRepository:
         else:
             command.next_retry_at = None
             command.finished_at = now
+        if claim.command_type == END_CALL and status == CommandStatus.SUCCEEDED:
+            await AiCallHandoffService(
+                AiCallRecordRepository(self._session)
+            ).finalize_active_for_call(
+                claim.call_id,
+                end_reason=record.end_reason or "unknown",
+            )
         await self._session.flush()
         return True
 
