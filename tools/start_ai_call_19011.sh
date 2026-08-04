@@ -89,6 +89,15 @@ export REDIS_HOST=127.0.0.1
 export REDIS_PORT="$redis_port"
 export REDIS_USER=
 export REDIS_PASSWORD="$redis_password"
+export AI_CALL_PROCESS_ROLES=api,runtime,dispatcher,jobs,outbound
+export AI_CALL_OWNER_COMMAND_V1_ENTRIES=outbound
+export AI_CALL_RUNTIME_INSTANCE_ID=ed81-owner-19011
+export AI_CALL_RUNTIME_PROVIDER_MODE=livekit
+export AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED=true
+export AI_CALL_OUTBOUND_EXECUTOR_ENABLED=true
+export AI_CALL_OUTBOUND_DIALER_MODE=sip
+export AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED=true
+export AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE=19900001001
 
 listener_pid="$(lsof -nP -tiTCP:19011 -sTCP:LISTEN | head -1 || true)"
 if [[ -n "$listener_pid" ]]; then

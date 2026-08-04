@@ -132,6 +132,15 @@ DATABASE_PASSWORD=<本地安全配置，不提交>
 REDIS_HOST=127.0.0.1
 REDIS_PORT=<codex-ruoyi-redis-6379 当前映射端口>
 REDIS_PASSWORD=<从本地 Redis 容器读取，不提交>
+AI_CALL_PROCESS_ROLES=api,runtime,dispatcher,jobs,outbound
+AI_CALL_OWNER_COMMAND_V1_ENTRIES=outbound
+AI_CALL_RUNTIME_INSTANCE_ID=ed81-owner-19011
+AI_CALL_RUNTIME_PROVIDER_MODE=livekit
+AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED=true
+AI_CALL_OUTBOUND_EXECUTOR_ENABLED=true
+AI_CALL_OUTBOUND_DIALER_MODE=sip
+AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED=true
+AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE=19900001001
 ROOT_PATH=
 ```
 
@@ -142,6 +151,8 @@ docker port ai-call-ed81-owner-19011-postgres 5432/tcp
 ```
 
 当前 19011 使用独立容器 `ai-call-ed81-owner-19011-postgres`，不连接线上业务数据库；登录态和业务接口依赖本机容器 `codex-ruoyi-redis-6379`。数据库和 Redis 密码由启动脚本从对应本地容器读取，不写入本文或提交。
+
+正式任务的“立即启动”依赖同一进程装配 `runtime + dispatcher + outbound`，并显式启用 Owner Runtime LiveKit Provider 和外呼执行器。缺少这些覆盖时，任务可以创建，但会停在 `SCHEDULED/PENDING` 且不会生成拨号 attempt。
 
 仓库内统一使用下面的受控启动入口。`--check` 只核对环境，不修改或重启服务；直接运行脚本时，如果 19011 已被占用会拒绝重复启动，不会终止现有进程：
 
