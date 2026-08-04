@@ -1241,8 +1241,14 @@ async def test_owner_agent_manager_registers_generation_identity_and_fail_closed
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("accepted", "expected_openings"),
+    [(True, ["call-1"]), (False, [])],
+)
 async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
     monkeypatch: pytest.MonkeyPatch,
+    accepted: bool,
+    expected_openings: list[str],
 ) -> None:
     from app.services.ai_call.runtime_control import livekit_provider
     from app.services.ai_call.runtime_control.livekit_provider import (
@@ -1251,6 +1257,10 @@ async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
     )
 
     recorded: list[tuple[str, str, str, int, str]] = []
+    openings: list[str] = []
+
+    async def start_opening(call_id: str) -> None:
+        openings.append(call_id)
 
     class FakeConnectedRepository:
         def __init__(self, _session) -> None:
@@ -1268,7 +1278,7 @@ async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
             recorded.append(
                 (tenant_id, call_id, owner_id, fencing_token, sip_call_status)
             )
-            return True
+            return accepted
 
     class SessionFactory:
         def begin(self):
@@ -1311,6 +1321,7 @@ async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
             registry=InMemorySessionRegistry(),
             agent_runner=runner,
             _build_effective_config=lambda _voice, _prompt: {},
+            start_opening=start_opening,
         ),
         runtime_registry=RuntimeRegistry(),
         session_factory=SessionFactory(),
@@ -1329,8 +1340,9 @@ async def test_owner_agent_manager_binds_connected_fact_to_effect_owner_fencing(
     )
     assert "call-1" in runner.audio_transport.observers
 
-    assert await runner.audio_transport.observers["call-1"]("active") is True
+    assert await runner.audio_transport.observers["call-1"]("active") is accepted
     assert recorded == [("tenant-a", "call-1", "runtime-1", 7, "active")]
+    assert openings == expected_openings
 
     await manager.stop("call-1")
 

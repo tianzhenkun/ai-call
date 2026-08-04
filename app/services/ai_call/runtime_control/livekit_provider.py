@@ -419,13 +419,16 @@ class OwnerRuntimeAgentManager:
 
         async def persist(sip_call_status: str) -> bool:
             async with self._session_factory.begin() as session:
-                return await RuntimeOwnerRepository(session).record_sip_connected(
+                accepted = await RuntimeOwnerRepository(session).record_sip_connected(
                     tenant_id=resource.tenant_id,
                     call_id=resource.call_id,
                     owner_id=resource.runtime_owner_id,
                     fencing_token=resource.runtime_fencing_token,
                     sip_call_status=sip_call_status,
                 )
+            if accepted:
+                await self._orchestrator.start_opening(resource.call_id)
+            return accepted
 
         bind(resource.call_id, persist)
 
