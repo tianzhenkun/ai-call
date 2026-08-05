@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import io
+import subprocess
 import wave
 from types import SimpleNamespace
 
@@ -223,6 +224,36 @@ def test_inspect_sample_uses_mutagen_metadata_for_compressed_formats(
     assert metadata.sample_rate == 48000
     assert metadata.channels == 1
     assert metadata.content_type == canonical_type
+
+
+def test_inspect_sample_uses_ffprobe_channels_when_m4a_mutagen_misreports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.ai_call.voice_sample.MutagenFile",
+        lambda _: SimpleNamespace(
+            info=SimpleNamespace(length=20.1, sample_rate=48000, channels=2),
+            mime=["audio/mp4"],
+        ),
+    )
+
+    def fake_run(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["ffprobe"],
+            returncode=0,
+            stdout='{"streams":[{"channels":1}]}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    metadata = inspect_sample(
+        b"iphone-m4a",
+        filename="voice.m4a",
+        content_type="audio/mp4",
+    )
+
+    assert metadata.channels == 1
 
 
 def test_inspect_sample_rejects_compressed_file_without_audio_metadata(

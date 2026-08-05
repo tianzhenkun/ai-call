@@ -1,6 +1,9 @@
 import base64
 import hashlib
 import io
+import json
+import subprocess
+import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,6 +144,7 @@ def inspect_sample(
         else:
             duration_seconds, sample_rate, channels = _inspect_compressed(
                 data,
+                extension=extension,
                 expected_mime_types=format_rule.container_mime_types,
             )
             sample_width = None
@@ -196,6 +200,7 @@ def _inspect_wav(data: bytes) -> tuple[float, int, int, int]:
 def _inspect_compressed(
     data: bytes,
     *,
+    extension: str,
     expected_mime_types: frozenset[str],
 ) -> tuple[float, int, int]:
     audio = MutagenFile(io.BytesIO(data))
@@ -210,8 +215,39 @@ def _inspect_compressed(
     }
     if not normalized_container_mime_types.intersection(expected_mime_types):
         raise VoiceSampleValidationError(_FORMAT_MISMATCH_MESSAGE)
-    return (
-        float(info.length),
-        int(info.sample_rate),
-        int(info.channels),
-    )
+    channels = int(info.channels)
+    if extension == ".m4a" and channels != 1:
+        channels = _ffprobe_channels(data, extension) or channels
+    return (float(info.length), int(info.sample_rate), channels)
+
+
+def _ffprobe_channels(data: bytes, extension: str) -> int | None:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=extension) as sample_file:
+            sample_file.write(data)
+            sample_file.flush()
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=channels",
+                    "-of",
+                    "json",
+                    sample_file.name,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        if result.returncode != 0:
+            return None
+        streams = json.loads(result.stdout or "{}").get("streams") or []
+    except Exception:
+        return None
+    channels = streams[0].get("channels")
+    return int(channels) if channels else None
