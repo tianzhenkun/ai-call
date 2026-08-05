@@ -2302,7 +2302,10 @@ async def _handle_livekit_webhook_event_background(
                 return result
             from app.services.ai_call.follow_up_service import AiCallFollowUpService
 
-            return await AiCallFollowUpService(db).handle_livekit_webhook_event(
+            return await AiCallFollowUpService(
+                db,
+                recording_service=service.recording_service,
+            ).handle_livekit_webhook_event(
                 event_type=event_type,
                 room_name=room_name,
                 participant_identity=participant_identity,

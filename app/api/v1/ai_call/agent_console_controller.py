@@ -76,7 +76,11 @@ async def get_follow_up_service(
             room_manager=ai_call_service.orchestrator.livekit_room_manager,
             sip_client=ai_call_service.sip_client,
         )
-    return AiCallFollowUpService(db, callback_factory=callback_factory)
+    return AiCallFollowUpService(
+        db,
+        callback_factory=callback_factory,
+        recording_service=ai_call_service.recording_service,
+    )
 
 
 async def get_agent_console_reconciler(

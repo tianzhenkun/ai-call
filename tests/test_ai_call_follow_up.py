@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -1301,7 +1303,18 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
     await _seed_unanswered_follow_up(session_factory)
 
     async with session_factory() as db:
-        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        factory = _FakeCallbackFactory()
+        recording_service = SimpleNamespace(
+            start_for_session=AsyncMock(),
+            start_session_participant_recordings=AsyncMock(),
+            start_human_agent_recording=AsyncMock(),
+            stop_for_session=AsyncMock(),
+        )
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            recording_service=recording_service,
+        )
         auth = _auth(db, user_id=20)
         await service.claim_follow_up(auth, follow_up_id=100)
         callback = await service.start_callback(
@@ -1317,6 +1330,32 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
         )
+        await service.handle_livekit_webhook_event(
+            event_type="participant_joined",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+        )
+        recording_service.start_for_session.assert_awaited_once_with(
+            tenant_id="tenant-a",
+            call_id=callback.call_id,
+            room_name=f"ai-call-{callback.call_id}",
+            customer_participant_identity=f"sip-{callback.call_id}",
+            ai_participant_identity=None,
+        )
+        recording_service.start_session_participant_recordings.assert_awaited_once_with(
+            tenant_id="tenant-a",
+            call_id=callback.call_id,
+            room_name=f"ai-call-{callback.call_id}",
+            customer_participant_identity=f"sip-{callback.call_id}",
+            ai_participant_identity=None,
+        )
+        recording_service.start_human_agent_recording.assert_awaited_once_with(
+            tenant_id="tenant-a",
+            call_id=callback.call_id,
+            room_name=f"ai-call-{callback.call_id}",
+            handoff_id=None,
+            participant_identity=f"human-callback-{callback.call_id}",
+        )
         await db.commit()
         result = await service.handle_livekit_webhook_event(
             event_type="participant_left",
@@ -1330,6 +1369,10 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
             "callId": callback.call_id,
             "attemptResult": "connected",
         }
+        recording_service.stop_for_session.assert_awaited_once_with(
+            tenant_id="tenant-a",
+            call_id=callback.call_id,
+        )
         record = (
             await db.execute(
                 select(AiCallRecordModel).where(
@@ -1358,7 +1401,12 @@ async def test_agent_ends_connected_callback_and_releases_presence(session_facto
 
     async with session_factory() as db:
         factory = _FakeCallbackFactory()
-        service = AiCallFollowUpService(db, callback_factory=factory)
+        recording_service = SimpleNamespace(stop_for_session=AsyncMock())
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            recording_service=recording_service,
+        )
         auth = _auth(db, user_id=20)
         await service.claim_follow_up(auth, follow_up_id=100)
         callback = await service.start_callback(
@@ -1386,3 +1434,7 @@ async def test_agent_ends_connected_callback_and_releases_presence(session_facto
         presence = await db.get(AiCallHandoffAgentModel, 20)
         assert presence.status == "available"
         assert presence.active_call_id is None
+        recording_service.stop_for_session.assert_awaited_once_with(
+            tenant_id="tenant-a",
+            call_id=callback.call_id,
+        )

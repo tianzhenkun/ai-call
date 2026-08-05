@@ -168,7 +168,7 @@ class AiCallRecordingService:
         tenant_id: str,
         call_id: str,
         room_name: str,
-        handoff_id: str,
+        handoff_id: str | None,
         participant_identity: str,
     ) -> None:
         if not self.enabled or not self.participant_recording_enabled:

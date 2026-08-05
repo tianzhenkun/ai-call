@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from fastapi import status
 from sqlalchemy import and_, or_, select, update
@@ -34,6 +35,9 @@ from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.livekit_sip import HumanOnlySipSessionFactory
 from app.utils.id_util import generate_snowflake_id
 
+if TYPE_CHECKING:
+    from app.services.ai_call.recording_service import AiCallRecordingService
+
 CLAIMABLE_UNASSIGNED_SOURCE_TYPES = {
     "handoff_unanswered",
     "ai_post_call",
@@ -58,11 +62,13 @@ class AiCallFollowUpService:
         db: AsyncSession,
         *,
         callback_factory: HumanOnlySipSessionFactory | None = None,
+        recording_service: AiCallRecordingService | None = None,
     ) -> None:
         self.db = db
         self.agent_service = AiCallAgentConsoleService(db)
         self.record_repository = AiCallRecordRepository(db)
         self.callback_factory = callback_factory
+        self.recording_service = recording_service
 
     async def submit_after_call_work(
         self,
@@ -414,6 +420,7 @@ class AiCallFollowUpService:
         if record.status not in {"ringing", "running"}:
             self._raise_conflict("当前回拨通话已经结束", "FOLLOW_UP_STATE_CONFLICT")
 
+        await self._stop_callback_recording(record)
         await self.callback_factory.end(call_id=call_id)
         now = datetime.now(timezone.utc)
         record.status = "completed"
@@ -537,6 +544,7 @@ class AiCallFollowUpService:
             existing_attempt = await self._attempt_by_call_id(call_id)
             if existing_attempt is not None and existing_attempt.attempt_result == "connected":
                 task = await self._required_task_by_id(record.follow_up_id)
+                await self._stop_callback_recording(record)
                 now = datetime.now(timezone.utc)
                 record.status = "completed"
                 record.ended_at = record.ended_at or now
@@ -567,18 +575,54 @@ class AiCallFollowUpService:
             if attempt_result == "technical_failure"
             else None
         )
+        existing_attempt = await self._attempt_by_call_id(call_id)
         attempt = await self.record_callback_outcome(
             call_id=call_id,
             attempt_result=attempt_result,
             ring_duration_seconds=self._callback_ring_duration(payload or {}),
             error_message=error_message,
         )
+        if attempt_result == "connected" and existing_attempt is None:
+            await self._start_callback_recording(record)
         return {
             "handled": True,
             "action": "record_callback_outcome",
             "callId": call_id,
             "attemptResult": attempt.attempt_result,
         }
+
+    async def _start_callback_recording(self, record: AiCallRecordModel) -> None:
+        if self.recording_service is None:
+            return
+        await self.recording_service.start_for_session(
+            tenant_id=record.tenant_id,
+            call_id=record.call_id,
+            room_name=record.room_name,
+            customer_participant_identity=record.participant_identity,
+            ai_participant_identity=None,
+        )
+        await self.recording_service.start_session_participant_recordings(
+            tenant_id=record.tenant_id,
+            call_id=record.call_id,
+            room_name=record.room_name,
+            customer_participant_identity=record.participant_identity,
+            ai_participant_identity=None,
+        )
+        await self.recording_service.start_human_agent_recording(
+            tenant_id=record.tenant_id,
+            call_id=record.call_id,
+            room_name=record.room_name,
+            handoff_id=None,
+            participant_identity=f"human-callback-{record.call_id}",
+        )
+
+    async def _stop_callback_recording(self, record: AiCallRecordModel) -> None:
+        if self.recording_service is None:
+            return
+        await self.recording_service.stop_for_session(
+            tenant_id=record.tenant_id,
+            call_id=record.call_id,
+        )
 
     async def complete_follow_up(
         self,
