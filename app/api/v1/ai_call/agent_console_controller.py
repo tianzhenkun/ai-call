@@ -804,8 +804,22 @@ async def list_admin_handoffs_controller(
         AiCallAgentConsoleReconciler,
         Depends(get_agent_console_reconciler),
     ],
+    scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
+    status: str | None = None,
+    customer_name: Annotated[str | None, Query(alias="customerName")] = None,
+    requested_at_begin: Annotated[datetime | None, Query(alias="requestedAtBegin")] = None,
+    requested_at_end: Annotated[datetime | None, Query(alias="requestedAtEnd")] = None,
 ):
-    return SuccessResponse(data=await service.list_handoffs(auth))
+    return SuccessResponse(
+        data=await service.list_handoffs(
+            auth,
+            scene_code=scene_code,
+            status=status,
+            customer_name=customer_name,
+            requested_at_begin=requested_at_begin,
+            requested_at_end=requested_at_end,
+        )
+    )
 
 
 @AgentAdminRouter.get("/handoffs/{handoff_id}", summary="查询转人工记录详情")

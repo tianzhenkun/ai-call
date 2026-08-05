@@ -38,6 +38,7 @@ from app.core.logger import log
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
+from app.services.ai_call.record_service import AiCallRecordService
 
 RoomExistsCallable = Callable[[str], bool | Awaitable[bool]]
 
@@ -179,6 +180,7 @@ class AiCallAgentConsoleReconciler:
     ) -> None:
         self.db = db
         self.repository = AiCallRecordRepository(db)
+        self.record_service = AiCallRecordService(self.repository)
         self.agent_service = AiCallAgentConsoleService(db)
         self.follow_up_service = AiCallFollowUpService(db)
         self.room_exists = room_exists
@@ -346,16 +348,47 @@ class AiCallAgentConsoleReconciler:
             user=user_row,
         )
 
-    async def list_handoffs(self, auth: AuthSchema) -> dict:
+    async def list_handoffs(
+        self,
+        auth: AuthSchema,
+        *,
+        scene_code: str | None = None,
+        status: str | None = None,
+        customer_name: str | None = None,
+        requested_at_begin: datetime | None = None,
+        requested_at_end: datetime | None = None,
+    ) -> dict:
         _, tenant_id = self._identity(auth)
-        handoffs = list(
-            (
-                await self.db.execute(
-                    select(AiCallHandoffModel)
-                    .where(AiCallHandoffModel.tenant_id == tenant_id)
-                    .order_by(AiCallHandoffModel.requested_at.desc())
+        stmt = select(AiCallHandoffModel).where(AiCallHandoffModel.tenant_id == tenant_id)
+        if scene_code := (scene_code or "").strip():
+            stmt = stmt.where(AiCallHandoffModel.scene_code == scene_code)
+        if status := (status or "").strip():
+            stmt = stmt.where(AiCallHandoffModel.status == status)
+        if requested_at_begin:
+            stmt = stmt.where(AiCallHandoffModel.requested_at >= requested_at_begin)
+        if requested_at_end:
+            stmt = stmt.where(AiCallHandoffModel.requested_at <= requested_at_end)
+        if customer_name := (customer_name or "").strip():
+            stmt = (
+                stmt
+                .join(
+                    AiCallOutboundAttemptModel,
+                    and_(
+                        AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                        AiCallOutboundAttemptModel.call_id == AiCallHandoffModel.call_id,
+                    ),
                 )
+                .join(
+                    AiCallOutboundTargetModel,
+                    and_(
+                        AiCallOutboundTargetModel.tenant_id == tenant_id,
+                        AiCallOutboundTargetModel.id == AiCallOutboundAttemptModel.target_id,
+                    ),
+                )
+                .where(AiCallOutboundTargetModel.customer_name.contains(customer_name))
             )
+        handoffs = list(
+            (await self.db.execute(stmt.order_by(AiCallHandoffModel.requested_at.desc())))
             .scalars()
             .all()
         )
@@ -363,6 +396,10 @@ class AiCallAgentConsoleReconciler:
             call_id: await self.repository.get_record(call_id)
             for call_id in {row.call_id for row in handoffs}
         }
+        customer_names_by_call_id = await self.repository.outbound_customer_names_by_call_ids(
+            tenant_id=tenant_id,
+            call_ids=list(records),
+        )
         follow_up_handoff_ids = (
             set(
                 (
@@ -384,6 +421,7 @@ class AiCallAgentConsoleReconciler:
             row = self._handoff_payload(handoff)
             record = records.get(handoff.call_id)
             row.update({
+                "masked_customer_name": customer_names_by_call_id.get(handoff.call_id),
                 "masked_contact": record.callee_phone_number_masked if record else None,
                 "business_type": record.business_type if record else None,
                 "business_id": record.business_id if record else None,
@@ -423,11 +461,47 @@ class AiCallAgentConsoleReconciler:
         if handoff is None:
             raise CustomException(msg="转人工记录不存在", status_code=404)
         record = await self.repository.get_record(handoff.call_id)
+        customer_name = (
+            await self.repository.outbound_customer_names_by_call_ids(
+                tenant_id=tenant_id,
+                call_ids=[handoff.call_id],
+            )
+        ).get(handoff.call_id)
+        dialogue_segments = await self.repository.list_handoff_context_dialogue(
+            handoff.call_id,
+            before_at=handoff.requested_at,
+        )
+        recording = await self.repository.get_recording(
+            tenant_id=tenant_id,
+            call_id=handoff.call_id,
+        )
         acw = await self._after_call_work(tenant_id, handoff_id)
         follow_up = await self._follow_up_by_handoff(tenant_id, handoff_id)
         return {
-            "handoff": self._handoff_payload(handoff),
-            "record": self._record_payload(record),
+            "handoff": {
+                **self._handoff_payload(handoff),
+                "masked_customer_name": customer_name,
+                "recent_dialogue": [
+                    {
+                        "id": str(segment.id),
+                        "speaker_type": segment.speaker_type,
+                        "text": segment.segment_text.strip(),
+                        "occurred_at": self._api_datetime(
+                            segment.started_at or segment.ended_at
+                        ),
+                    }
+                    for segment in dialogue_segments[-6:]
+                ],
+            },
+            "record": self._record_payload(
+                record,
+                recording_status=recording.status if recording else "not_generated",
+                execution_config=(
+                    await self.record_service.get_execution_config(record)
+                    if record is not None
+                    else None
+                ),
+            ),
             "after_call_work": (
                 self.follow_up_service.after_call_work_payload(acw) if acw else None
             ),
@@ -980,7 +1054,13 @@ class AiCallAgentConsoleReconciler:
         }
 
     @classmethod
-    def _record_payload(cls, record: AiCallRecordModel | None) -> dict | None:
+    def _record_payload(
+        cls,
+        record: AiCallRecordModel | None,
+        *,
+        recording_status: str,
+        execution_config: dict | None,
+    ) -> dict | None:
         if record is None:
             return None
         return {
@@ -991,7 +1071,9 @@ class AiCallAgentConsoleReconciler:
             "business_id": record.business_id,
             "scene_code": record.scene_code,
             "prompt_source_key": record.prompt_source_key,
+            "execution_config": execution_config,
             "entry_type": record.entry_type,
+            "recording_status": recording_status,
             "masked_contact": record.callee_phone_number_masked,
             "status": record.status,
             "end_reason": record.end_reason,

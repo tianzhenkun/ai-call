@@ -267,17 +267,26 @@ class AiCallRecordRepository:
     async def list_handoff_context_dialogue(
         self,
         call_id: str,
+        *,
+        before_at: datetime | None = None,
     ) -> list[AiCallDialogueSegmentModel]:
+        conditions = [
+            AiCallDialogueSegmentModel.call_id == call_id,
+            AiCallDialogueSegmentModel.segment_status.in_({"final", "interrupted"}),
+            AiCallDialogueSegmentModel.speaker_type.in_({"ai", "customer"}),
+            func.length(func.trim(AiCallDialogueSegmentModel.segment_text)) > 0,
+        ]
+        if before_at is not None:
+            conditions.append(
+                func.coalesce(
+                    AiCallDialogueSegmentModel.started_at,
+                    AiCallDialogueSegmentModel.ended_at,
+                )
+                <= before_at
+            )
         result = await self.db.execute(
             select(AiCallDialogueSegmentModel)
-            .where(
-                AiCallDialogueSegmentModel.call_id == call_id,
-                AiCallDialogueSegmentModel.segment_status.in_(
-                    {"final", "interrupted"}
-                ),
-                AiCallDialogueSegmentModel.speaker_type.in_({"ai", "customer"}),
-                func.length(func.trim(AiCallDialogueSegmentModel.segment_text)) > 0,
-            )
+            .where(*conditions)
             .order_by(
                 asc(AiCallDialogueSegmentModel.segment_no),
                 asc(AiCallDialogueSegmentModel.id),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
@@ -9,12 +10,18 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
+    AiCallDialogueSegmentModel,
     AiCallEventModel,
     AiCallFollowUpAttemptModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallRecordingModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -54,7 +61,7 @@ async def session_factory(tmp_path):
     await engine.dispose()
 
 
-async def _seed_management_rows(session_factory) -> None:
+async def _seed_management_rows(session_factory) -> datetime:
     now = datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
         db.add_all([
@@ -132,6 +139,78 @@ async def _seed_management_rows(session_factory) -> None:
                 connected_at=now - timedelta(seconds=10),
                 expires_at=now + timedelta(seconds=40),
             ),
+            AiCallOutboundTargetModel(
+                id=400,
+                tenant_id="tenant-a",
+                task_id=300,
+                validation_id=301,
+                source_validation_row_id=302,
+                source_row_number=2,
+                phone_number="13800000000",
+                customer_name="刘先生",
+                status="COMPLETED",
+                attempt_count=1,
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallOutboundAttemptModel(
+                id=401,
+                tenant_id="tenant-a",
+                task_id=300,
+                target_id=400,
+                attempt_no=1,
+                call_id="call-1",
+                status="COMPLETED",
+                started_at=now - timedelta(seconds=30),
+                created_at=now - timedelta(seconds=30),
+                updated_at=now,
+            ),
+            AiCallDialogueSegmentModel(
+                id=201,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                segment_no=2,
+                speaker_type="customer",
+                source="realtime",
+                source_segment_id="segment-1",
+                segment_text="我想转人工了解一下。",
+                segment_status="final",
+                started_at=now - timedelta(seconds=21),
+            ),
+            AiCallRecordingModel(
+                id=204,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                room_name="room-1",
+                status="completed",
+                started_at=now - timedelta(seconds=30),
+                ended_at=now - timedelta(seconds=1),
+                duration_ms=29_000,
+            ),
+            AiCallDialogueSegmentModel(
+                id=202,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                segment_no=1,
+                speaker_type="ai",
+                source="realtime",
+                source_segment_id="segment-2",
+                segment_text="好的，请问需要什么帮助？",
+                segment_status="interrupted",
+                started_at=now - timedelta(seconds=25),
+            ),
+            AiCallDialogueSegmentModel(
+                id=203,
+                tenant_id="tenant-a",
+                call_id="call-1",
+                segment_no=3,
+                speaker_type="customer",
+                source="realtime",
+                source_segment_id="segment-3",
+                segment_text="人工接通后的发言。",
+                segment_status="final",
+                started_at=now - timedelta(seconds=9),
+            ),
             AiCallFollowUpTaskModel(
                 id=300,
                 tenant_id="tenant-a",
@@ -163,14 +242,28 @@ async def _seed_management_rows(session_factory) -> None:
                 created_at=now - timedelta(minutes=10),
             ),
         ])
+    return now
 
 
 @pytest.mark.anyio
-async def test_admin_queries_return_metrics_details_and_string_ids(session_factory) -> None:
+async def test_admin_queries_return_metrics_details_and_string_ids(
+    session_factory, monkeypatch
+) -> None:
     await _seed_management_rows(session_factory)
     async with session_factory() as db:
         service = AiCallAgentConsoleReconciler(db, room_exists=lambda _room: False)
         auth = _auth(db)
+        monkeypatch.setattr(
+            service.record_service,
+            "get_execution_config",
+            AsyncMock(
+                return_value={
+                    "promptName": "智能外呼介绍",
+                    "voiceName": "小雅",
+                    "ruleName": "工作日外呼规则",
+                }
+            ),
+        )
 
         agents = await service.list_agents(auth)
         assert agents["metrics"] == {
@@ -187,9 +280,23 @@ async def test_admin_queries_return_metrics_details_and_string_ids(session_facto
         assert handoffs["metrics"]["request_count"] == 1
         assert handoffs["metrics"]["connected_rate_within_60_seconds"] == 1.0
         assert handoffs["rows"][0]["id"] == "200"
+        assert handoffs["rows"][0]["masked_customer_name"] == "刘先生"
         detail = await service.get_handoff_detail(auth, "handoff-1")
         assert detail["handoff"]["call_id"] == "call-1"
+        assert detail["handoff"]["masked_customer_name"] == "刘先生"
+        assert [
+            (item["speaker_type"], item["text"]) for item in detail["handoff"]["recent_dialogue"]
+        ] == [
+            ("ai", "好的，请问需要什么帮助？"),
+            ("customer", "我想转人工了解一下。"),
+        ]
         assert detail["record"]["prompt_source_key"] == "intro_contract"
+        assert detail["record"]["recording_status"] == "completed"
+        assert detail["record"]["execution_config"] == {
+            "promptName": "智能外呼介绍",
+            "voiceName": "小雅",
+            "ruleName": "工作日外呼规则",
+        }
         assert detail["follow_up"]["id"] == "300"
 
         follow_ups = await service.list_follow_ups(auth)
@@ -199,6 +306,48 @@ async def test_admin_queries_return_metrics_details_and_string_ids(session_facto
         follow_up_detail = await service.get_follow_up_detail(auth, 300)
         assert follow_up_detail["task"]["id"] == "300"
         assert follow_up_detail["attempts"][0]["attempt_result"] == "no_answer"
+
+
+@pytest.mark.anyio
+async def test_admin_handoff_list_filters_and_resolves_customer_name(session_factory) -> None:
+    now = await _seed_management_rows(session_factory)
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallHandoffModel(
+                id=202,
+                tenant_id="tenant-a",
+                handoff_id="handoff-2",
+                call_id="call-2",
+                room_name="room-2",
+                scene_code="intro_geo",
+                status="failed",
+                request_source="customer",
+                request_reason="customer_requested_human",
+                request_message="请转人工",
+                requested_at=now - timedelta(seconds=5),
+                ended_at=now - timedelta(seconds=1),
+            )
+        )
+
+    async with session_factory() as db:
+        service = AiCallAgentConsoleReconciler(db, room_exists=lambda _room: False)
+        auth = _auth(db)
+
+        by_name = await service.list_handoffs(auth, customer_name="刘")
+        assert [row["call_id"] for row in by_name["rows"]] == ["call-1"]
+        assert by_name["rows"][0]["masked_customer_name"] == "刘先生"
+
+        by_scene = await service.list_handoffs(auth, scene_code="intro_geo")
+        assert [row["call_id"] for row in by_scene["rows"]] == ["call-2"]
+
+        by_status = await service.list_handoffs(auth, status="failed")
+        assert [row["call_id"] for row in by_status["rows"]] == ["call-2"]
+
+        by_time = await service.list_handoffs(
+            auth,
+            requested_at_begin=now - timedelta(seconds=10),
+        )
+        assert [row["call_id"] for row in by_time["rows"]] == ["call-2"]
 
 
 @pytest.mark.anyio
