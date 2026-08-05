@@ -337,14 +337,15 @@ async def create_voice_enrollment_controller(
     ],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
-    accepted = await service.create(
-        auth.db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        idempotency_key=idempotency_key,
-        request=_parse_enrollment_request(request_json),
-        sample=file,
-    )
+    async with async_db_session() as db:
+        accepted = await service.create(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            request=_parse_enrollment_request(request_json),
+            sample=file,
+        )
     return SuccessResponse(
         data=accepted,
         msg="音色复刻任务已受理",
@@ -370,15 +371,16 @@ async def reenroll_voice_controller(
     ],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
-    accepted = await service.reenroll(
-        auth.db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        profile_id=profile_id,
-        idempotency_key=idempotency_key,
-        request=_parse_enrollment_request(request_json),
-        sample=file,
-    )
+    async with async_db_session() as db:
+        accepted = await service.reenroll(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            profile_id=profile_id,
+            idempotency_key=idempotency_key,
+            request=_parse_enrollment_request(request_json),
+            sample=file,
+        )
     return SuccessResponse(
         data=accepted,
         msg="音色复刻任务已受理",

@@ -230,6 +230,9 @@ async def _verify_token(
 async def get_voice_manager(
     auth: AuthSchema = Depends(get_current_user),
 ) -> AuthSchema:
+    if auth.user and auth.user.is_superuser:
+        return auth
+
     allowed_permissions = {"ai_call:voice:manage", "*:*:*"}
     if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
         raise CustomException(

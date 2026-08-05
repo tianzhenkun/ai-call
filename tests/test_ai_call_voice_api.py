@@ -60,10 +60,13 @@ class FakeVoiceRepository:
 
 class FakeEnrollmentService:
     def __init__(self) -> None:
+        self.create_dbs: list[object] = []
         self.create_calls: list[dict[str, object]] = []
+        self.reenroll_dbs: list[object] = []
         self.reenroll_calls: list[dict[str, object]] = []
 
     async def create(self, db, **values):
+        self.create_dbs.append(db)
         self.create_calls.append(values)
         return VoiceEnrollmentAcceptedOut(
             voice_profile_id=BIG_PROFILE_ID,
@@ -73,6 +76,7 @@ class FakeEnrollmentService:
         )
 
     async def reenroll(self, db, **values):
+        self.reenroll_dbs.append(db)
         self.reenroll_calls.append(values)
         if values["profile_id"] == 9002:
             raise CustomException(
@@ -174,6 +178,22 @@ class FakeLifecycleService:
             "deletionId": str(BIG_ENROLLMENT_ID),
             "status": "DELETING",
         }
+
+
+class FakeEnrollmentDbFactory:
+    def __init__(self) -> None:
+        self.sessions: list[object] = []
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        session = object()
+        self.sessions.append(session)
+        return session
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
 
 
 class FakeDefaultDeletionService:
@@ -311,6 +331,34 @@ def test_create_voice_accepts_multipart_and_returns_202(
     assert service.create_calls[0]["tenant_id"] == "tenant-a"
     assert service.create_calls[0]["user_id"] == 7
     assert service.create_calls[0]["idempotency_key"] == "key-1"
+
+
+def test_voice_enrollment_mutations_use_independent_db_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    db_factory = FakeEnrollmentDbFactory()
+    monkeypatch.setattr(voice_controller, "async_db_session", db_factory)
+    client, _repository, service, _lifecycle = _client(
+        monkeypatch,
+        permissions=frozenset({"ai_call:voice:manage"}),
+    )
+
+    create_response = client.post(
+        "/ai-call/voice-enrollments",
+        headers={"Idempotency-Key": "key-1"},
+        files=_enrollment_files(),
+    )
+    reenroll_response = client.post(
+        "/ai-call/tenant-voice-profiles/9001/enrollments",
+        headers={"Idempotency-Key": "key-2"},
+        files=_enrollment_files(),
+    )
+
+    assert create_response.status_code == 202
+    assert reenroll_response.status_code == 202
+    assert service.create_dbs == [db_factory.sessions[0]]
+    assert service.reenroll_dbs == [db_factory.sessions[1]]
 
 
 def test_disabled_voice_worker_keeps_read_available_but_create_returns_503(

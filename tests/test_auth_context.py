@@ -190,6 +190,19 @@ def test_voice_manager_allows_ruoyi_super_admin_permission(monkeypatch) -> None:
     assert asyncio.run(get_voice_manager(auth)) is auth
 
 
+def test_voice_manager_allows_superuser_without_explicit_permissions(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    superuser = UserModel(
+        user_id=1,
+        tenant_id="000000",
+        user_name="admin",
+        nick_name="超级管理员",
+    )
+    auth = AuthSchema(db=AsyncSession(), user=superuser, permissions=frozenset())
+
+    assert asyncio.run(get_voice_manager(auth)) is auth
+
+
 def test_voice_manager_preserves_development_fallback(monkeypatch) -> None:
     monkeypatch.setattr(settings, "JWT_ENABLE", False)
     auth = AuthSchema(db=AsyncSession(), permissions=frozenset())
