@@ -19,6 +19,8 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallPromptProfileModel,
+    AiCallQualityReviewModel,
+    AiCallQualityScoreModel,
     AiCallRecordingModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
@@ -38,6 +40,14 @@ SEMANTIC_ANALYSIS_STATUS_RUNNING = "1"
 SEMANTIC_ANALYSIS_STATUS_SUCCEEDED = "2"
 SEMANTIC_ANALYSIS_STATUS_FAILED = "3"
 SEMANTIC_ANALYSIS_STATUS_NO_USER_INPUT = "4"
+DEFAULT_QUALITY_SCORE_MODEL_VERSION = "quality-v1"
+QUALITY_SCORE_STATUS_PENDING = "pending"
+QUALITY_SCORE_STATUS_RUNNING = "processing"
+QUALITY_SCORE_STATUS_COMPLETED = "completed"
+QUALITY_SCORE_STATUS_FAILED = "failed"
+QUALITY_SCORE_MAX_RETRY_COUNT = 3
+QUALITY_SCORE_RETRY_COOLDOWN_MINUTES = 10
+QUALITY_REVIEW_RESULTS = {"excellent", "good", "pass", "fail"}
 DEFAULT_TENANT_ID = "000000"
 
 
@@ -445,9 +455,66 @@ class AiCallRecordRepository:
         )
         rows = (await self.db.execute(stmt)).scalars().all()
         await self._attach_outbound_context(rows, tenant_id=tenant_id)
+        await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_semantic_analysis(rows)
         await self._attach_follow_up_context(rows, tenant_id=tenant_id)
         return list(rows), total
+
+    async def _attach_quality_context(
+        self,
+        records: list[AiCallRecordModel],
+        *,
+        tenant_id: str | None,
+    ) -> None:
+        call_ids = [record.call_id for record in records]
+        if not call_ids or not tenant_id:
+            for record in records:
+                record._quality_context = {}
+            return
+
+        score_rows = (
+            await self.db.execute(
+                select(AiCallQualityScoreModel).where(
+                    AiCallQualityScoreModel.tenant_id == tenant_id,
+                    AiCallQualityScoreModel.call_id.in_(call_ids),
+                    AiCallQualityScoreModel.model_version
+                    == DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+                )
+            )
+        ).scalars().all()
+        review_rows = (
+            await self.db.execute(
+                select(AiCallQualityReviewModel).where(
+                    AiCallQualityReviewModel.tenant_id == tenant_id,
+                    AiCallQualityReviewModel.call_id.in_(call_ids),
+                )
+            )
+        ).scalars().all()
+        scores = {row.call_id: row for row in score_rows}
+        reviews = {row.call_id: row for row in review_rows}
+
+        for record in records:
+            score = scores.get(record.call_id)
+            review = reviews.get(record.call_id)
+            score_status = (
+                score.status
+                if score is not None
+                else (
+                    QUALITY_SCORE_STATUS_PENDING
+                    if self._quality_score_applicable(record)
+                    else "not_applicable"
+                )
+            )
+            record._quality_context = {
+                "qualityScoreStatus": score_status,
+                "qualityScore": (
+                    score.score
+                    if score is not None
+                    and score.status == QUALITY_SCORE_STATUS_COMPLETED
+                    else None
+                ),
+                "qualityReviewResult": review.quality_result if review else None,
+            }
 
     async def _attach_semantic_analysis(
         self,
@@ -1540,6 +1607,274 @@ class AiCallRecordRepository:
         await self.db.refresh(analysis)
         return analysis
 
+    async def ensure_quality_score(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        model_version: str = DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+    ) -> AiCallQualityScoreModel:
+        now = datetime.now(timezone.utc)
+        values = {
+            "id": generate_snowflake_id(),
+            "tenant_id": tenant_id,
+            "call_id": call_id,
+            "status": QUALITY_SCORE_STATUS_PENDING,
+            "model_version": model_version,
+            "retry_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        table = AiCallQualityScoreModel.__table__
+        dialect_name = self._dialect_name()
+        if dialect_name == "postgresql":
+            stmt = postgresql_insert(table).values(**values).on_conflict_do_nothing(
+                index_elements=[table.c.tenant_id, table.c.call_id, table.c.model_version]
+            )
+            await self.db.execute(stmt)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(table).values(**values).on_conflict_do_nothing(
+                index_elements=[table.c.tenant_id, table.c.call_id, table.c.model_version]
+            )
+            await self.db.execute(stmt)
+        elif dialect_name == "mysql":
+            insert_stmt = mysql_insert(table).values(**values)
+            await self.db.execute(
+                insert_stmt.on_duplicate_key_update(call_id=insert_stmt.inserted.call_id)
+            )
+        else:
+            existing = await self.get_quality_score(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                model_version=model_version,
+            )
+            if existing is not None:
+                return existing
+            self.db.add(AiCallQualityScoreModel(**values))
+        await self.db.flush()
+        score = await self.get_quality_score(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            model_version=model_version,
+        )
+        assert score is not None
+        return score
+
+    async def get_quality_score(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        model_version: str = DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+    ) -> AiCallQualityScoreModel | None:
+        result = await self.db.execute(
+            select(AiCallQualityScoreModel).where(
+                AiCallQualityScoreModel.tenant_id == tenant_id,
+                AiCallQualityScoreModel.call_id == call_id,
+                AiCallQualityScoreModel.model_version == model_version,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def claim_quality_score(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        model_version: str = DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+        now: datetime | None = None,
+    ) -> AiCallQualityScoreModel | None:
+        now = now or datetime.now(timezone.utc)
+        retry_cutoff = now - timedelta(minutes=QUALITY_SCORE_RETRY_COOLDOWN_MINUTES)
+        stale_processing_cutoff = now - timedelta(
+            minutes=QUALITY_SCORE_RETRY_COOLDOWN_MINUTES
+        )
+        result = await self.db.execute(
+            update(AiCallQualityScoreModel)
+            .where(
+                AiCallQualityScoreModel.tenant_id == tenant_id,
+                AiCallQualityScoreModel.call_id == call_id,
+                AiCallQualityScoreModel.model_version == model_version,
+                or_(
+                    AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_PENDING,
+                    and_(
+                        AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_FAILED,
+                        AiCallQualityScoreModel.retry_count < QUALITY_SCORE_MAX_RETRY_COUNT,
+                        AiCallQualityScoreModel.updated_at <= retry_cutoff,
+                    ),
+                    and_(
+                        AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_RUNNING,
+                        AiCallQualityScoreModel.started_at <= stale_processing_cutoff,
+                    ),
+                ),
+            )
+            .values(
+                status=QUALITY_SCORE_STATUS_RUNNING,
+                started_at=now,
+                finished_at=None,
+                error_message=None,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.get_quality_score(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            model_version=model_version,
+        )
+
+    async def list_recoverable_quality_score_call_ids(
+        self,
+        *,
+        limit: int,
+        now: datetime | None = None,
+    ) -> list[str]:
+        now = now or datetime.now(timezone.utc)
+        retry_cutoff = now - timedelta(minutes=QUALITY_SCORE_RETRY_COOLDOWN_MINUTES)
+        stale_processing_cutoff = now - timedelta(
+            minutes=QUALITY_SCORE_RETRY_COOLDOWN_MINUTES
+        )
+        result = await self.db.execute(
+            select(AiCallQualityScoreModel.call_id)
+            .where(
+                or_(
+                    AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_PENDING,
+                    and_(
+                        AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_FAILED,
+                        AiCallQualityScoreModel.retry_count < QUALITY_SCORE_MAX_RETRY_COUNT,
+                        AiCallQualityScoreModel.updated_at <= retry_cutoff,
+                    ),
+                    and_(
+                        AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_RUNNING,
+                        AiCallQualityScoreModel.started_at <= stale_processing_cutoff,
+                    ),
+                )
+            )
+            .order_by(AiCallQualityScoreModel.updated_at)
+            .limit(max(1, limit))
+        )
+        return list(result.scalars().all())
+
+    async def update_quality_score_success(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        score: int,
+        reason: str,
+        model_version: str = DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+        now: datetime | None = None,
+    ) -> AiCallQualityScoreModel:
+        row = await self.get_quality_score(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            model_version=model_version,
+        )
+        if row is None:
+            row = await self.ensure_quality_score(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                model_version=model_version,
+            )
+        now = now or datetime.now(timezone.utc)
+        row.status = QUALITY_SCORE_STATUS_COMPLETED
+        row.score = max(0, min(100, int(score)))
+        row.reason = reason
+        row.error_message = None
+        row.finished_at = now
+        row.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(row)
+        return row
+
+    async def update_quality_score_failed(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        error_message: str,
+        model_version: str = DEFAULT_QUALITY_SCORE_MODEL_VERSION,
+        now: datetime | None = None,
+    ) -> AiCallQualityScoreModel:
+        row = await self.get_quality_score(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            model_version=model_version,
+        )
+        if row is None:
+            row = await self.ensure_quality_score(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                model_version=model_version,
+            )
+        now = now or datetime.now(timezone.utc)
+        row.status = QUALITY_SCORE_STATUS_FAILED
+        row.retry_count = int(row.retry_count or 0) + 1
+        row.error_message = error_message[:500]
+        row.finished_at = now
+        row.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(row)
+        return row
+
+    async def get_quality_review(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallQualityReviewModel | None:
+        result = await self.db.execute(
+            select(AiCallQualityReviewModel).where(
+                AiCallQualityReviewModel.tenant_id == tenant_id,
+                AiCallQualityReviewModel.call_id == call_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert_quality_review(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        quality_result: str,
+        quality_reason: str | None,
+        reviewed_by: str,
+        reviewed_by_name: str | None,
+    ) -> AiCallQualityReviewModel:
+        if quality_result not in QUALITY_REVIEW_RESULTS:
+            raise ValueError("质检结果无效")
+        reason = (quality_reason or "").strip()
+        if quality_result == "fail" and not reason:
+            raise ValueError("不合格原因不能为空")
+        now = datetime.now(timezone.utc)
+        review = await self.get_quality_review(tenant_id=tenant_id, call_id=call_id)
+        if review is None:
+            review = AiCallQualityReviewModel(
+                id=generate_snowflake_id(),
+                tenant_id=tenant_id,
+                call_id=call_id,
+                quality_result=quality_result,
+                quality_reason=reason or None,
+                reviewed_by=reviewed_by,
+                reviewed_by_name=reviewed_by_name,
+                reviewed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(review)
+        else:
+            review.quality_result = quality_result
+            review.quality_reason = reason or None
+            review.reviewed_by = reviewed_by
+            review.reviewed_by_name = reviewed_by_name
+            review.reviewed_at = now
+            review.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(review)
+        return review
+
     @staticmethod
     def _clear_semantic_post_call_fields(
         analysis: AiCallSemanticAnalysisModel,
@@ -2382,6 +2717,15 @@ class AiCallRecordRepository:
     def _chunks(values: list[str], size: int):
         for index in range(0, len(values), size):
             yield values[index : index + size]
+
+    @staticmethod
+    def _quality_score_applicable(record: AiCallRecordModel) -> bool:
+        outbound_context = getattr(record, "_outbound_context", {})
+        return (
+            record.entry_type in {"sip_outbound", "outbound"}
+            and record.status == "completed"
+            and outbound_context.get("callResult") == "connected"
+        )
 
     @staticmethod
     def _semantic_analysis_claimable(

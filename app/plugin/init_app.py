@@ -30,6 +30,7 @@ class AiCallRoleWorkerHandles:
     event_worker: Any = None
     dialogue_worker: Any = None
     semantic_analysis_worker: Any = None
+    quality_scoring_worker: Any = None
     offline_asr_worker: Any = None
     recording_reconcile_worker: Any = None
     handoff_trigger_worker: Any = None
@@ -127,6 +128,7 @@ async def _start_ai_call_role_workers(
             handles.semantic_analysis_worker = (
                 await _start_ai_call_semantic_analysis_worker()
             )
+            handles.quality_scoring_worker = await _start_ai_call_quality_scoring_worker()
             handles.offline_asr_worker = await _start_ai_call_offline_asr_worker()
             handles.recording_reconcile_worker = (
                 await _start_ai_call_recording_reconcile_worker()
@@ -175,6 +177,8 @@ async def _stop_ai_call_role_workers(
         )
     if handles.offline_asr_worker is not None:
         await _stop_ai_call_offline_asr_worker(handles.offline_asr_worker)
+    if handles.quality_scoring_worker is not None:
+        await _stop_ai_call_quality_scoring_worker(handles.quality_scoring_worker)
     if handles.semantic_analysis_worker is not None:
         await _stop_ai_call_semantic_analysis_worker(
             handles.semantic_analysis_worker
@@ -857,11 +861,60 @@ async def _stop_ai_call_semantic_analysis_worker(worker) -> None:
     log.info("✅ AI Call 语义分析 worker 已关闭")
 
 
+async def _start_ai_call_quality_scoring_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_QUALITY_SCORING_ENABLED:
+        return None
+    from app.api.v1.ai_call.service import configure_ai_call_quality_scoring
+    from app.core.database import async_db_session
+    from app.services.ai_call.quality_scoring import (
+        AiCallQualityScoringWorker,
+        build_default_quality_scorer,
+    )
+
+    scorer = build_default_quality_scorer(
+        base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+        api_key=settings.EFFECTIVE_POST_ANALYSIS_API_KEY or settings.EFFECTIVE_LLM_API_KEY,
+        model=(
+            settings.AI_CALL_QUALITY_SCORING_MODEL
+            or settings.POST_ANALYSIS_MODEL
+            or settings.LLM_MODEL
+            or "qwen-plus"
+        ),
+        timeout_seconds=settings.AI_CALL_QUALITY_SCORING_TIMEOUT_SECONDS,
+    )
+    if scorer is None:
+        configure_ai_call_quality_scoring(None)
+        log.warning("AI Call 质检评分 worker 未启动：模型 base_url/api_key/model 未完整配置")
+        return None
+
+    worker = AiCallQualityScoringWorker(
+        async_db_session,
+        scorer=scorer,
+        enabled=settings.AI_CALL_QUALITY_SCORING_ENABLED,
+        queue_max_size=settings.AI_CALL_QUALITY_SCORING_QUEUE_MAX_SIZE,
+    )
+    await worker.start()
+    configure_ai_call_quality_scoring(worker)
+    log.info("✅ AI Call 质检评分 worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_quality_scoring_worker(worker) -> None:
+    from app.api.v1.ai_call.service import configure_ai_call_quality_scoring
+
+    configure_ai_call_quality_scoring(None)
+    if worker is None:
+        return
+    await worker.stop()
+    log.info("✅ AI Call 质检评分 worker 已关闭")
+
+
 async def _start_ai_call_offline_asr_worker():
     if not settings.SQL_DB_ENABLE or not settings.AI_CALL_OFFLINE_ASR_ENABLED:
         return None
     from app.api.v1.ai_call.service import (
         configure_ai_call_offline_asr,
+        enqueue_ai_call_quality_scoring,
         enqueue_ai_call_semantic_analysis,
     )
     from app.core.database import async_db_session
@@ -879,12 +932,16 @@ async def _start_ai_call_offline_asr_worker():
         timeout_seconds=settings.AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS,
         poll_interval_seconds=settings.AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS,
     )
+    def on_call_ready(call_id: str) -> None:
+        enqueue_ai_call_semantic_analysis(call_id)
+        enqueue_ai_call_quality_scoring(call_id)
+
     worker = AiCallOfflineAsrWorker(
         async_db_session,
         provider=provider,
         enabled=settings.AI_CALL_OFFLINE_ASR_ENABLED,
         queue_max_size=settings.AI_CALL_OFFLINE_ASR_QUEUE_MAX_SIZE,
-        on_call_ready_for_semantic_analysis=enqueue_ai_call_semantic_analysis,
+        on_call_ready_for_semantic_analysis=on_call_ready,
     )
     await worker.start()
     configure_ai_call_offline_asr(worker)

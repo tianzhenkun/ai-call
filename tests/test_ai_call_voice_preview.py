@@ -1420,21 +1420,25 @@ async def test_app_lifespan_starts_and_stops_preview_service(
         "_start_ai_call_event_worker",
         "_start_ai_call_dialogue_worker",
         "_start_ai_call_semantic_analysis_worker",
+        "_start_ai_call_quality_scoring_worker",
         "_start_ai_call_offline_asr_worker",
         "_start_ai_call_recording_reconcile_worker",
         "_start_ai_call_handoff_trigger_worker",
         "_start_ai_call_outbound_task_worker",
         "_start_ai_call_linphone_test_worker",
+        "_start_ai_call_voice_worker",
     ]
     stop_names = [
         "_stop_ai_call_event_worker",
         "_stop_ai_call_dialogue_worker",
         "_stop_ai_call_semantic_analysis_worker",
+        "_stop_ai_call_quality_scoring_worker",
         "_stop_ai_call_offline_asr_worker",
         "_stop_ai_call_recording_reconcile_worker",
         "_stop_ai_call_handoff_trigger_worker",
         "_stop_ai_call_outbound_task_worker",
         "_stop_ai_call_linphone_test_worker",
+        "_stop_ai_call_voice_worker",
     ]
     for name in start_names:
         monkeypatch.setattr(app_init, name, AsyncMock(return_value=None))

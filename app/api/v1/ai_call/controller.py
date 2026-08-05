@@ -85,6 +85,9 @@ from .schema import (
     PromptProfilePreviewOut,
     PromptProfilePreviewRequest,
     PromptProfileUpdateRequest,
+    QualityDetailOut,
+    QualityReviewOut,
+    QualityReviewRequest,
     RecordDetailOut,
     RecordEventListOut,
     RecordingOut,
@@ -659,6 +662,66 @@ async def reanalyze_record_semantic_analysis_controller(
 ) -> JSONResponse:
     result = await service.reanalyze_record_semantic_analysis(call_id)
     return SuccessResponse(data=SemanticAnalysisOut.model_validate(result), msg="重分析完成")
+
+
+@AiCallRouter.get(
+    "/records/{callId}/quality",
+    summary="查询通话质检评分",
+    response_model=ResponseSchema[QualityDetailOut],
+)
+async def get_record_quality_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_record_quality(tenant_id=tenant_id, call_id=call_id)
+    return SuccessResponse(data=QualityDetailOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.post(
+    "/records/{callId}/quality/score",
+    summary="立即生成通话质检评分",
+    response_model=ResponseSchema[QualityDetailOut],
+)
+async def score_record_quality_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.score_record_quality(tenant_id=tenant_id, call_id=call_id)
+    return SuccessResponse(data=QualityDetailOut.model_validate(result), msg="评分完成")
+
+
+@AiCallRouter.post(
+    "/records/{callId}/quality-review",
+    summary="保存通话人工质检结果",
+    response_model=ResponseSchema[QualityReviewOut],
+)
+async def save_record_quality_review_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    request: QualityReviewRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    reviewed_by_name = (
+        getattr(user, "nick_name", None)
+        or getattr(user, "user_name", None)
+        if user is not None
+        else None
+    )
+    result = await service.save_record_quality_review(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        quality_result=request.quality_result,
+        quality_reason=request.quality_reason,
+        reviewed_by=str(user_id),
+        reviewed_by_name=reviewed_by_name,
+    )
+    return SuccessResponse(data=QualityReviewOut.model_validate(result), msg="保存成功")
 
 
 @AiCallRouter.get(

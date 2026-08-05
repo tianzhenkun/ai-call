@@ -460,6 +460,7 @@ class AiCallRecordService:
         outbound_context = getattr(record, "_outbound_context", {})
         semantic_context = getattr(record, "_semantic_analysis_context", {})
         follow_up_context = getattr(record, "_follow_up_context", {})
+        quality_context = getattr(record, "_quality_context", {})
         semantic_summary = None
         semantic_analysis_result = getattr(record, "_semantic_analysis_result", None)
         if semantic_analysis_result:
@@ -489,6 +490,9 @@ class AiCallRecordService:
             ),
             "followUpId": follow_up_context.get("followUpId"),
             "followUpStatus": follow_up_context.get("followUpStatus"),
+            "qualityScoreStatus": quality_context.get("qualityScoreStatus"),
+            "qualityScore": quality_context.get("qualityScore"),
+            "qualityReviewResult": quality_context.get("qualityReviewResult"),
             "businessType": record.business_type,
             "businessId": record.business_id,
             "sceneCode": record.scene_code,

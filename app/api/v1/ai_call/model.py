@@ -903,6 +903,135 @@ class AiCallSemanticAnalysisModel(MappedBase):
         return value if isinstance(value, dict) else None
 
 
+class AiCallQualityScoreModel(MappedBase):
+    """AI Call 自动评分记录表。"""
+
+    __tablename__ = "ai_call_quality_score"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            "model_version",
+            name="uk_ai_call_quality_score_call_model",
+        ),
+        Index(
+            "idx_ai_call_quality_score_tenant_status",
+            "tenant_id",
+            "status",
+            "updated_at",
+        ),
+        Index("idx_ai_call_quality_score_call", "call_id"),
+        {"comment": "AI Call 自动评分记录表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        comment="雪花主键",
+    )
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, comment="评分状态")
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="AI评分")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True, comment="AI评分理由")
+    model_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        server_default=text("'quality-v1'"),
+        comment="评分模型或提示词版本",
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="评分失败重试次数",
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="评分失败摘要",
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="评分开始时间",
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="评分结束时间",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="创建时间",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="更新时间",
+    )
+
+
+class AiCallQualityReviewModel(MappedBase):
+    """AI Call 人工质检记录表。"""
+
+    __tablename__ = "ai_call_quality_review"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "call_id", name="uk_ai_call_quality_review_call"),
+        Index(
+            "idx_ai_call_quality_review_tenant_result",
+            "tenant_id",
+            "quality_result",
+            "reviewed_at",
+        ),
+        {"comment": "AI Call 人工质检记录表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        comment="雪花主键",
+    )
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="通话业务ID")
+    quality_result: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="人工质检结论：excellent/good/pass/fail",
+    )
+    quality_reason: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="人工质检原因",
+    )
+    reviewed_by: Mapped[str] = mapped_column(String(64), nullable=False, comment="质检员ID")
+    reviewed_by_name: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="质检员姓名",
+    )
+    reviewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="质检时间",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="创建时间",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="更新时间",
+    )
+
+
 class AiCallHandoffModel(MappedBase):
     """AI Call B3 转人工记录表。"""
 

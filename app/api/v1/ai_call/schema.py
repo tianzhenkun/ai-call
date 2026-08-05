@@ -352,6 +352,15 @@ class RecordOut(AiCallBaseSchema):
     answered_at: datetime | None = None
     ended_at: datetime | None = None
     duration_ms: int | None = None
+    quality_score_status: Literal[
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+        "not_applicable",
+    ] | None = None
+    quality_score: int | None = None
+    quality_review_result: Literal["excellent", "good", "pass", "fail"] | None = None
 
 
 class RecordEventOut(AiCallBaseSchema):
@@ -435,6 +444,43 @@ class SemanticAnalysisOut(AiCallBaseSchema):
     transcript_snapshot: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class QualityScoreOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    score: int | None = None
+    reason: str | None = None
+    error_message: str | None = None
+    model_version: str
+    retry_count: int
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class QualityReviewOut(AiCallBaseSchema):
+    id: str
+    call_id: str
+    quality_result: Literal["excellent", "good", "pass", "fail"]
+    quality_reason: str | None = None
+    reviewed_by: str
+    reviewed_by_name: str | None = None
+    reviewed_at: datetime
+
+
+class QualityDetailOut(AiCallBaseSchema):
+    score: QualityScoreOut | None = None
+    review: QualityReviewOut | None = None
+
+
+class QualityReviewRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    quality_result: Literal["excellent", "good", "pass", "fail"]
+    quality_reason: str | None = None
 
 
 class RecordingTrackOut(AiCallBaseSchema):

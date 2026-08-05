@@ -14,6 +14,8 @@ from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallFollowUpTaskModel,
+    AiCallQualityReviewModel,
+    AiCallQualityScoreModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
@@ -209,7 +211,7 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
             business_id=None,
             scene_code="intro_geo",
             prompt_source_key=None,
-            entry_type="sip_outbound",
+            entry_type="outbound",
             room_name="room-outbound-1",
             participant_identity="sip-13800138011",
             status="completed",
@@ -662,6 +664,32 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
                     created_at=now,
                     updated_at=now,
                 ),
+                AiCallQualityScoreModel(
+                    id=1101,
+                    tenant_id="tenant-a",
+                    call_id="call-pending-task",
+                    status="completed",
+                    score=86,
+                    reason="客户问题回应完整，转人工时机合理。",
+                    model_version="quality-v1",
+                    retry_count=0,
+                    started_at=now,
+                    finished_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallQualityReviewModel(
+                    id=1201,
+                    tenant_id="tenant-a",
+                    call_id="call-pending-task",
+                    quality_result="fail",
+                    quality_reason="关键问题未确认",
+                    reviewed_by="1",
+                    reviewed_by_name="管理员",
+                    reviewed_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
             ]
         )
         await session.commit()
@@ -683,7 +711,13 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
             "followUpSuggested": True,
             "followUpId": "1001",
             "followUpStatus": "pending",
+            "qualityScoreStatus": "completed",
+            "qualityScore": 86,
+            "qualityReviewResult": "fail",
         } == payloads["call-pending-task"]
+        assert payloads["call-positive-none"]["qualityScoreStatus"] == "pending"
+        assert payloads["call-positive-none"]["qualityScore"] is None
+        assert payloads["call-positive-none"]["qualityReviewResult"] is None
         assert payloads["call-completed-task"]["followUpStatus"] == "completed"
         assert payloads["call-analysis-running"]["analysisStatus"] == "1"
 

@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from app.services.ai_call.event_persistence import AiCallEventPersistenceWorker
     from app.services.ai_call.handoff_trigger_service import AiCallHandoffTriggerWorker
     from app.services.ai_call.offline_asr_service import AiCallOfflineAsrWorker
+    from app.services.ai_call.quality_scoring import AiCallQualityScoringWorker
     from app.services.ai_call.semantic_analysis import AiCallSemanticAnalysisWorker
 
 
@@ -115,6 +116,7 @@ class AiCallService:
         prompt_resolver: BusinessPromptResolver | None = None,
         prompt_composer: PromptComposer | None = None,
         sip_client: LiveKitSipClient | None = None,
+        quality_scorer: Any | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.record_service = record_service
@@ -128,6 +130,7 @@ class AiCallService:
         self.prompt_resolver = prompt_resolver
         self.prompt_composer = prompt_composer
         self.sip_client = sip_client
+        self.quality_scorer = quality_scorer
 
     async def create_web_session(
         self,
@@ -1110,6 +1113,83 @@ class AiCallService:
         )
         return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
 
+    async def get_record_quality(self, *, tenant_id: str, call_id: str) -> dict:
+        self._ensure_record_service()
+        assert self.record_service is not None
+        record = await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        repository = self.record_service.repository
+        score = await repository.get_quality_score(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        review = await repository.get_quality_review(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        return {
+            "score": self._quality_score_to_dict(score) if score else None,
+            "review": self._quality_review_to_dict(review) if review else None,
+        }
+
+    async def score_record_quality(self, *, tenant_id: str, call_id: str) -> dict:
+        self._ensure_record_service()
+        assert self.record_service is not None
+        record = await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        from app.services.ai_call.quality_scoring import AiCallQualityScoringService
+
+        scorer = self.quality_scorer if self.quality_scorer is not None else _manual_quality_scorer()
+        service = AiCallQualityScoringService(
+            self.record_service.repository,
+            scorer=scorer,
+        )
+        await service.score_call_once(tenant_id=tenant_id, call_id=call_id)
+        return await self.get_record_quality(tenant_id=tenant_id, call_id=call_id)
+
+    async def save_record_quality_review(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        quality_result: str,
+        quality_reason: str | None,
+        reviewed_by: str,
+        reviewed_by_name: str | None,
+    ) -> dict:
+        self._ensure_record_service()
+        assert self.record_service is not None
+        record = await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        try:
+            review = await self.record_service.repository.upsert_quality_review(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                quality_result=quality_result,
+                quality_reason=quality_reason,
+                reviewed_by=reviewed_by,
+                reviewed_by_name=reviewed_by_name,
+            )
+        except ValueError as exc:
+            raise CustomException(
+                msg=str(exc),
+                code=RET.BAD_REQUEST.code,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            ) from exc
+        return self._quality_review_to_dict(review)
+
     async def get_recording(self, *, tenant_id: str, call_id: str) -> dict | None:
         self._ensure_recording_service()
         recording = await self.recording_service.get_recording(
@@ -1157,6 +1237,35 @@ class AiCallService:
         return {
             "rows": [self.dialogue_service.segment_to_dict(row) for row in rows],
             "total": len(rows),
+        }
+
+    @staticmethod
+    def _quality_score_to_dict(score) -> dict:
+        return {
+            "id": str(score.id),
+            "callId": score.call_id,
+            "status": score.status,
+            "score": score.score,
+            "reason": score.reason,
+            "errorMessage": score.error_message,
+            "modelVersion": score.model_version,
+            "retryCount": score.retry_count,
+            "startedAt": score.started_at,
+            "finishedAt": score.finished_at,
+            "createdAt": score.created_at,
+            "updatedAt": score.updated_at,
+        }
+
+    @staticmethod
+    def _quality_review_to_dict(review) -> dict:
+        return {
+            "id": str(review.id),
+            "callId": review.call_id,
+            "qualityResult": review.quality_result,
+            "qualityReason": review.quality_reason,
+            "reviewedBy": review.reviewed_by,
+            "reviewedByName": review.reviewed_by_name,
+            "reviewedAt": review.reviewed_at,
         }
 
     async def create_handoff(
@@ -2124,6 +2233,7 @@ _default_handoff_exception_manager: AiCallHandoffExceptionManager | None = None
 _default_handoff_trigger_worker: AiCallHandoffTriggerWorker | None = None
 _default_offline_asr_worker: AiCallOfflineAsrWorker | None = None
 _default_semantic_analysis_worker: AiCallSemanticAnalysisWorker | None = None
+_default_quality_scoring_worker: AiCallQualityScoringWorker | None = None
 
 
 def configure_ai_call_event_persistence(
@@ -2171,6 +2281,11 @@ def configure_ai_call_semantic_analysis(worker: AiCallSemanticAnalysisWorker | N
     _default_semantic_analysis_worker = worker
 
 
+def configure_ai_call_quality_scoring(worker: AiCallQualityScoringWorker | None) -> None:
+    global _default_quality_scoring_worker
+    _default_quality_scoring_worker = worker
+
+
 def _manual_semantic_analyzer() -> Any | None:
     if _default_semantic_analysis_worker is not None:
         return _default_semantic_analysis_worker.analyzer
@@ -2187,6 +2302,24 @@ def _manual_semantic_analyzer() -> Any | None:
     )
 
 
+def _manual_quality_scorer() -> Any | None:
+    if _default_quality_scoring_worker is not None:
+        return _default_quality_scoring_worker.scorer
+    from app.services.ai_call.quality_scoring import build_default_quality_scorer
+
+    return build_default_quality_scorer(
+        base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+        api_key=settings.EFFECTIVE_POST_ANALYSIS_API_KEY or settings.EFFECTIVE_LLM_API_KEY,
+        model=(
+            settings.AI_CALL_QUALITY_SCORING_MODEL
+            or settings.POST_ANALYSIS_MODEL
+            or settings.LLM_MODEL
+            or "qwen-plus"
+        ),
+        timeout_seconds=settings.AI_CALL_QUALITY_SCORING_TIMEOUT_SECONDS,
+    )
+
+
 def enqueue_ai_call_offline_asr(call_id: str) -> None:
     if _default_offline_asr_worker is not None:
         _default_offline_asr_worker.enqueue(call_id)
@@ -2195,6 +2328,11 @@ def enqueue_ai_call_offline_asr(call_id: str) -> None:
 def enqueue_ai_call_semantic_analysis(call_id: str, scene_code: str | None = None) -> None:
     if _default_semantic_analysis_worker is not None:
         _default_semantic_analysis_worker.enqueue(call_id, scene_code=scene_code)
+
+
+def enqueue_ai_call_quality_scoring(call_id: str) -> None:
+    if _default_quality_scoring_worker is not None:
+        _default_quality_scoring_worker.enqueue(call_id)
 
 
 def get_default_ai_call_service(
