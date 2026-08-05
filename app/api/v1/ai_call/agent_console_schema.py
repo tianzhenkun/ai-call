@@ -94,6 +94,7 @@ FollowUpClosedReason = Literal[
     "no_longer_needed",
     "other",
 ]
+FollowUpNextAction = Literal["continue", "complete", "close"]
 
 
 class AfterCallWorkIn(BaseModel):
@@ -136,6 +137,54 @@ class FollowUpAttemptIn(BaseModel):
             raise ValueError("技术失败必须填写错误摘要")
         if self.customer_callback_at is not None and self.attempt_result != "connected":
             raise ValueError("只有客户已接通并明确预约时才能记录回访时间")
+        return self
+
+
+class FollowUpHandlingResultIn(BaseModel):
+    call_id: str | None = Field(default=None, min_length=1, max_length=64)
+    contact_channel: Literal["manual_phone", "wechat", "email", "other"] | None = None
+    contact_result: FollowUpAttemptResult
+    remark: str = Field(min_length=1, max_length=500)
+    next_action: FollowUpNextAction
+    next_follow_up_at: datetime | None = None
+    closed_reason: FollowUpClosedReason | None = None
+
+    @field_validator("call_id")
+    @classmethod
+    def normalize_call_id(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+    @field_validator("remark")
+    @classmethod
+    def normalize_remark(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("处理备注不能为空")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_next_action(self):
+        if self.call_id is None and self.contact_channel is None:
+            raise ValueError("非电话回拨必须选择联系渠道")
+        if self.call_id is None and self.contact_channel == "manual_phone":
+            raise ValueError("人工回拨必须关联 callId")
+        if self.next_action == "continue" and self.next_follow_up_at is None:
+            raise ValueError("继续跟进必须填写下次跟进时间")
+        if self.next_action == "complete" and self.contact_result != "connected":
+            raise ValueError("只有已接通的联系结果可以办结任务")
+        if self.next_action == "close" and self.closed_reason is None:
+            raise ValueError("终止跟进必须填写终止原因")
+        if self.contact_result in {"no_answer", "busy", "technical_failure"}:
+            if self.next_action != "continue":
+                raise ValueError("当前联系结果只能继续跟进")
+        if self.contact_result in {"rejected", "invalid_contact"}:
+            if self.next_action not in {"continue", "close"}:
+                raise ValueError("当前联系结果不能办结任务")
+        if self.next_action != "continue" and self.next_follow_up_at is not None:
+            raise ValueError("只有继续跟进可以填写下次跟进时间")
+        if self.next_action != "close" and self.closed_reason is not None:
+            raise ValueError("只有终止跟进可以填写终止原因")
         return self
 
 

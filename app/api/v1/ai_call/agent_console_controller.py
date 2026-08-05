@@ -38,6 +38,7 @@ from .agent_console_schema import (
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
+    FollowUpHandlingResultIn,
 )
 from .service import (
     end_agent_handoff_session_background,
@@ -532,6 +533,7 @@ async def list_follow_ups_controller(
         Literal["after_call_work", "handoff_unanswered", "ai_post_call"] | None,
         Query(alias="sourceType"),
     ] = None,
+    customer_name: Annotated[str | None, Query(alias="customerName")] = None,
     created_at_begin: Annotated[
         datetime | None,
         Query(alias="createdAtBegin"),
@@ -549,6 +551,7 @@ async def list_follow_ups_controller(
         status=status.split(",") if status else None,
         scene_code=scene_code,
         source_type=source_type,
+        customer_name=customer_name,
         created_at_begin=created_at_begin,
         created_at_end=created_at_end,
     )
@@ -586,6 +589,36 @@ async def append_follow_up_attempt_controller(
         {"follow_up_id": str(attempt.follow_up_id), "attempt_result": attempt.attempt_result},
     )
     return SuccessResponse(data=service.attempt_payload(attempt))
+
+
+@AgentConsoleRouter.post(
+    "/follow-ups/{follow_up_id}/handling-results",
+    summary="原子提交跟进处理结果",
+)
+async def submit_follow_up_handling_result_controller(
+    follow_up_id: int,
+    payload: FollowUpHandlingResultIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ],
+):
+    task, result = await service.submit_handling_result(
+        auth,
+        follow_up_id=follow_up_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+    )
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {"follow_up_id": str(task.id), "status": task.status},
+    )
+    response = service.follow_up_payload(task)
+    response["handling_result"] = service.handling_result_payload(result)
+    return SuccessResponse(data=response)
 
 
 @AgentConsoleRouter.post("/follow-ups/{follow_up_id}/claim", summary="原子认领人工未接回访")

@@ -7,6 +7,7 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpAttemptModel,
+    AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -106,6 +107,21 @@ def test_agent_console_models_match_tenant_scoped_contract() -> None:
             "customer_callback_at",
             "created_at",
         },
+        AiCallFollowUpHandlingResultModel: {
+            "tenant_id",
+            "follow_up_id",
+            "idempotency_key",
+            "related_call_id",
+            "contact_channel",
+            "contact_result",
+            "remark",
+            "next_action",
+            "next_follow_up_at",
+            "closed_reason",
+            "agent_identity",
+            "handled_at",
+            "created_at",
+        },
     }
 
     for model, columns in expected_columns.items():
@@ -152,3 +168,7 @@ def test_new_models_define_required_unique_constraints_and_indexes() -> None:
         ("tenant_id", "follow_up_id", "contacted_at"),
         ("tenant_id", "related_call_id"),
     } <= _index_columns(AiCallFollowUpAttemptModel)
+    assert {
+        ("tenant_id", "idempotency_key"),
+        ("tenant_id", "related_call_id"),
+    } <= _unique_columns(AiCallFollowUpHandlingResultModel)

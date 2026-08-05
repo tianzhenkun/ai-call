@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import status
 from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -16,16 +17,23 @@ from app.api.v1.ai_call.agent_console_schema import (
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
+    FollowUpHandlingResultIn,
 )
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpAttemptModel,
+    AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
@@ -161,6 +169,7 @@ class AiCallFollowUpService:
         status: list[str] | None = None,
         scene_code: str | None = None,
         source_type: str | None = None,
+        customer_name: str | None = None,
         created_at_begin: datetime | None = None,
         created_at_end: datetime | None = None,
     ) -> list[AiCallFollowUpTaskModel]:
@@ -169,6 +178,7 @@ class AiCallFollowUpService:
             status=status,
             scene_code=scene_code,
             source_type=source_type,
+            customer_name=customer_name,
             created_at_begin=created_at_begin,
             created_at_end=created_at_end,
         )
@@ -184,6 +194,8 @@ class AiCallFollowUpService:
         )
         tasks = list(result.scalars().all())
         await self._attach_latest_attempts(tasks)
+        await self._attach_pending_handling(tasks)
+        await self._attach_follow_up_labels(tasks)
         return tasks
 
     async def list_follow_up_page(
@@ -196,6 +208,7 @@ class AiCallFollowUpService:
         status: list[str] | None = None,
         scene_code: str | None = None,
         source_type: str | None = None,
+        customer_name: str | None = None,
         created_at_begin: datetime | None = None,
         created_at_end: datetime | None = None,
     ) -> tuple[list[AiCallFollowUpTaskModel], int]:
@@ -205,6 +218,7 @@ class AiCallFollowUpService:
             status=status,
             scene_code=scene_code,
             source_type=source_type,
+            customer_name=customer_name,
             created_at_begin=created_at_begin,
             created_at_end=created_at_end,
         )
@@ -228,6 +242,8 @@ class AiCallFollowUpService:
         )
         tasks = list(result.scalars().all())
         await self._attach_latest_attempts(tasks)
+        await self._attach_pending_handling(tasks)
+        await self._attach_follow_up_labels(tasks)
         return tasks, total
 
     async def get_follow_up(
@@ -326,6 +342,150 @@ class AiCallFollowUpService:
         task.updated_at = now
         await self.db.flush()
         return attempt
+
+    async def submit_handling_result(
+        self,
+        auth: AuthSchema,
+        *,
+        follow_up_id: int,
+        payload: FollowUpHandlingResultIn,
+        idempotency_key: str,
+    ) -> tuple[AiCallFollowUpTaskModel, AiCallFollowUpHandlingResultModel]:
+        profile = await self.agent_service.require_current_agent(auth)
+        normalized_key = idempotency_key.strip()
+        if not normalized_key:
+            raise CustomException(msg="Idempotency-Key 不能为空", status_code=422)
+        task = (
+            await self.db.execute(
+                select(AiCallFollowUpTaskModel)
+                .where(
+                    AiCallFollowUpTaskModel.tenant_id == profile.tenant_id,
+                    AiCallFollowUpTaskModel.id == follow_up_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if task is None:
+            raise CustomException(msg="跟进任务不存在", status_code=404)
+        if task.owner_agent_identity != profile.agent_identity:
+            raise CustomException(msg="当前坐席不是跟进任务负责人", status_code=403)
+        existing = await self._handling_result_by_key(profile.tenant_id, normalized_key)
+        if existing is not None:
+            if existing.follow_up_id != follow_up_id:
+                self._raise_conflict("幂等键已用于其他跟进任务", "FOLLOW_UP_STATE_CONFLICT")
+            await self._attach_follow_up_detail(task)
+            return task, existing
+        if task.status not in {"pending", "processing"}:
+            self._raise_conflict("终态跟进任务不能提交处理结果", "FOLLOW_UP_STATE_CONFLICT")
+
+        attempt: AiCallFollowUpAttemptModel
+        if payload.call_id:
+            record = await self._callback_record(
+                tenant_id=profile.tenant_id,
+                follow_up_id=task.id,
+                call_id=payload.call_id,
+            )
+            if record.status not in {"completed", "failed"}:
+                self._raise_conflict("本次回拨尚未结束", "FOLLOW_UP_STATE_CONFLICT")
+            attempt = (
+                await self.db.execute(
+                    select(AiCallFollowUpAttemptModel).where(
+                        AiCallFollowUpAttemptModel.tenant_id == profile.tenant_id,
+                        AiCallFollowUpAttemptModel.follow_up_id == task.id,
+                        AiCallFollowUpAttemptModel.related_call_id == payload.call_id,
+                    )
+                )
+            ).scalars().first()
+            if attempt is None:
+                self._raise_conflict("本次回拨结果尚未生成", "FOLLOW_UP_STATE_CONFLICT")
+            if attempt.attempt_result != payload.contact_result:
+                self._raise_conflict("联系结果与回拨事实不一致", "FOLLOW_UP_STATE_CONFLICT")
+            if await self._handling_result_by_call(profile.tenant_id, payload.call_id):
+                self._raise_conflict("本次回拨已提交处理结果", "FOLLOW_UP_STATE_CONFLICT")
+            contact_channel = "manual_phone"
+        else:
+            contact_channel = payload.contact_channel
+            if contact_channel is None:
+                raise CustomException(msg="非电话回拨必须选择联系渠道", status_code=422)
+            now = datetime.now(timezone.utc)
+            attempt = AiCallFollowUpAttemptModel(
+                id=generate_snowflake_id(),
+                tenant_id=profile.tenant_id,
+                follow_up_id=task.id,
+                agent_identity=profile.agent_identity,
+                contact_channel=contact_channel,
+                attempt_result=payload.contact_result,
+                related_call_id=None,
+                ring_duration_seconds=None,
+                error_message=(
+                    payload.remark if payload.contact_result == "technical_failure" else None
+                ),
+                remark=payload.remark,
+                contacted_at=now,
+                customer_callback_at=None,
+                created_at=now,
+            )
+
+        now = datetime.now(timezone.utc)
+        handling_result = AiCallFollowUpHandlingResultModel(
+            id=generate_snowflake_id(),
+            tenant_id=profile.tenant_id,
+            follow_up_id=task.id,
+            idempotency_key=normalized_key,
+            related_call_id=payload.call_id,
+            contact_channel=contact_channel,
+            contact_result=payload.contact_result,
+            remark=payload.remark,
+            next_action=payload.next_action,
+            next_follow_up_at=payload.next_follow_up_at,
+            closed_reason=payload.closed_reason,
+            agent_identity=profile.agent_identity,
+            handled_at=now,
+            created_at=now,
+        )
+        savepoint = await self.db.begin_nested()
+        try:
+            if payload.call_id is None:
+                self.db.add(attempt)
+            self.db.add(handling_result)
+            attempt.remark = payload.remark
+            if payload.next_action == "continue":
+                task.status = "processing"
+                task.customer_callback_at = payload.next_follow_up_at
+            elif payload.next_action == "complete":
+                task.status = "completed"
+                task.customer_callback_at = None
+                task.completed_at = now
+            else:
+                task.status = "closed"
+                task.customer_callback_at = None
+                task.closed_reason = payload.closed_reason
+                task.closed_remark = payload.remark
+                task.closed_at = now
+            task.updated_at = now
+            await self.db.flush()
+        except IntegrityError as exc:
+            await savepoint.rollback()
+            existing = await self._handling_result_by_key(
+                profile.tenant_id, normalized_key
+            )
+            if existing is not None and existing.follow_up_id == follow_up_id:
+                task = await self._required_task(profile.tenant_id, follow_up_id)
+                await self._attach_follow_up_detail(task)
+                return task, existing
+            if existing is not None:
+                self._raise_conflict(
+                    "幂等键已用于其他跟进任务", "FOLLOW_UP_STATE_CONFLICT"
+                )
+            if payload.call_id and await self._handling_result_by_call(
+                profile.tenant_id, payload.call_id
+            ):
+                self._raise_conflict("本次回拨已提交处理结果", "FOLLOW_UP_STATE_CONFLICT")
+            raise CustomException(msg="处理结果提交冲突", status_code=409) from exc
+        else:
+            await savepoint.commit()
+        await self._attach_follow_up_detail(task)
+        return task, handling_result
 
     async def start_callback(
         self,
@@ -475,8 +635,7 @@ class AiCallFollowUpService:
         record.status = "completed"
         record.ended_at = now
         record.end_reason = "callback_ended_by_agent"
-        attempt = await self._attempt_by_call_id(call_id)
-        task.status = "processing" if attempt and attempt.attempt_result == "connected" else "pending"
+        task.status = "processing"
         task.updated_at = now
         await self._settle_callback_presence(
             tenant_id=profile.tenant_id,
@@ -496,6 +655,7 @@ class AiCallFollowUpService:
         status: list[str] | None = None,
         scene_code: str | None = None,
         source_type: str | None = None,
+        customer_name: str | None = None,
         created_at_begin: datetime | None = None,
         created_at_end: datetime | None = None,
     ) -> list:
@@ -538,6 +698,29 @@ class AiCallFollowUpService:
             conditions.append(AiCallFollowUpTaskModel.scene_code == scene_code)
         if source_type:
             conditions.append(AiCallFollowUpTaskModel.source_type == source_type)
+        if normalized_customer_name := (customer_name or "").strip():
+            conditions.append(
+                select(AiCallOutboundAttemptModel.id)
+                .join(
+                    AiCallOutboundTargetModel,
+                    and_(
+                        AiCallOutboundTargetModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallOutboundTargetModel.id
+                        == AiCallOutboundAttemptModel.target_id,
+                    ),
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id
+                    == AiCallFollowUpTaskModel.tenant_id,
+                    AiCallOutboundAttemptModel.call_id
+                    == AiCallFollowUpTaskModel.source_call_id,
+                    AiCallOutboundTargetModel.customer_name.contains(
+                        normalized_customer_name
+                    ),
+                )
+                .exists()
+            )
         if created_at_begin:
             conditions.append(AiCallFollowUpTaskModel.created_at >= created_at_begin)
         if created_at_end:
@@ -600,7 +783,7 @@ class AiCallFollowUpService:
             if attempt_result == "technical_failure":
                 record.failure_stage = "sip_callback"
                 record.failure_message = attempt.error_message
-            task.status = "pending"
+            task.status = "processing"
         task.updated_at = now
         await self._settle_callback_presence(
             tenant_id=task.tenant_id,
@@ -832,6 +1015,8 @@ class AiCallFollowUpService:
             "scene_code": task.scene_code,
             "business_type": task.business_type,
             "business_id": task.business_id,
+            "customer_name": getattr(task, "_customer_name", None),
+            "task_name": getattr(task, "_task_name", None),
             "masked_contact": task.masked_contact,
             "owner_agent_identity": task.owner_agent_identity,
             "status": task.status,
@@ -847,6 +1032,12 @@ class AiCallFollowUpService:
             "latest_attempt": (
                 cls.attempt_payload(latest_attempt) if latest_attempt is not None else None
             ),
+            "awaiting_handling_result": bool(
+                getattr(task, "_pending_handling_call_id", None)
+            ),
+            "pending_handling_call_id": getattr(
+                task, "_pending_handling_call_id", None
+            ),
         }
         attempts = getattr(task, "_attempts", None)
         if attempts is not None:
@@ -857,6 +1048,10 @@ class AiCallFollowUpService:
             payload["callback_records"] = [
                 cls.follow_up_record_payload(record)
                 for record in getattr(task, "_callback_records", [])
+            ]
+            payload["handling_results"] = [
+                cls.handling_result_payload(result)
+                for result in getattr(task, "_handling_results", [])
             ]
         return payload
 
@@ -890,6 +1085,24 @@ class AiCallFollowUpService:
             "remark": attempt.remark,
             "contacted_at": cls._api_datetime(attempt.contacted_at),
             "customer_callback_at": cls._api_datetime(attempt.customer_callback_at),
+        }
+
+    @classmethod
+    def handling_result_payload(
+        cls, result: AiCallFollowUpHandlingResultModel
+    ) -> dict:
+        return {
+            "id": str(result.id),
+            "follow_up_id": str(result.follow_up_id),
+            "related_call_id": result.related_call_id,
+            "contact_channel": result.contact_channel,
+            "contact_result": result.contact_result,
+            "remark": result.remark,
+            "next_action": result.next_action,
+            "next_follow_up_at": cls._api_datetime(result.next_follow_up_at),
+            "closed_reason": result.closed_reason,
+            "agent_identity": result.agent_identity,
+            "handled_at": cls._api_datetime(result.handled_at),
         }
 
     @staticmethod
@@ -1026,6 +1239,31 @@ class AiCallFollowUpService:
         )
         return result.scalars().first()
 
+    async def _handling_result_by_key(
+        self, tenant_id: str, idempotency_key: str
+    ) -> AiCallFollowUpHandlingResultModel | None:
+        return (
+            await self.db.execute(
+                select(AiCallFollowUpHandlingResultModel).where(
+                    AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                    AiCallFollowUpHandlingResultModel.idempotency_key
+                    == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def _handling_result_by_call(
+        self, tenant_id: str, call_id: str
+    ) -> AiCallFollowUpHandlingResultModel | None:
+        return (
+            await self.db.execute(
+                select(AiCallFollowUpHandlingResultModel).where(
+                    AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                    AiCallFollowUpHandlingResultModel.related_call_id == call_id,
+                )
+            )
+        ).scalar_one_or_none()
+
     async def _attach_latest_attempts(
         self,
         tasks: list[AiCallFollowUpTaskModel],
@@ -1048,6 +1286,114 @@ class AiCallFollowUpService:
         for task in tasks:
             task._latest_attempt = latest_by_task.get(task.id)
 
+    async def _attach_pending_handling(
+        self, tasks: list[AiCallFollowUpTaskModel]
+    ) -> None:
+        task_ids = [task.id for task in tasks]
+        if not task_ids:
+            return
+        terminal_call_ids = set(
+            (
+                await self.db.execute(
+                    select(AiCallRecordModel.call_id).where(
+                        AiCallRecordModel.tenant_id == tasks[0].tenant_id,
+                        AiCallRecordModel.follow_up_id.in_(task_ids),
+                        AiCallRecordModel.entry_type == "sip_callback",
+                        AiCallRecordModel.status.in_({"completed", "failed"}),
+                    )
+                )
+            ).scalars()
+        )
+        handled_call_ids = set(
+            (
+                await self.db.execute(
+                    select(AiCallFollowUpHandlingResultModel.related_call_id).where(
+                        AiCallFollowUpHandlingResultModel.tenant_id
+                        == tasks[0].tenant_id,
+                        AiCallFollowUpHandlingResultModel.follow_up_id.in_(task_ids),
+                        AiCallFollowUpHandlingResultModel.related_call_id.is_not(None),
+                    )
+                )
+            ).scalars()
+        )
+        callback_attempts = (
+            (
+                await self.db.execute(
+                    select(AiCallFollowUpAttemptModel)
+                    .where(
+                        AiCallFollowUpAttemptModel.tenant_id == tasks[0].tenant_id,
+                        AiCallFollowUpAttemptModel.follow_up_id.in_(task_ids),
+                        AiCallFollowUpAttemptModel.related_call_id.is_not(None),
+                        AiCallFollowUpAttemptModel.related_call_id.in_(terminal_call_ids),
+                    )
+                    .order_by(
+                        AiCallFollowUpAttemptModel.contacted_at.desc(),
+                        AiCallFollowUpAttemptModel.id.desc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending_by_task: dict[int, str] = {}
+        for attempt in callback_attempts:
+            if (
+                attempt.related_call_id not in handled_call_ids
+                and attempt.follow_up_id not in pending_by_task
+            ):
+                pending_by_task[attempt.follow_up_id] = attempt.related_call_id
+        for task in tasks:
+            task._pending_handling_call_id = (
+                None
+                if task.status in {"completed", "closed"}
+                else pending_by_task.get(task.id)
+            )
+
+    async def _attach_follow_up_labels(
+        self, tasks: list[AiCallFollowUpTaskModel]
+    ) -> None:
+        call_ids = [task.source_call_id for task in tasks]
+        if not call_ids:
+            return
+        rows = (
+            await self.db.execute(
+                select(
+                    AiCallOutboundAttemptModel.call_id,
+                    AiCallOutboundTargetModel.customer_name,
+                    AiCallOutboundTaskModel.task_name,
+                )
+                .join(
+                    AiCallOutboundTargetModel,
+                    and_(
+                        AiCallOutboundTargetModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallOutboundTargetModel.id
+                        == AiCallOutboundAttemptModel.target_id,
+                    ),
+                )
+                .join(
+                    AiCallOutboundTaskModel,
+                    and_(
+                        AiCallOutboundTaskModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallOutboundTaskModel.id == AiCallOutboundAttemptModel.task_id,
+                    ),
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tasks[0].tenant_id,
+                    AiCallOutboundAttemptModel.call_id.in_(call_ids),
+                )
+            )
+        ).all()
+        labels = {
+            row.call_id: (row.customer_name, row.task_name)
+            for row in rows
+        }
+        for task in tasks:
+            task._customer_name, task._task_name = labels.get(
+                task.source_call_id, (None, None)
+            )
+
     async def _attach_follow_up_detail(
         self,
         task: AiCallFollowUpTaskModel,
@@ -1069,6 +1415,23 @@ class AiCallFollowUpService:
             .scalars()
             .all()
         )
+        handling_results = list(
+            (
+                await self.db.execute(
+                    select(AiCallFollowUpHandlingResultModel)
+                    .where(
+                        AiCallFollowUpHandlingResultModel.tenant_id == task.tenant_id,
+                        AiCallFollowUpHandlingResultModel.follow_up_id == task.id,
+                    )
+                    .order_by(
+                        AiCallFollowUpHandlingResultModel.handled_at,
+                        AiCallFollowUpHandlingResultModel.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         _, source_record, callback_records = (
             await self.record_repository.get_follow_up_relation(
                 tenant_id=task.tenant_id,
@@ -1078,8 +1441,34 @@ class AiCallFollowUpService:
         )
         task._attempts = attempts
         task._latest_attempt = attempts[-1] if attempts else None
+        task._handling_results = handling_results
+        handled_call_ids = {
+            result.related_call_id
+            for result in handling_results
+            if result.related_call_id
+        }
+        terminal_call_ids = {
+            record.call_id
+            for record in callback_records
+            if record.status in {"completed", "failed"}
+        }
+        task._pending_handling_call_id = (
+            None
+            if task.status in {"completed", "closed"}
+            else next(
+                (
+                    attempt.related_call_id
+                    for attempt in reversed(attempts)
+                    if attempt.related_call_id
+                    and attempt.related_call_id in terminal_call_ids
+                    and attempt.related_call_id not in handled_call_ids
+                ),
+                None,
+            )
+        )
         task._source_record = source_record
         task._callback_records = callback_records
+        await self._attach_follow_up_labels([task])
 
     async def _required_task_by_id(self, follow_up_id: int) -> AiCallFollowUpTaskModel:
         result = await self.db.execute(

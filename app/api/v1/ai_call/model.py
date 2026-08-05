@@ -1373,6 +1373,47 @@ class AiCallFollowUpAttemptModel(MappedBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AiCallFollowUpHandlingResultModel(MappedBase):
+    """AI Call 跟进处理结果表。"""
+
+    __tablename__ = "ai_call_follow_up_handling_result"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uk_ai_call_follow_up_handling_key",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "related_call_id",
+            name="uk_ai_call_follow_up_handling_call",
+        ),
+        Index(
+            "idx_ai_call_follow_up_handling_time",
+            "tenant_id",
+            "follow_up_id",
+            "handled_at",
+        ),
+        {"comment": "AI Call 跟进处理结果表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    follow_up_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    related_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    contact_channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    contact_result: Mapped[str] = mapped_column(String(32), nullable=False)
+    remark: Mapped[str] = mapped_column(String(500), nullable=False)
+    next_action: Mapped[str] = mapped_column(String(16), nullable=False)
+    next_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    handled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AiCallPromptProfileModel(MappedBase):
     """AI Call B4 业务提示词配置表。"""
 

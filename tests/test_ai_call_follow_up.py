@@ -19,16 +19,23 @@ from app.api.v1.ai_call.agent_console_schema import (
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
+    FollowUpHandlingResultIn,
 )
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpAttemptModel,
+    AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -275,6 +282,7 @@ def test_task5_routes_are_registered() -> None:
         "/ai-call/agent-console/follow-ups",
         "/ai-call/agent-console/follow-ups/{follow_up_id}",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/attempts",
+        "/ai-call/agent-console/follow-ups/{follow_up_id}/handling-results",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/claim",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/call",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/call/{call_id}/end",
@@ -291,6 +299,216 @@ def test_quick_wrap_up_requires_only_disposition_and_follow_up_flag() -> None:
         AfterCallWorkIn(needs_follow_up=False)
     with pytest.raises(ValidationError):
         AfterCallWorkIn(disposition_code="resolved")
+
+
+def test_handling_result_requires_one_valid_next_action() -> None:
+    with pytest.raises(ValidationError, match="下次跟进时间"):
+        FollowUpHandlingResultIn(
+            contact_channel="wechat",
+            contact_result="no_answer",
+            remark="客户暂未回复",
+            next_action="continue",
+        )
+    with pytest.raises(ValidationError, match="只有已接通"):
+        FollowUpHandlingResultIn(
+            contact_channel="wechat",
+            contact_result="no_answer",
+            remark="客户暂未回复",
+            next_action="complete",
+        )
+    with pytest.raises(ValidationError, match="终止原因"):
+        FollowUpHandlingResultIn(
+            contact_channel="wechat",
+            contact_result="rejected",
+            remark="客户拒绝继续沟通",
+            next_action="close",
+        )
+    with pytest.raises(ValidationError, match="必须关联 callId"):
+        FollowUpHandlingResultIn(
+            contact_channel="manual_phone",
+            contact_result="connected",
+            remark="电话已接通",
+            next_action="complete",
+        )
+
+
+@pytest.mark.anyio
+async def test_submit_handling_result_is_atomic_and_idempotent(session_factory) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_agent(session_factory, user_id=21, agent_identity="agent-21")
+    await _seed_unanswered_follow_up(session_factory)
+    next_follow_up_at = datetime.now(timezone.utc) + timedelta(days=1)
+    payload = FollowUpHandlingResultIn(
+        contact_channel="wechat",
+        contact_result="no_answer",
+        remark="客户暂未回复，明天再次联系",
+        next_action="continue",
+        next_follow_up_at=next_follow_up_at,
+    )
+
+    async with session_factory() as db, db.begin():
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        first = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=payload,
+            idempotency_key="handling-result-1",
+        )
+        first_id = first[1].id
+        assert first[0].status == "processing"
+        assert first[0].customer_callback_at == next_follow_up_at
+
+    async with session_factory() as db, db.begin():
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        second = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=payload,
+            idempotency_key="handling-result-1",
+        )
+
+        assert first_id == second[1].id
+        assert await db.scalar(select(func.count(AiCallFollowUpAttemptModel.id))) == 1
+        assert (
+            await db.scalar(select(func.count(AiCallFollowUpHandlingResultModel.id)))
+            == 1
+        )
+        with pytest.raises(CustomException, match="当前坐席不是"):
+            await service.submit_handling_result(
+                _auth(db, user_id=21),
+                follow_up_id=100,
+                payload=payload,
+                idempotency_key="handling-result-1",
+            )
+
+
+@pytest.mark.anyio
+async def test_handling_result_produces_completed_and_closed_terminal_states(
+    session_factory,
+) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(
+        session_factory, task_id=100, owner_agent_identity="agent-20"
+    )
+    await _seed_unanswered_follow_up(
+        session_factory, task_id=101, owner_agent_identity="agent-20"
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        completed, _ = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpHandlingResultIn(
+                contact_channel="wechat",
+                contact_result="connected",
+                remark="客户问题已解决",
+                next_action="complete",
+            ),
+            idempotency_key="handling-complete",
+        )
+        closed, _ = await service.submit_handling_result(
+            auth,
+            follow_up_id=101,
+            payload=FollowUpHandlingResultIn(
+                contact_channel="wechat",
+                contact_result="rejected",
+                remark="客户明确拒绝继续联系",
+                next_action="close",
+                closed_reason="customer_refused",
+            ),
+            idempotency_key="handling-close",
+        )
+
+        assert completed.status == "completed"
+        assert completed.completed_at is not None
+        assert closed.status == "closed"
+        assert closed.closed_reason == "customer_refused"
+        assert closed.closed_remark == "客户明确拒绝继续联系"
+
+
+@pytest.mark.anyio
+async def test_follow_up_list_filters_customer_and_returns_task_labels(session_factory) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(session_factory)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        db.add_all(
+            [
+                AiCallOutboundTaskModel(
+                    id=201,
+                    tenant_id="tenant-a",
+                    validation_id=1,
+                    idempotency_key="follow-up-label-task",
+                    request_fingerprint="follow-up-label-fingerprint",
+                    task_name="GEO 产品回访",
+                    task_mode="single",
+                    status="COMPLETED",
+                    total_targets=1,
+                    completed_targets=1,
+                    connected_targets=0,
+                    failed_targets=1,
+                    execution_mode="immediate",
+                    prompt_name="GEO 产品介绍",
+                    scene_code="intro_contract",
+                    voice="Tina",
+                    rule_id=1,
+                    rule_name="工作日规则",
+                    rule_summary="全天",
+                    config_snapshot_json="{}",
+                    created_by=1,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundTargetModel(
+                    id=202,
+                    tenant_id="tenant-a",
+                    task_id=201,
+                    validation_id=1,
+                    source_validation_row_id=1,
+                    source_row_number=1,
+                    phone_number="13800000000",
+                    customer_name="张三",
+                    status="COMPLETED",
+                    attempt_count=1,
+                    latest_result="no_answer",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=203,
+                    tenant_id="tenant-a",
+                    task_id=201,
+                    target_id=202,
+                    attempt_no=1,
+                    call_id="call-unanswered-100",
+                    status="COMPLETED",
+                    call_result="no_answer",
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        rows, total = await service.list_follow_up_page(
+            _auth(db, user_id=20),
+            page_num=1,
+            page_size=10,
+            customer_name="张",
+        )
+        payload = service.follow_up_payload(rows[0])
+
+        assert total == 1
+        assert payload["customer_name"] == "张三"
+        assert payload["task_name"] == "GEO 产品回访"
 
 
 @pytest.mark.anyio
@@ -873,6 +1091,7 @@ async def test_follow_up_list_controller_forwards_filters() -> None:
         status="pending",
         scene_code="intro_contract",
         source_type="handoff_unanswered",
+        customer_name=None,
         created_at_begin=now - timedelta(days=1),
         created_at_end=now,
     )
@@ -885,6 +1104,7 @@ async def test_follow_up_list_controller_forwards_filters() -> None:
         status=["pending"],
         scene_code="intro_contract",
         source_type="handoff_unanswered",
+        customer_name=None,
         created_at_begin=now - timedelta(days=1),
         created_at_end=now,
     )
@@ -1205,7 +1425,7 @@ async def test_callback_rejects_follow_up_without_a_saved_source_phone(session_f
 
 
 @pytest.mark.anyio
-async def test_no_answer_callback_appends_once_returns_pending_and_releases_agent(
+async def test_no_answer_callback_waits_for_atomic_handling_result(
     session_factory,
 ) -> None:
     console_session_id = await _seed_agent(
@@ -1245,11 +1465,60 @@ async def test_no_answer_callback_appends_once_returns_pending_and_releases_agen
                 select(AiCallFollowUpTaskModel).where(AiCallFollowUpTaskModel.id == 100)
             )
         ).scalar_one()
-        assert task.status == "pending"
+        assert task.status == "processing"
         attempts = list((await db.execute(select(AiCallFollowUpAttemptModel))).scalars().all())
         assert len(attempts) == 1
         assert attempts[0].attempt_result == "no_answer"
         assert attempts[0].ring_duration_seconds == 12
+
+        detail = service.follow_up_payload(
+            await service.get_follow_up(auth, follow_up_id=100)
+        )
+        assert detail["awaiting_handling_result"] is True
+        assert detail["pending_handling_call_id"] == callback.call_id
+
+        next_follow_up_at = datetime.now(timezone.utc) + timedelta(days=1)
+        with pytest.raises(CustomException, match="联系结果与回拨事实不一致"):
+            await service.submit_handling_result(
+                auth,
+                follow_up_id=100,
+                payload=FollowUpHandlingResultIn(
+                    call_id=callback.call_id,
+                    contact_result="connected",
+                    remark="错误地改成已接通",
+                    next_action="continue",
+                    next_follow_up_at=next_follow_up_at,
+                ),
+                idempotency_key="callback-mismatch",
+            )
+        handled_task, handling = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpHandlingResultIn(
+                call_id=callback.call_id,
+                contact_result="no_answer",
+                remark="本次回拨未接通",
+                next_action="continue",
+                next_follow_up_at=next_follow_up_at,
+            ),
+            idempotency_key="callback-no-answer",
+        )
+        assert handled_task.status == "processing"
+        assert handling.contact_channel == "manual_phone"
+        assert service.follow_up_payload(handled_task)["awaiting_handling_result"] is False
+        with pytest.raises(CustomException, match="已提交处理结果"):
+            await service.submit_handling_result(
+                auth,
+                follow_up_id=100,
+                payload=FollowUpHandlingResultIn(
+                    call_id=callback.call_id,
+                    contact_result="no_answer",
+                    remark="重复提交同一次回拨",
+                    next_action="continue",
+                    next_follow_up_at=next_follow_up_at,
+                ),
+                idempotency_key="callback-no-answer-second-key",
+            )
 
         presence = (
             await db.execute(
@@ -1354,7 +1623,7 @@ async def test_immediate_sip_failure_records_technical_failure_and_releases_agen
         ).scalar_one()
         assert attempt.attempt_result == "technical_failure"
         task = await db.get(AiCallFollowUpTaskModel, 100)
-        assert task.status == "pending"
+        assert task.status == "processing"
         presence = await db.get(AiCallHandoffAgentModel, 20)
         assert presence.status == "available"
         assert presence.active_call_id is None
@@ -1542,6 +1811,10 @@ async def test_agent_ends_connected_callback_and_releases_presence(session_facto
             call_id=callback.call_id,
             attempt_result="connected",
         )
+        active_detail = service.follow_up_payload(
+            await service.get_follow_up(auth, follow_up_id=100)
+        )
+        assert active_detail["awaiting_handling_result"] is False
 
         record = await service.end_callback(
             auth,
@@ -1555,6 +1828,11 @@ async def test_agent_ends_connected_callback_and_releases_presence(session_facto
         assert record.end_reason == "callback_ended_by_agent"
         task = await db.get(AiCallFollowUpTaskModel, 100)
         assert task.status == "processing"
+        ended_detail = service.follow_up_payload(
+            await service.get_follow_up(auth, follow_up_id=100)
+        )
+        assert ended_detail["awaiting_handling_result"] is True
+        assert ended_detail["pending_handling_call_id"] == callback.call_id
         presence = await db.get(AiCallHandoffAgentModel, 20)
         assert presence.status == "available"
         assert presence.active_call_id is None
