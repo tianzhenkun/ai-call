@@ -932,6 +932,7 @@ async def _start_ai_call_offline_asr_worker():
         timeout_seconds=settings.AI_CALL_OFFLINE_ASR_TIMEOUT_SECONDS,
         poll_interval_seconds=settings.AI_CALL_OFFLINE_ASR_POLL_INTERVAL_SECONDS,
     )
+
     def on_call_ready(call_id: str) -> None:
         enqueue_ai_call_semantic_analysis(call_id)
         enqueue_ai_call_quality_scoring(call_id)
