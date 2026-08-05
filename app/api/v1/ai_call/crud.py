@@ -135,6 +135,60 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_follow_up_relation(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        follow_up_id: int | None,
+    ) -> tuple[
+        AiCallFollowUpTaskModel | None,
+        AiCallRecordModel | None,
+        list[AiCallRecordModel],
+    ]:
+        task_stmt = select(AiCallFollowUpTaskModel).where(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id
+        )
+        if follow_up_id is not None:
+            task_stmt = task_stmt.where(AiCallFollowUpTaskModel.id == follow_up_id)
+        else:
+            task_stmt = task_stmt.where(
+                AiCallFollowUpTaskModel.source_call_id == call_id
+            )
+        tasks = list((await self.db.execute(task_stmt)).scalars().all())
+        if not tasks:
+            return None, None, []
+        active = [task for task in tasks if task.status not in {"completed", "closed"}]
+        task = max(
+            active or tasks,
+            key=lambda item: (item.updated_at or item.created_at, item.id),
+        )
+        records = list(
+            (
+                await self.db.execute(
+                    select(AiCallRecordModel)
+                    .where(
+                        AiCallRecordModel.tenant_id == tenant_id,
+                        or_(
+                            AiCallRecordModel.call_id == task.source_call_id,
+                            AiCallRecordModel.follow_up_id == task.id,
+                        ),
+                    )
+                    .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        source_record = next(
+            (record for record in records if record.call_id == task.source_call_id),
+            None,
+        )
+        callback_records = [
+            record for record in records if record.follow_up_id == task.id
+        ]
+        return task, source_record, callback_records
+
     async def get_after_call_work(
         self,
         *,

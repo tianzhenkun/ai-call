@@ -16,6 +16,7 @@ from app.api.v1.ai_call.agent_console_schema import (
     FollowUpCallIn,
     FollowUpCloseIn,
 )
+from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
     AiCallAgentSceneScopeModel,
@@ -60,6 +61,7 @@ class AiCallFollowUpService:
     ) -> None:
         self.db = db
         self.agent_service = AiCallAgentConsoleService(db)
+        self.record_repository = AiCallRecordRepository(db)
         self.callback_factory = callback_factory
 
     async def submit_after_call_work(
@@ -183,17 +185,16 @@ class AiCallFollowUpService:
     ) -> AiCallFollowUpTaskModel:
         profile = await self.agent_service.require_current_agent(auth)
         task = await self._required_task(profile.tenant_id, follow_up_id)
-        if task.owner_agent_identity == profile.agent_identity:
-            await self._attach_latest_attempts([task])
-            return task
-        if (
+        allowed = task.owner_agent_identity == profile.agent_identity or (
             task.owner_agent_identity is None
             and task.source_type in CLAIMABLE_UNASSIGNED_SOURCE_TYPES
-        ):
+        )
+        if not allowed:
+            raise CustomException(msg="当前坐席无权查看该跟进任务", status_code=403)
+        if task.owner_agent_identity is None:
             await self.agent_service.require_scene_access(auth, task.scene_code)
-            await self._attach_latest_attempts([task])
-            return task
-        raise CustomException(msg="当前坐席无权查看该跟进任务", status_code=403)
+        await self._attach_follow_up_detail(task)
+        return task
 
     async def claim_follow_up(
         self,
@@ -674,7 +675,7 @@ class AiCallFollowUpService:
     @classmethod
     def follow_up_payload(cls, task: AiCallFollowUpTaskModel) -> dict:
         latest_attempt = getattr(task, "_latest_attempt", None)
-        return {
+        payload = {
             "id": str(task.id),
             "source_type": task.source_type,
             "source_call_id": task.source_call_id,
@@ -697,6 +698,33 @@ class AiCallFollowUpService:
             "latest_attempt": (
                 cls.attempt_payload(latest_attempt) if latest_attempt is not None else None
             ),
+        }
+        attempts = getattr(task, "_attempts", None)
+        if attempts is not None:
+            payload["attempts"] = [cls.attempt_payload(attempt) for attempt in attempts]
+            payload["source_record"] = cls.follow_up_record_payload(
+                getattr(task, "_source_record", None)
+            )
+            payload["callback_records"] = [
+                cls.follow_up_record_payload(record)
+                for record in getattr(task, "_callback_records", [])
+            ]
+        return payload
+
+    @classmethod
+    def follow_up_record_payload(cls, record: AiCallRecordModel | None) -> dict | None:
+        if record is None:
+            return None
+        return {
+            "id": str(record.id),
+            "call_id": record.call_id,
+            "entry_type": record.entry_type,
+            "status": record.status,
+            "end_reason": record.end_reason,
+            "started_at": cls._api_datetime(record.started_at),
+            "answered_at": cls._api_datetime(record.answered_at),
+            "ended_at": cls._api_datetime(record.ended_at),
+            "duration_ms": record.duration_ms,
         }
 
     @classmethod
@@ -870,6 +898,39 @@ class AiCallFollowUpService:
             latest_by_task.setdefault(attempt.follow_up_id, attempt)
         for task in tasks:
             task._latest_attempt = latest_by_task.get(task.id)
+
+    async def _attach_follow_up_detail(
+        self,
+        task: AiCallFollowUpTaskModel,
+    ) -> None:
+        attempts = list(
+            (
+                await self.db.execute(
+                    select(AiCallFollowUpAttemptModel)
+                    .where(
+                        AiCallFollowUpAttemptModel.tenant_id == task.tenant_id,
+                        AiCallFollowUpAttemptModel.follow_up_id == task.id,
+                    )
+                    .order_by(
+                        AiCallFollowUpAttemptModel.contacted_at,
+                        AiCallFollowUpAttemptModel.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _, source_record, callback_records = (
+            await self.record_repository.get_follow_up_relation(
+                tenant_id=task.tenant_id,
+                call_id=task.source_call_id,
+                follow_up_id=task.id,
+            )
+        )
+        task._attempts = attempts
+        task._latest_attempt = attempts[-1] if attempts else None
+        task._source_record = source_record
+        task._callback_records = callback_records
 
     async def _required_task_by_id(self, follow_up_id: int) -> AiCallFollowUpTaskModel:
         result = await self.db.execute(

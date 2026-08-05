@@ -385,6 +385,9 @@ class RecordFollowUpOut(AiCallBaseSchema):
     id: str
     status: str
     reason: str
+    source_call_id: str
+    source_record: RecordOut | None = None
+    callback_records: list[RecordOut] = Field(default_factory=list)
 
 
 class RecordDetailOut(AiCallBaseSchema):

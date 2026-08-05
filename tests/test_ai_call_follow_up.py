@@ -1023,6 +1023,37 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
 
 
 @pytest.mark.anyio
+async def test_owned_follow_up_detail_lists_source_and_callback_records(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+
+        task = await service.get_follow_up(auth, follow_up_id=100)
+        detail = service.follow_up_payload(task)
+
+        assert detail["source_record"]["call_id"] == "call-unanswered-100"
+        assert [record["call_id"] for record in detail["callback_records"]] == [
+            callback.call_id
+        ]
+        assert detail["attempts"] == []
+
+
+@pytest.mark.anyio
 async def test_callback_rejects_follow_up_without_a_saved_source_phone(session_factory) -> None:
     console_session_id = await _seed_agent(
         session_factory,

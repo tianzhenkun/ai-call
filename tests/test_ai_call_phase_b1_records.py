@@ -1402,6 +1402,24 @@ async def test_record_detail_returns_seat_after_call_disposition(b1_service) -> 
                 created_at=now,
                 updated_at=now,
             ),
+            AiCallRecordModel(
+                id=324800000000000203,
+                tenant_id=record.tenant_id,
+                call_id="call-record-detail-callback",
+                follow_up_id=324800000000000202,
+                business_type=None,
+                business_id=None,
+                scene_code="intro_geo",
+                entry_type="sip_callback",
+                room_name="room-record-detail-callback",
+                participant_identity="customer-record-detail-callback",
+                status="completed",
+                end_reason="callback_ended_by_agent",
+                started_at=now,
+                answered_at=now,
+                ended_at=now,
+                duration_ms=0,
+            ),
         ])
         await db.commit()
 
@@ -1415,11 +1433,15 @@ async def test_record_detail_returns_seat_after_call_disposition(b1_service) -> 
     assert after_call_work["summary"] == "请继续跟进试用方案"
     assert after_call_work["needsFollowUp"] is True
     assert after_call_work["submittedAt"].startswith("2026-08-04T08:06:00")
-    assert response["followUp"] == {
-        "id": "324800000000000202",
-        "status": "pending",
-        "reason": "人工通话后续跟进",
-    }
+    follow_up = response["followUp"]
+    assert follow_up["id"] == "324800000000000202"
+    assert follow_up["status"] == "pending"
+    assert follow_up["reason"] == "人工通话后续跟进"
+    assert follow_up["sourceCallId"] == result.call_id
+    assert follow_up["sourceRecord"]["callId"] == result.call_id
+    assert [row["callId"] for row in follow_up["callbackRecords"]] == [
+        "call-record-detail-callback"
+    ]
 
 
 @pytest.mark.anyio

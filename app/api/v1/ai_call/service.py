@@ -1010,6 +1010,29 @@ class AiCallService:
         after_call_work = None
         follow_up = None
         if record.tenant_id:
+            task, source_record, callback_records = (
+                await self.record_service.repository.get_follow_up_relation(
+                    tenant_id=record.tenant_id,
+                    call_id=record.call_id,
+                    follow_up_id=record.follow_up_id,
+                )
+            )
+            if task is not None:
+                follow_up = {
+                    "id": str(task.id),
+                    "status": task.status,
+                    "reason": task.follow_up_reason,
+                    "sourceCallId": task.source_call_id,
+                    "sourceRecord": (
+                        self.record_service.record_to_dict(source_record)
+                        if source_record is not None
+                        else None
+                    ),
+                    "callbackRecords": [
+                        self.record_service.record_to_dict(callback_record)
+                        for callback_record in callback_records
+                    ],
+                }
             work = await self.record_service.repository.get_after_call_work(
                 tenant_id=record.tenant_id,
                 call_id=call_id,
@@ -1022,17 +1045,6 @@ class AiCallService:
                     "needsFollowUp": work.needs_follow_up,
                     "submittedAt": work.submitted_at,
                 }
-                task = await self.record_service.repository.get_follow_up_by_source(
-                    tenant_id=record.tenant_id,
-                    source_type="after_call_work",
-                    source_key=f"handoff:{work.handoff_id}",
-                )
-                if task is not None:
-                    follow_up = {
-                        "id": str(task.id),
-                        "status": task.status,
-                        "reason": task.follow_up_reason,
-                    }
         return {
             "record": self.record_service.record_to_dict(record),
             "lastEvent": self.record_service.event_to_dict(last_event) if last_event else None,
