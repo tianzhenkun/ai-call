@@ -324,6 +324,38 @@ async def test_presence_requires_preflight_and_enforces_console_session(session_
 
 
 @pytest.mark.anyio
+async def test_online_does_not_overwrite_an_active_callback(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+        status="in_call",
+    )
+    async with session_factory() as db, db.begin():
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        presence.active_call_id = "call-active"
+
+    async with session_factory() as db:
+        service = AiCallAgentConsoleService(db)
+        with pytest.raises(CustomException) as conflict:
+            await service.online(
+                _auth(db, user_id=20),
+                console_session_id=console_session_id,
+                device_preflight_passed=True,
+            )
+
+    assert _error_code(conflict.value) == "AGENT_ALREADY_IN_CALL"
+
+
+@pytest.mark.anyio
 async def test_bootstrap_restores_completed_handoff_during_quick_wrap_up(
     session_factory,
 ) -> None:

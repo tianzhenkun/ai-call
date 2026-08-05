@@ -411,6 +411,8 @@ class AiCallFollowUpService:
             follow_up_id=task.id,
             call_id=call_id,
         )
+        if record.status in {"completed", "failed"}:
+            return record
         await self._callback_presence(
             tenant_id=profile.tenant_id,
             agent_identity=profile.agent_identity,

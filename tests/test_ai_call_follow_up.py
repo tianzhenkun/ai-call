@@ -1389,6 +1389,15 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
         assert presence.status == "available"
         assert presence.active_call_id is None
 
+        ended = await service.end_callback(
+            auth,
+            follow_up_id=100,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+        assert ended.status == "completed"
+        assert factory.ended_calls == []
+
 
 @pytest.mark.anyio
 async def test_agent_ends_connected_callback_and_releases_presence(session_factory) -> None:

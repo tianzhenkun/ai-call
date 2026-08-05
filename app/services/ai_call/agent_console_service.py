@@ -84,7 +84,7 @@ class AiCallAgentConsoleService:
             )
             self.db.add(presence)
         else:
-            if presence.active_handoff_id:
+            if presence.active_handoff_id or presence.active_call_id:
                 self._raise_conflict("坐席当前正在处理通话", "AGENT_ALREADY_IN_CALL")
             presence.skill_group = "default"
             presence.status = "available"
