@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import status
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -154,34 +154,81 @@ class AiCallFollowUpService:
         await self.db.flush()
         return work, follow_up
 
-    async def list_follow_ups(self, auth: AuthSchema) -> list[AiCallFollowUpTaskModel]:
-        profile = await self.agent_service.require_current_agent(auth)
-        scene_codes = await self._scene_codes(profile.tenant_id, profile.agent_identity)
+    async def list_follow_ups(
+        self,
+        auth: AuthSchema,
+        *,
+        status: list[str] | None = None,
+        scene_code: str | None = None,
+        source_type: str | None = None,
+        created_at_begin: datetime | None = None,
+        created_at_end: datetime | None = None,
+    ) -> list[AiCallFollowUpTaskModel]:
+        conditions = await self._follow_up_list_conditions(
+            auth,
+            status=status,
+            scene_code=scene_code,
+            source_type=source_type,
+            created_at_begin=created_at_begin,
+            created_at_end=created_at_end,
+        )
         result = await self.db.execute(
             select(AiCallFollowUpTaskModel)
-            .where(
-                AiCallFollowUpTaskModel.tenant_id == profile.tenant_id,
-                or_(
-                    AiCallFollowUpTaskModel.owner_agent_identity == profile.agent_identity,
-                    and_(
-                        AiCallFollowUpTaskModel.owner_agent_identity.is_(None),
-                        AiCallFollowUpTaskModel.source_type.in_(
-                            CLAIMABLE_UNASSIGNED_SOURCE_TYPES
-                        ),
-                        AiCallFollowUpTaskModel.status == "pending",
-                        AiCallFollowUpTaskModel.scene_code.in_(scene_codes),
-                    ),
-                ),
-            )
+            .where(*conditions)
             .order_by(
                 AiCallFollowUpTaskModel.customer_callback_at.is_(None),
                 AiCallFollowUpTaskModel.customer_callback_at,
                 AiCallFollowUpTaskModel.created_at,
+                AiCallFollowUpTaskModel.id,
             )
         )
         tasks = list(result.scalars().all())
         await self._attach_latest_attempts(tasks)
         return tasks
+
+    async def list_follow_up_page(
+        self,
+        auth: AuthSchema,
+        *,
+        page_num: int,
+        page_size: int,
+        ownership: str | None = None,
+        status: list[str] | None = None,
+        scene_code: str | None = None,
+        source_type: str | None = None,
+        created_at_begin: datetime | None = None,
+        created_at_end: datetime | None = None,
+    ) -> tuple[list[AiCallFollowUpTaskModel], int]:
+        conditions = await self._follow_up_list_conditions(
+            auth,
+            ownership=ownership,
+            status=status,
+            scene_code=scene_code,
+            source_type=source_type,
+            created_at_begin=created_at_begin,
+            created_at_end=created_at_end,
+        )
+        total = int(
+            await self.db.scalar(
+                select(func.count(AiCallFollowUpTaskModel.id)).where(*conditions)
+            )
+            or 0
+        )
+        result = await self.db.execute(
+            select(AiCallFollowUpTaskModel)
+            .where(*conditions)
+            .order_by(
+                AiCallFollowUpTaskModel.customer_callback_at.is_(None),
+                AiCallFollowUpTaskModel.customer_callback_at,
+                AiCallFollowUpTaskModel.created_at,
+                AiCallFollowUpTaskModel.id,
+            )
+            .offset((page_num - 1) * page_size)
+            .limit(page_size)
+        )
+        tasks = list(result.scalars().all())
+        await self._attach_latest_attempts(tasks)
+        return tasks, total
 
     async def get_follow_up(
         self,
@@ -440,6 +487,62 @@ class AiCallFollowUpService:
         )
         await self.db.flush()
         return record
+
+    async def _follow_up_list_conditions(
+        self,
+        auth: AuthSchema,
+        *,
+        ownership: str | None = None,
+        status: list[str] | None = None,
+        scene_code: str | None = None,
+        source_type: str | None = None,
+        created_at_begin: datetime | None = None,
+        created_at_end: datetime | None = None,
+    ) -> list:
+        profile = await self.agent_service.require_current_agent(auth)
+        scene_codes = await self._scene_codes(profile.tenant_id, profile.agent_identity)
+        conditions = [AiCallFollowUpTaskModel.tenant_id == profile.tenant_id]
+        if ownership == "mine":
+            conditions.append(
+                AiCallFollowUpTaskModel.owner_agent_identity == profile.agent_identity
+            )
+        elif ownership == "unassigned":
+            conditions.extend(
+                [
+                    AiCallFollowUpTaskModel.owner_agent_identity.is_(None),
+                    AiCallFollowUpTaskModel.source_type.in_(
+                        CLAIMABLE_UNASSIGNED_SOURCE_TYPES
+                    ),
+                    AiCallFollowUpTaskModel.status == "pending",
+                    AiCallFollowUpTaskModel.scene_code.in_(scene_codes),
+                ]
+            )
+        else:
+            conditions.append(
+                or_(
+                    AiCallFollowUpTaskModel.owner_agent_identity
+                    == profile.agent_identity,
+                    and_(
+                        AiCallFollowUpTaskModel.owner_agent_identity.is_(None),
+                        AiCallFollowUpTaskModel.source_type.in_(
+                            CLAIMABLE_UNASSIGNED_SOURCE_TYPES
+                        ),
+                        AiCallFollowUpTaskModel.status == "pending",
+                        AiCallFollowUpTaskModel.scene_code.in_(scene_codes),
+                    ),
+                )
+            )
+        if status:
+            conditions.append(AiCallFollowUpTaskModel.status.in_(status))
+        if scene_code:
+            conditions.append(AiCallFollowUpTaskModel.scene_code == scene_code)
+        if source_type:
+            conditions.append(AiCallFollowUpTaskModel.source_type == source_type)
+        if created_at_begin:
+            conditions.append(AiCallFollowUpTaskModel.created_at >= created_at_begin)
+        if created_at_end:
+            conditions.append(AiCallFollowUpTaskModel.created_at <= created_at_end)
+        return conditions
 
     async def record_callback_outcome(
         self,

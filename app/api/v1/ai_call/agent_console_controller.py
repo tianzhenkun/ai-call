@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, status
@@ -523,11 +523,38 @@ async def submit_after_call_work_controller(
 async def list_follow_ups_controller(
     auth: AuthenticatedUser,
     service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
+    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 10,
+    ownership: Annotated[Literal["unassigned", "mine"] | None, Query()] = None,
+    status: Annotated[str | None, Query()] = None,
+    scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
+    source_type: Annotated[
+        Literal["after_call_work", "handoff_unanswered", "ai_post_call"] | None,
+        Query(alias="sourceType"),
+    ] = None,
+    created_at_begin: Annotated[
+        datetime | None,
+        Query(alias="createdAtBegin"),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(alias="createdAtEnd"),
+    ] = None,
 ):
-    rows = await service.list_follow_ups(auth)
+    rows, total = await service.list_follow_up_page(
+        auth,
+        page_num=page_num,
+        page_size=page_size,
+        ownership=ownership,
+        status=status.split(",") if status else None,
+        scene_code=scene_code,
+        source_type=source_type,
+        created_at_begin=created_at_begin,
+        created_at_end=created_at_end,
+    )
     return TableResponse(
         rows=[service.follow_up_payload(task) for task in rows],
-        total=len(rows),
+        total=total,
     )
 
 

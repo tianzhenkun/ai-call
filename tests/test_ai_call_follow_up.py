@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call.agent_console_controller import list_follow_ups_controller
 from app.api.v1.ai_call.agent_console_schema import (
     AfterCallWorkIn,
     AgentPresenceSessionIn,
@@ -173,8 +174,16 @@ async def _seed_completed_handoff(session_factory) -> str:
     return console_session_id
 
 
-async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> None:
-    now = datetime.now(timezone.utc)
+async def _seed_unanswered_follow_up(
+    session_factory,
+    *,
+    task_id: int = 100,
+    scene_code: str = "intro_contract",
+    source_type: str = "handoff_unanswered",
+    owner_agent_identity: str | None = None,
+    created_at: datetime | None = None,
+) -> None:
+    now = created_at or datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
         db.add(
             AiCallRecordModel(
@@ -199,16 +208,16 @@ async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> 
             AiCallFollowUpTaskModel(
                 id=task_id,
                 tenant_id="tenant-a",
-                source_type="handoff_unanswered",
-                source_key=f"handoff:handoff-unanswered-{task_id}",
+                source_type=source_type,
+                source_key=f"{source_type}:follow-up-{task_id}",
                 source_call_id=f"call-unanswered-{task_id}",
                 source_handoff_id=f"handoff-unanswered-{task_id}",
-                scene_code="intro_contract",
+                scene_code=scene_code,
                 business_type="lead",
                 business_id="lead-2",
                 contact_ref=f"call:call-unanswered-{task_id}",
                 masked_contact="139****0000",
-                owner_agent_identity=None,
+                owner_agent_identity=owner_agent_identity,
                 status="pending",
                 follow_up_reason="首次人工接通等待超时",
                 customer_callback_at=None,
@@ -801,6 +810,112 @@ async def test_follow_up_list_respects_owner_and_scene_and_close_is_terminal(ses
         assert closed.status == "closed"
         assert closed.closed_reason == "customer_refused"
         assert closed.closed_at is not None
+
+
+@pytest.mark.anyio
+async def test_follow_up_list_applies_scene_status_source_and_created_period_filters(
+    session_factory,
+) -> None:
+    now = datetime.now(timezone.utc)
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=100,
+        created_at=now,
+    )
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=101,
+        source_type="ai_post_call",
+        created_at=now,
+    )
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=102,
+        scene_code="intro_geo",
+        owner_agent_identity="agent-20",
+        created_at=now,
+    )
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=103,
+        created_at=now - timedelta(days=2),
+    )
+
+    async with session_factory() as db:
+        rows = await AiCallFollowUpService(db).list_follow_ups(
+            _auth(db, user_id=20),
+            status=["pending"],
+            scene_code="intro_contract",
+            source_type="handoff_unanswered",
+            created_at_begin=now - timedelta(hours=1),
+            created_at_end=now + timedelta(hours=1),
+        )
+
+    assert [task.id for task in rows] == [100]
+
+
+@pytest.mark.anyio
+async def test_follow_up_list_controller_forwards_filters() -> None:
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    auth = SimpleNamespace()
+    service = SimpleNamespace(
+        list_follow_up_page=AsyncMock(return_value=([], 0)),
+        follow_up_payload=lambda task: task,
+    )
+
+    await list_follow_ups_controller(
+        auth,
+        service,
+        page_num=2,
+        page_size=10,
+        ownership="mine",
+        status="pending",
+        scene_code="intro_contract",
+        source_type="handoff_unanswered",
+        created_at_begin=now - timedelta(days=1),
+        created_at_end=now,
+    )
+
+    service.list_follow_up_page.assert_awaited_once_with(
+        auth,
+        page_num=2,
+        page_size=10,
+        ownership="mine",
+        status=["pending"],
+        scene_code="intro_contract",
+        source_type="handoff_unanswered",
+        created_at_begin=now - timedelta(days=1),
+        created_at_end=now,
+    )
+
+
+@pytest.mark.anyio
+async def test_follow_up_page_filters_ownership_before_pagination(session_factory) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(session_factory, task_id=100)
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=101,
+        owner_agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(
+        session_factory,
+        task_id=102,
+        owner_agent_identity="agent-20",
+    )
+
+    async with session_factory() as db:
+        rows, total = await AiCallFollowUpService(db).list_follow_up_page(
+            _auth(db, user_id=20),
+            page_num=2,
+            page_size=1,
+            ownership="mine",
+            status=["pending"],
+        )
+
+    assert total == 2
+    assert [task.id for task in rows] == [102]
 
 
 @pytest.mark.anyio
