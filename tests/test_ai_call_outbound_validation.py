@@ -270,11 +270,11 @@ async def test_business_issues_share_row_table_and_finish_failed(database) -> No
         ).all()
     reasons = {row.row_number: json.loads(row.reasons_json or "[]") for row in rows}
     assert validation.status == "FAILED"
-    assert validation.issue_count == 4
+    assert validation.issue_count == 3
     assert "手机号格式错误" in reasons[2]
     assert reasons[3] == ["手机号重复"]
     assert reasons[4] == ["手机号重复"]
-    assert "空行" in reasons[5]
+    assert 5 not in reasons
     assert rows[1].duplicate_row_number == 4
     assert rows[2].duplicate_row_number == 3
 

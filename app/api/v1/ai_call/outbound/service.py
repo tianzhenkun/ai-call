@@ -242,12 +242,14 @@ class OutboundValidationService:
                 )
                 if not batch_values:
                     break
-                found_data_row = True
                 batch = [
                     self._build_row(row_number + offset, values, header_map)
                     for offset, values in enumerate(batch_values)
+                    if not self._is_empty_row(values)
                 ]
-                await self._persist_batch(db, validation, batch)
+                if batch:
+                    found_data_row = True
+                    await self._persist_batch(db, validation, batch)
                 row_number += len(batch_values)
 
             if not found_data_row:
@@ -288,7 +290,7 @@ class OutboundValidationService:
         phone = self._value_at(values, header_map["手机号"])
         customer_name = self._value_at(values, header_map.get("客户名称"))
         reasons: list[str] = []
-        if not phone and not customer_name and not any(self._cell_text(value) for value in values):
+        if self._is_empty_row(values):
             reasons.append("空行")
         elif not phone:
             reasons.append("手机号不能为空")
@@ -309,6 +311,10 @@ class OutboundValidationService:
             "duplicate_row_number": None,
             "created_at": _now(),
         }
+
+    @classmethod
+    def _is_empty_row(cls, values: tuple[Any, ...]) -> bool:
+        return not any(cls._cell_text(value) for value in values)
 
     @staticmethod
     def _issue_row(
