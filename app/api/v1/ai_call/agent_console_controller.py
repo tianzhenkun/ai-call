@@ -592,6 +592,33 @@ async def start_follow_up_call_controller(
     return SuccessResponse(data=service.callback_payload(callback), msg="回拨任务已受理")
 
 
+@AgentConsoleRouter.post(
+    "/follow-ups/{follow_up_id}/call/{call_id}/end",
+    summary="结束浏览器人工回拨",
+)
+async def end_follow_up_call_controller(
+    follow_up_id: int,
+    call_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    record = await service.end_callback(
+        auth,
+        follow_up_id=follow_up_id,
+        call_id=call_id,
+        payload=payload,
+    )
+    await _publish(
+        auth,
+        "follow_up.callback_ended",
+        {"follow_up_id": str(follow_up_id), "call_id": call_id},
+    )
+    return SuccessResponse(
+        data={"call_id": call_id, "status": record.status, "end_reason": record.end_reason}
+    )
+
+
 @AgentConsoleRouter.post("/follow-ups/{follow_up_id}/complete", summary="完成跟进任务")
 async def complete_follow_up_controller(
     follow_up_id: int,

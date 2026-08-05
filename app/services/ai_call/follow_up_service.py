@@ -11,6 +11,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.v1.ai_call.agent_console_schema import (
     AfterCallWorkIn,
+    AgentPresenceSessionIn,
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
@@ -283,6 +284,10 @@ class AiCallFollowUpService:
         if task.status not in {"pending", "processing"}:
             self._raise_conflict("当前跟进状态不允许回拨", "FOLLOW_UP_STATE_CONFLICT")
         await self.agent_service.require_scene_access(auth, task.scene_code)
+        callee_phone_number = await self._callback_callee_phone_number(
+            tenant_id=profile.tenant_id,
+            source_call_id=task.source_call_id,
+        )
         _, presence = await self.agent_service.require_available_presence(
             auth,
             console_session_id=str(payload.console_session_id),
@@ -322,6 +327,7 @@ class AiCallFollowUpService:
         self.db.add(
             AiCallRecordModel(
                 id=generate_snowflake_id(),
+                tenant_id=profile.tenant_id,
                 call_id=call_id,
                 follow_up_id=task.id,
                 business_type=task.business_type,
@@ -330,8 +336,8 @@ class AiCallFollowUpService:
                 entry_type="sip_callback",
                 room_name=f"ai-call-{call_id}",
                 participant_identity=f"sip-{call_id}",
-                callee_phone_number_hash=self._phone_hash(payload.callee_phone_number),
-                callee_phone_number_masked=self._mask_phone(payload.callee_phone_number),
+                callee_phone_number_hash=self._phone_hash(callee_phone_number),
+                callee_phone_number_masked=self._mask_phone(callee_phone_number),
                 status="ringing",
                 started_at=now,
             )
@@ -345,7 +351,7 @@ class AiCallFollowUpService:
         try:
             session = await self.callback_factory.create(
                 call_id=call_id,
-                callee_phone_number=payload.callee_phone_number,
+                callee_phone_number=callee_phone_number,
             )
         except AiCallError as exc:
             await self.record_callback_outcome(
@@ -381,6 +387,49 @@ class AiCallFollowUpService:
             participant_identity=session.agent_participant_identity,
             expires_in_seconds=session.expires_in_seconds,
         )
+
+    async def end_callback(
+        self,
+        auth: AuthSchema,
+        *,
+        follow_up_id: int,
+        call_id: str,
+        payload: AgentPresenceSessionIn,
+    ) -> AiCallRecordModel:
+        profile, task = await self._required_owned_task(auth, follow_up_id)
+        if self.callback_factory is None:
+            raise CustomException(msg="人工回拨服务未配置", status_code=503)
+        record = await self._callback_record(
+            tenant_id=profile.tenant_id,
+            follow_up_id=task.id,
+            call_id=call_id,
+        )
+        await self._callback_presence(
+            tenant_id=profile.tenant_id,
+            agent_identity=profile.agent_identity,
+            console_session_id=str(payload.console_session_id),
+            call_id=call_id,
+        )
+        if record.status not in {"ringing", "running"}:
+            self._raise_conflict("当前回拨通话已经结束", "FOLLOW_UP_STATE_CONFLICT")
+
+        await self.callback_factory.end(call_id=call_id)
+        now = datetime.now(timezone.utc)
+        record.status = "completed"
+        record.ended_at = now
+        record.end_reason = "callback_ended_by_agent"
+        attempt = await self._attempt_by_call_id(call_id)
+        task.status = "processing" if attempt and attempt.attempt_result == "connected" else "pending"
+        task.updated_at = now
+        await self._settle_callback_presence(
+            tenant_id=profile.tenant_id,
+            agent_identity=profile.agent_identity,
+            call_id=call_id,
+            connected=False,
+            now=now,
+        )
+        await self.db.flush()
+        return record
 
     async def record_callback_outcome(
         self,
@@ -729,6 +778,68 @@ class AiCallFollowUpService:
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
         )
         return result.scalar_one_or_none()
+
+    async def _callback_callee_phone_number(
+        self,
+        *,
+        tenant_id: str,
+        source_call_id: str,
+    ) -> str:
+        phone_number = await self.db.scalar(
+            select(AiCallRecordModel.callee_phone_number).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == source_call_id,
+            )
+        )
+        if not phone_number:
+            self._raise_conflict(
+                "原通话未保存可回拨号码",
+                "CALLBACK_NUMBER_UNAVAILABLE",
+            )
+        return phone_number
+
+    async def _callback_record(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_id: int,
+        call_id: str,
+    ) -> AiCallRecordModel:
+        result = await self.db.execute(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.follow_up_id == follow_up_id,
+                AiCallRecordModel.call_id == call_id,
+                AiCallRecordModel.entry_type == "sip_callback",
+            )
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            raise CustomException(msg="人工回拨记录不存在", status_code=404)
+        return record
+
+    async def _callback_presence(
+        self,
+        *,
+        tenant_id: str,
+        agent_identity: str,
+        console_session_id: str,
+        call_id: str,
+    ) -> AiCallHandoffAgentModel:
+        result = await self.db.execute(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.tenant_id == tenant_id,
+                AiCallHandoffAgentModel.agent_identity == agent_identity,
+            )
+        )
+        presence = result.scalar_one_or_none()
+        if presence is None:
+            self._raise_conflict("坐席未上线", "AGENT_NOT_AVAILABLE")
+        if presence.console_session_id != console_session_id:
+            self._raise_conflict("当前标签页不拥有坐席控制权", "CONSOLE_SESSION_CONFLICT")
+        if presence.active_call_id != call_id:
+            self._raise_conflict("坐席活动通话状态不一致", "AGENT_ACTIVE_CALL_EXISTS")
+        return presence
 
     async def _attempt_by_call_id(self, call_id: str) -> AiCallFollowUpAttemptModel | None:
         result = await self.db.execute(

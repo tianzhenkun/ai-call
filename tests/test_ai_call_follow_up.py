@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.agent_console_schema import (
     AfterCallWorkIn,
+    AgentPresenceSessionIn,
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
@@ -174,17 +175,36 @@ async def _seed_unanswered_follow_up(session_factory, *, task_id: int = 100) -> 
     now = datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
         db.add(
+            AiCallRecordModel(
+                id=task_id + 10_000,
+                tenant_id="tenant-a",
+                call_id=f"call-unanswered-{task_id}",
+                business_type="lead",
+                business_id="lead-2",
+                scene_code="intro_contract",
+                entry_type="sip",
+                room_name=f"room-unanswered-{task_id}",
+                participant_identity=f"customer-unanswered-{task_id}",
+                callee_phone_number="13800000000",
+                callee_phone_number_hash="source-phone-hash",
+                callee_phone_number_masked="138****0000",
+                status="completed",
+                started_at=now,
+                ended_at=now,
+            )
+        )
+        db.add(
             AiCallFollowUpTaskModel(
                 id=task_id,
                 tenant_id="tenant-a",
                 source_type="handoff_unanswered",
                 source_key=f"handoff:handoff-unanswered-{task_id}",
-                source_call_id="call-unanswered",
+                source_call_id=f"call-unanswered-{task_id}",
                 source_handoff_id=f"handoff-unanswered-{task_id}",
                 scene_code="intro_contract",
                 business_type="lead",
                 business_id="lead-2",
-                contact_ref="call:call-unanswered",
+                contact_ref=f"call:call-unanswered-{task_id}",
                 masked_contact="139****0000",
                 owner_agent_identity=None,
                 status="pending",
@@ -246,6 +266,7 @@ def test_task5_routes_are_registered() -> None:
         "/ai-call/agent-console/follow-ups/{follow_up_id}/attempts",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/claim",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/call",
+        "/ai-call/agent-console/follow-ups/{follow_up_id}/call/{call_id}/end",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/complete",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/close",
     } <= paths
@@ -853,6 +874,7 @@ class _FakeSipClient:
 class _FakeCallbackFactory:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.ended_calls: list[str] = []
 
     async def create(self, **kwargs) -> HumanCallbackSessionResult:
         self.calls.append(kwargs)
@@ -866,6 +888,9 @@ class _FakeCallbackFactory:
             participant_token="agent-token",
             expires_in_seconds=60,
         )
+
+    async def end(self, *, call_id: str) -> None:
+        self.ended_calls.append(call_id)
 
 
 class _FailingCallbackFactory:
@@ -949,7 +974,6 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
                 follow_up_id=100,
                 payload=FollowUpCallIn(
                     console_session_id=console_session_id,
-                    callee_phone_number="13800000000",
                 ),
             )
 
@@ -958,7 +982,6 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
             follow_up_id=100,
             payload=FollowUpCallIn(
                 console_session_id=console_session_id,
-                callee_phone_number="13800000000",
             ),
         )
         assert result.status == "accepted"
@@ -974,6 +997,9 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
         assert record.callee_phone_number_hash != "13800000000"
         assert record.callee_phone_number_masked == "138****0000"
         assert "13800000000" not in repr(record.__dict__)
+        assert owner_service.callback_factory.calls == [
+            {"call_id": result.call_id, "callee_phone_number": "13800000000"}
+        ]
 
         presence = (
             await db.execute(
@@ -991,10 +1017,43 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
                 follow_up_id=100,
                 payload=FollowUpCallIn(
                     console_session_id=console_session_id,
-                    callee_phone_number="13900000000",
                 ),
             )
         assert _error_code(busy.value) == "AGENT_ALREADY_IN_CALL"
+
+
+@pytest.mark.anyio
+async def test_callback_rejects_follow_up_without_a_saved_source_phone(session_factory) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        source = (
+            await db.execute(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == "call-unanswered-100"
+                )
+            )
+        ).scalar_one()
+        source.callee_phone_number = None
+        await db.commit()
+
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        with pytest.raises(CustomException) as failed:
+            await service.start_callback(
+                auth,
+                follow_up_id=100,
+                payload=FollowUpCallIn(console_session_id=console_session_id),
+            )
+
+        assert _error_code(failed.value) == "CALLBACK_NUMBER_UNAVAILABLE"
+        assert service.callback_factory.calls == []
 
 
 @pytest.mark.anyio
@@ -1017,7 +1076,6 @@ async def test_no_answer_callback_appends_once_returns_pending_and_releases_agen
             follow_up_id=100,
             payload=FollowUpCallIn(
                 console_session_id=console_session_id,
-                callee_phone_number="13800000000",
             ),
         )
 
@@ -1076,7 +1134,6 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             follow_up_id=100,
             payload=FollowUpCallIn(
                 console_session_id=console_session_id,
-                callee_phone_number="13800000000",
             ),
         )
 
@@ -1129,7 +1186,6 @@ async def test_immediate_sip_failure_records_technical_failure_and_releases_agen
                 follow_up_id=100,
                 payload=FollowUpCallIn(
                     console_session_id=console_session_id,
-                    callee_phone_number="13800000000",
                 ),
             )
         assert failed.value.data == {"errorCode": "sip_create_participant_failed"}
@@ -1180,7 +1236,6 @@ async def test_concurrent_callbacks_allow_only_one_active_call(session_factory) 
                     follow_up_id=100,
                     payload=FollowUpCallIn(
                         console_session_id=console_session_id,
-                        callee_phone_number="13800000000",
                     ),
                 )
             except CustomException as exc:
@@ -1223,7 +1278,6 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
             follow_up_id=100,
             payload=FollowUpCallIn(
                 console_session_id=console_session_id,
-                callee_phone_number="13800000000",
             ),
         )
 
@@ -1255,6 +1309,47 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
         assert record.status == "completed"
         assert record.ended_at is not None
         assert record.end_reason == "callback_completed"
+        task = await db.get(AiCallFollowUpTaskModel, 100)
+        assert task.status == "processing"
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.status == "available"
+        assert presence.active_call_id is None
+
+
+@pytest.mark.anyio
+async def test_agent_ends_connected_callback_and_releases_presence(session_factory) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        factory = _FakeCallbackFactory()
+        service = AiCallFollowUpService(db, callback_factory=factory)
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+        await service.record_callback_outcome(
+            call_id=callback.call_id,
+            attempt_result="connected",
+        )
+
+        record = await service.end_callback(
+            auth,
+            follow_up_id=100,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+
+        assert factory.ended_calls == [callback.call_id]
+        assert record.status == "completed"
+        assert record.end_reason == "callback_ended_by_agent"
         task = await db.get(AiCallFollowUpTaskModel, 100)
         assert task.status == "processing"
         presence = await db.get(AiCallHandoffAgentModel, 20)

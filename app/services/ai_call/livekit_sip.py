@@ -136,6 +136,12 @@ class HumanOnlySipSessionFactory:
             expires_in_seconds=token.expires_in_seconds,
         )
 
+    async def end(self, *, call_id: str) -> None:
+        await self.room_manager.remove_participant(
+            f"ai-call-{call_id}",
+            f"sip-{call_id}",
+        )
+
 
 class LiveKitSipClient:
     def __init__(
