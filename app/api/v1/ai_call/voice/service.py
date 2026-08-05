@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import io
 import json
 import secrets
 import time
+import wave
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +31,11 @@ from app.services.ai_call.orchestrator import (
     EndSessionResult,
 )
 from app.services.ai_call.prompt_config import PromptEffectiveConfig
+from app.services.ai_call.providers.aliyun_qwen_realtime import (
+    AliyunQwenRealtimeProvider,
+    QwenRealtimeSessionConfig,
+)
+from app.services.ai_call.providers.base import ProviderEvent
 from app.services.ai_call.session_registry import CallSessionStatus
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.services.ai_call.voice_sample import (
@@ -53,6 +61,11 @@ CLEANUP_ERROR_MESSAGE = "即时删除声音样本失败，等待后台重试"
 CLEANUP_PERSISTENCE_LOG = "音色样本清理补偿持久化失败，需人工检查后台回收"
 VOICE_PREVIEW_OPENING_MESSAGE = "您好，我是您的智能语音助手，很高兴为您服务。"
 VOICE_PREVIEW_INSTRUCTIONS = "你是智能语音助手，请自然地与用户进行简短试听对话。"
+VOICE_PREVIEW_AUDIO_INSTRUCTIONS = (
+    "你只负责音色试听。收到文本后，只朗读文本本身，不要添加、改写或解释。"
+)
+VOICE_PREVIEW_AUDIO_SAMPLE_RATE_HZ = 24000
+VOICE_PREVIEW_AUDIO_TIMEOUT_SECONDS = 15
 VOICE_PREVIEW_TIMEOUT_SECONDS = 30
 VOICE_PREVIEW_CLEANUP_RETRY_DELAYS = (0.5, 1.0, 2.0)
 SAMPLE_EXTENSION_BY_CONTENT_TYPE = {
@@ -90,6 +103,18 @@ class VoicePreviewOrchestrator(Protocol):
     def dispose_session(self, call_id: str) -> None: ...
 
     async def shutdown(self) -> None: ...
+
+
+class VoicePreviewAudioProvider(Protocol):
+    async def connect(self) -> None: ...
+
+    async def update_session(self, config: QwenRealtimeSessionConfig) -> None: ...
+
+    async def create_response(self, input_text: str | None = None) -> None: ...
+
+    async def receive_events(self) -> AsyncIterator[ProviderEvent]: ...
+
+    async def close(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -130,6 +155,11 @@ class VoicePreviewService:
         monotonic: Callable[[], float] = time.monotonic,
         token_generator: Callable[[], str] = lambda: secrets.token_urlsafe(24),
         id_generator: Callable[[], int] | None = None,
+        preview_audio_provider_factory: Callable[[], VoicePreviewAudioProvider] | None = None,
+        preview_audio_timeout_seconds: float = VOICE_PREVIEW_AUDIO_TIMEOUT_SECONDS,
+        vad_type: str = "server_vad",
+        vad_threshold: float = 0.5,
+        vad_silence_duration_ms: int = 800,
     ) -> None:
         self.orchestrator = orchestrator
         self.target_model = target_model
@@ -141,6 +171,11 @@ class VoicePreviewService:
         self.token_generator = token_generator
         # 仅保留给既有测试的确定性注入；生产默认始终使用高熵随机 token。
         self.id_generator = id_generator
+        self.preview_audio_provider_factory = preview_audio_provider_factory
+        self.preview_audio_timeout_seconds = max(0.001, preview_audio_timeout_seconds)
+        self.vad_type = vad_type
+        self.vad_threshold = vad_threshold
+        self.vad_silence_duration_ms = vad_silence_duration_ms
         self._sessions: dict[str, _VoicePreviewSession] = {}
         self._tombstones: OrderedDict[str, _VoicePreviewTombstone] = OrderedDict()
         self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
@@ -258,6 +293,44 @@ class VoicePreviewService:
             )
         return result
 
+    async def create_preview_audio(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        user_id: int,
+        voice: str,
+    ) -> dict[str, str]:
+        if not self._accepting:
+            raise CustomException(
+                msg="音色试听服务正在停止，请稍后重试",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        resolved_voice = await self._resolve_voice(
+            db,
+            tenant_id=tenant_id,
+            voice=voice,
+        )
+        try:
+            audio_url = await asyncio.wait_for(
+                self._generate_preview_audio(resolved_voice),
+                timeout=self.preview_audio_timeout_seconds,
+            )
+        except TimeoutError:
+            log.warning("音色试听音频生成超时: userId={}", user_id)
+            raise CustomException(
+                msg="音色试听生成超时，请稍后重试",
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            ) from None
+        except CustomException:
+            raise
+        except Exception as exc:
+            self._raise_runtime_error("preview_audio", exc)
+        return {
+            "audioUrl": audio_url,
+            "text": VOICE_PREVIEW_OPENING_MESSAGE,
+        }
+
     async def ready_preview_session(
         self,
         *,
@@ -317,6 +390,42 @@ class VoicePreviewService:
             return tombstone.result
         self._assert_owner(session, tenant_id=tenant_id, user_id=user_id)
         return await self._release(session, end_reason="voice_preview_user_end")
+
+    async def _generate_preview_audio(self, resolved_voice: str) -> str:
+        if self.preview_audio_provider_factory is None:
+            raise CustomException(
+                msg="音色试听音频服务未启用",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        provider = self.preview_audio_provider_factory()
+        chunks: list[bytes] = []
+        try:
+            await provider.connect()
+            await provider.update_session(
+                QwenRealtimeSessionConfig(
+                    voice=resolved_voice,
+                    instructions=VOICE_PREVIEW_AUDIO_INSTRUCTIONS,
+                    vad_type=self.vad_type,
+                    vad_threshold=self.vad_threshold,
+                    vad_silence_duration_ms=self.vad_silence_duration_ms,
+                )
+            )
+            await provider.create_response(VOICE_PREVIEW_OPENING_MESSAGE)
+            async for event in provider.receive_events():
+                if event.type == "model_audio_delta":
+                    delta = event.payload.get("delta")
+                    if isinstance(delta, str) and delta:
+                        chunks.append(base64.b64decode(delta, validate=True))
+                elif event.type == "model_error":
+                    raise RuntimeError("Qwen Realtime preview returned an error")
+                elif event.type in {"model_audio_done", "model_response_done"}:
+                    break
+        finally:
+            with suppress(Exception):
+                await provider.close()
+        if not chunks:
+            raise RuntimeError("Qwen Realtime preview returned no audio")
+        return _pcm16_to_wav_data_url(b"".join(chunks))
 
     async def _resolve_voice(
         self,
@@ -804,6 +913,14 @@ def build_default_voice_preview_service() -> VoicePreviewService:
     return VoicePreviewService(
         orchestrator=AiCallOrchestrator.from_settings(settings),
         target_model=settings.QWEN_REALTIME_MODEL,
+        preview_audio_provider_factory=lambda: AliyunQwenRealtimeProvider(
+            realtime_url=settings.DASHSCOPE_REALTIME_URL,
+            api_key=settings.DASHSCOPE_API_KEY,
+            model=settings.QWEN_REALTIME_MODEL,
+        ),
+        vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
+        vad_threshold=settings.QWEN_REALTIME_VAD_THRESHOLD,
+        vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
     )
 
 
@@ -817,6 +934,21 @@ def get_app_voice_preview_service(app: Any) -> VoicePreviewService:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _pcm16_to_wav_data_url(
+    pcm: bytes,
+    *,
+    sample_rate_hz: int = VOICE_PREVIEW_AUDIO_SAMPLE_RATE_HZ,
+) -> str:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate_hz)
+        wav_file.writeframes(pcm)
+    wav_base64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:audio/wav;base64,{wav_base64}"
 
 
 def _random_sample_nonce() -> bytes:

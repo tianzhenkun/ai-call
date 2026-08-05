@@ -264,6 +264,7 @@ def test_voice_routes_replace_old_direct_registration_entry() -> None:
         ("/ai-call/voice-enrollments", "POST"),
         ("/ai-call/tenant-voice-profiles/{id}/enrollments", "POST"),
         ("/ai-call/voice-enrollments/{id}", "GET"),
+        ("/ai-call/voice-preview-audio", "POST"),
         ("/ai-call/voice-preview-sessions", "POST"),
         ("/ai-call/voice-preview-sessions/{callId}/ready", "POST"),
         ("/ai-call/voice-preview-sessions/{callId}", "DELETE"),

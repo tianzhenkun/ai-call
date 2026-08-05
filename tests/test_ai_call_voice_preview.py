@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
+import io
 import json
+import wave
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -37,6 +40,8 @@ from app.services.ai_call.orchestrator import (
     EndSessionResult,
     WebAudioConstraints,
 )
+from app.services.ai_call.providers.aliyun_qwen_realtime import QwenRealtimeSessionConfig
+from app.services.ai_call.providers.base import ProviderEvent
 from app.services.ai_call.session_registry import CallSession, CallSessionStatus
 
 TARGET_MODEL = "qwen3.5-omni-plus-realtime"
@@ -300,6 +305,13 @@ class FakeDefaultPreviewService:
             ),
         )
 
+    async def create_preview_audio(self, db, **values):
+        self.calls.append(("audio", (db, values)))
+        return {
+            "audioUrl": "data:audio/wav;base64,UklGRg==",
+            "text": VOICE_PREVIEW_OPENING_MESSAGE,
+        }
+
     async def ready_preview_session(self, **values):
         self.calls.append(("ready", values))
         return BrowserEventReportResult(
@@ -317,6 +329,34 @@ class FakeDefaultPreviewService:
             call_id=values["call_id"],
             status=CallSessionStatus.COMPLETED,
         )
+
+
+class FakePreviewAudioProvider:
+    def __init__(self, pcm: bytes = b"\x01\x02\x03\x04") -> None:
+        self.pcm = pcm
+        self.connected = False
+        self.closed = False
+        self.session_configs: list[QwenRealtimeSessionConfig] = []
+        self.response_inputs: list[str | None] = []
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def update_session(self, config: QwenRealtimeSessionConfig) -> None:
+        self.session_configs.append(config)
+
+    async def create_response(self, input_text: str | None = None) -> None:
+        self.response_inputs.append(input_text)
+
+    async def receive_events(self):
+        yield ProviderEvent(
+            type="model_audio_delta",
+            payload={"delta": base64.b64encode(self.pcm).decode("ascii")},
+        )
+        yield ProviderEvent(type="model_audio_done", payload={})
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 async def _wait_until(predicate, *, attempts: int = 100) -> None:
@@ -512,6 +552,41 @@ async def test_preview_allows_builtin_and_enabled_tenant_voice_with_fixed_config
         user_id=7,
         call_id=result.call_id,
     )
+
+
+@pytest.mark.anyio
+async def test_preview_audio_generates_direct_wav_data_url_without_livekit(
+    preview_database,
+) -> None:
+    provider = FakePreviewAudioProvider(pcm=b"\x01\x02\x03\x04")
+    orchestrator, _rooms, _runner = _orchestrator()
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        preview_audio_provider_factory=lambda: provider,
+    )
+
+    async with preview_database() as db:
+        result = await service.create_preview_audio(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="tenant-a-enabled",
+        )
+
+    assert provider.connected is True
+    assert provider.closed is True
+    assert provider.session_configs[0].voice == "tenant-a-enabled"
+    assert provider.response_inputs == [VOICE_PREVIEW_OPENING_MESSAGE]
+    assert result["text"] == VOICE_PREVIEW_OPENING_MESSAGE
+    assert result["audioUrl"].startswith("data:audio/wav;base64,")
+
+    wav_bytes = base64.b64decode(result["audioUrl"].split(",", 1)[1])
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 24000
+        assert wav_file.readframes(wav_file.getnframes()) == b"\x01\x02\x03\x04"
 
 
 @pytest.mark.anyio
@@ -735,6 +810,10 @@ def test_http_preview_routes_use_default_isolated_service(
     app.dependency_overrides[get_current_user] = lambda: auth
 
     with TestClient(app) as client:
+        audio = client.post(
+            "/ai-call/voice-preview-audio",
+            json={"voice": "Tina"},
+        )
         created = client.post(
             "/ai-call/voice-preview-sessions",
             json={"voice": "Tina"},
@@ -742,15 +821,28 @@ def test_http_preview_routes_use_default_isolated_service(
         ready = client.post("/ai-call/voice-preview-sessions/preview_http/ready")
         closed = client.delete("/ai-call/voice-preview-sessions/preview_http")
 
+    assert audio.status_code == 200
     assert created.status_code == 200
     assert ready.status_code == 200
     assert closed.status_code == 200
+    assert audio.json()["data"] == {
+        "audioUrl": "data:audio/wav;base64,UklGRg==",
+        "text": VOICE_PREVIEW_OPENING_MESSAGE,
+    }
     assert created.json()["data"]["participantIdentity"] == "browser-preview_http"
     assert created.json()["data"]["effectiveConfig"]["voice"] == "Tina"
     assert "prompt" not in created.json()["data"]["effectiveConfig"]
     assert "openingMessage" not in created.json()["data"]["effectiveConfig"]
-    assert preview_service.calls[0][0] == "create"
-    create_db, create_values = preview_service.calls[0][1]
+    assert preview_service.calls[0][0] == "audio"
+    audio_db, audio_values = preview_service.calls[0][1]
+    assert audio_db is auth.db
+    assert audio_values == {
+        "tenant_id": "tenant-a",
+        "user_id": 7,
+        "voice": "Tina",
+    }
+    assert preview_service.calls[1][0] == "create"
+    create_db, create_values = preview_service.calls[1][1]
     assert create_db is auth.db
     assert create_values == {
         "tenant_id": "tenant-a",

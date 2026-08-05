@@ -63,6 +63,14 @@ class VoiceLifecycleService(Protocol):
         voice: str,
     ) -> Any: ...
 
+    async def create_preview_audio(
+        self,
+        *,
+        tenant_id: str,
+        user_id: int,
+        voice: str,
+    ) -> Any: ...
+
     async def ready_preview_session(
         self,
         *,
@@ -127,6 +135,9 @@ class _UnavailableVoiceLifecycleService:
     async def create_preview_session(self, **kwargs):
         self._raise_unavailable()
 
+    async def create_preview_audio(self, **kwargs):
+        self._raise_unavailable()
+
     async def ready_preview_session(self, **kwargs):
         self._raise_unavailable()
 
@@ -163,6 +174,14 @@ class _DefaultVoiceLifecycleService(_UnavailableVoiceLifecycleService):
         if self.preview_service is None:
             self._raise_unavailable()
         return await self.preview_service.create_preview_session(
+            self.db,
+            **kwargs,
+        )
+
+    async def create_preview_audio(self, **kwargs):
+        if self.preview_service is None:
+            self._raise_unavailable()
+        return await self.preview_service.create_preview_audio(
             self.db,
             **kwargs,
         )
@@ -385,6 +404,27 @@ async def get_voice_enrollment_controller(
         enrollment_id=enrollment_id,
     )
     return SuccessResponse(data=result, msg="查询成功")
+
+
+@VoiceRouter.post(
+    "/voice-preview-audio",
+    summary="生成音色试听音频",
+)
+async def create_voice_preview_audio_controller(
+    request: VoicePreviewRequest,
+    auth: Annotated[AuthSchema, Depends(get_voice_manager)],
+    service: Annotated[
+        VoiceLifecycleService,
+        Depends(get_voice_preview_lifecycle_service),
+    ],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.create_preview_audio(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        voice=request.voice,
+    )
+    return SuccessResponse(data=result, msg="试听音频生成成功")
 
 
 @VoiceRouter.post(
