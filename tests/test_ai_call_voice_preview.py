@@ -124,11 +124,16 @@ class BlockingEndOrchestrator(AiCallOrchestrator):
         call_id: str,
         *,
         end_reason: str = "session_aborted",
+        strict_agent_stop: bool = True,
     ):
         self.end_calls.append(call_id)
         self.end_started.set()
         await self.release_end.wait()
-        return await super().abort_session(call_id, end_reason=end_reason)
+        return await super().abort_session(
+            call_id,
+            end_reason=end_reason,
+            strict_agent_stop=strict_agent_stop,
+        )
 
 
 class BlockingReadyOrchestrator(AiCallOrchestrator):
@@ -150,9 +155,14 @@ class BlockingReadyOrchestrator(AiCallOrchestrator):
         call_id: str,
         *,
         end_reason: str = "session_aborted",
+        strict_agent_stop: bool = True,
     ):
         self.abort_calls.append(call_id)
-        return await super().abort_session(call_id, end_reason=end_reason)
+        return await super().abort_session(
+            call_id,
+            end_reason=end_reason,
+            strict_agent_stop=strict_agent_stop,
+        )
 
 
 class BlockingCreateRoomManager(FakeLiveKitRoomManager):
@@ -250,6 +260,12 @@ class FailingAgentRunner(FakeAgentRunner):
         raise RuntimeError("agent failed api-key=secret-value object=private/sample.wav")
 
 
+class SlowStopAgentRunner(FakeAgentRunner):
+    async def stop(self, call_id: str) -> None:
+        self.stopped_call_ids.append(call_id)
+        await asyncio.Event().wait()
+
+
 class FailingCreateOrchestrator:
     def __init__(self) -> None:
         self.created_call_ids: list[str] = []
@@ -259,7 +275,13 @@ class FailingCreateOrchestrator:
         self.created_call_ids.append(call_id)
         raise RuntimeError("provider failed with api-key=secret-value")
 
-    async def abort_session(self, call_id: str, *, end_reason: str):
+    async def abort_session(
+        self,
+        call_id: str,
+        *,
+        end_reason: str,
+        strict_agent_stop: bool = True,
+    ):
         self.ended_call_ids.append(call_id)
         return EndSessionResult(
             call_id=call_id,
@@ -751,6 +773,44 @@ async def test_timeout_and_delete_race_releases_once_without_task_leak(
     assert rooms.deleted_rooms == [preview.room_name]
     assert runner.stopped_call_ids == [preview.call_id]
     assert service.pending_timeout_count == 0
+
+
+@pytest.mark.anyio
+async def test_preview_close_continues_after_agent_stop_timeout(
+    preview_database,
+) -> None:
+    room_manager = FakeLiveKitRoomManager()
+    runner = SlowStopAgentRunner()
+    orchestrator = AiCallOrchestrator(
+        config=_runtime_config(),
+        livekit_room_manager=room_manager,
+        agent_runner=runner,
+        browser_ready_timeout_seconds=60,
+        end_cleanup_timeout_seconds=0.01,
+    )
+    service = VoicePreviewService(
+        orchestrator=orchestrator,
+        target_model=TARGET_MODEL,
+        id_generator=SequenceIds(215),
+    )
+    async with preview_database() as db:
+        preview = await service.create_preview_session(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            voice="Tina",
+        )
+
+    result = await service.close_preview_session(
+        tenant_id="tenant-a",
+        user_id=7,
+        call_id=preview.call_id,
+    )
+
+    assert result.status == CallSessionStatus.COMPLETED
+    assert runner.stopped_call_ids == [preview.call_id]
+    assert room_manager.deleted_rooms == [preview.room_name]
+    assert service.active_session_count == 0
 
 
 @pytest.mark.anyio

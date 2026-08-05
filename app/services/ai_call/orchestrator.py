@@ -996,6 +996,7 @@ class AiCallOrchestrator:
         call_id: str,
         *,
         end_reason: str = "session_aborted",
+        strict_agent_stop: bool = True,
     ) -> EndSessionResult:
         self._cancel_browser_ready_watchdog(call_id)
         session = self.registry.get(call_id)
@@ -1018,6 +1019,7 @@ class AiCallOrchestrator:
                 call_id,
                 step="agent_stop",
                 awaitable=self.agent_runner.stop(call_id),
+                strict=strict_agent_stop,
             )
         if should_delete_room and not self._is_resource_clean(call_id, "delete_room"):
             await self._run_end_cleanup_step(

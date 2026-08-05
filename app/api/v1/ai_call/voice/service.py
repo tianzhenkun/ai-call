@@ -98,6 +98,7 @@ class VoicePreviewOrchestrator(Protocol):
         call_id: str,
         *,
         end_reason: str = "web_user_end",
+        strict_agent_stop: bool = True,
     ) -> EndSessionResult: ...
 
     def dispose_session(self, call_id: str) -> None: ...
@@ -559,6 +560,7 @@ class VoicePreviewService:
             result = await self.orchestrator.abort_session(
                 session.call_id,
                 end_reason=end_reason,
+                strict_agent_stop=False,
             )
         except AiCallError as exc:
             if exc.error_id != "session_not_found":
