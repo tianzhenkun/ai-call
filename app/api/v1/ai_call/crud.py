@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Select, and_, asc, desc, func, or_, select, update
+from sqlalchemy import Select, String, and_, asc, cast, desc, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -549,11 +549,18 @@ class AiCallRecordRepository:
         tenant_id: str | None,
     ) -> None:
         call_ids = [record.call_id for record in records]
+        attempt_ids = [
+            int(record.business_id)
+            for record in records
+            if record.business_type == "outbound_attempt"
+            and str(record.business_id or "").isdigit()
+        ]
         if not call_ids or not tenant_id:
             return
         context_rows = (
             await self.db.execute(
                 select(
+                    AiCallOutboundAttemptModel.id,
                     AiCallOutboundAttemptModel.call_id,
                     AiCallOutboundAttemptModel.task_id,
                     AiCallOutboundAttemptModel.target_id,
@@ -585,11 +592,14 @@ class AiCallRecordRepository:
                 )
                 .where(
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
-                    AiCallOutboundAttemptModel.call_id.in_(call_ids),
+                    or_(
+                        AiCallOutboundAttemptModel.call_id.in_(call_ids),
+                        AiCallOutboundAttemptModel.id.in_(attempt_ids),
+                    ),
                 )
             )
         ).all()
-        contexts = {
+        contexts_by_call_id = {
             row.call_id: {
                 "taskId": str(row.task_id),
                 "targetId": str(row.target_id),
@@ -601,8 +611,18 @@ class AiCallRecordRepository:
             }
             for row in context_rows
         }
+        contexts_by_attempt_id = {
+            row.id: contexts_by_call_id[row.call_id] for row in context_rows
+        }
         for record in records:
-            record._outbound_context = contexts.get(record.call_id, {})
+            context = contexts_by_call_id.get(record.call_id)
+            if (
+                context is None
+                and record.business_type == "outbound_attempt"
+                and str(record.business_id or "").isdigit()
+            ):
+                context = contexts_by_attempt_id.get(int(record.business_id))
+            record._outbound_context = context or {}
 
     async def append_event(
         self,
@@ -2083,7 +2103,14 @@ class AiCallRecordRepository:
             stmt = (
                 stmt.outerjoin(
                     AiCallOutboundAttemptModel,
-                    AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
+                    or_(
+                        AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
+                        and_(
+                            AiCallRecordModel.business_type == "outbound_attempt",
+                            AiCallRecordModel.business_id
+                            == cast(AiCallOutboundAttemptModel.id, String),
+                        ),
+                    ),
                 )
                 .outerjoin(
                     AiCallOutboundTargetModel,
@@ -2126,7 +2153,9 @@ class AiCallRecordRepository:
                 )
             )
         if formal_outbound_only:
-            stmt = stmt.where(AiCallRecordModel.entry_type == "sip_outbound")
+            stmt = stmt.where(
+                AiCallRecordModel.entry_type.in_(("outbound", "sip_outbound"))
+            )
         if filters.get("call_id"):
             stmt = stmt.where(AiCallRecordModel.call_id == filters["call_id"])
         if filters.get("task_id"):

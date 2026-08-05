@@ -35,6 +35,7 @@ from app.api.v1.ai_call.model import (
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
 from app.api.v1.ai_call.schema import HandoffListOut, RecordDetailOut
@@ -1592,6 +1593,109 @@ async def test_record_list_includes_successful_semantic_summary(b1_service) -> N
     page = await service.list_records(tenant_id="000000")
 
     assert page["rows"][0]["summary"] == "客户希望进一步了解服务效果。"
+
+
+@pytest.mark.anyio
+async def test_callback_record_inherits_source_outbound_context(b1_service) -> None:
+    now = datetime.now(timezone.utc)
+    task_id = 324800000000000301
+    target_id = 324800000000000302
+    attempt_id = 324800000000000303
+    callback_call_id = "call-record-list-callback"
+    async with b1_service.session_maker.begin() as db:
+        db.add_all(
+            [
+                AiCallOutboundTaskModel(
+                    id=task_id,
+                    tenant_id="000000",
+                    validation_id=1,
+                    idempotency_key="callback-record-context-task",
+                    request_fingerprint="callback-record-context-fingerprint",
+                    task_name="回拨来源任务",
+                    task_mode="single",
+                    status="COMPLETED",
+                    total_targets=1,
+                    completed_targets=1,
+                    connected_targets=1,
+                    failed_targets=0,
+                    execution_mode="immediate",
+                    started_at=now,
+                    ended_at=now,
+                    prompt_name="GEO 产品介绍",
+                    scene_code="intro_geo",
+                    voice="Tina",
+                    voice_name="甜甜 Tina",
+                    rule_id=1,
+                    rule_name="工作日规则",
+                    rule_summary="00:00-23:55",
+                    config_snapshot_json="{}",
+                    created_by=1,
+                    created_by_name="管理员",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundTargetModel(
+                    id=target_id,
+                    tenant_id="000000",
+                    task_id=task_id,
+                    validation_id=1,
+                    source_validation_row_id=1,
+                    source_row_number=1,
+                    phone_number="19900001001",
+                    customer_name="刘先生",
+                    status="COMPLETED",
+                    attempt_count=1,
+                    latest_result="connected",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=attempt_id,
+                    tenant_id="000000",
+                    task_id=task_id,
+                    target_id=target_id,
+                    attempt_no=1,
+                    call_id="call-record-list-source",
+                    status="COMPLETED",
+                    call_result="connected",
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallRecordModel(
+                    id=324800000000000304,
+                    tenant_id="000000",
+                    call_id=callback_call_id,
+                    follow_up_id=324800000000000305,
+                    business_type="outbound_attempt",
+                    business_id=str(attempt_id),
+                    scene_code="intro_geo",
+                    entry_type="sip_callback",
+                    room_name="room-record-list-callback",
+                    participant_identity="sip-record-list-callback",
+                    status="completed",
+                    started_at=now,
+                    ended_at=now,
+                    duration_ms=0,
+                ),
+            ]
+        )
+
+    page = await b1_service.service.list_records(
+        tenant_id="000000",
+        task_id=task_id,
+        customer_name="刘先生",
+    )
+
+    assert page["total"] == 1
+    row = page["rows"][0]
+    assert row["callId"] == callback_call_id
+    assert row["taskId"] == str(task_id)
+    assert row["targetId"] == str(target_id)
+    assert row["taskName"] == "回拨来源任务"
+    assert row["customerName"] == "刘先生"
+    assert row["phoneNumber"] == "19900001001"
 
 
 @pytest.mark.anyio
