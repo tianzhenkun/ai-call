@@ -179,6 +179,7 @@ async def test_web_legacy_mode_preserves_synchronous_response(
         business_id="biz-1",
         scene_code="collection",
         business_params={"customerName": "张三"},
+        tenant_id="tenant-a",
     )
 
 
