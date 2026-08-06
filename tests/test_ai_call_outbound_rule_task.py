@@ -4,8 +4,10 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -69,10 +71,12 @@ def _validation_config(
     phone_number: str | None = None,
     customer_name: str | None = None,
     voice: str = "Tina",
+    answer_mode: str = "linphone",
 ) -> dict:
     result = {
         "taskName": task_name,
         "taskMode": task_mode,
+        "answerMode": answer_mode,
         "promptProfileId": str(prompt_id),
         "sceneCode": "intro_contract",
         "voice": voice,
@@ -91,6 +95,109 @@ def _create_task_request(config: dict, validation_id: int) -> CreateTaskRequest:
         **config,
         "validationId": str(validation_id),
     })
+
+
+def test_web_single_request_allows_empty_phone_and_excludes_it_from_config() -> None:
+    request = SingleValidationRequest(
+        task_name="Web 接听任务",
+        task_mode="single",
+        answer_mode="web",
+        prompt_profile_id="1001",
+        scene_code="intro_contract",
+        voice="Tina",
+        rule_id="1002",
+        execution_mode="immediate",
+        phone_number=None,
+        customer_name="王先生",
+    )
+
+    assert request.answer_mode == "web"
+    assert request.phone_number is None
+    assert request.config_dict()["answerMode"] == "web"
+    assert "phoneNumber" not in request.config_dict()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"task_mode": "single", "answer_mode": "linphone", "phone_number": None},
+        {"task_mode": "batch", "answer_mode": "web", "phone_number": None},
+    ],
+)
+def test_answer_mode_rejects_invalid_task_combinations(payload: dict) -> None:
+    with pytest.raises(ValidationError):
+        CreateTaskRequest.model_validate({
+            "taskName": "接听方式校验",
+            "promptProfileId": "1001",
+            "sceneCode": "intro_contract",
+            "voice": "Tina",
+            "ruleId": "1002",
+            "executionMode": "immediate",
+            "validationId": "1003",
+            **payload,
+        })
+
+
+@pytest.mark.anyio
+async def test_web_single_validation_and_task_creation_skip_sip_line(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+
+    service.line_service.resolve_default = AsyncMock(
+        side_effect=AssertionError("Web 接听不应解析 SIP 线路")
+    )
+    request = SingleValidationRequest(
+        task_name="Web 单个客户任务",
+        task_mode="single",
+        answer_mode="web",
+        prompt_profile_id=str(prompt_id),
+        scene_code="intro_contract",
+        voice="Tina",
+        rule_id=str(rule.id),
+        execution_mode="immediate",
+        phone_number=None,
+        customer_name="王先生",
+    )
+
+    async with database() as session:
+        validation = await service.validate_single(session, "tenant-a", 10, request)
+        await session.commit()
+        validation_id = validation.id
+
+    assert validation.line_id is None
+    assert validation.line_snapshot_json is None
+    service.line_service.resolve_default.assert_not_awaited()
+
+    async with database() as session:
+        task, created = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-web-single",
+            _create_task_request(request.model_dump(mode="json", by_alias=True), validation_id),
+        )
+        await session.commit()
+        targets, total = await service.list_targets(
+            session,
+            "tenant-a",
+            task.id,
+            page_num=1,
+            page_size=20,
+            phone_number=None,
+            customer_name=None,
+            target_status=None,
+        )
+
+    assert created is True
+    assert task.answer_mode == "web"
+    assert task.line_id is None
+    assert "sipLine" not in json.loads(task.config_snapshot_json)
+    assert total == 1
+    assert targets[0].phone_number is None
 
 
 @pytest.mark.anyio
@@ -1026,6 +1133,7 @@ def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
         "tenant_id",
         "validation_id",
         "config_snapshot_json",
+        "answer_mode",
         "error_message",
         "voice",
         "voice_name",
@@ -1035,6 +1143,7 @@ def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
     assert {"tenant_id", "task_id", "validation_id"} <= {
         column.name for column in AiCallOutboundTargetModel.__table__.columns
     }
+    assert AiCallOutboundTargetModel.__table__.columns.phone_number.nullable is True
     for model in (
         AiCallOutboundRuleModel,
         AiCallOutboundTaskModel,
@@ -1057,6 +1166,20 @@ def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
     )
     assert "add column if not exists voice_type" in migration
     assert "add column if not exists voice_target_model" in migration
+
+    web_answer_migration = (
+        (
+            Path(__file__).parents[1]
+            / "docs"
+            / "livekit-ai-outbound"
+            / "sql"
+            / "phase-h10-outbound-web-answer-mode-postgres.sql"
+        )
+        .read_text(encoding="utf-8")
+        .lower()
+    )
+    assert "add column if not exists answer_mode varchar(16) not null default 'linphone'" in web_answer_migration
+    assert "alter column phone_number drop not null" in web_answer_migration
 
 
 def test_rule_task_routes_are_registered() -> None:

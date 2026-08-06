@@ -79,6 +79,7 @@ class CallRuleMetadataOut(OutboundSchema):
 class TaskConfigRequest(OutboundSchema):
     task_name: str = Field(min_length=1, max_length=50)
     task_mode: Literal["single", "batch"]
+    answer_mode: Literal["linphone", "web"] = "linphone"
     prompt_profile_id: str | None = None
     scene_code: str = Field(min_length=1, max_length=64)
     voice: str = Field(min_length=1, max_length=128)
@@ -109,18 +110,22 @@ class TaskConfigRequest(OutboundSchema):
             raise ValueError("定时执行必须提供 scheduledAt")
         if self.execution_mode == "immediate":
             self.scheduled_at = None
-        if self.task_mode == "single":
-            if not self.phone_number:
-                raise ValueError("单号码任务必须提供 phoneNumber")
-        else:
+        if self.task_mode == "batch":
+            if self.answer_mode == "web":
+                raise ValueError("名单外呼暂不支持 Web 接听")
             self.phone_number = None
             self.customer_name = None
+        elif self.answer_mode == "linphone" and not self.phone_number:
+            raise ValueError("Linphone 接听任务必须提供 phoneNumber")
+        elif self.answer_mode == "web":
+            self.phone_number = None
         return self
 
     def config_dict(self) -> dict:
         result = self.model_dump(mode="json", by_alias=True)
-        if self.task_mode == "batch":
+        if self.task_mode == "batch" or self.answer_mode == "web":
             result.pop("phoneNumber", None)
+        if self.task_mode == "batch":
             result.pop("customerName", None)
         return result
 
@@ -166,6 +171,7 @@ class OutboundTaskOut(OutboundSchema):
     task_id: str
     task_name: str
     task_mode: Literal["single", "batch"]
+    answer_mode: Literal["linphone", "web"]
     status: str
     total_targets: int
     completed_targets: int
@@ -199,7 +205,7 @@ class OutboundTargetOut(OutboundSchema):
     target_id: str
     task_id: str
     customer_name: str | None = None
-    phone_number: str
+    phone_number: str | None = None
     status: str
     attempt_count: int
     latest_result: str | None = None

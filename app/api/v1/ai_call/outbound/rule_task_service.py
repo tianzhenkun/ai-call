@@ -52,7 +52,9 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _mask_phone_number(phone_number: str) -> str:
+def _mask_phone_number(phone_number: str | None) -> str | None:
+    if phone_number is None:
+        return None
     digits = "".join(character for character in phone_number if character.isdigit())
     if len(digits) <= 7:
         return "***"
@@ -249,13 +251,23 @@ class OutboundRuleTaskService:
         user_id: int,
         request: SingleValidationRequest,
     ) -> AiCallOutboundValidationModel:
-        if not request.phone_number or not PHONE_PATTERN.fullmatch(request.phone_number):
+        if (
+            request.answer_mode == "linphone"
+            and (
+                not request.phone_number
+                or not PHONE_PATTERN.fullmatch(request.phone_number)
+            )
+        ):
             raise CustomException(
                 msg="手机号格式错误",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         await self._resolve_references(db, tenant_id, request)
-        line = await self.line_service.resolve_default(db, tenant_id)
+        line = (
+            await self.line_service.resolve_default(db, tenant_id)
+            if request.answer_mode == "linphone"
+            else None
+        )
         now = _now()
         validation = AiCallOutboundValidationModel(
             id=generate_snowflake_id(),
@@ -266,8 +278,10 @@ class OutboundRuleTaskService:
             temp_file_path=None,
             file_size=0,
             task_config_json=_json(request.config_dict()),
-            line_id=line.id,
-            line_snapshot_json=self.line_service.snapshot_json(line),
+            line_id=line.id if line is not None else None,
+            line_snapshot_json=(
+                self.line_service.snapshot_json(line) if line is not None else None
+            ),
             valid_target_count=1,
             issue_count=0,
             issue_stats_json="{}",
@@ -347,11 +361,14 @@ class OutboundRuleTaskService:
                 msg="只有 PASSED 校验结果可以创建任务",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        line, line_snapshot = await self._resolve_validation_line(
-            db,
-            tenant_id,
-            validation,
-        )
+        line = None
+        line_snapshot = None
+        if request.answer_mode == "linphone":
+            line, line_snapshot = await self._resolve_validation_line(
+                db,
+                tenant_id,
+                validation,
+            )
         validation_config = self._load_object(validation.task_config_json)
         request_config = request.config_dict()
         if validation_config != request_config:
@@ -390,8 +407,9 @@ class OutboundRuleTaskService:
                 "targetModel": voice.target_model,
             },
             "rule": self.rule_out(rule).model_dump(mode="json", by_alias=True),
-            "sipLine": line_snapshot.model_dump(mode="json", by_alias=True),
         }
+        if line_snapshot is not None:
+            snapshot["sipLine"] = line_snapshot.model_dump(mode="json", by_alias=True)
         task = AiCallOutboundTaskModel(
             id=generate_snowflake_id(),
             tenant_id=tenant_id,
@@ -400,6 +418,7 @@ class OutboundRuleTaskService:
             request_fingerprint=fingerprint,
             task_name=request.task_name,
             task_mode=request.task_mode,
+            answer_mode=request.answer_mode,
             status="SCHEDULED",
             total_targets=0,
             completed_targets=0,
@@ -419,8 +438,8 @@ class OutboundRuleTaskService:
             rule_id=rule.id,
             rule_name=rule.rule_name,
             rule_summary=self._rule_summary(rule),
-            line_id=line.id,
-            line_name=line.line_name,
+            line_id=line.id if line is not None else None,
+            line_name=line.line_name if line is not None else None,
             config_snapshot_json=_json(snapshot),
             error_message=None,
             created_by=user_id,
@@ -522,7 +541,7 @@ class OutboundRuleTaskService:
                     validation_id=validation_id,
                     source_validation_row_id=row.id,
                     source_row_number=row.row_number,
-                    phone_number=row.normalized_phone or row.phone_number or "",
+                    phone_number=row.normalized_phone or row.phone_number,
                     customer_name=row.customer_name,
                     status="PENDING",
                     attempt_count=0,
@@ -972,6 +991,7 @@ class OutboundRuleTaskService:
             task_id=str(task.id),
             task_name=task.task_name,
             task_mode=task.task_mode,
+            answer_mode=task.answer_mode,
             status=task.status,
             total_targets=task.total_targets,
             completed_targets=task.completed_targets,

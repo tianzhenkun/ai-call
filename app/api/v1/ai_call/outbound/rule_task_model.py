@@ -82,6 +82,12 @@ class AiCallOutboundTaskModel(MappedBase):
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     task_name: Mapped[str] = mapped_column(String(50), nullable=False)
     task_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    answer_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="linphone",
+        server_default="linphone",
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     total_targets: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completed_targets: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -156,7 +162,7 @@ class AiCallOutboundTargetModel(MappedBase):
     validation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     source_validation_row_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     source_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    phone_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    phone_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
