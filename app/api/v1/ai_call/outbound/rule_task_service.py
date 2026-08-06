@@ -5,10 +5,14 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import status
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.v1.ai_call.model import AiCallPromptProfileModel, AiCallVoiceProfileModel
+from app.api.v1.ai_call.model import (
+    AiCallPromptProfileModel,
+    AiCallRecordModel,
+    AiCallVoiceProfileModel,
+)
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import settings
 from app.core.exceptions import CustomException
@@ -808,10 +812,17 @@ class OutboundRuleTaskService:
             tenant_id,
             [target.id for target in targets],
         )
+        active_call_ids = await self._active_call_ids_by_target(
+            db,
+            tenant_id,
+            [target.id for target in targets],
+        )
         return [
             self.target_out(
                 target,
                 latest_dialer_type=latest_dialer_types.get(target.id),
+                active_call_id=(active_call_ids.get(target.id) or (None, None))[0],
+                active_call_status=(active_call_ids.get(target.id) or (None, None))[1],
             )
             for target in targets
         ], total
@@ -1043,6 +1054,8 @@ class OutboundRuleTaskService:
         target: AiCallOutboundTargetModel,
         *,
         latest_dialer_type: str | None = None,
+        active_call_id: str | None = None,
+        active_call_status: str | None = None,
     ) -> OutboundTargetOut:
         return OutboundTargetOut(
             target_id=str(target.id),
@@ -1053,6 +1066,8 @@ class OutboundRuleTaskService:
             attempt_count=target.attempt_count,
             latest_result=target.latest_result,
             latest_dialer_type=latest_dialer_type,
+            active_call_id=active_call_id,
+            active_call_status=active_call_status,
             updated_at=OutboundRuleTaskService._format_datetime(target.updated_at) or "",
         )
 
@@ -1114,6 +1129,48 @@ class OutboundRuleTaskService:
         result: dict[int, str | None] = {}
         for target_id, dialer_type in rows:
             result.setdefault(target_id, dialer_type)
+        return result
+
+    @staticmethod
+    async def _active_call_ids_by_target(
+        db: AsyncSession,
+        tenant_id: str,
+        target_ids: list[int],
+    ) -> dict[int, tuple[str, str | None]]:
+        if not target_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundAttemptModel.call_id,
+                    AiCallRecordModel.status,
+                )
+                .outerjoin(
+                    AiCallRecordModel,
+                    and_(
+                        AiCallRecordModel.tenant_id
+                        == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallRecordModel.call_id
+                        == AiCallOutboundAttemptModel.call_id,
+                    ),
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.target_id.in_(target_ids),
+                    AiCallOutboundAttemptModel.status.in_(
+                        {"QUEUED", "STARTING", "DIALING", "IN_CALL"}
+                    ),
+                )
+                .order_by(
+                    AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundAttemptModel.attempt_no.desc(),
+                )
+            )
+        ).all()
+        result: dict[int, tuple[str, str | None]] = {}
+        for target_id, call_id, call_status in rows:
+            result.setdefault(target_id, (call_id, call_status))
         return result
 
     @staticmethod

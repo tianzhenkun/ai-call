@@ -629,6 +629,7 @@ class AiCallService:
             if owner_mode and event_type in {
                 "browser_ready",
                 "browser_disconnect",
+                "browser_connection_failed",
                 "browser_first_audio",
                 "browser_audio_input_diagnostics",
             }:
@@ -668,8 +669,9 @@ class AiCallService:
                     )
                 else:
                     await self.record_service.mark_answered(call_id, result.timestamp)
-            elif event_type == "browser_disconnect" and record.runtime_control_mode == (
-                "owner_command_v1"
+            elif (
+                event_type in {"browser_disconnect", "browser_connection_failed"}
+                and record.runtime_control_mode == "owner_command_v1"
             ):
                 await RuntimeCommandRepository(
                     self.record_service.repository.db
@@ -678,8 +680,8 @@ class AiCallService:
                         tenant_id=tenant_id,
                         call_id=call_id,
                         source="browser_client",
-                        end_reason="browser_disconnect",
-                        dedupe_key=f"browser_disconnect:{call_id}",
+                        end_reason=event_type,
+                        dedupe_key=f"{event_type}:{call_id}",
                         event_at=result.timestamp,
                         evidence={
                             "eventId": result.event_id,

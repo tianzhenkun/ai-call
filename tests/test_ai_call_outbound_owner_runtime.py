@@ -14,6 +14,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.task_executor import OutboundTaskExecutor
 from app.core.base_model import MappedBase
@@ -87,15 +88,16 @@ async def _seed_due_task(
     retry_count: int = 0,
     retry_intervals_minutes: list[int] | None = None,
     retryable_results: list[str] | None = None,
-) -> tuple[int, int, str]:
+    answer_mode: str = "linphone",
+) -> tuple[int, int, str | None]:
     task_id = generate_snowflake_id()
     target_id = generate_snowflake_id()
-    phone_number = "13800138001"
+    phone_number = None if answer_mode == "web" else "13800138001"
     line = _line_snapshot()
     line["lineId"] = str(line_id)
     if tenant_id != "tenant-a" or line_id != 340700000000000001:
         line["lineCode"] = f"provider-{tenant_id}-{line_id}"
-    snapshot = json.dumps({
+    snapshot = {
         "request": {"taskName": "Owner Runtime 外呼"},
         "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
         "voice": {"voice": "Tina"},
@@ -104,11 +106,13 @@ async def _seed_due_task(
             "retryIntervalsMinutes": retry_intervals_minutes or [],
             "retryableResults": retryable_results or [],
         },
-        "sipLine": line,
-    })
+    }
+    if answer_mode == "linphone":
+        snapshot["sipLine"] = line
     async with database.begin() as session:
-        session.add(
-            AiCallSipLineModel(
+        if answer_mode == "linphone":
+            session.add(
+                AiCallSipLineModel(
                 id=int(line["lineId"]),
                 tenant_id=tenant_id,
                 line_code=str(line["lineCode"]),
@@ -134,8 +138,8 @@ async def _seed_due_task(
                 updated_by=1,
                 created_at=now,
                 updated_at=now,
+                )
             )
-        )
         session.add(
             AiCallOutboundTaskModel(
                 id=task_id,
@@ -144,7 +148,8 @@ async def _seed_due_task(
                 idempotency_key=f"owner-runtime-{task_id}",
                 request_fingerprint=f"{task_id:064d}"[-64:],
                 task_name="Owner Runtime 外呼",
-                task_mode="batch",
+                task_mode="single" if answer_mode == "web" else "batch",
+                answer_mode=answer_mode,
                 status="SCHEDULED",
                 total_targets=target_count,
                 completed_targets=0,
@@ -162,9 +167,9 @@ async def _seed_due_task(
                 rule_id=generate_snowflake_id(),
                 rule_name="测试规则",
                 rule_summary="测试规则摘要",
-                line_id=int(line["lineId"]),
-                line_name=str(line["lineName"]),
-                config_snapshot_json=snapshot,
+                line_id=int(line["lineId"]) if answer_mode == "linphone" else None,
+                line_name=str(line["lineName"]) if answer_mode == "linphone" else None,
+                config_snapshot_json=json.dumps(snapshot),
                 error_message=None,
                 created_by=1,
                 created_by_name="测试用户",
@@ -182,7 +187,9 @@ async def _seed_due_task(
                     source_validation_row_id=generate_snowflake_id(),
                     source_row_number=index + 2,
                     phone_number=(
-                        phone_number if index == 0 else f"13800138{index + 1:03d}"
+                        phone_number
+                        if index == 0 or answer_mode == "web"
+                        else f"13800138{index + 1:03d}"
                     ),
                     customer_name=f"客户{index + 1}",
                     status="PENDING",
@@ -219,12 +226,18 @@ async def _seed_ready_worker(database, now: datetime) -> str:
 async def _seed_owner_assigned_chain(
     database,
     now: datetime,
+    *,
+    answer_mode: str = "linphone",
 ) -> tuple[int, int, str, str]:
     from app.api.v1.ai_call.outbound.owner_runtime_start import (
         OwnerRuntimeOutboundStart,
     )
 
-    task_id, target_id, _phone_number = await _seed_due_task(database, now)
+    task_id, target_id, _phone_number = await _seed_due_task(
+        database,
+        now,
+        answer_mode=answer_mode,
+    )
     worker_id = await _seed_ready_worker(database, now)
     executor = OutboundTaskExecutor(
         database,
@@ -261,6 +274,7 @@ async def _seed_start_completion_facts(
     call_id: str,
     now: datetime,
     missing: str | None = None,
+    answer_mode: str = "linphone",
 ) -> None:
     async with database.begin() as session:
         attempt = await session.scalar(
@@ -285,11 +299,16 @@ async def _seed_start_completion_facts(
         assert attempt is not None
         assert record is not None
         assert command is not None
-        assert reservation is not None
+        if answer_mode == "linphone":
+            assert reservation is not None
+        else:
+            assert reservation is None
         record.status = "preparing" if missing == "record" else "ready"
         command.status = "PENDING" if missing == "command" else "SUCCEEDED"
-        reservation.status = "RESERVED" if missing == "reservation" else "ACTIVE"
-        if missing != "effect":
+        if reservation is not None:
+            reservation.status = "RESERVED" if missing == "reservation" else "ACTIVE"
+        if answer_mode == "linphone" and missing != "effect":
+            assert reservation is not None
             session.add(
                 AiCallRuntimeEffectModel(
                     id=generate_snowflake_id(),
@@ -389,6 +408,100 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
     assert phone_number not in (command.payload_json or "")
     assert command.sensitive_payload_ciphertext is None
     assert command.payload_key_version is None
+
+
+@pytest.mark.anyio
+async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    task_id, target_id, phone_number = await _seed_due_task(
+        database,
+        now,
+        answer_mode="web",
+    )
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+
+    assert phone_number is None
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.task_id == task_id
+            )
+        )
+        assert attempt is not None
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == attempt.call_id)
+        )
+        command = await session.scalar(
+            select(AiCallRuntimeCommandModel).where(
+                AiCallRuntimeCommandModel.call_id == attempt.call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        lease = await DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(now.replace(tzinfo=None)),
+        ).assign_initial_owner("tenant-a", attempt.call_id)
+        await session.commit()
+
+    assert record is not None and record.entry_type == "web"
+    assert record.callee_phone_number is None
+    assert record.callee_phone_number_masked is None
+    assert record.callee_phone_number_hash is None
+    assert command is not None
+    assert json.loads(command.payload_json or "{}") == {
+        "attempt_id": str(attempt.id),
+        "attempt_no": 1,
+        "line_code": None,
+        "line_id": None,
+        "prompt_profile_id": "prompt-1",
+        "scene_code": "intro_contract",
+        "target_id": str(target_id),
+        "task_id": str(task_id),
+        "voice": "Tina",
+    }
+    assert lease is not None and lease.owner_id == worker_id
+
+    async with database() as session:
+        targets, total = await OutboundRuleTaskService(database).list_targets(
+            session,
+            "tenant-a",
+            task_id,
+            page_num=1,
+            page_size=20,
+            phone_number=None,
+            customer_name=None,
+            target_status=None,
+        )
+    assert total == 1
+    assert targets[0].active_call_id == attempt.call_id
+    assert targets[0].active_call_status == "preparing"
+    async with database() as session:
+        reservation_count = int(
+            await session.scalar(
+                select(func.count(AiCallSipLineReservationModel.id)).where(
+                    AiCallSipLineReservationModel.call_id == attempt.call_id
+                )
+            )
+            or 0
+        )
+    assert reservation_count == 0
 
 
 @pytest.mark.anyio
@@ -816,6 +929,74 @@ async def test_attempt_reconciler_projects_complete_start_facts_to_dialing(
     assert attempt is not None and attempt.status == "DIALING"
     assert target is not None and target.status == "DIALING"
     assert attempt.reconcile_after == database_now + timedelta(seconds=1)
+
+
+@pytest.mark.anyio
+async def test_web_attempt_reconciler_projects_browser_answer_without_sip_evidence(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import (
+        OutboundAttemptReconciler,
+    )
+
+    now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+    _task_id, target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database,
+        now,
+        answer_mode="web",
+    )
+    await _seed_start_completion_facts(
+        database,
+        call_id=call_id,
+        now=now,
+        answer_mode="web",
+    )
+    database_now = now.replace(tzinfo=None)
+
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-web",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-web",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+    assert result is not None and result.status == "DIALING"
+
+    terminal_at = database_now + timedelta(seconds=2)
+    async with database.begin() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        assert record is not None
+        record.status = "completed"
+        record.answered_at = terminal_at
+        record.ended_at = terminal_at
+
+    async with database.begin() as session:
+        terminal_claim = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-web-terminal",
+            database_clock=lambda _session: _constant_time(terminal_at),
+        ).claim_next()
+    assert terminal_claim is not None
+    async with database.begin() as session:
+        terminal_result = await OutboundAttemptReconciler(
+            session,
+            worker_id="reconciler-web-terminal",
+            database_clock=lambda _session: _constant_time(terminal_at),
+        ).submit(terminal_claim)
+    assert terminal_result is not None and terminal_result.status == "COMPLETED"
+    async with database() as session:
+        attempt = await session.get(AiCallOutboundAttemptModel, terminal_claim.attempt_id)
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+    assert attempt is not None and attempt.call_result == "connected"
+    assert target is not None and target.status == "COMPLETED"
 
 
 @pytest.mark.anyio

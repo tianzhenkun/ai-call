@@ -216,7 +216,10 @@ class OutboundAttemptReconciler:
             media_connected = bool(
                 record is not None
                 and record.answered_at is not None
-                and await has_persisted_media_evidence(self._session, claim.call_id)
+                and (
+                    record.entry_type == "web"
+                    or await has_persisted_media_evidence(self._session, claim.call_id)
+                )
             )
             decision = terminal_attempt_decision(
                 record,
@@ -241,6 +244,7 @@ class OutboundAttemptReconciler:
                 command=command,
                 reservation=reservation,
                 effect=effect,
+                answer_mode=task.answer_mode,
             ):
                 attempt.status = "DIALING"
             elif attempt.status == "QUEUED" and _starting_facts_complete(
@@ -248,6 +252,7 @@ class OutboundAttemptReconciler:
                 record=record,
                 reservation=reservation,
                 now=now,
+                answer_mode=task.answer_mode,
             ):
                 attempt.status = "STARTING"
 
@@ -389,10 +394,11 @@ def _starting_facts_complete(
     record: AiCallRecordModel | None,
     reservation: AiCallSipLineReservationModel | None,
     now: datetime,
+    answer_mode: str,
 ) -> bool:
-    return (
+    common_facts_complete = (
         record is not None
-        and record.entry_type == "outbound"
+        and record.entry_type == ("web" if answer_mode == "web" else "outbound")
         and record.business_type == "outbound_attempt"
         and record.business_id == str(attempt.id)
         and record.runtime_owner_id is not None
@@ -400,6 +406,11 @@ def _starting_facts_complete(
         and record.runtime_lease_expires_at is not None
         and record.runtime_lease_expires_at > now
         and record.runtime_capacity_class == "active"
+    )
+    if answer_mode == "web":
+        return common_facts_complete and reservation is None
+    return (
+        common_facts_complete
         and reservation is not None
         and reservation.attempt_id == attempt.id
         and reservation.line_id == attempt.line_id
@@ -415,15 +426,21 @@ def _dialing_facts_complete(
     command: AiCallRuntimeCommandModel | None,
     reservation: AiCallSipLineReservationModel | None,
     effect: AiCallRuntimeEffectModel | None,
+    answer_mode: str,
 ) -> bool:
-    return (
+    common_facts_complete = (
         record is not None
-        and record.entry_type == "outbound"
+        and record.entry_type == ("web" if answer_mode == "web" else "outbound")
         and record.business_type == "outbound_attempt"
         and record.business_id == str(attempt.id)
         and record.status == "ready"
         and command is not None
         and command.status == CommandStatus.SUCCEEDED
+    )
+    if answer_mode == "web":
+        return common_facts_complete and reservation is None and effect is None
+    return (
+        common_facts_complete
         and reservation is not None
         and reservation.attempt_id == attempt.id
         and reservation.line_id == attempt.line_id

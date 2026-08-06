@@ -63,7 +63,7 @@ class OutboundStartRefs:
     task_id: int
     target_id: int
     attempt_id: int
-    line_id: int
+    line_id: int | None
 
 
 def build_worker_id(deployment_instance_id: str, startup_id: UUID) -> str:
@@ -207,7 +207,7 @@ class DispatcherOwnerRepository:
         record = await self._lock_record(tenant_id, call_id)
         if record is None or not self._initial_assignment_allowed(record):
             return None
-        is_outbound = getattr(record, "entry_type", None) == "outbound"
+        is_outbound = getattr(record, "entry_type", None) in {"outbound", "web"}
         if is_outbound:
             if outbound_refs is None or outbound_chain is None:
                 return None
@@ -806,7 +806,7 @@ class RecoveryOwnerRepository:
             )
         ):
             return None
-        if record.entry_type == "outbound":
+        if record.entry_type in {"outbound", "web"}:
             if (
                 outbound_refs is None
                 or outbound_chain is None
@@ -1168,9 +1168,21 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         return None
     if not all(
         isinstance(payload[key], str) and payload[key].strip()
-        for key in ("line_code", "scene_code", "voice")
+        for key in ("scene_code", "voice")
     ):
         return None
+    line_code = payload["line_code"]
+    line_id_value = payload["line_id"]
+    if line_id_value is None:
+        if line_code is not None:
+            return None
+        line_id = None
+    else:
+        if not isinstance(line_code, str) or not line_code.strip():
+            return None
+        line_id = _canonical_positive_decimal(line_id_value)
+        if line_id is None:
+            return None
     prompt_profile_id = payload["prompt_profile_id"]
     if prompt_profile_id is not None and (
         not isinstance(prompt_profile_id, str) or not prompt_profile_id.strip()
@@ -1178,7 +1190,7 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         return None
     parsed_ids = {
         key: _canonical_positive_decimal(payload[key])
-        for key in ("task_id", "target_id", "attempt_id", "line_id")
+        for key in ("task_id", "target_id", "attempt_id")
     }
     if any(value is None for value in parsed_ids.values()):
         return None
@@ -1186,7 +1198,7 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         task_id=parsed_ids["task_id"],
         target_id=parsed_ids["target_id"],
         attempt_id=parsed_ids["attempt_id"],
-        line_id=parsed_ids["line_id"],
+        line_id=line_id,
     )
 
 
@@ -1221,6 +1233,7 @@ def _outbound_chain_matches(
         and task.id == refs.task_id
         and task.status == "RUNNING"
         and task.line_id == refs.line_id
+        and task.answer_mode == ("web" if refs.line_id is None else "linphone")
         and target.tenant_id == tenant_id
         and target.task_id == refs.task_id
         and target.id == refs.target_id
@@ -1233,7 +1246,7 @@ def _outbound_chain_matches(
         and attempt.status == expected_attempt_status
         and attempt.line_id == refs.line_id
         and attempt.attempt_no == target.attempt_count
-        and record.entry_type == "outbound"
+        and record.entry_type == ("web" if refs.line_id is None else "outbound")
         and record.business_type == "outbound_attempt"
         and record.business_id == str(refs.attempt_id)
     )

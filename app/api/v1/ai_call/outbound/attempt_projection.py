@@ -25,6 +25,7 @@ BUSY_END_REASONS = {
     "sip_486",
 }
 NO_ANSWER_END_REASONS = {
+    "browser_disconnect",
     "connect_timeout",
     "no_answer",
     "ringing_timeout",

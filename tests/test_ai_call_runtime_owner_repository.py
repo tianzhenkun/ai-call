@@ -108,6 +108,30 @@ def test_outbound_start_refs_accept_only_canonical_positive_identifiers() -> Non
     )
 
 
+def test_outbound_start_refs_accept_web_without_sip_line() -> None:
+    payload = {
+        "attempt_id": "13",
+        "attempt_no": 1,
+        "line_code": None,
+        "line_id": None,
+        "prompt_profile_id": "prompt-1",
+        "scene_code": "intro_contract",
+        "target_id": "12",
+        "task_id": "11",
+        "voice": "Tina",
+    }
+
+    assert parse_outbound_start_refs(json.dumps(payload)) == OutboundStartRefs(
+        task_id=11,
+        target_id=12,
+        attempt_id=13,
+        line_id=None,
+    )
+    assert parse_outbound_start_refs(
+        json.dumps({**payload, "line_code": "provider-a"})
+    ) is None
+
+
 @pytest.mark.anyio
 async def test_initial_owner_assignment_publishes_one_transactional_wakeup(
     monkeypatch: pytest.MonkeyPatch,

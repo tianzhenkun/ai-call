@@ -210,4 +210,6 @@ class OutboundTargetOut(OutboundSchema):
     attempt_count: int
     latest_result: str | None = None
     latest_dialer_type: str | None = None
+    active_call_id: str | None = None
+    active_call_status: str | None = None
     updated_at: str

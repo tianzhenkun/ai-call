@@ -5,7 +5,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -49,12 +49,13 @@ class OutboundDialRequest:
     task_id: int
     target_id: int
     attempt_no: int
-    phone_number: str
+    phone_number: str | None
     customer_name: str | None
     scene_code: str
     voice: str
     prompt_profile_id: str | None
     line: SipLineSnapshot | None = None
+    answer_mode: Literal["linphone", "web"] = "linphone"
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +461,7 @@ class OutboundTaskExecutor:
                     voice=task.voice,
                     prompt_profile_id=task.prompt_profile_id,
                     line=self._task_line_snapshot(task),
+                    answer_mode=task.answer_mode,
                 )
                 if attempt.dialer_type in {None, "mock"}:
                     result = DialResult(
@@ -473,9 +475,15 @@ class OutboundTaskExecutor:
                             AiCallRecordModel.call_id == attempt.call_id
                         )
                     )
-                    media_connected = await has_persisted_media_evidence(
-                        db,
-                        attempt.call_id,
+                    media_connected = bool(
+                        record is not None
+                        and (
+                            record.entry_type == "web"
+                            or await has_persisted_media_evidence(
+                                db,
+                                attempt.call_id,
+                            )
+                        )
                     )
                     if (
                         record is not None
@@ -756,7 +764,7 @@ class OutboundTaskExecutor:
             ):
                 return None
             line = self._task_line_snapshot(task)
-            requires_sip_line = (
+            requires_sip_line = task.answer_mode == "linphone" and (
                 self.dialer.dialer_type == "sip"
                 or self.owner_runtime_start is not None
             )
@@ -768,7 +776,8 @@ class OutboundTaskExecutor:
                 await db.commit()
                 return None
             if (
-                self.owner_runtime_start is None
+                task.answer_mode == "linphone"
+                and self.owner_runtime_start is None
                 and self.dialer.dialer_type == "sip"
                 and line is not None
             ):
@@ -803,7 +812,11 @@ class OutboundTaskExecutor:
                 )
                 if active_line_attempts >= current_line.max_concurrency:
                     return None
-            if self.owner_runtime_start is not None and line is not None:
+            if (
+                task.answer_mode == "linphone"
+                and self.owner_runtime_start is not None
+                and line is not None
+            ):
                 queue_snapshot = await OutboundQueueRepository(
                     db,
                     limits=self.owner_queue_limits,
@@ -888,6 +901,7 @@ class OutboundTaskExecutor:
                     voice=task.voice,
                     prompt_profile_id=task.prompt_profile_id,
                     line=line,
+                    answer_mode=task.answer_mode,
                 )
                 if self.owner_runtime_start is not None:
                     call_id = await self.owner_runtime_start.create(

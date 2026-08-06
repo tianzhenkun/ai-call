@@ -42,10 +42,16 @@ class OwnerRuntimeOutboundStart:
         *,
         now: datetime,
     ) -> str:
-        if request.line is None:
+        if request.answer_mode == "linphone" and request.line is None:
             raise ValueError("Owner Runtime 外呼缺少 SIP 线路快照")
+        if request.answer_mode == "linphone" and not request.phone_number:
+            raise ValueError("Owner Runtime 外呼缺少手机号")
 
-        phone = prepare_direct_sip_phone(request.phone_number)
+        phone = (
+            prepare_direct_sip_phone(request.phone_number)
+            if request.answer_mode == "linphone"
+            else None
+        )
         attempt_id = self._id_generator()
         idempotency_key = (
             f"outbound:{request.tenant_id}:{request.task_id}:"
@@ -54,8 +60,8 @@ class OwnerRuntimeOutboundStart:
         payload = {
             "attempt_id": str(attempt_id),
             "attempt_no": request.attempt_no,
-            "line_code": request.line.line_code,
-            "line_id": str(request.line.line_id),
+            "line_code": request.line.line_code if request.line is not None else None,
+            "line_id": str(request.line.line_id) if request.line is not None else None,
             "prompt_profile_id": request.prompt_profile_id,
             "scene_code": request.scene_code,
             "target_id": str(request.target_id),
@@ -68,7 +74,7 @@ class OwnerRuntimeOutboundStart:
         ).create_start_call(
             StartCallIntent(
                 tenant_id=request.tenant_id,
-                entry_type="outbound",
+                entry_type="outbound" if request.answer_mode == "linphone" else "web",
                 idempotency_key=idempotency_key,
                 payload=payload,
                 business_type="outbound_attempt",
@@ -76,9 +82,9 @@ class OwnerRuntimeOutboundStart:
                 scene_code=request.scene_code,
                 prompt_source_key=request.prompt_profile_id,
                 allocation_timeout_seconds=self._allocation_timeout_seconds,
-                callee_phone_number=phone.plaintext,
-                callee_phone_number_masked=phone.masked,
-                callee_phone_number_hash=phone.fingerprint,
+                callee_phone_number=phone.plaintext if phone is not None else None,
+                callee_phone_number_masked=phone.masked if phone is not None else None,
+                callee_phone_number_hash=phone.fingerprint if phone is not None else None,
             )
         )
         session.add(
@@ -96,8 +102,8 @@ class OwnerRuntimeOutboundStart:
                 status="QUEUED",
                 call_result=None,
                 error_message=None,
-                line_id=int(request.line.line_id),
-                line_code=request.line.line_code,
+                line_id=int(request.line.line_id) if request.line is not None else None,
+                line_code=request.line.line_code if request.line is not None else None,
                 provider_status_code=None,
                 provider_reason=None,
                 hangup_cause=None,
