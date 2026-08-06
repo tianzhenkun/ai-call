@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import status
 from sqlalchemy import and_, func, select, update
@@ -599,10 +600,16 @@ class OutboundRuleTaskService:
             tenant_id,
             [task.id for task in tasks],
         )
+        failed_attempts_by_task = await self._failed_attempt_counts_by_task(
+            db,
+            tenant_id,
+            [task.id for task in tasks],
+        )
         return [
             self.task_out(
                 task,
                 attempt_dialer_types=dialer_types_by_task.get(task.id, []),
+                failed_attempts=failed_attempts_by_task.get(task.id, 0),
             )
             for task in tasks
         ], total
@@ -619,9 +626,15 @@ class OutboundRuleTaskService:
             tenant_id,
             [task.id],
         )
+        failed_attempts_by_task = await self._failed_attempt_counts_by_task(
+            db,
+            tenant_id,
+            [task.id],
+        )
         return self.task_out(
             task,
             attempt_dialer_types=dialer_types_by_task.get(task.id, []),
+            failed_attempts=failed_attempts_by_task.get(task.id, 0),
         )
 
     async def update_schedule(
@@ -997,6 +1010,7 @@ class OutboundRuleTaskService:
         task: AiCallOutboundTaskModel,
         *,
         attempt_dialer_types: list[str] | None = None,
+        failed_attempts: int = 0,
     ) -> OutboundTaskOut:
         return OutboundTaskOut(
             task_id=str(task.id),
@@ -1008,9 +1022,13 @@ class OutboundRuleTaskService:
             completed_targets=task.completed_targets,
             connected_targets=task.connected_targets,
             failed_targets=task.failed_targets,
+            failed_attempts=failed_attempts,
             attempt_dialer_types=attempt_dialer_types or [],
             execution_mode=task.execution_mode,
             scheduled_at=OutboundRuleTaskService._format_datetime(task.scheduled_at),
+            next_dispatch_at=OutboundRuleTaskService._format_business_datetime(
+                task.next_dispatch_at
+            ),
             started_at=OutboundRuleTaskService._format_datetime(task.started_at),
             ended_at=OutboundRuleTaskService._format_datetime(task.ended_at),
             prompt_profile_id=task.prompt_profile_id,
@@ -1101,6 +1119,30 @@ class OutboundRuleTaskService:
             task_id: sorted(dialer_types)
             for task_id, dialer_types in result.items()
         }
+
+    @staticmethod
+    async def _failed_attempt_counts_by_task(
+        db: AsyncSession,
+        tenant_id: str,
+        task_ids: list[int],
+    ) -> dict[int, int]:
+        if not task_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    AiCallOutboundAttemptModel.task_id,
+                    func.count(AiCallOutboundAttemptModel.id),
+                )
+                .where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.task_id.in_(task_ids),
+                    AiCallOutboundAttemptModel.status == "FAILED",
+                )
+                .group_by(AiCallOutboundAttemptModel.task_id)
+            )
+        ).all()
+        return {task_id: int(count) for task_id, count in rows}
 
     @staticmethod
     async def _latest_dialer_types_by_target(
@@ -1225,6 +1267,15 @@ class OutboundRuleTaskService:
     @staticmethod
     def _format_datetime(value: datetime | None) -> str | None:
         return value.strftime("%Y-%m-%d %H:%M:%S") if value else None
+
+    @staticmethod
+    def _format_business_datetime(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        aware_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return aware_value.astimezone(
+            ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _load_list(value: str) -> list:

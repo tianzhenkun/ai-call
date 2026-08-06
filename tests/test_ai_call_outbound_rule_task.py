@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -1493,7 +1493,7 @@ async def test_single_task_has_one_target_and_uses_snapshots_after_rule_delete(d
 
 
 @pytest.mark.anyio
-async def test_task_and_target_outputs_expose_attempt_dialer_provenance(database) -> None:
+async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
     prompt_id, _ = await _seed_references(database)
     service = OutboundRuleTaskService(database)
     async with database() as session:
@@ -1528,13 +1528,14 @@ async def test_task_and_target_outputs_expose_attempt_dialer_provenance(database
             )
         )
         assert target is not None
-        now = _now()
-        target.status = "COMPLETED"
+        now = datetime(2026, 8, 6, 5, 0, tzinfo=timezone.utc)
+        retry_at = now + timedelta(minutes=30)
+        target.status = "RETRY_WAIT"
         target.attempt_count = 1
-        target.latest_result = "connected"
-        task.status = "COMPLETED"
-        task.completed_targets = 1
-        task.connected_targets = 1
+        target.latest_result = "call_failed"
+        target.next_attempt_at = retry_at
+        task.status = "RUNNING"
+        task.next_dispatch_at = retry_at
         session.add(
             AiCallOutboundAttemptModel(
                 id=generate_snowflake_id(),
@@ -1547,9 +1548,9 @@ async def test_task_and_target_outputs_expose_attempt_dialer_provenance(database
                 test_scenario=None,
                 command_idempotency_key=None,
                 active_slot=None,
-                status="COMPLETED",
-                call_result="connected",
-                error_message=None,
+                status="FAILED",
+                call_result="call_failed",
+                error_message="browser_connection_failed",
                 line_id=task.line_id,
                 line_code="default-tenant-a",
                 provider_status_code=None,
@@ -1578,6 +1579,8 @@ async def test_task_and_target_outputs_expose_attempt_dialer_provenance(database
         )
 
     assert task_out.attempt_dialer_types == ["mock"]
+    assert task_out.failed_attempts == 1
+    assert task_out.next_dispatch_at == "2026-08-06 13:30:00"
     assert total == 1
     assert targets[0].latest_dialer_type == "mock"
 

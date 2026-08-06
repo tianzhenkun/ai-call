@@ -177,9 +177,11 @@ class OutboundTaskOut(OutboundSchema):
     completed_targets: int
     connected_targets: int
     failed_targets: int
+    failed_attempts: int = 0
     attempt_dialer_types: list[str] = Field(default_factory=list)
     execution_mode: Literal["immediate", "scheduled"]
     scheduled_at: str | None = None
+    next_dispatch_at: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     prompt_profile_id: str | None = None
