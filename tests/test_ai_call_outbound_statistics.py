@@ -321,10 +321,13 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
                 ),
             ])
 
-        for row_id, entry_type in (
-            (9, "web"),
-            (10, "outbound_mock"),
-            (11, "sip_inbound"),
+        for row_id, entry_type, call_result in (
+            (9, "web", "connected"),
+            (10, "outbound_mock", "connected"),
+            (11, "sip_inbound", "connected"),
+            (14, "web", "no_answer"),
+            (15, "web", "busy"),
+            (16, "web", "invalid_number"),
         ):
             started_at = begin + timedelta(hours=2)
             session.add_all([
@@ -343,7 +346,7 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
                     row_id=row_id,
                     tenant_id="tenant-a",
                     task_id=100,
-                    call_result="connected",
+                    call_result=call_result,
                     started_at=started_at,
                 ),
             ])
@@ -417,20 +420,20 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
 
     await engine.dispose()
 
-    assert overview.dial_attempts == 8
-    assert overview.connected_calls == 2
+    assert overview.dial_attempts == 12
+    assert overview.connected_calls == 3
     assert overview.pending_follow_ups == 2
     assert result_counts == {
-        "connected": 2,
-        "no_answer": 1,
+        "connected": 3,
+        "no_answer": 2,
         "busy": 1,
         "invalid_number": 1,
         "call_failed": 1,
         "processing": 1,
-        "other": 1,
+        "other": 3,
     }
     assert [(item.dial_attempts, item.connected_calls) for item in trend] == [
-        (4, 2),
+        (8, 3),
         (4, 0),
     ]
 

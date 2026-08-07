@@ -361,6 +361,41 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def has_task_owned_outbound_attempt(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> bool:
+        attempt_id = await self.db.scalar(
+            select(AiCallOutboundAttemptModel.id)
+            .join(
+                AiCallOutboundTargetModel,
+                and_(
+                    AiCallOutboundTargetModel.id
+                    == AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundTargetModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                    AiCallOutboundTargetModel.task_id
+                    == AiCallOutboundAttemptModel.task_id,
+                ),
+            )
+            .join(
+                AiCallOutboundTaskModel,
+                and_(
+                    AiCallOutboundTaskModel.id == AiCallOutboundAttemptModel.task_id,
+                    AiCallOutboundTaskModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                ),
+            )
+            .where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.call_id == call_id,
+            )
+            .limit(1)
+        )
+        return attempt_id is not None
+
     async def get_active_sip_record_by_callee_hash(
         self,
         *,
@@ -2498,7 +2533,9 @@ class AiCallRecordRepository:
             )
         if formal_outbound_only:
             stmt = stmt.where(
-                AiCallRecordModel.entry_type.in_(("outbound", "sip_outbound"))
+                AiCallRecordModel.entry_type.in_(
+                    ("outbound", "sip_outbound", "web")
+                )
             )
         if filters.get("call_id"):
             stmt = stmt.where(AiCallRecordModel.call_id == filters["call_id"])
@@ -2731,7 +2768,13 @@ class AiCallRecordRepository:
     def _quality_score_applicable(record: AiCallRecordModel) -> bool:
         outbound_context = getattr(record, "_outbound_context", {})
         return (
-            record.entry_type in {"sip_outbound", "outbound"}
+            (
+                record.entry_type in {"sip_outbound", "outbound"}
+                or (
+                    record.entry_type == "web"
+                    and bool(outbound_context.get("taskId"))
+                )
+            )
             and record.status == "completed"
             and outbound_context.get("callResult") == "connected"
         )

@@ -695,6 +695,19 @@ class AiCallAgentConsoleService:
     async def bootstrap_payload(self, auth: AuthSchema) -> dict:
         profile = await self.require_current_agent(auth)
         presence = await self._presence(profile)
+        if (
+            presence is not None
+            and presence.status != "offline"
+            and not presence.active_handoff_id
+            and not presence.active_call_id
+            and presence.last_seen_at is not None
+            and datetime.now(timezone.utc) - self._ensure_utc(presence.last_seen_at)
+            > timedelta(seconds=30)
+        ):
+            presence.status = "offline"
+            presence.console_session_id = None
+            presence.status_updated_at = datetime.now(timezone.utc)
+            await self.db.flush()
         current_handoff = None
         if presence is not None and presence.active_handoff_id:
             handoff = await self.repository.get_console_handoff_for_claim(

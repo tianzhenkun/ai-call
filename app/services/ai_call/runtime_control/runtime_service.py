@@ -75,6 +75,8 @@ class RuntimeProvider(Protocol):
 
 
 class RuntimeLocalHandle(Protocol):
+    async def start_opening(self) -> None: ...
+
     async def shutdown(self) -> None: ...
 
     async def fail_closed(self) -> None: ...
@@ -571,6 +573,22 @@ class RuntimeControlService:
                 command_claim,
                 lease,
             )
+        elif command_claim.command_type == "START_OPENING":
+            handle = self.registry.local_handles.get(command_claim.call_id)
+            decision = CommandDecision(status=CommandStatus.SUCCEEDED)
+            if handle is None:
+                decision = CommandDecision(
+                    status=CommandStatus.RETRY_WAIT,
+                    error_message="owner local agent is not ready",
+                    retry_after=timedelta(seconds=0.5),
+                )
+            else:
+                await handle.start_opening()
+            async with session_factory.begin() as session:
+                await RuntimeCommandRepository(session).complete(
+                    command_claim,
+                    decision,
+                )
         else:
             async with session_factory.begin() as session:
                 await RuntimeCommandRepository(session).complete(

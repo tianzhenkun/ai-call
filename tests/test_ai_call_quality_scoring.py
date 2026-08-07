@@ -17,6 +17,11 @@ from app.api.v1.ai_call.model import (
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
 )
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
+)
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
 from app.services.ai_call.quality_scoring import (
@@ -139,6 +144,135 @@ async def test_quality_scoring_scores_after_recording_and_dialogue_ready(
         assert result.status == QUALITY_SCORE_STATUS_COMPLETED
         assert result.score == 86
     assert result.reason == "客户问题回应完整，转人工时机合理。"
+
+
+@pytest.mark.anyio
+async def test_quality_scoring_scores_task_owned_web_after_evidence_ready(
+    session_maker,
+) -> None:
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        call_id = "call-quality-web-ready"
+        await _create_completed_record(
+            repository,
+            call_id=call_id,
+            entry_type="web",
+        )
+        await _create_task_owned_attempt(repository, call_id=call_id)
+        now = datetime.now(timezone.utc)
+        await repository.create_recording(
+            tenant_id="000000",
+            call_id=call_id,
+            room_name=f"room-{call_id}",
+            status="completed",
+            started_at=now,
+            object_name=f"recov/ai-call/recordings/{call_id}.ogg",
+        )
+        await repository.upsert_dialogue_segment(
+            call_id=call_id,
+            segment_no=1,
+            speaker_type="customer",
+            speaker_identity="web-customer",
+            source="offline_asr",
+            source_segment_id="offline-web-1",
+            segment_text="我想了解一下你们这个服务怎么收费。",
+            segment_status="final",
+            started_at=now,
+            ended_at=now,
+            duration_ms=1000,
+        )
+
+        result = await AiCallQualityScoringService(
+            repository,
+            scorer=FakeQualityScorer(),
+        ).score_call_once(
+            tenant_id="000000",
+            call_id=call_id,
+            model_version="quality-v1",
+        )
+
+        assert result.status == QUALITY_SCORE_STATUS_COMPLETED
+        assert result.score == 86
+
+
+@pytest.mark.anyio
+async def test_quality_scoring_skips_generic_web_browser_test(session_maker) -> None:
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        call_id = "call-quality-web-generic"
+        await _create_completed_record(
+            repository,
+            call_id=call_id,
+            entry_type="web",
+        )
+        now = datetime.now(timezone.utc)
+        await repository.create_recording(
+            tenant_id="000000",
+            call_id=call_id,
+            room_name=f"room-{call_id}",
+            status="completed",
+            started_at=now,
+            object_name=f"recov/ai-call/recordings/{call_id}.ogg",
+        )
+        await repository.upsert_dialogue_segment(
+            call_id=call_id,
+            segment_no=1,
+            speaker_type="customer",
+            speaker_identity="web-customer",
+            source="offline_asr",
+            source_segment_id="offline-web-generic-1",
+            segment_text="我想了解一下你们这个服务怎么收费。",
+            segment_status="final",
+            started_at=now,
+            ended_at=now,
+            duration_ms=1000,
+        )
+
+        result = await AiCallQualityScoringService(
+            repository,
+            scorer=FakeQualityScorer(),
+        ).score_call_once(
+            tenant_id="000000",
+            call_id=call_id,
+            model_version="quality-v1",
+        )
+
+        assert result.status == QUALITY_SCORE_STATUS_PENDING
+
+
+@pytest.mark.anyio
+async def test_record_list_marks_only_task_owned_web_as_quality_applicable(
+    session_maker,
+) -> None:
+    async with session_maker() as db:
+        repository = AiCallRecordRepository(db)
+        await _create_completed_record(
+            repository,
+            call_id="call-quality-web-task-list",
+            entry_type="web",
+        )
+        await _create_task_owned_attempt(
+            repository,
+            call_id="call-quality-web-task-list",
+        )
+        await _create_completed_record(
+            repository,
+            call_id="call-quality-web-generic-list",
+            entry_type="web",
+        )
+
+        record_service = AiCallRecordService(repository)
+        rows, _ = await record_service.list_records(
+            tenant_id="000000",
+            page_size=10,
+        )
+        payloads = {row.call_id: record_service.record_to_dict(row) for row in rows}
+
+        assert payloads["call-quality-web-task-list"]["qualityScoreStatus"] == "pending"
+        assert (
+            payloads["call-quality-web-generic-list"]["qualityScoreStatus"]
+            == "not_applicable"
+        )
 
 
 @pytest.mark.anyio
@@ -301,6 +435,7 @@ async def _create_completed_record(
     repository: AiCallRecordRepository,
     *,
     call_id: str,
+    entry_type: str = "outbound",
 ) -> None:
     await repository.create_record(
         tenant_id="000000",
@@ -308,9 +443,77 @@ async def _create_completed_record(
         business_type=None,
         business_id=None,
         scene_code="intro_geo",
-        entry_type="outbound",
+        entry_type=entry_type,
         room_name=f"room-{call_id}",
         participant_identity="sip-13800138000",
         status="completed",
         started_at=datetime.now(timezone.utc),
     )
+
+
+async def _create_task_owned_attempt(
+    repository: AiCallRecordRepository,
+    *,
+    call_id: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    task_id = 1101
+    target_id = 1102
+    repository.db.add_all(
+        [
+            AiCallOutboundTaskModel(
+                id=task_id,
+                tenant_id="000000",
+                validation_id=1100,
+                idempotency_key=f"quality-{call_id}",
+                request_fingerprint="quality-test",
+                task_name="Web 评分测试",
+                task_mode="single",
+                answer_mode="web",
+                status="RUNNING",
+                total_targets=1,
+                completed_targets=0,
+                connected_targets=0,
+                failed_targets=0,
+                execution_mode="immediate",
+                prompt_name="测试提示词",
+                scene_code="intro_geo",
+                voice="test-voice",
+                rule_id=1,
+                rule_name="测试规则",
+                rule_summary="测试规则摘要",
+                config_snapshot_json="{}",
+                created_by=1,
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallOutboundTargetModel(
+                id=target_id,
+                tenant_id="000000",
+                task_id=task_id,
+                validation_id=1100,
+                source_validation_row_id=1103,
+                source_row_number=1,
+                phone_number=None,
+                customer_name="Web 客户",
+                status="PENDING",
+                attempt_count=1,
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallOutboundAttemptModel(
+                id=1104,
+                tenant_id="000000",
+                task_id=task_id,
+                target_id=target_id,
+                attempt_no=1,
+                call_id=call_id,
+                status="COMPLETED",
+                call_result="connected",
+                started_at=now,
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
+    )
+    await repository.db.flush()

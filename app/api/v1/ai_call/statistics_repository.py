@@ -12,6 +12,9 @@ from .outbound.rule_task_model import (
     AiCallOutboundTaskModel,
 )
 
+FORMAL_TASK_ENTRY_TYPES = ("outbound", "sip_outbound", "web")
+SIP_OUTBOUND_ENTRY_TYPES = ("outbound", "sip_outbound")
+
 
 @dataclass(frozen=True)
 class StatisticsOverviewAggregate:
@@ -66,7 +69,7 @@ class OutboundStatisticsRepository:
     ) -> Select:
         return statement.where(
             AiCallOutboundAttemptModel.tenant_id == tenant_id,
-            AiCallRecordModel.entry_type.in_(("outbound", "sip_outbound")),
+            AiCallRecordModel.entry_type.in_(FORMAL_TASK_ENTRY_TYPES),
             AiCallRecordModel.started_at >= started_at,
             AiCallRecordModel.started_at < ended_at,
         )
@@ -132,9 +135,18 @@ class OutboundStatisticsRepository:
         result_group = case(
             (AiCallOutboundAttemptModel.call_result == "connected", "connected"),
             (AiCallOutboundAttemptModel.call_result == "no_answer", "no_answer"),
-            (AiCallOutboundAttemptModel.call_result == "busy", "busy"),
             (
-                AiCallOutboundAttemptModel.call_result == "invalid_number",
+                and_(
+                    AiCallOutboundAttemptModel.call_result == "busy",
+                    AiCallRecordModel.entry_type.in_(SIP_OUTBOUND_ENTRY_TYPES),
+                ),
+                "busy",
+            ),
+            (
+                and_(
+                    AiCallOutboundAttemptModel.call_result == "invalid_number",
+                    AiCallRecordModel.entry_type.in_(SIP_OUTBOUND_ENTRY_TYPES),
+                ),
                 "invalid_number",
             ),
             (

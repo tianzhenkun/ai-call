@@ -9,11 +9,14 @@ from pydantic.alias_generators import to_camel
 VoiceStatus = Literal[
     "CREATING",
     "ENABLED",
+    "DISABLED",
     "CREATE_FAILED",
     "DELETING",
     "DELETE_FAILED",
     "DELETED",
 ]
+
+VoiceAvailabilityStatus = Literal["ENABLED", "DISABLED"]
 
 
 def _stringify_positive_bigint(value: object) -> str:
@@ -59,6 +62,12 @@ class VoiceEnrollmentRequest(BaseModel):
             normalized = value.strip()
             return normalized or None
         return value
+
+
+class VoiceAvailabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: VoiceAvailabilityStatus
 
 
 class VoiceEnrollmentAcceptedOut(BaseModel):

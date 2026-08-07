@@ -37,6 +37,7 @@ async def webhook_session_factory(tmp_path):
 async def _seed_owner_record(
     session_factory,
     *,
+    entry_type: str = "web",
     with_handoff: bool = True,
     handoff_status: str = "accepted",
     record_id: int = 101,
@@ -50,7 +51,7 @@ async def _seed_owner_record(
                 id=record_id,
                 tenant_id="tenant-a",
                 call_id=call_id,
-                entry_type="web",
+                entry_type=entry_type,
                 room_name=room_name,
                 participant_identity=f"caller-{call_id}",
                 status="ready",
@@ -473,14 +474,20 @@ async def test_old_processing_token_cannot_write_evidence_or_command(
 
 
 @pytest.mark.anyio
-async def test_sip_participant_left_appends_one_end_call_and_evidence(
+@pytest.mark.parametrize(
+    ("entry_type", "expected_end_reason"),
+    (("web", "browser_disconnect"), ("direct_sip", "sip_participant_left")),
+)
+async def test_customer_participant_left_uses_entry_specific_end_reason(
     webhook_session_factory,
+    entry_type: str,
+    expected_end_reason: str,
 ) -> None:
     from app.services.ai_call.runtime_control.webhook_repository import (
         RuntimeWebhookRepository,
     )
 
-    await _seed_owner_record(webhook_session_factory)
+    await _seed_owner_record(webhook_session_factory, entry_type=entry_type)
     now = datetime(2026, 8, 2, 3, 4, tzinfo=timezone.utc)
     intent = _receive_intent(
         dedupe_key="EV_sip_left_1",
@@ -522,6 +529,7 @@ async def test_sip_participant_left_appends_one_end_call_and_evidence(
     assert record.terminal_requested_at.replace(tzinfo=timezone.utc) == now
     assert [command.command_type for command in commands] == ["END_CALL"]
     assert evidence.source == "livekit_webhook"
+    assert evidence.end_reason == expected_end_reason
     assert evidence.provider_event_id == "EV_sip_left_1"
     assert inbox.status == "SUCCEEDED"
 

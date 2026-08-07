@@ -620,3 +620,77 @@ async def test_runtime_routes_media_ready_to_specialized_handler(monkeypatch) ->
 
     assert processed is True
     assert len(routed) == 1
+
+
+@pytest.mark.anyio
+async def test_runtime_routes_start_opening_to_owner_local_handle(monkeypatch) -> None:
+    from app.services.ai_call.runtime_control import runtime_service
+
+    claim = SimpleNamespace(command_type="START_OPENING", call_id="call-1")
+    lease = SimpleNamespace(call_id="call-1")
+    decisions = []
+    openings = []
+
+    class _Transaction:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+            return None
+
+    class _SessionFactory:
+        def begin(self):
+            return _Transaction()
+
+    class _CommandRepository:
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_pending_end(self, _lease):
+            return None
+
+        async def claim_next_for_owner(self, _lease):
+            return claim
+
+        async def complete(self, received_claim, decision):
+            assert received_claim is claim
+            decisions.append(decision)
+
+    class _EffectRepository:
+        def __init__(self, _session) -> None:
+            return None
+
+        async def claim_next(self, _lease):
+            return None
+
+        async def mark_cleanup_clean(self, _lease):
+            return False
+
+    class _Handle:
+        async def start_opening(self):
+            openings.append("call-1")
+
+    monkeypatch.setattr(runtime_service, "RuntimeCommandRepository", _CommandRepository)
+    monkeypatch.setattr(runtime_service, "RuntimeEffectRepository", _EffectRepository)
+    service = RuntimeControlService(
+        worker_id="runtime-test:12345678-1234-5678-1234-567812345678",
+        registry=RuntimeRegistry(local_handles={"call-1": _Handle()}),
+        session_factory=None,
+        provider=None,
+    )
+    watchdog = OwnerFailClosedWatchdog(
+        lease_ttl_seconds=15,
+        safety_margin_seconds=3,
+    )
+    watchdog.observe_renewal()
+
+    processed = await service._process_owned_call(
+        _SessionFactory(),
+        SimpleNamespace(),
+        lease,
+        watchdog,
+    )
+
+    assert processed is True
+    assert openings == ["call-1"]
+    assert decisions[0].status.value == "SUCCEEDED"

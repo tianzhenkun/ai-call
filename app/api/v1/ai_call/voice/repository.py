@@ -244,7 +244,7 @@ class VoiceRepository:
             status=profile.status,
             error_message=profile.error_message,
             can_preview=profile.status == "ENABLED" and bool(profile.voice),
-            can_delete=profile.status in {"ENABLED", "DELETE_FAILED"},
+            can_delete=profile.status in {"ENABLED", "DISABLED", "DELETE_FAILED"},
             created_at=profile.created_at,
             updated_at=profile.updated_at,
         )

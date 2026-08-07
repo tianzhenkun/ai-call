@@ -577,6 +577,8 @@ class AiCallAgentConsoleReconciler:
         auth: AuthSchema,
         *,
         status: str | None = None,
+        source_type: str | None = None,
+        scene_code: str | None = None,
         formal_outbound_only: bool = False,
         source_started_at_begin: datetime | None = None,
         source_started_at_end: datetime | None = None,
@@ -585,6 +587,8 @@ class AiCallAgentConsoleReconciler:
     ) -> dict:
         _, tenant_id = self._identity(auth)
         normalized_status = (status or "").strip() or None
+        normalized_source_type = (source_type or "").strip() or None
+        normalized_scene_code = (scene_code or "").strip() or None
         if normalized_status not in {
             None,
             "pending",
@@ -606,6 +610,14 @@ class AiCallAgentConsoleReconciler:
         formal_source_scope = None
         if normalized_status:
             filtered_stmt = filtered_stmt.where(AiCallFollowUpTaskModel.status == normalized_status)
+        if normalized_source_type:
+            filtered_stmt = filtered_stmt.where(
+                AiCallFollowUpTaskModel.source_type == normalized_source_type
+            )
+        if normalized_scene_code:
+            filtered_stmt = filtered_stmt.where(
+                AiCallFollowUpTaskModel.scene_code == normalized_scene_code
+            )
         if (
             formal_outbound_only
             or source_started_at_begin is not None
@@ -804,7 +816,10 @@ class AiCallAgentConsoleReconciler:
         return {
             "task": self.follow_up_service.follow_up_payload(task),
             "attempts": [self.follow_up_service.attempt_payload(attempt) for attempt in attempts],
-            "callback_records": [self._record_payload(record) for record in callback_records],
+            "callback_records": [
+                self.follow_up_service.follow_up_record_payload(record)
+                for record in callback_records
+            ],
         }
 
     async def _append_audit_event(

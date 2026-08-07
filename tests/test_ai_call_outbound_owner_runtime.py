@@ -397,6 +397,7 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
     assert payload == {
         "attempt_id": str(attempt.id),
         "attempt_no": 1,
+        "business_params": {"customerName": "客户1"},
         "line_code": "provider-a",
         "line_id": "340700000000000001",
         "prompt_profile_id": "prompt-1",
@@ -468,6 +469,7 @@ async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
     assert json.loads(command.payload_json or "{}") == {
         "attempt_id": str(attempt.id),
         "attempt_no": 1,
+        "business_params": {"customerName": "客户1"},
         "line_code": None,
         "line_id": None,
         "prompt_profile_id": "prompt-1",

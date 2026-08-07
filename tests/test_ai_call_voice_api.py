@@ -92,6 +92,9 @@ class FakeEnrollmentService:
 
 
 class FakeLifecycleService:
+    def __init__(self) -> None:
+        self.availability_calls: list[dict[str, object]] = []
+
     async def get_enrollment(self, *, tenant_id: str, enrollment_id: int):
         if enrollment_id == 9002:
             raise CustomException(
@@ -177,6 +180,25 @@ class FakeLifecycleService:
             "voiceProfileId": str(profile_id),
             "deletionId": str(BIG_ENROLLMENT_ID),
             "status": "DELETING",
+        }
+
+    async def set_availability(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        availability_status: str,
+    ):
+        self.availability_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "profile_id": profile_id,
+                "status": availability_status,
+            },
+        )
+        return {
+            "id": str(profile_id),
+            "status": availability_status,
         }
 
 
@@ -289,6 +311,7 @@ def test_voice_routes_replace_old_direct_registration_entry() -> None:
         ("/ai-call/voice-preview-sessions/{callId}/ready", "POST"),
         ("/ai-call/voice-preview-sessions/{callId}", "DELETE"),
         ("/ai-call/tenant-voice-profiles/{id}/deletion-check", "GET"),
+        ("/ai-call/tenant-voice-profiles/{id}/status", "PATCH"),
         ("/ai-call/tenant-voice-profiles/{id}", "DELETE"),
     }
     registered = {
@@ -498,6 +521,34 @@ def test_cross_tenant_resource_operations_do_not_expose_resources(
     assert preview.status_code in {403, 404}
     assert deletion_check.status_code in {403, 404}
     assert delete.status_code in {403, 404}
+
+
+def test_tenant_voice_availability_routes_to_tenant_lifecycle_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    client, _repository, _service, lifecycle = _client(
+        monkeypatch,
+        permissions=frozenset({"ai_call:voice:manage"}),
+    )
+
+    response = client.patch(
+        f"/ai-call/tenant-voice-profiles/{BIG_PROFILE_ID}/status",
+        json={"status": "DISABLED"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "id": str(BIG_PROFILE_ID),
+        "status": "DISABLED",
+    }
+    assert lifecycle.availability_calls == [
+        {
+            "tenant_id": "tenant-a",
+            "profile_id": BIG_PROFILE_ID,
+            "status": "DISABLED",
+        },
+    ]
 
 
 def test_delete_conflict_returns_structured_task_references(

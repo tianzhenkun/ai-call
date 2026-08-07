@@ -195,7 +195,12 @@ class AiCallQualityScoringService:
         )
         if record is None:
             return False
-        if record.entry_type not in {"outbound", "sip_outbound"}:
+        if record.entry_type == "web" and not await self.repository.has_task_owned_outbound_attempt(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        ):
+            return False
+        if record.entry_type not in {"outbound", "sip_outbound", "web"}:
             return False
         if record.status != "completed":
             return False

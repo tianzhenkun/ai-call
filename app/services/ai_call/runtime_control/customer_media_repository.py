@@ -6,6 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.services.ai_call.runtime_control.command_repository import (
+    CommandIntent,
+    RuntimeCommandRepository,
+)
 from app.services.ai_call.runtime_control.postgres_wakeup import (
     publish_control_wakeup,
 )
@@ -43,6 +47,22 @@ class OwnerCustomerMediaRepository:
         )
         record.answered_at = record.answered_at or now
         record.status = "connected"
+
+        async def database_clock(_session: AsyncSession) -> datetime:
+            return now
+
+        await RuntimeCommandRepository(
+            self._session,
+            database_clock=database_clock,
+        ).append_command(
+            CommandIntent(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                command_type="START_OPENING",
+                idempotency_key=f"start-opening:{call_id}",
+                payload={},
+            )
+        )
         await self._session.flush()
         await publish_control_wakeup(self._session)
         return True

@@ -522,6 +522,7 @@ async def test_list_applies_model_availability_type_gender_and_status_filters(
             status="DELETE_FAILED",
         ),
         _tenant_voice(profile_id=26, voice=None, status="DELETED"),
+        _tenant_voice(profile_id=27, voice="vc-disabled", status="DISABLED"),
     )
 
     async with factory() as database:
@@ -958,6 +959,93 @@ async def test_deletion_check_bounds_blocking_task_id_page(
     assert len(result["blockingTaskIds"]) == 100
     assert result["blockingTaskIds"][0] == "1000"
     assert result["blockingTaskIds"][-1] == "1099"
+
+
+@pytest.mark.anyio
+async def test_tenant_voice_availability_can_be_disabled_and_reenabled(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(factory, _tenant_voice(profile_id=7021, voice="vc-enabled"))
+    service = _deletion_service(factory)
+
+    async with factory() as database:
+        disabled = await service.set_availability(
+            database,
+            tenant_id="tenant-a",
+            profile_id=7021,
+            availability_status="DISABLED",
+        )
+    async with factory() as database:
+        enabled = await service.set_availability(
+            database,
+            tenant_id="tenant-a",
+            profile_id=7021,
+            availability_status="ENABLED",
+        )
+
+    assert disabled.status == "DISABLED"
+    assert disabled.can_preview is False
+    assert disabled.can_delete is True
+    assert enabled.status == "ENABLED"
+    assert enabled.can_preview is True
+
+
+@pytest.mark.anyio
+async def test_tenant_voice_availability_rejects_transient_status(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(
+        factory,
+        _tenant_voice(profile_id=7023, voice="vc-creating", status="CREATING"),
+    )
+    service = _deletion_service(factory)
+
+    async with factory() as database:
+        with pytest.raises(CustomException) as caught:
+            await service.set_availability(
+                database,
+                tenant_id="tenant-a",
+                profile_id=7023,
+                availability_status="DISABLED",
+            )
+
+    assert caught.value.status_code == 409
+
+
+@pytest.mark.anyio
+async def test_disabled_tenant_voice_can_be_deleted(
+    deletion_database,
+) -> None:
+    _engine, factory = deletion_database
+    await _seed(
+        factory,
+        _tenant_voice(
+            profile_id=7022,
+            voice="vc-disabled",
+            status="DISABLED",
+        ),
+    )
+    service = _deletion_service(factory, ids=(822,))
+
+    async with factory() as database:
+        preflight = await service.deletion_check(
+            database,
+            tenant_id="tenant-a",
+            profile_id=7022,
+        )
+    async with factory() as database:
+        accepted = await service.request_deletion(
+            database,
+            tenant_id="tenant-a",
+            user_id=7,
+            profile_id=7022,
+            idempotency_key="delete-disabled-voice",
+        )
+
+    assert preflight["deletable"] is True
+    assert accepted["status"] == "DELETING"
 
 
 @pytest.mark.anyio

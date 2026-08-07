@@ -137,7 +137,6 @@ class WorkerRegistryRepository:
             .where(
                 AiCallRuntimeWorkerModel.worker_id == lease.worker_id,
                 AiCallRuntimeWorkerModel.status.in_({"READY", "DRAINING"}),
-                AiCallRuntimeWorkerModel.lease_expires_at > now,
             )
             .values(
                 heartbeat_at=now,
@@ -1145,6 +1144,7 @@ _INVALID_LINE_ID = object()
 _OUTBOUND_START_PAYLOAD_KEYS = frozenset({
     "attempt_id",
     "attempt_no",
+    "business_params",
     "line_code",
     "line_id",
     "prompt_profile_id",
@@ -1162,10 +1162,21 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         payload = json.loads(payload_json)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or set(payload) != _OUTBOUND_START_PAYLOAD_KEYS:
+    if not isinstance(payload, dict) or set(payload) not in {
+        _OUTBOUND_START_PAYLOAD_KEYS,
+        _OUTBOUND_START_PAYLOAD_KEYS - {"business_params"},
+    }:
         return None
     if type(payload["attempt_no"]) is not int or payload["attempt_no"] <= 0:
         return None
+    business_params = payload.get("business_params")
+    if business_params is not None:
+        if not isinstance(business_params, dict) or set(business_params) != {
+            "customerName"
+        }:
+            return None
+        if not isinstance(business_params["customerName"], str):
+            return None
     if not all(
         isinstance(payload[key], str) and payload[key].strip()
         for key in ("scene_code", "voice")

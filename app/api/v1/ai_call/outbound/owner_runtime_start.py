@@ -60,6 +60,7 @@ class OwnerRuntimeOutboundStart:
         payload = {
             "attempt_id": str(attempt_id),
             "attempt_no": request.attempt_no,
+            "business_params": {"customerName": request.customer_name or ""},
             "line_code": request.line.line_code if request.line is not None else None,
             "line_id": str(request.line.line_id) if request.line is not None else None,
             "prompt_profile_id": request.prompt_profile_id,

@@ -619,12 +619,16 @@ async def test_task_history_keeps_voice_snapshot_after_tenant_voice_deleted(
 
 
 @pytest.mark.anyio
-async def test_formal_task_rejects_non_enabled_tenant_voice(database) -> None:
+@pytest.mark.parametrize("voice_status", ["DELETING", "DISABLED"])
+async def test_formal_task_rejects_non_enabled_tenant_voice(
+    database,
+    voice_status: str,
+) -> None:
     prompt_id, _ = await _seed_references(database)
     await _seed_tenant_voice(
         database,
         voice="qwen-omni-vc-deleting",
-        status="DELETING",
+        status=voice_status,
     )
     service = OutboundRuleTaskService(database)
     async with database() as session:
@@ -651,7 +655,7 @@ async def test_formal_task_rejects_non_enabled_tenant_voice(database) -> None:
                 "tenant-a",
                 10,
                 "管理员",
-                "idem-deleting-voice",
+                f"idem-{voice_status.lower()}-voice",
                 _create_task_request(config, validation_id),
             )
 

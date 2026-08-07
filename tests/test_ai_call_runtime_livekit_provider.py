@@ -1055,6 +1055,85 @@ async def test_resource_resolver_uses_effect_generation_and_source_reference() -
 
 
 @pytest.mark.anyio
+async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypatch) -> None:
+    from app.api.v1.ai_call import service as ai_call_service
+    from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+
+    contexts = []
+    prompt_config = SimpleNamespace(opening_message="您好刘先生，想介绍一下 GEO。")
+
+    class PromptResolver:
+        async def resolve(self, context):
+            contexts.append(context)
+            return SimpleNamespace()
+
+    monkeypatch.setattr(
+        ai_call_service,
+        "_build_prompt_resolver",
+        lambda _repository, _orchestrator: PromptResolver(),
+    )
+    monkeypatch.setattr(
+        ai_call_service,
+        "_build_prompt_composer",
+        lambda _orchestrator: SimpleNamespace(compose=lambda _result: prompt_config),
+    )
+    rows = {
+        AiCallRecordModel: SimpleNamespace(
+            tenant_id="tenant-a",
+            call_id="call-1",
+            room_name="ai-call-call-1",
+            participant_identity="browser-call-1",
+            callee_phone_number=None,
+            business_id="attempt-1",
+            scene_code="intro_geo",
+        ),
+        AiCallRuntimeCommandModel: SimpleNamespace(
+            payload_json=(
+                '{"business_params":{"customerName":"刘先生"},"voice":"Cherry"}'
+            )
+        ),
+    }
+
+    class FakeSession:
+        async def scalar(self, statement):
+            entity = statement.column_descriptions[0]["entity"]
+            if entity is AiCallRuntimeEffectModel:
+                return SimpleNamespace(
+                    id=101,
+                    tenant_id="tenant-a",
+                    call_id="call-1",
+                    command_id=77,
+                    provider_namespace="livekit:test",
+                    resource_generation=5,
+                    provider_reference=None,
+                )
+            return rows.get(entity)
+
+    class SessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    resource = await DatabaseRuntimeProviderResourceResolver(
+        lambda: SessionContext(),
+        orchestrator=object(),
+    ).resolve(_effect("ATTACH_AGENT_PARTICIPANT"))
+
+    assert resource.prompt_effective_config is prompt_config
+    assert contexts[0].scene_code == "intro_geo"
+    assert contexts[0].business_params == {"customerName": "刘先生"}
+
+
+@pytest.mark.anyio
 async def test_resource_resolver_validates_customer_track_scope_and_source_reference() -> None:
     from app.api.v1.ai_call.model import AiCallRecordModel
     from app.services.ai_call.runtime_control.livekit_provider import (
@@ -1206,12 +1285,17 @@ async def test_owner_agent_manager_registers_generation_identity_and_fail_closed
             self.stopped.append(call_id)
 
     runner = FakeRunner()
+    prompt_config = SimpleNamespace(
+        instructions="GEO 业务话术",
+        opening_message="您好刘先生，我是灵宸智能助手。",
+    )
     orchestrator = SimpleNamespace(
         registry=InMemorySessionRegistry(),
         agent_runner=runner,
-        _build_effective_config=lambda voice, prompt: {
+        _build_effective_config=lambda voice, prompt, prompt_effective_config=None: {
             "voice": voice,
             "prompt": prompt,
+            "prompt_effective_config": prompt_effective_config,
         },
     )
     runtime_registry = RuntimeRegistry()
@@ -1225,12 +1309,14 @@ async def test_owner_agent_manager_registers_generation_identity_and_fail_closed
         customer_participant_identity="sip-call-1",
         agent_participant_identity="agent-call-1-g7",
         voice="Cherry",
+        prompt_effective_config=prompt_config,
     )
 
     reference = await manager.start(resource)
 
     assert reference == "agent-call-1-g7"
     assert runner.started[0].local_participant_identity == "agent-call-1-g7"
+    assert runner.started[0].effective_config["prompt_effective_config"] is prompt_config
     assert "call-1" in runtime_registry.local_handles
 
     await runtime_registry.local_handles["call-1"].fail_closed()

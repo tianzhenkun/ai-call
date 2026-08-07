@@ -2219,6 +2219,41 @@ async def test_worker_registration_uses_database_time_and_stable_instance_identi
         await engine.dispose()
 
 
+async def test_worker_heartbeat_recovers_after_process_sleep() -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 6, tzinfo=timezone.utc)
+
+    async def database_clock(_session: AsyncSession) -> datetime:
+        return now
+
+    try:
+        async with factory.begin() as session:
+            registry = WorkerRegistryRepository(
+                session,
+                lease_ttl=timedelta(seconds=30),
+                database_clock=database_clock,
+            )
+            lease = await registry.register(
+                WorkerRegistration(
+                    deployment_instance_id="runtime-a",
+                    startup_id=UUID("12345678-1234-5678-1234-567812345678"),
+                    capacity=2,
+                    cleanup_capacity=1,
+                )
+            )
+            now += timedelta(minutes=15)
+
+            assert await registry.heartbeat(lease) is True
+            worker = await session.get(AiCallRuntimeWorkerModel, lease.worker_id)
+            assert worker is not None
+            assert worker.heartbeat_at == now
+            assert worker.lease_expires_at == now + timedelta(seconds=30)
+    finally:
+        await engine.dispose()
+
+
 async def test_owner_dispatcher_assigns_once_and_runtime_only_renews_exact_lease() -> None:
     engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
     await _reset_repository_schema(engine)

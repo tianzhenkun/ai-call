@@ -33,6 +33,7 @@ from ..outbound.controller import _identity
 from ..schema import CreateSessionOut, EndSessionOut, EventOut
 from .repository import VoiceRepository
 from .schema import (
+    VoiceAvailabilityRequest,
     VoiceEnrollmentAcceptedOut,
     VoiceEnrollmentRequest,
     VoiceStatus,
@@ -103,6 +104,14 @@ class VoiceLifecycleService(Protocol):
         idempotency_key: str,
     ) -> Any: ...
 
+    async def set_availability(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        availability_status: str,
+    ) -> Any: ...
+
 
 class VoicePreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -148,6 +157,9 @@ class _UnavailableVoiceLifecycleService:
         self._raise_unavailable()
 
     async def request_deletion(self, **kwargs):
+        self._raise_unavailable()
+
+    async def set_availability(self, **kwargs):
         self._raise_unavailable()
 
     @staticmethod
@@ -205,6 +217,11 @@ class _DefaultVoiceLifecycleService(_UnavailableVoiceLifecycleService):
         if self.deletion_service is None:
             self._raise_unavailable()
         return await self.deletion_service.request_deletion(self.db, **kwargs)
+
+    async def set_availability(self, **kwargs):
+        if self.deletion_service is None:
+            self._raise_unavailable()
+        return await self.deletion_service.set_availability(self.db, **kwargs)
 
 
 _unavailable_enrollment_service = _UnavailableVoiceEnrollmentService()
@@ -521,6 +538,28 @@ async def check_voice_deletion_controller(
         profile_id=profile_id,
     )
     return SuccessResponse(data=result, msg="检查成功")
+
+
+@VoiceRouter.patch(
+    "/tenant-voice-profiles/{id}/status",
+    summary="切换租户音色状态",
+)
+async def set_tenant_voice_availability_controller(
+    profile_id: Annotated[int, Path(alias="id", gt=0)],
+    request: VoiceAvailabilityRequest,
+    auth: Annotated[AuthSchema, Depends(get_voice_manager)],
+    service: Annotated[
+        VoiceLifecycleService,
+        Depends(get_voice_deletion_lifecycle_service),
+    ],
+) -> JSONResponse:
+    tenant_id, _user_id = _identity(auth)
+    result = await service.set_availability(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        availability_status=request.status,
+    )
+    return SuccessResponse(data=result, msg="音色状态已更新")
 
 
 @VoiceRouter.delete(

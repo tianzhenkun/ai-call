@@ -443,6 +443,34 @@ async def test_stale_available_presence_is_persisted_as_offline(session_factory)
 
 
 @pytest.mark.anyio
+async def test_bootstrap_releases_stale_available_console_session(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    async with session_factory() as db, db.begin():
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        presence.last_seen_at = datetime.now(timezone.utc) - timedelta(seconds=31)
+
+    async with session_factory() as db, db.begin():
+        payload = await AiCallAgentConsoleService(db).bootstrap_payload(
+            _auth(db, user_id=20)
+        )
+
+    assert payload["presence"]["status"] == "offline"
+    assert payload["presence"]["console_session_id"] is None
+
+
+@pytest.mark.anyio
 async def test_pending_pool_filters_tenant_status_expiry_and_scene_scope(session_factory) -> None:
     console_session_id = str(uuid4())
     await _seed_agent(

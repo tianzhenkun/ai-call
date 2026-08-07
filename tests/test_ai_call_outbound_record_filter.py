@@ -230,6 +230,19 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
             status="completed",
             started_at=now,
         )
+        generic_web = AiCallRecordModel(
+            id=304,
+            call_id="call-generic-web-1",
+            business_type=None,
+            business_id=None,
+            scene_code="intro_geo",
+            prompt_source_key=None,
+            entry_type="web",
+            room_name="room-generic-web-1",
+            participant_identity="browser-lab",
+            status="completed",
+            started_at=now,
+        )
         manual_sip_record = AiCallRecordModel(
             id=303,
             call_id="call-manual-sip-1",
@@ -245,7 +258,15 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
         )
         attempt_table = MappedBase.metadata.tables["ai_call_outbound_attempt"]
         session.add_all(
-            [task, target, web_target, record, unrelated, manual_sip_record]
+            [
+                task,
+                target,
+                web_target,
+                record,
+                unrelated,
+                generic_web,
+                manual_sip_record,
+            ]
         )
         await session.flush()
         await session.execute(
@@ -309,8 +330,11 @@ async def test_record_list_filters_and_enriches_outbound_attempt_context() -> No
             tenant_id="000000",
             formal_outbound_only=True,
         )
-        assert formal_total == 1
-        assert [row.call_id for row in formal_rows] == ["call-outbound-1"]
+        assert formal_total == 2
+        assert {row.call_id for row in formal_rows} == {
+            "call-outbound-1",
+            "call-web-1",
+        }
 
         empty_rows, empty_total = await service.list_records(
             tenant_id="000000",

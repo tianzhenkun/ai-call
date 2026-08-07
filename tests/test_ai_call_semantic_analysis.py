@@ -1078,6 +1078,31 @@ def test_semantic_evidence_marks_direct_future_call_instruction_as_consent() -> 
     assert "follow_up_consent" in evidence["supported_strong_fact_types"]
 
 
+def test_semantic_evidence_marks_trial_link_acceptance_as_follow_up_consent() -> None:
+    snapshot = _build_snapshot([
+        _segment(
+            segment_no=1,
+            speaker_type="ai",
+            text="我稍后可以把试用申请链接发给您，您看方便吗？",
+            started_offset_seconds=0,
+            ended_offset_seconds=2,
+        ),
+        _segment(
+            segment_no=2,
+            speaker_type="customer",
+            text="方便。",
+            source="qwen_realtime",
+            started_offset_seconds=3,
+            ended_offset_seconds=4,
+        ),
+    ])
+
+    evidence = _user_turns(snapshot)[0]["semantic_evidence"]
+
+    assert evidence["supports_strong_fact"] is True
+    assert "follow_up_consent" in evidence["supported_strong_fact_types"]
+
+
 def test_semantic_evidence_marks_weak_feedback_without_business_fact() -> None:
     snapshot = _build_snapshot([
         _segment(

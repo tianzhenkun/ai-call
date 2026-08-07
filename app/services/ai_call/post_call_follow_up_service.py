@@ -54,7 +54,7 @@ def decide_post_call_follow_up(
 
 
 class AiCallPostCallFollowUpService:
-    """只为正式 SIP 外呼创建结构化 AI 话后跟进任务。"""
+    """为正式外呼创建结构化 AI 话后跟进任务。"""
 
     def __init__(self, repository: AiCallRecordRepository) -> None:
         self.repository = repository
@@ -70,12 +70,16 @@ class AiCallPostCallFollowUpService:
             return None
 
         record = await self.repository.get_record(analysis.call_id)
-        if record is None or record.entry_type != "sip_outbound":
+        if record is None or record.entry_type not in {
+            "sip_outbound",
+            "outbound",
+            "web",
+        }:
             return None
         attempt = await self.repository.get_outbound_attempt_by_call_id(
             analysis.call_id
         )
-        if attempt is None or attempt.dialer_type != "sip":
+        if attempt is None or attempt.dialer_type not in {"sip", "owner_runtime"}:
             return None
         handoffs = await self.repository.list_handoffs(analysis.call_id)
         if handoffs:
@@ -94,7 +98,10 @@ class AiCallPostCallFollowUpService:
             "business_type": record.business_type,
             "business_id": record.business_id,
             "contact_ref": f"call:{analysis.call_id}",
-            "masked_contact": record.callee_phone_number_masked or "未提供",
+            "masked_contact": (
+                record.callee_phone_number_masked
+                or ("Web 浏览器" if record.entry_type == "web" else "未提供")
+            ),
             "owner_agent_identity": None,
             "status": "pending",
             "follow_up_reason": decision.reason or "客户明确要求后续联系",

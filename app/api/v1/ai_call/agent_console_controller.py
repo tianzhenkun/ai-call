@@ -861,6 +861,8 @@ async def list_admin_follow_ups_controller(
         Depends(get_agent_console_reconciler),
     ],
     status: Annotated[str | None, Query()] = None,
+    source_type: Annotated[str | None, Query(alias="sourceType")] = None,
+    scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     formal_outbound_only: Annotated[
         bool,
         Query(alias="formalOutboundOnly"),
@@ -880,6 +882,8 @@ async def list_admin_follow_ups_controller(
         data=await service.list_follow_ups(
             auth,
             status=status,
+            source_type=source_type,
+            scene_code=scene_code,
             formal_outbound_only=formal_outbound_only,
             source_started_at_begin=source_started_at_begin,
             source_started_at_end=source_started_at_end,

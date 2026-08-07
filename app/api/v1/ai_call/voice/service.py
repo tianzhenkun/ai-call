@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Never, Protocol
+from typing import Any, Literal, Never, Protocol
 
 from fastapi import UploadFile, status
 from sqlalchemy import select, update
@@ -53,7 +53,7 @@ from .model import (
     AiCallVoiceSampleCleanupModel,
 )
 from .repository import VoiceRepository, VoiceTaskReferenceSummary
-from .schema import VoiceEnrollmentAcceptedOut, VoiceEnrollmentRequest
+from .schema import VoiceEnrollmentAcceptedOut, VoiceEnrollmentRequest, VoiceProfileOut
 
 MAX_SAMPLE_BYTES = 10 * 1024 * 1024
 PROVIDER = "aliyun_qwen"
@@ -1002,12 +1002,43 @@ class VoiceDeletionService:
         return {
             "voiceProfileId": str(profile.id),
             "deletable": (
-                profile.status in {"ENABLED", "DELETE_FAILED"}
+                profile.status in {"ENABLED", "DISABLED", "DELETE_FAILED"}
                 and bool(profile.voice)
                 and summary["blockingTaskCount"] == 0
             ),
             **summary,
         }
+
+    async def set_availability(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        availability_status: Literal["ENABLED", "DISABLED"],
+    ) -> VoiceProfileOut:
+        repository = VoiceRepository(db)
+        profile = await repository.get_tenant_profile(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            for_update=True,
+        )
+        if profile is None or profile.status == "DELETED":
+            self._raise_not_found()
+        if profile.status not in {"ENABLED", "DISABLED"}:
+            raise CustomException(
+                msg="当前音色状态不允许切换",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        profile.status = availability_status
+        profile.updated_at = self.now()
+        result = repository._tenant_profile(profile)
+        try:
+            await db.commit()
+        except Exception:
+            await self._safe_rollback(db)
+            self._raise_persistence_failure()
+        return result
 
     async def request_deletion(
         self,
@@ -1054,7 +1085,7 @@ class VoiceDeletionService:
             finally:
                 await self._safe_rollback(db)
             return result
-        if profile.status not in {"ENABLED", "DELETE_FAILED"} or not profile.voice:
+        if profile.status not in {"ENABLED", "DISABLED", "DELETE_FAILED"} or not profile.voice:
             await self._safe_rollback(db)
             raise CustomException(
                 msg="当前音色状态不允许删除",

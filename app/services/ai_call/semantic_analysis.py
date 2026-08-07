@@ -124,6 +124,14 @@ FOLLOW_UP_CONTACT_OFFER_PATTERN = re.compile(
     r"给您.{0,3}(?:打电话|来电)|顾问.{0,6}联系|"
     r"安排.{0,6}(?:顾问|专人|人员))"
 )
+FOLLOW_UP_DELIVERY_PATTERN = re.compile(
+    r"(?:给我|向我).{0,6}(?:发|发送|提供).{0,8}(?:试用|链接|资料|方案|报价)|"
+    r"(?:试用|链接|资料|方案|报价).{0,8}(?:发给我|发送给我|提供给我)"
+)
+FOLLOW_UP_DELIVERY_OFFER_PATTERN = re.compile(
+    r"(?:发|发送|提供).{0,10}(?:试用|链接|资料|方案|报价)|"
+    r"(?:试用|链接|资料|方案|报价).{0,10}(?:发|发送|提供)"
+)
 FOLLOW_UP_REFUSAL_PATTERN = re.compile(
     r"(?:不用|不要|别|无需|不需要|拒绝).{0,6}(?:联系|回访|回拨|打电话)|"
     r"(?:联系|回访|回拨).{0,6}(?:不用|不要|别)"
@@ -172,7 +180,7 @@ JSON 字段固定为：
 - key_points: 字符串数组，客户表达的事实、诉求、异议、承诺、风险点或约束条件。
 - time_hint: 对象，包含 time_text、time_value、original_texts。
 - tags: 字符串数组，开放中文标签。
-- follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 仅表示客户侧存在后续联系需求；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺联系不能作为客户同意证据。"""
+- follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 表示客户侧存在后续联系或业务履约需求（如回访、发送资料或试用链接）；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺跟进不能作为客户同意证据。"""
 
 FOLLOW_UP_CONSENTS = {"explicit", "missing", "refused"}
 FOLLOW_UP_CONFIDENCES = {"high", "medium", "low"}
@@ -1515,11 +1523,17 @@ class SemanticTranscriptBuilder:
     ) -> bool:
         if not text or FOLLOW_UP_REFUSAL_PATTERN.search(text):
             return False
-        if FOLLOW_UP_CONTACT_PATTERN.search(text):
+        if (
+            FOLLOW_UP_CONTACT_PATTERN.search(text)
+            or FOLLOW_UP_DELIVERY_PATTERN.search(text)
+        ):
             return True
         return bool(
             cls._normalized_text_value(text) in SHORT_ANSWER_TEXTS
-            and FOLLOW_UP_CONTACT_OFFER_PATTERN.search(previous_ai_text)
+            and (
+                FOLLOW_UP_CONTACT_OFFER_PATTERN.search(previous_ai_text)
+                or FOLLOW_UP_DELIVERY_OFFER_PATTERN.search(previous_ai_text)
+            )
         )
 
     @staticmethod
@@ -2255,17 +2269,16 @@ def _enforce_follow_up_evidence(
 ) -> dict[str, Any]:
     follow_up = result["follow_up"]
     supports_consent = _snapshot_supports_follow_up_consent(snapshot)
-    if (
-        follow_up["required"] is True
-        and follow_up["consent"] == "missing"
-        and supports_consent
+    if supports_consent and (
+        follow_up["required"] is not True or follow_up["consent"] == "missing"
     ):
         return {
             **result,
             "follow_up": {
                 **follow_up,
+                "required": True,
                 "consent": "explicit",
-                "reason": "客户明确同意后续电话联系",
+                "reason": "客户明确同意后续跟进",
                 "confidence": "high",
             },
         }

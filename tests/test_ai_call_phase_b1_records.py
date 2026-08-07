@@ -8899,8 +8899,25 @@ def test_dialogue_runtime_suppresses_orphan_ai_item_when_response_done_uses_fina
 @pytest.mark.anyio
 async def test_owner_browser_ready_recording_writes_ready_without_legacy_track_start(
     b1_service,
+    monkeypatch,
 ) -> None:
+    from app.services.ai_call.runtime_control import customer_media_repository
+
     service, record_service = b1_service
+    opening_commands = []
+
+    class CommandRepositorySpy:
+        def __init__(self, _session, **_kwargs) -> None:
+            pass
+
+        async def append_command(self, request) -> None:
+            opening_commands.append(request)
+
+    monkeypatch.setattr(
+        customer_media_repository,
+        "RuntimeCommandRepository",
+        CommandRepositorySpy,
+    )
     result = await service.create_web_session(
         tenant_id="000000",
         voice=None,
@@ -8933,6 +8950,7 @@ async def test_owner_browser_ready_recording_writes_ready_without_legacy_track_s
     assert spy.start_calls == []
     assert record.answered_at is not None
     assert record.status == CallSessionStatus.CONNECTED.value
+    assert [command.command_type for command in opening_commands] == ["START_OPENING"]
 
 
 @pytest.mark.anyio

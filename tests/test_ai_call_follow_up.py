@@ -1112,23 +1112,26 @@ async def test_follow_up_list_controller_forwards_filters() -> None:
 
 @pytest.mark.anyio
 async def test_follow_up_page_filters_ownership_before_pagination(session_factory) -> None:
+    now = datetime.now(timezone.utc)
     await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
     await _seed_unanswered_follow_up(session_factory, task_id=100)
     await _seed_unanswered_follow_up(
         session_factory,
         task_id=101,
         owner_agent_identity="agent-20",
+        created_at=now - timedelta(hours=1),
     )
     await _seed_unanswered_follow_up(
         session_factory,
         task_id=102,
         owner_agent_identity="agent-20",
+        created_at=now,
     )
 
     async with session_factory() as db:
         rows, total = await AiCallFollowUpService(db).list_follow_up_page(
             _auth(db, user_id=20),
-            page_num=2,
+            page_num=1,
             page_size=1,
             ownership="mine",
             status=["pending"],
@@ -1470,6 +1473,15 @@ async def test_no_answer_callback_waits_for_atomic_handling_result(
         assert len(attempts) == 1
         assert attempts[0].attempt_result == "no_answer"
         assert attempts[0].ring_duration_seconds == 12
+        record = (
+            await db.execute(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == callback.call_id
+                )
+            )
+        ).scalar_one()
+        assert record.duration_ms is not None
+        assert record.duration_ms >= 0
 
         detail = service.follow_up_payload(
             await service.get_follow_up(auth, follow_up_id=100)
@@ -1766,6 +1778,8 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
         ).scalar_one()
         assert record.status == "completed"
         assert record.ended_at is not None
+        assert record.duration_ms is not None
+        assert record.duration_ms >= 0
         assert record.end_reason == "callback_completed"
         task = await db.get(AiCallFollowUpTaskModel, 100)
         assert task.status == "processing"
@@ -1825,6 +1839,8 @@ async def test_agent_ends_connected_callback_and_releases_presence(session_facto
 
         assert factory.ended_calls == [callback.call_id]
         assert record.status == "completed"
+        assert record.duration_ms is not None
+        assert record.duration_ms >= 0
         assert record.end_reason == "callback_ended_by_agent"
         task = await db.get(AiCallFollowUpTaskModel, 100)
         assert task.status == "processing"

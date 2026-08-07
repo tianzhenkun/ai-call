@@ -262,7 +262,11 @@ class RuntimeWebhookRepository:
                     tenant_id=claim.tenant_id,
                     call_id=claim.call_id,
                     source="livekit_webhook",
-                    end_reason="sip_participant_left",
+                    end_reason=(
+                        "browser_disconnect"
+                        if record.entry_type == "web"
+                        else "sip_participant_left"
+                    ),
                     dedupe_key=self._end_dedupe_key(claim),
                     provider=claim.provider,
                     provider_namespace=claim.provider_namespace,

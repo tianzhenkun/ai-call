@@ -78,6 +78,19 @@ class AiCallFollowUpService:
         self.callback_factory = callback_factory
         self.recording_service = recording_service
 
+    @staticmethod
+    def _callback_duration_ms(
+        record: AiCallRecordModel, ended_at: datetime
+    ) -> int | None:
+        if record.duration_ms is not None or record.started_at is None:
+            return record.duration_ms
+        started_at = record.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        if ended_at.tzinfo is None:
+            ended_at = ended_at.replace(tzinfo=timezone.utc)
+        return max(0, int((ended_at - started_at).total_seconds() * 1000))
+
     async def submit_after_call_work(
         self,
         auth: AuthSchema,
@@ -232,10 +245,8 @@ class AiCallFollowUpService:
             select(AiCallFollowUpTaskModel)
             .where(*conditions)
             .order_by(
-                AiCallFollowUpTaskModel.customer_callback_at.is_(None),
-                AiCallFollowUpTaskModel.customer_callback_at,
-                AiCallFollowUpTaskModel.created_at,
-                AiCallFollowUpTaskModel.id,
+                AiCallFollowUpTaskModel.created_at.desc(),
+                AiCallFollowUpTaskModel.id.desc(),
             )
             .offset((page_num - 1) * page_size)
             .limit(page_size)
@@ -634,6 +645,7 @@ class AiCallFollowUpService:
         now = datetime.now(timezone.utc)
         record.status = "completed"
         record.ended_at = now
+        record.duration_ms = self._callback_duration_ms(record, now)
         record.end_reason = "callback_ended_by_agent"
         task.status = "processing"
         task.updated_at = now
@@ -778,7 +790,9 @@ class AiCallFollowUpService:
             task.status = "processing"
         else:
             record.status = "failed" if attempt_result == "technical_failure" else "completed"
-            record.ended_at = record.ended_at or now
+            ended_at = record.ended_at or now
+            record.ended_at = ended_at
+            record.duration_ms = self._callback_duration_ms(record, ended_at)
             record.end_reason = f"callback_{attempt_result}"
             if attempt_result == "technical_failure":
                 record.failure_stage = "sip_callback"
@@ -835,7 +849,9 @@ class AiCallFollowUpService:
                 await self._stop_callback_recording(record)
                 now = datetime.now(timezone.utc)
                 record.status = "completed"
-                record.ended_at = record.ended_at or now
+                ended_at = record.ended_at or now
+                record.ended_at = ended_at
+                record.duration_ms = self._callback_duration_ms(record, ended_at)
                 record.end_reason = record.end_reason or "callback_completed"
                 task.updated_at = now
                 await self._settle_callback_presence(

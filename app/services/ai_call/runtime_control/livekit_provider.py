@@ -13,6 +13,10 @@ from app.services.ai_call.livekit_egress import (
     LiveKitEgressAlreadyCompleteError,
     LiveKitEgressNotFoundError,
 )
+from app.services.ai_call.prompt_config import (
+    PromptEffectiveConfig,
+    PromptResolveContext,
+)
 from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
@@ -44,6 +48,7 @@ class RuntimeProviderResource:
     runtime_owner_id: str | None = None
     runtime_fencing_token: int | None = None
     egress_scope: str | None = None
+    prompt_effective_config: PromptEffectiveConfig | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -53,8 +58,14 @@ class RuntimeProviderResourceResolver(Protocol):
 class DatabaseRuntimeProviderResourceResolver:
     """Loads immutable provider inputs, then closes the DB session before I/O."""
 
-    def __init__(self, session_factory: Any) -> None:
+    def __init__(
+        self,
+        session_factory: Any,
+        *,
+        orchestrator: Any | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._orchestrator = orchestrator
 
     async def resolve(self, claim: EffectClaim) -> RuntimeProviderResource:
         from app.api.v1.ai_call.model import AiCallRecordModel
@@ -106,6 +117,13 @@ class DatabaseRuntimeProviderResourceResolver:
             voice = self._payload_voice(
                 getattr(command, "payload_json", None) if command is not None else None
             )
+            prompt_effective_config = None
+            if claim.effect_type == "ATTACH_AGENT_PARTICIPANT":
+                prompt_effective_config = await self._resolve_prompt_effective_config(
+                    session,
+                    record,
+                    command,
+                )
             egress_scope = "main"
             track_effect = current_effect
             if claim.effect_type in {"START_TRACK_EGRESS", "STOP_TRACK_EGRESS"}:
@@ -154,20 +172,56 @@ class DatabaseRuntimeProviderResourceResolver:
                 runtime_owner_id=claim.processing_owner_id,
                 runtime_fencing_token=claim.processing_fencing_token,
                 egress_scope=egress_scope,
+                prompt_effective_config=prompt_effective_config,
             )
+
+    async def _resolve_prompt_effective_config(self, session, record, command):
+        if self._orchestrator is None:
+            return None
+        from app.api.v1.ai_call.crud import AiCallRecordRepository
+        from app.api.v1.ai_call.service import (
+            _build_prompt_composer,
+            _build_prompt_resolver,
+        )
+
+        payload = self._payload(getattr(command, "payload_json", None))
+        business_params = payload.get("business_params")
+        if not isinstance(business_params, dict):
+            business_params = {}
+        result = await _build_prompt_resolver(
+            AiCallRecordRepository(session),
+            self._orchestrator,
+        ).resolve(
+            PromptResolveContext(
+                call_id=str(record.call_id),
+                business_id=(
+                    str(record.business_id) if record.business_id is not None else None
+                ),
+                scene_code=(
+                    str(record.scene_code) if record.scene_code is not None else None
+                ),
+                business_params=business_params,
+            )
+        )
+        return _build_prompt_composer(self._orchestrator).compose(result)
 
     @staticmethod
     def _payload_voice(payload_json: str | None) -> str | None:
+        payload = DatabaseRuntimeProviderResourceResolver._payload(payload_json)
+        voice = payload.get("voice")
+        return str(voice).strip() or None if isinstance(voice, str) else None
+
+    @staticmethod
+    def _payload(payload_json: str | None) -> dict[str, Any]:
         if not payload_json:
-            return None
+            return {}
         try:
             payload = json.loads(payload_json)
         except (TypeError, ValueError):
-            return None
+            return {}
         if not isinstance(payload, dict):
-            return None
-        voice = payload.get("voice")
-        return str(voice).strip() or None if isinstance(voice, str) else None
+            return {}
+        return payload
 
 
 class RuntimeRoomManager(Protocol):
@@ -253,6 +307,9 @@ class _OwnerAgentLocalHandle:
     async def fail_closed(self) -> None:
         await self._manager.fail_closed(self._call_id)
 
+    async def start_opening(self) -> None:
+        await self._manager.start_opening(self._call_id)
+
     async def shutdown(self) -> None:
         await self._manager.shutdown_call(self._call_id)
 
@@ -291,15 +348,21 @@ class OwnerRuntimeAgentManager:
                 raise RuntimeError("runtime dialogue fence was rejected")
             self._dialogue_fences[resource.call_id] = dialogue_fence
 
+        effective_config = (
+            self._orchestrator._build_effective_config(
+                resource.voice,
+                None,
+                resource.prompt_effective_config,
+            )
+            if resource.prompt_effective_config is not None
+            else self._orchestrator._build_effective_config(resource.voice, None)
+        )
         session = CallSession(
             call_id=resource.call_id,
             room_name=resource.room_name,
             participant_identity=resource.customer_participant_identity,
             status=CallSessionStatus.READY,
-            effective_config=self._orchestrator._build_effective_config(
-                resource.voice,
-                None,
-            ),
+            effective_config=effective_config,
             local_participant_identity=resource.agent_participant_identity,
         )
         self._orchestrator.registry.add(session)
@@ -329,6 +392,9 @@ class OwnerRuntimeAgentManager:
 
     async def exists(self, call_id: str) -> bool:
         return call_id in self._active_identities
+
+    async def start_opening(self, call_id: str) -> None:
+        await self._orchestrator.start_opening(call_id)
 
     async def stop(self, call_id: str) -> None:
         await self._stop_agent(call_id)
@@ -1124,7 +1190,10 @@ def build_livekit_runtime_provider(
         )
         handoff_trigger_worker.attach_event_store(orchestrator.event_store)
     return LiveKitRuntimeProvider(
-        resolver=DatabaseRuntimeProviderResourceResolver(session_factory),
+        resolver=DatabaseRuntimeProviderResourceResolver(
+            session_factory,
+            orchestrator=orchestrator,
+        ),
         room_manager=room_manager,
         agent_manager=OwnerRuntimeAgentManager(
             orchestrator=orchestrator,

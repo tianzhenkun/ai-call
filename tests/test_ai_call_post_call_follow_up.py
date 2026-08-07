@@ -249,7 +249,49 @@ def test_direct_customer_call_instruction_corrects_conservative_model_result() -
 
     assert result["follow_up"]["consent"] == "explicit"
     assert result["follow_up"]["confidence"] == "high"
-    assert result["follow_up"]["reason"] == "客户明确同意后续电话联系"
+    assert result["follow_up"]["reason"] == "客户明确同意后续跟进"
+
+
+def test_trial_link_consent_corrects_model_no_follow_up_result() -> None:
+    result = semantic_analysis.enforce_semantic_evidence_on_result(
+        {
+            "summary": "客户希望获得免费试用链接",
+            "feedback_type": "正向",
+            "key_points": ["客户询问免费试用"],
+            "time_hint": {},
+            "tags": [],
+            "follow_up": {
+                "required": False,
+                "consent": "missing",
+                "reason": None,
+                "preferred_time": None,
+                "confidence": "low",
+            },
+        },
+        {
+            "call_id": "call-trial-link",
+            "turns": [
+                {
+                    "role": "user",
+                    "speaker_type": "customer",
+                    "text": "方便。",
+                    "semantic_evidence": {
+                        "analysis_usage": "use_as_customer_signal",
+                        "supports_strong_fact": True,
+                        "supported_strong_fact_types": ["follow_up_consent"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert result["follow_up"] == {
+        "required": True,
+        "consent": "explicit",
+        "reason": "客户明确同意后续跟进",
+        "preferred_time": None,
+        "confidence": "high",
+    }
 
 
 @pytest.mark.parametrize(
@@ -299,6 +341,8 @@ async def _seed_post_call_analysis(
     entry_type: str,
     with_formal_attempt: bool,
     status: str = "2",
+    dialer_type: str = "sip",
+    with_phone: bool = True,
 ) -> None:
     now = datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
@@ -312,8 +356,8 @@ async def _seed_post_call_analysis(
                 entry_type=entry_type,
                 room_name=f"room-{call_id}",
                 participant_identity=f"participant-{call_id}",
-                callee_phone_number_hash="hash-1",
-                callee_phone_number_masked="199****1001",
+                callee_phone_number_hash="hash-1" if with_phone else None,
+                callee_phone_number_masked="199****1001" if with_phone else None,
                 status="completed",
                 started_at=now,
                 ended_at=now,
@@ -362,7 +406,7 @@ async def _seed_post_call_analysis(
                     validation_id=1,
                     source_validation_row_id=1,
                     source_row_number=2,
-                    phone_number="19900001001",
+                    phone_number="19900001001" if with_phone else None,
                     customer_name="本地白名单终端",
                     status="COMPLETED",
                     attempt_count=1,
@@ -379,7 +423,7 @@ async def _seed_post_call_analysis(
                     target_id=400,
                     attempt_no=1,
                     call_id=call_id,
-                    dialer_type="sip",
+                    dialer_type=dialer_type,
                     test_scenario=None,
                     command_idempotency_key=f"command-{call_id}",
                     active_slot=None,
@@ -507,6 +551,32 @@ async def test_post_call_follow_up_is_idempotent_for_same_formal_call(
             .where(AiCallFollowUpTaskModel.source_call_id == "call-formal-1")
         )
         assert count == 1
+
+
+@pytest.mark.anyio
+async def test_formal_web_call_creates_post_call_follow_up_without_phone(
+    session_factory,
+) -> None:
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id="call-formal-web",
+        entry_type="web",
+        with_formal_attempt=True,
+        dialer_type="owner_runtime",
+        with_phone=False,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(call_id="call-formal-web")
+        assert analysis is not None
+
+        created = await post_call_follow_up_service.AiCallPostCallFollowUpService(
+            repository
+        ).apply(analysis)
+
+        assert created is not None
+        assert created.masked_contact == "Web 浏览器"
 
 
 @pytest.mark.anyio

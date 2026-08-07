@@ -40,14 +40,16 @@ def _follow_up(
     tenant_id: str,
     status: str,
     created_at: datetime,
+    source_type: str = "ai_suggested",
+    scene_code: str = "product_intro",
 ) -> AiCallFollowUpTaskModel:
     return AiCallFollowUpTaskModel(
         id=row_id,
         tenant_id=tenant_id,
-        source_type="ai_suggested",
+        source_type=source_type,
         source_key=f"call:call-{row_id}",
         source_call_id=f"call-{row_id}",
-        scene_code="product_intro",
+        scene_code=scene_code,
         contact_ref=f"contact-{row_id}",
         masked_contact="138****0000",
         status=status,
@@ -260,6 +262,8 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
         auth,
         service,
         status="pending",
+        source_type="after_call_work",
+        scene_code="intro_geo",
         formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,
@@ -270,9 +274,96 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
     service.list_follow_ups.assert_awaited_once_with(
         auth,
         status="pending",
+        source_type="after_call_work",
+        scene_code="intro_geo",
         formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,
         page_num=2,
         page_size=20,
     )
+
+
+@pytest.mark.anyio
+async def test_admin_follow_up_detail_serializes_callback_records() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 6, tzinfo=timezone.utc)
+
+    async with session_maker() as session:
+        session.add_all([
+            _follow_up(
+                row_id=1,
+                tenant_id="tenant-a",
+                status="pending",
+                created_at=now,
+            ),
+            _record(row_id=1, started_at=now),
+        ])
+        await session.commit()
+
+        detail = await AiCallAgentConsoleReconciler(
+            session,
+            room_exists=lambda _room: False,
+        ).get_follow_up_detail(_auth(session), 1)
+
+    await engine.dispose()
+
+    assert detail["callback_records"] == [
+        {
+            "id": "10001",
+            "call_id": "call-1",
+            "entry_type": "sip_outbound",
+            "status": "completed",
+            "end_reason": None,
+            "started_at": now,
+            "answered_at": None,
+            "ended_at": None,
+            "duration_ms": None,
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_admin_follow_ups_filter_by_source_type_and_scene() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 6, tzinfo=timezone.utc)
+
+    async with session_maker() as session:
+        session.add_all([
+            _follow_up(
+                row_id=1,
+                tenant_id="tenant-a",
+                status="pending",
+                source_type="after_call_work",
+                scene_code="intro_geo",
+                created_at=now,
+            ),
+            _follow_up(
+                row_id=2,
+                tenant_id="tenant-a",
+                status="pending",
+                source_type="handoff_unanswered",
+                scene_code="intro_contract",
+                created_at=now,
+            ),
+        ])
+        await session.commit()
+
+        page = await AiCallAgentConsoleReconciler(
+            session,
+            room_exists=lambda _room: False,
+        ).list_follow_ups(
+            _auth(session),
+            source_type="after_call_work",
+            scene_code="intro_geo",
+        )
+
+    await engine.dispose()
+
+    assert [row["id"] for row in page["rows"]] == ["1"]
