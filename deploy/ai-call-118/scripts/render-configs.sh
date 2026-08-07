@@ -33,3 +33,6 @@ umask 077
 render config/livekit.yaml.template runtime/livekit.yaml
 render config/egress.yaml.template runtime/egress.yaml
 render config/sip.yaml.template runtime/sip.yaml
+
+# livekit-egress runs as uid 1001 in group root, so its config cannot remain root-only.
+chmod 640 runtime/egress.yaml

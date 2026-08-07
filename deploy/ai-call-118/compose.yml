@@ -25,7 +25,7 @@ services:
     image: ai-call-transfer/redis:7.4.9-alpine-amd64
     restart: unless-stopped
     env_file: .env
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "$$REDIS_PASSWORD"]
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
     volumes:
       - redis-data:/data
     healthcheck:
@@ -89,7 +89,8 @@ services:
   livekit-egress:
     image: ai-call-transfer/livekit-egress:v1.13.0-amd64
     restart: unless-stopped
-    command: ["--config", "/etc/egress.yaml"]
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
     volumes:
       - ./runtime/egress.yaml:/etc/egress.yaml:ro
     depends_on:
@@ -101,7 +102,7 @@ services:
     networks: [ai-call]
 
   freeswitch:
-    image: ai-call-transfer/freeswitch:20260807
+    image: ai-call-transfer/freeswitch:20260807-r1
     restart: unless-stopped
     env_file: .env
     ports:

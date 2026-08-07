@@ -11,6 +11,7 @@ if [ ! -f /etc/freeswitch/freeswitch.xml ]; then
   sed -i 's/default_password=[^"]*/default_password='"$FS_DEFAULT_PASSWORD"'/' /etc/freeswitch/vars.xml
   sed -i "s#external_rtp_ip=stun:stun.freeswitch.org#external_rtp_ip=${FS_EXTERNAL_IP}#" /etc/freeswitch/vars.xml
   sed -i "s#external_sip_ip=stun:stun.freeswitch.org#external_sip_ip=${FS_EXTERNAL_IP}#" /etc/freeswitch/vars.xml
+  sed -i 's#<param name="listen-ip" value="::"/>#<param name="listen-ip" value="0.0.0.0"/>#' /etc/freeswitch/autoload_configs/event_socket.conf.xml
   sed -i 's#<!-- <param name="rtp-start-port" value="16384"/> -->#<param name="rtp-start-port" value="16384"/>#' /etc/freeswitch/autoload_configs/switch.conf.xml
   sed -i 's#<!-- <param name="rtp-end-port" value="32768"/> -->#<param name="rtp-end-port" value="16484"/>#' /etc/freeswitch/autoload_configs/switch.conf.xml
 fi
