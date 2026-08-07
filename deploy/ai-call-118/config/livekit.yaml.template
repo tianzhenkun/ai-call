@@ -1,0 +1,27 @@
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: true
+
+redis:
+  address: redis:6379
+  password: "__REDIS_PASSWORD__"
+
+keys:
+  __LIVEKIT_API_KEY__: __LIVEKIT_API_SECRET__
+
+room:
+  auto_create: true
+
+webhook:
+  api_key: __LIVEKIT_API_KEY__
+  urls:
+    - http://api:19011/ai-call/livekit-webhook
+
+logging:
+  level: info

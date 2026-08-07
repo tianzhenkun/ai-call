@@ -1,0 +1,8 @@
+FROM sip-realtime-freeswitch-audio-stream:1.0.3
+
+COPY deploy/ai-call-118/freeswitch/ /usr/share/freeswitch/conf/vanilla/
+COPY deploy/ai-call-118/freeswitch/docker-entrypoint.sh /usr/local/bin/ai-call-freeswitch-entrypoint
+
+RUN chmod 0755 /usr/local/bin/ai-call-freeswitch-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/ai-call-freeswitch-entrypoint"]

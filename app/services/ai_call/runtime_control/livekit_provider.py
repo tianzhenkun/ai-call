@@ -1077,6 +1077,7 @@ def build_livekit_runtime_provider(
 
     room_manager = LiveKitRoomManager(
         livekit_url=settings.LIVEKIT_URL,
+        browser_livekit_url=settings.LIVEKIT_BROWSER_URL,
         api_key=settings.LIVEKIT_API_KEY,
         api_secret=settings.LIVEKIT_API_SECRET,
         browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,

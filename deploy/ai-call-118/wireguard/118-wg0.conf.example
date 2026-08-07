@@ -1,0 +1,14 @@
+[Interface]
+Address = 10.77.0.2/24
+ListenPort = 51820
+PrivateKey = REPLACE_118_PRIVATE_KEY
+
+[Peer]
+# 81.68.166.109 Nginx
+PublicKey = REPLACE_81_PUBLIC_KEY
+AllowedIPs = 10.77.0.1/32
+
+[Peer]
+# Mac Linphone test client
+PublicKey = REPLACE_MAC_PUBLIC_KEY
+AllowedIPs = 10.77.0.3/32

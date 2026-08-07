@@ -1,0 +1,19 @@
+FROM ai-call-transfer/python:3.12.9-slim-amd64
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY app ./app
+COPY main.py ./
+COPY deploy/ai-call-118/scripts/bootstrap_db.py /opt/ai-call/bootstrap_db.py
+
+RUN pip install . \
+ && useradd --create-home --uid 10001 ai-call \
+ && mkdir -p /app/logs /app/static/upload /app/static/download \
+ && chown -R ai-call:ai-call /app /opt/ai-call
+
+USER ai-call

@@ -36,8 +36,11 @@ class LiveKitRoomManager:
         api_key: str,
         api_secret: str,
         browser_token_ttl_seconds: int,
+        *,
+        browser_livekit_url: str = "",
     ) -> None:
         self.livekit_url = livekit_url
+        self.browser_livekit_url = browser_livekit_url.strip() or livekit_url
         self.api_key = api_key
         self.api_secret = api_secret
         self.browser_token_ttl_seconds = browser_token_ttl_seconds
@@ -125,7 +128,7 @@ class LiveKitRoomManager:
             )
         token = jwt.encode(payload, self.api_secret, algorithm="HS256")
         return BrowserRoomToken(
-            livekit_url=self.livekit_url,
+            livekit_url=self.browser_livekit_url,
             participant_token=token,
             participant_identity=participant_identity,
             expires_in_seconds=expires_in_seconds,

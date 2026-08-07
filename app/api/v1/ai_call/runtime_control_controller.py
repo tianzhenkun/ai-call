@@ -257,6 +257,7 @@ async def create_runtime_token_controller(
                 settings.LIVEKIT_API_KEY,
                 settings.LIVEKIT_API_SECRET,
                 settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
+                browser_livekit_url=getattr(settings, "LIVEKIT_BROWSER_URL", ""),
             ),
         ).issue_browser_token(tenant_id=tenant_id, call_id=call_id)
     except RuntimeTokenNotFoundError as exc:

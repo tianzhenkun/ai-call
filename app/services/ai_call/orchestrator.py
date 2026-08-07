@@ -132,11 +132,13 @@ class AiCallRuntimeConfig:
     sip_vad_shadow_fsmn_endpoint: str = ""
     sip_vad_shadow_fsmn_timeout_seconds: float = 0.2
     sip_vad_shadow_queue_size: int = 50
+    browser_livekit_url: str = ""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
         return cls(
             livekit_url=settings.LIVEKIT_URL,
+            browser_livekit_url=settings.LIVEKIT_BROWSER_URL,
             livekit_api_key=settings.LIVEKIT_API_KEY,
             livekit_api_secret=settings.LIVEKIT_API_SECRET,
             browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
@@ -339,6 +341,7 @@ class AiCallOrchestrator:
             api_key=config.livekit_api_key,
             api_secret=config.livekit_api_secret,
             browser_token_ttl_seconds=config.browser_token_ttl_seconds,
+            browser_livekit_url=config.browser_livekit_url,
         )
         self._auto_end_tasks: set[asyncio.Task[None]] = set()
         self._browser_ready_timeout_handles: dict[str, asyncio.TimerHandle] = {}

@@ -161,3 +161,17 @@ def test_livekit_browser_token_contains_controlled_runtime_metadata() -> None:
         '{"call_id":"call-1","participant_identity":"caller-call-1",'
         '"resource_generation":"7"}'
     )
+
+
+def test_livekit_browser_token_can_use_public_url_while_api_uses_private_url() -> None:
+    manager = LiveKitRoomManager(
+        livekit_url="ws://livekit:7880",
+        browser_livekit_url="wss://recov.lingchen-ai.com:7880",
+        api_key="livekit-key",
+        api_secret=LIVEKIT_SECRET,
+        browser_token_ttl_seconds=60,
+    )
+
+    token = manager.issue_browser_token("ai-call-call-1", "caller-call-1")
+
+    assert token.livekit_url == "wss://recov.lingchen-ai.com:7880"

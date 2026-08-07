@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     # ******************* LiveKit配置 ****************** #
     # ================================================= #
     LIVEKIT_URL: str = ""
+    LIVEKIT_BROWSER_URL: str = ""
     LIVEKIT_API_KEY: str = ""
     LIVEKIT_API_SECRET: str = ""
     LIVEKIT_BROWSER_TOKEN_TTL_SECONDS: int = 600
