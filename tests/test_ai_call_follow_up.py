@@ -19,6 +19,7 @@ from app.api.v1.ai_call.agent_console_schema import (
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
+    FollowUpDataCallIn,
     FollowUpHandlingResultIn,
 )
 from app.api.v1.ai_call.model import (
@@ -26,6 +27,7 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpAttemptModel,
+    AiCallFollowUpCallRequestModel,
     AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
@@ -356,6 +358,33 @@ async def _link_follow_up_data(
     return data_id
 
 
+async def _seed_follow_up_data_without_task(session_factory) -> tuple[str, int]:
+    console_session_id = await _seed_completed_handoff(session_factory)
+    await _seed_outbound_context(session_factory)
+    async with session_factory() as db:
+        source = await db.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == "call-1")
+        )
+        assert source is not None
+        source.callee_phone_number = "13800000000"
+        service = AiCallFollowUpService(db)
+        work, task = await service.submit_after_call_work(
+            _auth(db, user_id=20),
+            call_id="call-1",
+            payload=AfterCallWorkIn(
+                classification="interested",
+                conclusion="客户希望继续了解产品。",
+                schedule_follow_up=False,
+                expected_version=0,
+            ),
+            idempotency_key="seed-follow-up-data-no-task",
+        )
+        await db.commit()
+        assert task is None
+        assert work.follow_up_data_id is not None
+        return console_session_id, work.follow_up_data_id
+
+
 async def _seed_ai_post_call_follow_up(session_factory, *, task_id: int = 102) -> None:
     now = datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
@@ -413,6 +442,7 @@ def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None
     data_table = AiCallFollowUpDataModel.__table__
     history_table = AiCallFollowUpClassificationHistoryModel.__table__
     schedule_table = AiCallFollowUpScheduleRequestModel.__table__
+    call_request_table = AiCallFollowUpCallRequestModel.__table__
     record_table = AiCallRecordModel.__table__
     task_table = AiCallFollowUpTaskModel.__table__
     handling_table = AiCallFollowUpHandlingResultModel.__table__
@@ -434,6 +464,17 @@ def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None
         if isinstance(constraint, UniqueConstraint)
     } >= {frozenset({"tenant_id", "task_id", "target_id"})}
     assert not data_table.foreign_keys
+
+    assert {
+        "follow_up_data_id",
+        "follow_up_id",
+        "call_id",
+        "idempotency_key",
+        "assignment_action",
+        "previous_owner_agent_identity",
+        "new_owner_agent_identity",
+    } <= set(call_request_table.columns.keys())
+    assert not call_request_table.foreign_keys
 
     assert {
         "follow_up_data_id",
@@ -501,6 +542,9 @@ def test_task5_routes_are_registered() -> None:
         "/ai-call/agent-console/follow-ups/{follow_up_id}/claim",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/call",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/call/{call_id}/end",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/call",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/call/{call_id}/end",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/handling-results",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/complete",
         "/ai-call/agent-console/follow-ups/{follow_up_id}/close",
     } <= paths
@@ -1672,6 +1716,262 @@ def test_callback_result_maps_livekit_disconnect_reason(
         )
         == expected
     )
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_direct_call_does_not_create_task_and_submits_result(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        callback, task = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-1",
+        )
+
+        assert task is None
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        data = await db.get(AiCallFollowUpDataModel, data_id)
+        request = await db.scalar(
+            select(AiCallFollowUpCallRequestModel).where(
+                AiCallFollowUpCallRequestModel.call_id == callback.call_id
+            )
+        )
+        assert record is not None
+        assert record.follow_up_id is None
+        assert record.follow_up_data_id == data_id
+        assert record.operator_agent_identity == "agent-20"
+        assert data is not None
+        assert data.blocking_human_call_id == callback.call_id
+        assert request is not None
+        assert request.assignment_action == "direct"
+
+        with pytest.raises(CustomException) as replayed:
+            await service.start_follow_up_data_callback(
+                auth,
+                follow_up_data_id=data_id,
+                payload=FollowUpDataCallIn(console_session_id=console_session_id),
+                idempotency_key="direct-call-1",
+            )
+        assert _error_code(replayed.value) == "FOLLOW_UP_CALL_ALREADY_STARTED"
+
+        joined = await service.handle_livekit_webhook_event(
+            event_type="participant_joined",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+        )
+        assert joined["attemptResult"] == "connected"
+        await service.end_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+        data, next_task, result = (
+            await service.submit_follow_up_data_handling_result(
+                auth,
+                follow_up_data_id=data_id,
+                payload=FollowUpHandlingResultIn(
+                    call_id=callback.call_id,
+                    contact_result="connected",
+                    classification="nurturing",
+                    conclusion="客户暂未确定时间，先不安排回访。",
+                    schedule_follow_up=False,
+                    expected_version=1,
+                ),
+                idempotency_key="direct-result-1",
+            )
+        )
+        await db.commit()
+
+        assert next_task is None
+        assert result.follow_up_id is None
+        assert result.follow_up_data_id == data_id
+        assert data.classification == "nurturing"
+        assert data.blocking_human_call_id is None
+        assert data.version == 2
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpTaskModel)
+        ) == 0
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_direct_call_keeps_classification_when_not_connected(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        callback, _ = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-no-answer",
+        )
+        await service.handle_livekit_webhook_event(
+            event_type="participant_left",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+            payload={"participant": {"attributes": {"sip.callStatus": "no_answer"}}},
+        )
+
+        data, task, _ = await service.submit_follow_up_data_handling_result(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpHandlingResultIn(
+                call_id=callback.call_id,
+                contact_result="no_answer",
+                remark="本次人工外呼无人接听。",
+                schedule_follow_up=False,
+                expected_version=1,
+            ),
+            idempotency_key="direct-result-no-answer",
+        )
+
+        assert task is None
+        assert data.classification == "interested"
+        assert data.latest_conclusion == "本次人工外呼无人接听。"
+        assert data.blocking_human_call_id is None
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_direct_call_can_schedule_owned_task(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+    callback_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        callback, _ = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-schedule",
+        )
+        await service.handle_livekit_webhook_event(
+            event_type="participant_joined",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+        )
+        await service.end_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+        _, task, _ = await service.submit_follow_up_data_handling_result(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpHandlingResultIn(
+                call_id=callback.call_id,
+                contact_result="connected",
+                classification="interested",
+                conclusion="客户约定明天再沟通。",
+                schedule_follow_up=True,
+                next_follow_up_at=callback_at,
+                expected_version=1,
+            ),
+            idempotency_key="direct-result-schedule",
+        )
+        await db.commit()
+
+        assert task is not None
+        assert task.owner_agent_identity == "agent-20"
+        assert task.customer_callback_at == callback_at
+        assert task.source_type == "manual_schedule"
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_call_requires_confirmation_before_takeover(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+    await _seed_agent(session_factory, user_id=21, agent_identity="agent-21")
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallFollowUpTaskModel(
+                id=700,
+                tenant_id="tenant-a",
+                follow_up_data_id=data_id,
+                source_type="manual_schedule",
+                source_key="takeover-test",
+                source_call_id="call-1",
+                source_handoff_id=None,
+                scene_code="intro_contract",
+                business_type="outbound_attempt",
+                business_id="302",
+                contact_ref="call:call-1",
+                masked_contact="138****0000",
+                owner_agent_identity="agent-21",
+                status="processing",
+                follow_up_reason="原坐席跟进",
+                customer_callback_at=None,
+                summary=None,
+                closed_reason=None,
+                closed_remark=None,
+                completed_at=None,
+                closed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        with pytest.raises(CustomException) as confirmation:
+            await service.start_follow_up_data_callback(
+                auth,
+                follow_up_data_id=data_id,
+                payload=FollowUpDataCallIn(console_session_id=console_session_id),
+                idempotency_key="takeover-call",
+            )
+        assert _error_code(confirmation.value) == "FOLLOW_UP_TAKEOVER_REQUIRED"
+
+        callback, task = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(
+                console_session_id=console_session_id,
+                takeover=True,
+                takeover_reason="管理员确认由当前坐席接管并外呼",
+            ),
+            idempotency_key="takeover-call",
+        )
+
+        assert task is not None
+        assert task.owner_agent_identity == "agent-20"
+        request = await db.scalar(
+            select(AiCallFollowUpCallRequestModel).where(
+                AiCallFollowUpCallRequestModel.call_id == callback.call_id
+            )
+        )
+        assert request is not None
+        assert request.assignment_action == "takeover"
+        assert request.previous_owner_agent_identity == "agent-21"
+        assert request.new_owner_agent_identity == "agent-20"
 
 
 @pytest.mark.anyio

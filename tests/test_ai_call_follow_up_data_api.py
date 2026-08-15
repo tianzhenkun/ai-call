@@ -175,6 +175,9 @@ def test_follow_up_data_routes_require_manager_permission() -> None:
         "/ai-call/follow-up-data/{follow_up_data_id}",
         "/ai-call/follow-up-data/{follow_up_data_id}/classification",
         "/ai-call/follow-up-data/{follow_up_data_id}/schedule",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/call",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/call/{call_id}/end",
+        "/ai-call/agent-console/follow-up-data/{follow_up_data_id}/handling-results",
     }
     routes = {route.path: route for route in AiCallRouter.routes}
     assert expected_paths <= routes.keys()

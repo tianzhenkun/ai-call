@@ -43,6 +43,7 @@ from .agent_console_schema import (
     FollowUpAttemptIn,
     FollowUpCallIn,
     FollowUpCloseIn,
+    FollowUpDataCallIn,
     FollowUpHandlingResultIn,
 )
 from .service import (
@@ -658,6 +659,49 @@ async def submit_follow_up_handling_result_controller(
     return SuccessResponse(data=response)
 
 
+@AgentConsoleRouter.post(
+    "/follow-up-data/{follow_up_data_id}/handling-results",
+    summary="提交无任务人工外呼话后结果",
+    dependencies=[Depends(get_ai_call_manager)],
+)
+async def submit_follow_up_data_handling_result_controller(
+    follow_up_data_id: int,
+    payload: FollowUpHandlingResultIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ],
+):
+    data, task, result = await service.submit_follow_up_data_handling_result(
+        auth,
+        follow_up_data_id=follow_up_data_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+    )
+    await _publish(
+        auth,
+        "follow_up.changed",
+        {
+            "follow_up_data_id": str(data.id),
+            "follow_up_id": str(task.id) if task else None,
+            "classification": data.classification,
+            "result_version": result.result_version,
+            "status": task.status if task else None,
+        },
+    )
+    return SuccessResponse(
+        data={
+            "follow_up_data_id": str(data.id),
+            "classification": data.classification,
+            "version": data.version,
+            "follow_up": service.follow_up_payload(task) if task else None,
+            "handling_result": service.handling_result_payload(result),
+        }
+    )
+
+
 @AgentConsoleRouter.post("/follow-ups/{follow_up_id}/claim", summary="原子认领人工未接回访")
 async def claim_follow_up_controller(
     follow_up_id: int,
@@ -694,6 +738,41 @@ async def start_follow_up_call_controller(
 
 
 @AgentConsoleRouter.post(
+    "/follow-up-data/{follow_up_data_id}/call",
+    summary="从跟进数据发起人工外呼",
+    dependencies=[Depends(get_ai_call_manager)],
+)
+async def start_follow_up_data_call_controller(
+    follow_up_data_id: int,
+    payload: FollowUpDataCallIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ],
+):
+    callback, task = await service.start_follow_up_data_callback(
+        auth,
+        follow_up_data_id=follow_up_data_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+    )
+    await _publish(
+        auth,
+        "follow_up.callback_started",
+        {
+            "follow_up_data_id": str(follow_up_data_id),
+            "follow_up_id": str(task.id) if task else None,
+            "call_id": callback.call_id,
+        },
+    )
+    response = service.callback_payload(callback)
+    response["follow_up_id"] = str(task.id) if task else None
+    return SuccessResponse(data=response, msg="人工外呼已受理")
+
+
+@AgentConsoleRouter.post(
     "/follow-ups/{follow_up_id}/call/{call_id}/end",
     summary="结束浏览器人工回拨",
 )
@@ -714,6 +793,34 @@ async def end_follow_up_call_controller(
         auth,
         "follow_up.callback_ended",
         {"follow_up_id": str(follow_up_id), "call_id": call_id},
+    )
+    return SuccessResponse(
+        data={"call_id": call_id, "status": record.status, "end_reason": record.end_reason}
+    )
+
+
+@AgentConsoleRouter.post(
+    "/follow-up-data/{follow_up_data_id}/call/{call_id}/end",
+    summary="结束跟进数据人工外呼",
+    dependencies=[Depends(get_ai_call_manager)],
+)
+async def end_follow_up_data_call_controller(
+    follow_up_data_id: int,
+    call_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    record = await service.end_follow_up_data_callback(
+        auth,
+        follow_up_data_id=follow_up_data_id,
+        call_id=call_id,
+        payload=payload,
+    )
+    await _publish(
+        auth,
+        "follow_up.callback_ended",
+        {"follow_up_data_id": str(follow_up_data_id), "call_id": call_id},
     )
     return SuccessResponse(
         data={"call_id": call_id, "status": record.status, "end_reason": record.end_reason}

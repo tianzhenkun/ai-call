@@ -1601,6 +1601,53 @@ class AiCallFollowUpScheduleRequestModel(MappedBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AiCallFollowUpCallRequestModel(MappedBase):
+    """跟进数据人工外呼请求与任务归属审计。"""
+
+    __tablename__ = "ai_call_follow_up_call_request"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uk_ai_call_follow_up_call_request_key",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "call_id",
+            name="uk_ai_call_follow_up_call_request_call",
+        ),
+        Index(
+            "idx_ai_call_follow_up_call_request_data_time",
+            "tenant_id",
+            "follow_up_data_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "assignment_action in ('direct', 'claim', 'owned', 'takeover')",
+            name="ck_ai_call_follow_up_call_request_action",
+        ),
+        {"comment": "AI Call 跟进数据人工外呼幂等与归属审计"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    follow_up_data_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    follow_up_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    assignment_action: Mapped[str] = mapped_column(String(16), nullable=False)
+    previous_owner_agent_identity: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    new_owner_agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    takeover_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    changed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    changed_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AiCallFollowUpTaskModel(MappedBase):
     """AI Call 人工跟进任务表。"""
 

@@ -615,6 +615,12 @@ class AiCallFollowUpDataService:
             "follow_up_task_status": (
                 active_task.status if active_task is not None else None
             ),
+            "active_follow_up_owner_agent_identity": (
+                active_task.owner_agent_identity if active_task is not None else None
+            ),
+            "active_follow_up_reason": (
+                active_task.follow_up_reason if active_task is not None else None
+            ),
             "classification_updated_at": data.classification_updated_at,
             "classification_updated_by": data.classification_updated_by,
             "after_call_result_status": (

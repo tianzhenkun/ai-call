@@ -141,6 +141,8 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
         "call_result": "no_answer",
         "customer_intent": "positive",
         "follow_up_status": "suggested",
+        "after_call_result_status": None,
+        "operator_agent_identity": None,
         "business_type": None,
         "business_id": None,
         "status": None,

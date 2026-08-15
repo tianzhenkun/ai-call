@@ -335,6 +335,25 @@ class FollowUpCallIn(BaseModel):
     console_session_id: UUID
 
 
+class FollowUpDataCallIn(FollowUpCallIn):
+    takeover: bool = False
+    takeover_reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("takeover_reason")
+    @classmethod
+    def normalize_takeover_reason(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_takeover_reason(self):
+        if self.takeover and self.takeover_reason is None:
+            raise ValueError("接管并外呼必须填写接管原因")
+        if not self.takeover and self.takeover_reason is not None:
+            raise ValueError("未接管时不能填写接管原因")
+        return self
+
+
 class FollowUpCloseIn(BaseModel):
     closed_reason: FollowUpClosedReason
     closed_remark: str | None = Field(default=None, max_length=500)

@@ -476,6 +476,20 @@ class AiCallRecordService:
                 raw_summary = parsed_analysis.get("summary")
                 if isinstance(raw_summary, str) and raw_summary.strip():
                     semantic_summary = raw_summary.strip()
+        call_result = outbound_context.get("callResult")
+        if call_result is None and record.entry_type == "sip_callback":
+            if record.answered_at is not None:
+                call_result = "connected"
+            elif record.end_reason and record.end_reason.startswith("callback_"):
+                candidate = record.end_reason.removeprefix("callback_")
+                if candidate in {
+                    "no_answer",
+                    "busy",
+                    "rejected",
+                    "invalid_contact",
+                    "technical_failure",
+                }:
+                    call_result = candidate
         return {
             "id": str(record.id),
             "callId": record.call_id,
@@ -485,7 +499,7 @@ class AiCallRecordService:
             "customerName": outbound_context.get("customerName"),
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
-            "callResult": outbound_context.get("callResult"),
+            "callResult": call_result,
             "summary": semantic_summary,
             "analysisStatus": semantic_context.get("analysisStatus"),
             "customerIntent": semantic_context.get("customerIntent"),
