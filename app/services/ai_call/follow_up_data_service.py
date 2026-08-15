@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.follow_up_data_schema import FollowUpDataClassificationIn
 from app.api.v1.ai_call.model import (
+    AiCallAfterCallWorkModel,
     AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
+    AiCallFollowUpHandlingResultModel,
+    AiCallFollowUpTaskModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
@@ -20,6 +27,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.core.exceptions import CustomException
 from app.utils.id_util import generate_snowflake_id
 
 AI_CLASSIFICATIONS = {"interested", "nurturing", "low_value"}
@@ -32,6 +40,618 @@ class AiCallFollowUpDataService:
     def __init__(self, repository: AiCallRecordRepository) -> None:
         self.repository = repository
         self.db = repository.db
+
+    @classmethod
+    def from_session(cls, db: AsyncSession) -> AiCallFollowUpDataService:
+        return cls(AiCallRecordRepository(db))
+
+    async def list_page(
+        self,
+        *,
+        tenant_id: str,
+        classification: str | None,
+        page_num: int,
+        page_size: int,
+        keyword: str | None = None,
+        task_id: int | None = None,
+        last_contact_at_begin: datetime | None = None,
+        last_contact_at_end: datetime | None = None,
+        next_follow_up_at_begin: datetime | None = None,
+        next_follow_up_at_end: datetime | None = None,
+        suggest_review: bool | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        active_task = aliased(AiCallFollowUpTaskModel)
+        source_record = aliased(AiCallRecordModel)
+        joins = (
+            (AiCallOutboundTargetModel, and_(
+                AiCallOutboundTargetModel.tenant_id
+                == AiCallFollowUpDataModel.tenant_id,
+                AiCallOutboundTargetModel.task_id == AiCallFollowUpDataModel.task_id,
+                AiCallOutboundTargetModel.id == AiCallFollowUpDataModel.target_id,
+            )),
+            (AiCallOutboundTaskModel, and_(
+                AiCallOutboundTaskModel.tenant_id == AiCallFollowUpDataModel.tenant_id,
+                AiCallOutboundTaskModel.id == AiCallFollowUpDataModel.task_id,
+            )),
+        )
+        conditions = [AiCallFollowUpDataModel.tenant_id == tenant_id]
+        if classification:
+            conditions.append(AiCallFollowUpDataModel.classification == classification)
+        else:
+            conditions.append(AiCallFollowUpDataModel.classification.is_not(None))
+        normalized_keyword = (keyword or "").strip()
+        if normalized_keyword:
+            conditions.append(
+                or_(
+                    AiCallOutboundTargetModel.customer_name.contains(
+                        normalized_keyword
+                    ),
+                    AiCallOutboundTargetModel.phone_number.contains(
+                        normalized_keyword
+                    ),
+                )
+            )
+        if task_id is not None:
+            conditions.append(AiCallFollowUpDataModel.task_id == task_id)
+        if last_contact_at_begin is not None:
+            conditions.append(
+                AiCallFollowUpDataModel.last_contact_at >= last_contact_at_begin
+            )
+        if last_contact_at_end is not None:
+            conditions.append(
+                AiCallFollowUpDataModel.last_contact_at < last_contact_at_end
+            )
+        if next_follow_up_at_begin is not None:
+            conditions.append(active_task.customer_callback_at >= next_follow_up_at_begin)
+        if next_follow_up_at_end is not None:
+            conditions.append(active_task.customer_callback_at < next_follow_up_at_end)
+        if suggest_review is not None:
+            conditions.append(
+                AiCallFollowUpDataModel.suggest_review == suggest_review
+            )
+
+        statement = select(
+            AiCallFollowUpDataModel,
+            AiCallOutboundTargetModel,
+            AiCallOutboundTaskModel,
+            active_task,
+            source_record,
+        )
+        count_statement = select(func.count(AiCallFollowUpDataModel.id))
+        for joined_model, on_clause in joins:
+            statement = statement.join(joined_model, on_clause)
+            count_statement = count_statement.join(joined_model, on_clause)
+        active_on = and_(
+            active_task.tenant_id == AiCallFollowUpDataModel.tenant_id,
+            active_task.follow_up_data_id == AiCallFollowUpDataModel.id,
+            active_task.status.in_({"pending", "processing"}),
+        )
+        record_on = and_(
+            source_record.tenant_id == AiCallFollowUpDataModel.tenant_id,
+            source_record.call_id == AiCallFollowUpDataModel.source_call_id,
+        )
+        statement = statement.outerjoin(active_task, active_on).outerjoin(
+            source_record, record_on
+        )
+        count_statement = count_statement.outerjoin(active_task, active_on)
+        total = int(
+            await self.db.scalar(count_statement.where(*conditions)) or 0
+        )
+        rows = (
+            await self.db.execute(
+                statement.where(*conditions)
+                .order_by(
+                    AiCallFollowUpDataModel.last_contact_at.desc(),
+                    AiCallFollowUpDataModel.id.desc(),
+                )
+                .offset((page_num - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+        submitted_ids = await self._submitted_data_ids(
+            tenant_id=tenant_id,
+            follow_up_data_ids=[row[0].id for row in rows],
+        )
+        return [
+            self._row_payload(
+                *row,
+                has_submitted_result=row[0].id in submitted_ids,
+            )
+            for row in rows
+        ], total
+
+    async def get_detail(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+    ) -> dict[str, Any]:
+        context = await self._load_context(
+            tenant_id=tenant_id,
+            follow_up_data_id=follow_up_data_id,
+        )
+        if context is None:
+            raise CustomException(msg="跟进数据不存在", status_code=404)
+        data, target, task, active_task, source_record = context
+        records = list(
+            (
+                await self.db.scalars(
+                    select(AiCallRecordModel)
+                    .where(
+                        AiCallRecordModel.tenant_id == tenant_id,
+                        or_(
+                            AiCallRecordModel.follow_up_data_id == data.id,
+                            AiCallRecordModel.call_id == data.source_call_id,
+                        ),
+                    )
+                    .order_by(AiCallRecordModel.started_at, AiCallRecordModel.id)
+                )
+            ).all()
+        )
+        call_ids = [record.call_id for record in records]
+        semantic_by_call = {
+            row.call_id: row
+            for row in (
+                (
+                    await self.db.scalars(
+                        select(AiCallSemanticAnalysisModel).where(
+                            AiCallSemanticAnalysisModel.call_id.in_(call_ids)
+                        )
+                    )
+                ).all()
+                if call_ids
+                else []
+            )
+        }
+        acw_by_call = {
+            row.call_id: row
+            for row in (
+                (
+                    await self.db.scalars(
+                        select(AiCallAfterCallWorkModel).where(
+                            AiCallAfterCallWorkModel.tenant_id == tenant_id,
+                            AiCallAfterCallWorkModel.call_id.in_(call_ids),
+                        )
+                    )
+                ).all()
+                if call_ids
+                else []
+            )
+        }
+        handling_by_call = {
+            row.related_call_id: row
+            for row in (
+                (
+                    await self.db.scalars(
+                        select(AiCallFollowUpHandlingResultModel).where(
+                            AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                            AiCallFollowUpHandlingResultModel.related_call_id.in_(
+                                call_ids
+                            ),
+                        )
+                    )
+                ).all()
+                if call_ids
+                else []
+            )
+        }
+        history_without_call = list(
+            (
+                await self.db.scalars(
+                    select(AiCallFollowUpClassificationHistoryModel)
+                    .where(
+                        AiCallFollowUpClassificationHistoryModel.tenant_id
+                        == tenant_id,
+                        AiCallFollowUpClassificationHistoryModel.follow_up_data_id
+                        == data.id,
+                        AiCallFollowUpClassificationHistoryModel.call_id.is_(None),
+                    )
+                    .order_by(AiCallFollowUpClassificationHistoryModel.created_at)
+                )
+            ).all()
+        )
+        timeline = [
+            self._record_timeline_payload(
+                record,
+                semantic=semantic_by_call.get(record.call_id),
+                after_call_work=acw_by_call.get(record.call_id),
+                handling_result=handling_by_call.get(record.call_id),
+            )
+            for record in records
+        ]
+        timeline.extend(
+            {
+                "type": "classification_adjustment",
+                "call_id": None,
+                "occurred_at": history.created_at,
+                "from_classification": history.from_classification,
+                "to_classification": history.to_classification,
+                "conclusion": history.change_reason,
+                "operator": history.changed_by_name or history.changed_by,
+            }
+            for history in history_without_call
+        )
+        timeline.sort(
+            key=lambda item: item["occurred_at"]
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        payload = self._row_payload(
+            data,
+            target,
+            task,
+            active_task,
+            source_record,
+            has_submitted_result=any(
+                item.get("after_call_result_status") == "submitted"
+                for item in timeline
+            ),
+        )
+        payload["timeline"] = timeline
+        return payload
+
+    async def adjust_classification(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+        payload: FollowUpDataClassificationIn,
+        idempotency_key: str,
+        changed_by: str,
+        changed_by_name: str | None,
+    ) -> dict[str, Any]:
+        normalized_key = idempotency_key.strip()
+        if not normalized_key:
+            raise CustomException(msg="缺少 Idempotency-Key", status_code=400)
+        fingerprint = self._classification_fingerprint(
+            follow_up_data_id=follow_up_data_id,
+            payload=payload,
+        )
+        existing = await self._get_idempotent_history(tenant_id, normalized_key)
+        if existing is not None:
+            return self._replay_adjustment(existing, fingerprint)
+
+        data = await self.db.scalar(
+            select(AiCallFollowUpDataModel)
+            .where(
+                AiCallFollowUpDataModel.tenant_id == tenant_id,
+                AiCallFollowUpDataModel.id == follow_up_data_id,
+            )
+            .with_for_update()
+        )
+        if data is None:
+            raise CustomException(msg="跟进数据不存在", status_code=404)
+        existing = await self._get_idempotent_history(tenant_id, normalized_key)
+        if existing is not None:
+            return self._replay_adjustment(existing, fingerprint)
+        if data.version != payload.expected_version:
+            raise CustomException(
+                msg="跟进数据已更新，请刷新后重试",
+                status_code=409,
+                data={
+                    "errorCode": "VERSION_CONFLICT",
+                    "currentVersion": data.version,
+                },
+            )
+
+        now = datetime.now(timezone.utc)
+        from_classification = data.classification
+        data.classification = payload.classification
+        data.classification_reason = payload.reason
+        data.classification_source = "human"
+        data.classification_confidence = None
+        data.suggest_review = False
+        data.low_value_reason = payload.low_value_reason
+        data.classification_updated_at = now
+        data.classification_updated_by = changed_by
+        data.version += 1
+        data.updated_at = now
+        await self._finish_active_task_for_classification(
+            data=data,
+            reason=payload.reason,
+            low_value_reason=payload.low_value_reason,
+            now=now,
+        )
+        history = AiCallFollowUpClassificationHistoryModel(
+            id=generate_snowflake_id(),
+            tenant_id=tenant_id,
+            follow_up_data_id=data.id,
+            from_classification=from_classification,
+            to_classification=payload.classification,
+            change_reason=payload.reason,
+            source="manual_adjustment",
+            call_id=None,
+            semantic_analysis_id=None,
+            semantic_analysis_version=None,
+            ai_suggested_classification=None,
+            ai_confidence=None,
+            ai_reason=None,
+            ai_evidence_json=None,
+            ai_conflict=None,
+            ai_adopted=None,
+            idempotency_key=normalized_key,
+            request_fingerprint=fingerprint,
+            result_version=data.version,
+            changed_by=changed_by,
+            changed_by_name=changed_by_name,
+            created_at=now,
+        )
+        self.db.add(history)
+        await self.db.flush()
+        return self._adjustment_result(history)
+
+    async def _load_context(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+    ):
+        active_task = aliased(AiCallFollowUpTaskModel)
+        source_record = aliased(AiCallRecordModel)
+        return (
+            await self.db.execute(
+                select(
+                    AiCallFollowUpDataModel,
+                    AiCallOutboundTargetModel,
+                    AiCallOutboundTaskModel,
+                    active_task,
+                    source_record,
+                )
+                .join(
+                    AiCallOutboundTargetModel,
+                    and_(
+                        AiCallOutboundTargetModel.tenant_id
+                        == AiCallFollowUpDataModel.tenant_id,
+                        AiCallOutboundTargetModel.task_id
+                        == AiCallFollowUpDataModel.task_id,
+                        AiCallOutboundTargetModel.id
+                        == AiCallFollowUpDataModel.target_id,
+                    ),
+                )
+                .join(
+                    AiCallOutboundTaskModel,
+                    and_(
+                        AiCallOutboundTaskModel.tenant_id
+                        == AiCallFollowUpDataModel.tenant_id,
+                        AiCallOutboundTaskModel.id == AiCallFollowUpDataModel.task_id,
+                    ),
+                )
+                .outerjoin(
+                    active_task,
+                    and_(
+                        active_task.tenant_id == AiCallFollowUpDataModel.tenant_id,
+                        active_task.follow_up_data_id == AiCallFollowUpDataModel.id,
+                        active_task.status.in_({"pending", "processing"}),
+                    ),
+                )
+                .outerjoin(
+                    source_record,
+                    and_(
+                        source_record.tenant_id == AiCallFollowUpDataModel.tenant_id,
+                        source_record.call_id == AiCallFollowUpDataModel.source_call_id,
+                    ),
+                )
+                .where(
+                    AiCallFollowUpDataModel.tenant_id == tenant_id,
+                    AiCallFollowUpDataModel.id == follow_up_data_id,
+                )
+            )
+        ).one_or_none()
+
+    @staticmethod
+    def _row_payload(
+        data: AiCallFollowUpDataModel,
+        target: AiCallOutboundTargetModel,
+        task: AiCallOutboundTaskModel,
+        active_task: AiCallFollowUpTaskModel | None,
+        source_record: AiCallRecordModel | None,
+        *,
+        has_submitted_result: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "follow_up_data_id": str(data.id),
+            "tenant_id": data.tenant_id,
+            "task_id": str(data.task_id),
+            "target_id": str(data.target_id),
+            "source_call_id": data.source_call_id,
+            "customer_name": target.customer_name,
+            "masked_contact": (
+                source_record.callee_phone_number_masked
+                if source_record is not None
+                else active_task.masked_contact if active_task is not None else None
+            ),
+            "task_name": task.task_name,
+            "classification": data.classification,
+            "classification_reason": data.classification_reason,
+            "classification_source": data.classification_source,
+            "classification_confidence": data.classification_confidence,
+            "suggest_review": data.suggest_review,
+            "low_value_reason": data.low_value_reason,
+            "latest_conclusion": data.latest_conclusion,
+            "last_contact_at": data.last_contact_at,
+            "next_follow_up_at": (
+                active_task.customer_callback_at if active_task is not None else None
+            ),
+            "active_follow_up_id": (
+                str(active_task.id) if active_task is not None else None
+            ),
+            "follow_up_task_status": (
+                active_task.status if active_task is not None else None
+            ),
+            "classification_updated_at": data.classification_updated_at,
+            "classification_updated_by": data.classification_updated_by,
+            "after_call_result_status": (
+                "pending"
+                if data.blocking_human_call_id
+                else "submitted" if has_submitted_result else "not_applicable"
+            ),
+            "blocking_human_call_id": data.blocking_human_call_id,
+            "version": data.version,
+        }
+
+    async def _submitted_data_ids(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_ids: list[int],
+    ) -> set[int]:
+        if not follow_up_data_ids:
+            return set()
+        statement = select(
+            AiCallFollowUpHandlingResultModel.follow_up_data_id
+        ).where(
+            AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+            AiCallFollowUpHandlingResultModel.follow_up_data_id.in_(
+                follow_up_data_ids
+            ),
+        ).union(
+            select(AiCallRecordModel.follow_up_data_id)
+            .join(
+                AiCallAfterCallWorkModel,
+                and_(
+                    AiCallAfterCallWorkModel.tenant_id
+                    == AiCallRecordModel.tenant_id,
+                    AiCallAfterCallWorkModel.call_id == AiCallRecordModel.call_id,
+                ),
+            )
+            .where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.follow_up_data_id.in_(follow_up_data_ids),
+            )
+        )
+        return {int(value) for value in await self.db.scalars(statement) if value}
+
+    @staticmethod
+    def _record_timeline_payload(
+        record: AiCallRecordModel,
+        *,
+        semantic: AiCallSemanticAnalysisModel | None,
+        after_call_work: AiCallAfterCallWorkModel | None,
+        handling_result: AiCallFollowUpHandlingResultModel | None,
+    ) -> dict[str, Any]:
+        analysis_result = semantic.analysis_result_dict if semantic else None
+        conclusion = (
+            handling_result.remark
+            if handling_result is not None
+            else after_call_work.summary
+            if after_call_work is not None
+            else (analysis_result or {}).get("summary")
+        )
+        if handling_result is not None or after_call_work is not None:
+            result_status = "submitted"
+        elif record.operator_agent_identity and record.status in {"completed", "failed"}:
+            result_status = "pending"
+        else:
+            result_status = "not_applicable"
+        return {
+            "type": "call",
+            "call_id": record.call_id,
+            "occurred_at": record.started_at,
+            "entry_type": record.entry_type,
+            "status": record.status,
+            "end_reason": record.end_reason,
+            "duration_ms": record.duration_ms,
+            "operator_agent_identity": record.operator_agent_identity,
+            "conclusion": conclusion,
+            "after_call_result_status": result_status,
+            "semantic_analysis": analysis_result,
+            "next_follow_up_at": (
+                handling_result.next_follow_up_at
+                if handling_result is not None
+                else None
+            ),
+        }
+
+    async def _get_idempotent_history(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+    ) -> AiCallFollowUpClassificationHistoryModel | None:
+        return await self.db.scalar(
+            select(AiCallFollowUpClassificationHistoryModel).where(
+                AiCallFollowUpClassificationHistoryModel.tenant_id == tenant_id,
+                AiCallFollowUpClassificationHistoryModel.idempotency_key
+                == idempotency_key,
+            )
+        )
+
+    @staticmethod
+    def _classification_fingerprint(
+        *,
+        follow_up_data_id: int,
+        payload: FollowUpDataClassificationIn,
+    ) -> str:
+        body = {
+            "followUpDataId": str(follow_up_data_id),
+            **payload.model_dump(mode="json", by_alias=True),
+        }
+        return sha256(
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    @classmethod
+    def _replay_adjustment(
+        cls,
+        history: AiCallFollowUpClassificationHistoryModel,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        if history.request_fingerprint != fingerprint:
+            raise CustomException(
+                msg="Idempotency-Key 已用于其他请求",
+                status_code=409,
+                data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+            )
+        return cls._adjustment_result(history)
+
+    @staticmethod
+    def _adjustment_result(
+        history: AiCallFollowUpClassificationHistoryModel,
+    ) -> dict[str, Any]:
+        return {
+            "follow_up_data_id": str(history.follow_up_data_id),
+            "classification": history.to_classification,
+            "reason": history.change_reason,
+            "version": history.result_version,
+        }
+
+    async def _finish_active_task_for_classification(
+        self,
+        *,
+        data: AiCallFollowUpDataModel,
+        reason: str,
+        low_value_reason: str | None,
+        now: datetime,
+    ) -> None:
+        if data.classification not in {"low_value", "converted"}:
+            return
+        task = await self.db.scalar(
+            select(AiCallFollowUpTaskModel)
+            .where(
+                AiCallFollowUpTaskModel.tenant_id == data.tenant_id,
+                AiCallFollowUpTaskModel.follow_up_data_id == data.id,
+                AiCallFollowUpTaskModel.status.in_({"pending", "processing"}),
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return
+        task.customer_callback_at = None
+        task.updated_at = now
+        if data.classification == "converted":
+            task.status = "completed"
+            task.completed_at = now
+            return
+        task.status = "closed"
+        task.closed_reason = {
+            "explicit_rejection": "customer_refused",
+            "invalid_contact": "invalid_contact",
+        }.get(low_value_reason or "", "other")
+        task.closed_remark = reason
+        task.closed_at = now
 
     async def apply_ai_analysis(
         self,
@@ -141,6 +761,9 @@ class AiCallFollowUpDataService:
             ),
             "ai_conflict": result.get("evidence_conflict") is True,
             "ai_adopted": not protected,
+            "idempotency_key": None,
+            "request_fingerprint": None,
+            "result_version": data.version,
             "changed_by": "ai",
             "changed_by_name": "AI",
             "created_at": now,

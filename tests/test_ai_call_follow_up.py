@@ -309,6 +309,9 @@ def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None
         "semantic_analysis_version",
         "ai_suggested_classification",
         "ai_adopted",
+        "idempotency_key",
+        "request_fingerprint",
+        "result_version",
     } <= set(history_table.columns.keys())
     assert {
         frozenset(constraint.columns.keys())
@@ -317,7 +320,8 @@ def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None
     } >= {
         frozenset(
             {"tenant_id", "semantic_analysis_id", "semantic_analysis_version"}
-        )
+        ),
+        frozenset({"tenant_id", "idempotency_key"}),
     }
     assert not history_table.foreign_keys
 

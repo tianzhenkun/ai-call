@@ -1,5 +1,6 @@
 from .agent_console_controller import AgentAdminRouter, AgentConsoleRouter
 from .controller import AiCallRouter
+from .follow_up_data_controller import FollowUpDataRouter
 from .outbound import OutboundValidationRouter
 from .runtime_control_controller import RuntimeEntryRouter
 from .statistics_controller import OutboundStatisticsRouter
@@ -7,6 +8,7 @@ from .voice import VoiceRouter
 
 AiCallRouter.include_router(AgentConsoleRouter)
 AiCallRouter.include_router(AgentAdminRouter)
+AiCallRouter.include_router(FollowUpDataRouter)
 AiCallRouter.include_router(OutboundValidationRouter)
 AiCallRouter.include_router(RuntimeEntryRouter)
 AiCallRouter.include_router(OutboundStatisticsRouter)

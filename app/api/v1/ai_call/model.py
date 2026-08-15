@@ -1447,6 +1447,11 @@ class AiCallFollowUpClassificationHistoryModel(MappedBase):
             "semantic_analysis_version",
             name="uk_ai_call_follow_up_history_analysis",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uk_ai_call_follow_up_history_idempotency",
+        ),
         Index(
             "idx_ai_call_follow_up_history_data_time",
             "tenant_id",
@@ -1478,6 +1483,15 @@ class AiCallFollowUpClassificationHistoryModel(MappedBase):
             "ai_confidence is null or ai_confidence in ('high', 'medium', 'low')",
             name="ck_ai_call_follow_up_history_ai_confidence",
         ),
+        CheckConstraint(
+            "(idempotency_key is null and request_fingerprint is null) or "
+            "(idempotency_key is not null and request_fingerprint is not null)",
+            name="ck_ai_call_follow_up_history_idempotency",
+        ),
+        CheckConstraint(
+            "result_version > 0",
+            name="ck_ai_call_follow_up_history_result_version",
+        ),
         {"comment": "AI Call 跟进分类审计历史"},
     )
     __permission_strategy__ = None
@@ -1500,6 +1514,14 @@ class AiCallFollowUpClassificationHistoryModel(MappedBase):
     ai_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     ai_conflict: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ai_adopted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
     changed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     changed_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

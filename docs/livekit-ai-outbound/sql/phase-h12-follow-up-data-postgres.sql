@@ -71,11 +71,16 @@ create table if not exists ai_call_follow_up_classification_history (
     ai_evidence_json text,
     ai_conflict boolean,
     ai_adopted boolean,
+    idempotency_key varchar(128),
+    request_fingerprint varchar(64),
+    result_version integer not null default 1,
     changed_by varchar(128),
     changed_by_name varchar(100),
     created_at timestamptz not null,
     constraint uk_ai_call_follow_up_history_analysis
         unique (tenant_id, semantic_analysis_id, semantic_analysis_version),
+    constraint uk_ai_call_follow_up_history_idempotency
+        unique (tenant_id, idempotency_key),
     constraint ck_ai_call_follow_up_history_from check (
         from_classification is null or from_classification in
             ('interested', 'nurturing', 'low_value', 'converted')
@@ -93,8 +98,51 @@ create table if not exists ai_call_follow_up_classification_history (
     ),
     constraint ck_ai_call_follow_up_history_ai_confidence check (
         ai_confidence is null or ai_confidence in ('high', 'medium', 'low')
+    ),
+    constraint ck_ai_call_follow_up_history_idempotency check (
+        (idempotency_key is null and request_fingerprint is null)
+        or (idempotency_key is not null and request_fingerprint is not null)
+    ),
+    constraint ck_ai_call_follow_up_history_result_version check (
+        result_version > 0
     )
 );
+
+alter table ai_call_follow_up_classification_history
+    add column if not exists idempotency_key varchar(128),
+    add column if not exists request_fingerprint varchar(64),
+    add column if not exists result_version integer not null default 1;
+
+do $$
+begin
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_history_idempotency'
+          and conrelid = 'ai_call_follow_up_classification_history'::regclass
+    ) then
+        alter table ai_call_follow_up_classification_history
+            add constraint ck_ai_call_follow_up_history_idempotency check (
+                (idempotency_key is null and request_fingerprint is null)
+                or (idempotency_key is not null and request_fingerprint is not null)
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_history_result_version'
+          and conrelid = 'ai_call_follow_up_classification_history'::regclass
+    ) then
+        alter table ai_call_follow_up_classification_history
+            add constraint ck_ai_call_follow_up_history_result_version check (
+                result_version > 0
+            );
+    end if;
+end
+$$;
+
+create unique index if not exists uk_ai_call_follow_up_history_idempotency
+    on ai_call_follow_up_classification_history (tenant_id, idempotency_key);
 
 create index if not exists idx_ai_call_follow_up_history_data_time
     on ai_call_follow_up_classification_history
