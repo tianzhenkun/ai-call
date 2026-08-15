@@ -339,6 +339,14 @@ class RecordOut(AiCallBaseSchema):
     id: str
     call_id: str
     task_id: str | None = None
+    follow_up_data_id: str | None = None
+    operator_agent_identity: str | None = None
+    after_call_result_status: Literal[
+        "not_applicable", "pending", "submitted"
+    ] = "not_applicable"
+    after_call_result_type: Literal[
+        "handoff", "follow_up", "follow_up_data"
+    ] | None = None
     business_type: str | None = None
     business_id: str | None = None
     scene_code: str | None = None
@@ -407,6 +415,27 @@ class RecordAfterCallWorkOut(AiCallBaseSchema):
     submitted_at: datetime
 
 
+class RecordHandlingResultOut(AiCallBaseSchema):
+    id: str
+    follow_up_id: str | None = None
+    follow_up_data_id: str | None = None
+    contact_result: str
+    remark: str
+    classification: str | None = None
+    low_value_reason: str | None = None
+    next_follow_up_at: datetime | None = None
+    result_version: int | None = None
+    handled_at: datetime
+
+
+class RecordFollowUpDataOut(AiCallBaseSchema):
+    id: str
+    classification: str | None = None
+    low_value_reason: str | None = None
+    latest_conclusion: str | None = None
+    version: int
+
+
 class RecordFollowUpOut(AiCallBaseSchema):
     id: str
     status: str
@@ -422,6 +451,8 @@ class RecordDetailOut(AiCallBaseSchema):
     execution_config: RecordExecutionConfigOut | None = None
     exception_handling: RecordExceptionHandlingOut | None = None
     after_call_work: RecordAfterCallWorkOut | None = None
+    handling_result: RecordHandlingResultOut | None = None
+    follow_up_data: RecordFollowUpDataOut | None = None
     follow_up: RecordFollowUpOut | None = None
 
 

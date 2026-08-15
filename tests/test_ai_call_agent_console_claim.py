@@ -1026,6 +1026,20 @@ async def test_media_ready_requires_livekit_microphone_before_connected(session_
         console_session_id=console_session_id,
     )
     await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        db.add(
+            AiCallRecordModel(
+                id=1001,
+                tenant_id="tenant-a",
+                call_id="call-handoff-1",
+                entry_type="web",
+                room_name="room-handoff-1",
+                participant_identity="customer-handoff-1",
+                status="running",
+                started_at=now,
+            )
+        )
     claimed = await _claim(
         session_factory,
         user_id=20,
@@ -1062,7 +1076,13 @@ async def test_media_ready_requires_livekit_microphone_before_connected(session_
             console_session_id=console_session_id,
             participant_identity="human-agent-handoff-1",
         )
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == "call-handoff-1"
+            )
+        )
     assert connected.status == "connected"
+    assert record.operator_agent_identity == "agent-20"
 
 
 @pytest.mark.anyio

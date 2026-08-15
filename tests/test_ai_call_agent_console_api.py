@@ -11,7 +11,7 @@ from fastapi import BackgroundTasks, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call import AiCallRouter, agent_console_controller
+from app.api.v1.ai_call import AiCallRouter, agent_console_controller, controller
 from app.api.v1.ai_call import service as ai_call_service_module
 from app.api.v1.ai_call.agent_console_controller import (
     get_agent_console_reconciler,
@@ -572,6 +572,53 @@ async def test_admin_and_console_endpoints_require_their_permissions(db_session)
     with _client(authenticated, service) as client:
         assert client.get("/ai-call/admin/agents").status_code == 200
         assert client.get("/ai-call/agent-console/events").status_code == 403
+
+
+@pytest.mark.anyio
+async def test_record_operator_scope_separates_manager_and_console(
+    db_session,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(controller.settings, "JWT_ENABLE", True)
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        AiCallAgentProfileModel(
+            id=20,
+            tenant_id="tenant-a",
+            agent_identity="agent-20",
+            user_id=20,
+            enabled=True,
+            created_by=1,
+            created_at=now,
+            updated_by=1,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+
+    assert (
+        await controller._after_call_record_operator_scope(
+            _auth(
+                db_session,
+                permissions=frozenset({"ai_call:agent:console"}),
+            )
+        )
+        == "agent-20"
+    )
+    assert (
+        await controller._after_call_record_operator_scope(
+            _auth(
+                db_session,
+                permissions=frozenset({"ai_call:agent:manage"}),
+            )
+        )
+        is None
+    )
+    with pytest.raises(CustomException) as forbidden:
+        await controller._after_call_record_operator_scope(
+            _auth(db_session, permissions=frozenset())
+        )
+    assert forbidden.value.status_code == 403
 
 
 @pytest.mark.anyio

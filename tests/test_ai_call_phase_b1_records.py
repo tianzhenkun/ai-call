@@ -26,6 +26,8 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallFollowUpDataModel,
+    AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -1640,6 +1642,130 @@ async def test_record_list_includes_successful_semantic_summary(b1_service) -> N
     page = await service.list_records(tenant_id="000000")
 
     assert page["rows"][0]["summary"] == "客户希望进一步了解服务效果。"
+
+
+@pytest.mark.anyio
+async def test_record_list_filters_and_projects_after_call_result_status(
+    b1_service,
+) -> None:
+    now = datetime.now(timezone.utc)
+
+    def record(row_id: int, call_id: str, operator: str | None):
+        return AiCallRecordModel(
+            id=row_id,
+            tenant_id="000000",
+            call_id=call_id,
+            follow_up_data_id=9001 if call_id == "call-result-pending" else None,
+            operator_agent_identity=operator,
+            entry_type="sip_callback",
+            room_name=f"room-{call_id}",
+            participant_identity=f"sip-{call_id}",
+            status="completed",
+            started_at=now,
+            ended_at=now,
+        )
+
+    async with b1_service.session_maker.begin() as db:
+        db.add_all(
+            [
+                record(9101, "call-result-pending", "agent-a"),
+                record(9102, "call-result-acw", "agent-a"),
+                record(9103, "call-result-handling", "agent-a"),
+                record(9104, "call-result-na", None),
+                AiCallFollowUpDataModel(
+                    id=9001,
+                    tenant_id="000000",
+                    task_id=9201,
+                    target_id=9202,
+                    source_call_id="call-result-pending",
+                    classification="interested",
+                    classification_reason="客户有明确需求",
+                    classification_source="human",
+                    classification_confidence=None,
+                    suggest_review=False,
+                    low_value_reason=None,
+                    latest_conclusion="等待人工提交本次结果",
+                    last_contact_at=now,
+                    blocking_human_call_id="call-result-pending",
+                    version=3,
+                    classification_updated_at=now,
+                    classification_updated_by="agent-a",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallAfterCallWorkModel(
+                    id=9301,
+                    work_id="acw-result-submitted",
+                    tenant_id="000000",
+                    call_id="call-result-acw",
+                    handoff_id="handoff-result-acw",
+                    agent_identity="agent-a",
+                    disposition_code="resolved",
+                    summary="已提交转人工结果",
+                    needs_follow_up=False,
+                    submitted_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallFollowUpHandlingResultModel(
+                    id=9401,
+                    tenant_id="000000",
+                    follow_up_id=9402,
+                    follow_up_data_id=None,
+                    idempotency_key="handling-result-submitted",
+                    request_fingerprint=None,
+                    related_call_id="call-result-handling",
+                    contact_channel="manual_phone",
+                    contact_result="connected",
+                    remark="已提交人工回拨结果",
+                    next_action="complete",
+                    next_follow_up_at=None,
+                    closed_reason=None,
+                    classification=None,
+                    low_value_reason=None,
+                    result_version=None,
+                    agent_identity="agent-a",
+                    handled_at=now,
+                    created_at=now,
+                ),
+            ]
+        )
+
+    pending = await b1_service.service.list_records(
+        tenant_id="000000",
+        after_call_result_status="pending",
+        operator_agent_identity="agent-a",
+    )
+    submitted = await b1_service.service.list_records(
+        tenant_id="000000",
+        after_call_result_status="submitted",
+        operator_agent_identity="agent-a",
+    )
+    not_applicable = await b1_service.service.list_records(
+        tenant_id="000000",
+        after_call_result_status="not_applicable",
+    )
+
+    assert [row["callId"] for row in pending["rows"]] == ["call-result-pending"]
+    assert pending["rows"][0]["afterCallResultStatus"] == "pending"
+    assert pending["rows"][0]["afterCallResultType"] == "follow_up_data"
+    assert {row["callId"] for row in submitted["rows"]} == {
+        "call-result-acw",
+        "call-result-handling",
+    }
+    assert "call-result-na" in {row["callId"] for row in not_applicable["rows"]}
+
+    pending_detail = RecordDetailOut.model_validate(
+        await b1_service.service.get_record_detail("call-result-pending")
+    ).model_dump(mode="json", by_alias=True)
+    handling_detail = RecordDetailOut.model_validate(
+        await b1_service.service.get_record_detail("call-result-handling")
+    ).model_dump(mode="json", by_alias=True)
+    assert pending_detail["record"]["afterCallResultStatus"] == "pending"
+    assert pending_detail["followUpData"]["classification"] == "interested"
+    assert pending_detail["followUpData"]["version"] == 3
+    assert handling_detail["record"]["afterCallResultStatus"] == "submitted"
+    assert handling_detail["handlingResult"]["remark"] == "已提交人工回拨结果"
 
 
 @pytest.mark.anyio

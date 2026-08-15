@@ -19,7 +19,11 @@ from livekit import api
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.ai_call.model import AiCallHandoffModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallAgentProfileModel,
+    AiCallHandoffModel,
+    AiCallRecordModel,
+)
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
@@ -445,7 +449,34 @@ async def _require_record_for_current_tenant(
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> None:
     tenant_id, _ = _identity(auth)
-    await service.require_record_for_tenant(tenant_id=tenant_id, call_id=call_id)
+    await service.require_record_for_tenant(
+        tenant_id=tenant_id,
+        call_id=call_id,
+    )
+
+
+async def _after_call_record_operator_scope(auth: AuthSchema) -> str | None:
+    user = auth.user
+    if user is None:
+        raise CustomException(msg="认证已失效", code=10401, status_code=401)
+    if (
+        not settings.JWT_ENABLE
+        or user.is_superuser
+        or not auth.permissions.isdisjoint({"ai_call:agent:manage", "*:*:*"})
+    ):
+        return None
+    if auth.permissions.isdisjoint({"ai_call:agent:console", "*:*:*"}):
+        raise CustomException(msg="无权限操作", code=10403, status_code=403)
+    profile = await auth.db.scalar(
+        select(AiCallAgentProfileModel).where(
+            AiCallAgentProfileModel.tenant_id == user.tenant_id,
+            AiCallAgentProfileModel.user_id == user.id,
+            AiCallAgentProfileModel.enabled.is_(True),
+        )
+    )
+    if profile is None:
+        raise CustomException(msg="当前账号未开通坐席功能", code=10403, status_code=403)
+    return profile.agent_identity
 
 
 @AiCallRouter.get(
@@ -732,6 +763,10 @@ async def list_records_controller(
         | None,
         Query(alias="followUpStatus"),
     ] = None,
+    after_call_result_status: Annotated[
+        Literal["all", "pending", "submitted", "not_applicable"] | None,
+        Query(alias="afterCallResultStatus"),
+    ] = None,
     business_type: Annotated[str | None, Query(alias="businessType")] = None,
     business_id: Annotated[str | None, Query(alias="businessId")] = None,
     status: str | None = None,
@@ -756,6 +791,12 @@ async def list_records_controller(
         call_result=call_result,
         customer_intent=customer_intent,
         follow_up_status=follow_up_status,
+        after_call_result_status=after_call_result_status,
+        operator_agent_identity=(
+            await _after_call_record_operator_scope(auth)
+            if after_call_result_status not in {None, "all"}
+            else None
+        ),
         business_type=business_type,
         business_id=business_id,
         status=status,

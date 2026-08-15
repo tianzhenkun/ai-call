@@ -360,6 +360,8 @@ class AiCallAgentConsoleService:
         handoff.status = "connected"
         handoff.connected_at = handoff.connected_at or now
         handoff.reconnect_expires_at = None
+        if record is not None:
+            record.operator_agent_identity = profile.agent_identity
         presence.status = "in_call"
         presence.last_seen_at = now
         presence.status_updated_at = now

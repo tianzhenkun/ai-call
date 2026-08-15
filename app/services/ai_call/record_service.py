@@ -405,6 +405,8 @@ class AiCallRecordService:
         call_result: str | None = None,
         customer_intent: str | None = None,
         follow_up_status: str | None = None,
+        after_call_result_status: str | None = None,
+        operator_agent_identity: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -425,6 +427,8 @@ class AiCallRecordService:
             call_result=call_result,
             customer_intent=customer_intent,
             follow_up_status=follow_up_status,
+            after_call_result_status=after_call_result_status,
+            operator_agent_identity=operator_agent_identity,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -494,6 +498,25 @@ class AiCallRecordService:
             "followUpReviewStatus": semantic_context.get("followUpReviewStatus"),
             "followUpId": follow_up_context.get("followUpId"),
             "followUpStatus": follow_up_context.get("followUpStatus"),
+            "followUpDataId": (
+                str(record.follow_up_data_id)
+                if record.follow_up_data_id is not None
+                else None
+            ),
+            "operatorAgentIdentity": record.operator_agent_identity,
+            "afterCallResultStatus": getattr(
+                record, "_after_call_result_status", "not_applicable"
+            ),
+            "afterCallResultType": (
+                "follow_up"
+                if record.follow_up_id is not None
+                else "follow_up_data"
+                if record.follow_up_data_id is not None
+                and record.entry_type == "sip_callback"
+                else "handoff"
+                if record.operator_agent_identity
+                else None
+            ),
             "qualityScoreStatus": quality_context.get("qualityScoreStatus"),
             "qualityScore": quality_context.get("qualityScore"),
             "qualityReviewResult": quality_context.get("qualityReviewResult"),

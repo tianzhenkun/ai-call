@@ -15,6 +15,8 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallFollowUpDataModel,
+    AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -305,6 +307,34 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_follow_up_handling_result(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> AiCallFollowUpHandlingResultModel | None:
+        return await self.db.scalar(
+            select(AiCallFollowUpHandlingResultModel)
+            .where(
+                AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                AiCallFollowUpHandlingResultModel.related_call_id == call_id,
+            )
+            .order_by(AiCallFollowUpHandlingResultModel.handled_at.desc())
+        )
+
+    async def get_follow_up_data(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+    ) -> AiCallFollowUpDataModel | None:
+        return await self.db.scalar(
+            select(AiCallFollowUpDataModel).where(
+                AiCallFollowUpDataModel.tenant_id == tenant_id,
+                AiCallFollowUpDataModel.id == follow_up_data_id,
+            )
+        )
+
     async def list_records_by_call_ids(
         self,
         call_ids: list[str],
@@ -532,6 +562,8 @@ class AiCallRecordRepository:
         call_result: str | None = None,
         customer_intent: str | None = None,
         follow_up_status: str | None = None,
+        after_call_result_status: str | None = None,
+        operator_agent_identity: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -553,6 +585,8 @@ class AiCallRecordRepository:
             call_result=call_result,
             customer_intent=customer_intent,
             follow_up_status=follow_up_status,
+            after_call_result_status=after_call_result_status,
+            operator_agent_identity=operator_agent_identity,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -572,6 +606,8 @@ class AiCallRecordRepository:
             call_result=call_result,
             customer_intent=customer_intent,
             follow_up_status=follow_up_status,
+            after_call_result_status=after_call_result_status,
+            operator_agent_identity=operator_agent_identity,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -594,7 +630,49 @@ class AiCallRecordRepository:
         await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_semantic_analysis(rows)
         await self._attach_follow_up_context(rows, tenant_id=tenant_id)
+        await self.attach_after_call_result_context(rows, tenant_id=tenant_id)
         return list(rows), total
+
+    async def attach_after_call_result_context(
+        self,
+        records: list[AiCallRecordModel],
+        *,
+        tenant_id: str | None,
+    ) -> None:
+        call_ids = [record.call_id for record in records]
+        if not call_ids:
+            return
+        after_call_work = select(AiCallAfterCallWorkModel.call_id).where(
+            AiCallAfterCallWorkModel.call_id.in_(call_ids)
+        )
+        handling_result = select(
+            AiCallFollowUpHandlingResultModel.related_call_id
+        ).where(
+            AiCallFollowUpHandlingResultModel.related_call_id.in_(call_ids)
+        )
+        if tenant_id:
+            after_call_work = after_call_work.where(
+                AiCallAfterCallWorkModel.tenant_id == tenant_id
+            )
+            handling_result = handling_result.where(
+                AiCallFollowUpHandlingResultModel.tenant_id == tenant_id
+            )
+        submitted_call_ids = {
+            value
+            for value in await self.db.scalars(
+                after_call_work.union(handling_result)
+            )
+            if value
+        }
+        for record in records:
+            record._after_call_result_status = (
+                "submitted"
+                if record.call_id in submitted_call_ids
+                else "pending"
+                if record.operator_agent_identity
+                and record.status in {"completed", "failed"}
+                else "not_applicable"
+            )
 
     async def _attach_quality_context(
         self,
@@ -2780,6 +2858,12 @@ class AiCallRecordRepository:
         follow_up_status = (
             str(filters.get("follow_up_status") or "").strip() or None
         )
+        after_call_result_status = (
+            str(filters.get("after_call_result_status") or "").strip() or None
+        )
+        operator_agent_identity = (
+            str(filters.get("operator_agent_identity") or "").strip() or None
+        )
         formal_outbound_only = bool(filters.get("formal_outbound_only"))
         has_outbound_filters = any(
             (
@@ -3036,6 +3120,50 @@ class AiCallRecordRepository:
                     .where(*semantic_conditions)
                     .exists(),
                     selected_task_status.is_(None),
+                )
+        if operator_agent_identity:
+            stmt = stmt.where(
+                AiCallRecordModel.operator_agent_identity
+                == operator_agent_identity
+            )
+        if after_call_result_status not in {None, "all"}:
+            after_call_work_conditions = [
+                AiCallAfterCallWorkModel.call_id == AiCallRecordModel.call_id
+            ]
+            handling_result_conditions = [
+                AiCallFollowUpHandlingResultModel.related_call_id
+                == AiCallRecordModel.call_id
+            ]
+            if tenant_id:
+                after_call_work_conditions.append(
+                    AiCallAfterCallWorkModel.tenant_id == tenant_id
+                )
+                handling_result_conditions.append(
+                    AiCallFollowUpHandlingResultModel.tenant_id == tenant_id
+                )
+            submitted = or_(
+                select(AiCallAfterCallWorkModel.id)
+                .where(*after_call_work_conditions)
+                .exists(),
+                select(AiCallFollowUpHandlingResultModel.id)
+                .where(*handling_result_conditions)
+                .exists(),
+            )
+            if after_call_result_status == "submitted":
+                stmt = stmt.where(submitted)
+            elif after_call_result_status == "pending":
+                stmt = stmt.where(
+                    AiCallRecordModel.operator_agent_identity.is_not(None),
+                    AiCallRecordModel.status.in_({"completed", "failed"}),
+                    ~submitted,
+                )
+            elif after_call_result_status == "not_applicable":
+                stmt = stmt.where(
+                    ~submitted,
+                    or_(
+                        AiCallRecordModel.operator_agent_identity.is_(None),
+                        AiCallRecordModel.status.not_in({"completed", "failed"}),
+                    ),
                 )
         if filters.get("started_at_begin"):
             stmt = stmt.where(AiCallRecordModel.started_at >= filters["started_at_begin"])

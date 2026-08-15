@@ -1204,6 +1204,8 @@ class AiCallService:
         call_result: str | None = None,
         customer_intent: str | None = None,
         follow_up_status: str | None = None,
+        after_call_result_status: str | None = None,
+        operator_agent_identity: str | None = None,
         business_type: str | None = None,
         business_id: str | None = None,
         status: str | None = None,
@@ -1225,6 +1227,8 @@ class AiCallService:
             call_result=call_result,
             customer_intent=customer_intent,
             follow_up_status=follow_up_status,
+            after_call_result_status=after_call_result_status,
+            operator_agent_identity=operator_agent_identity,
             business_type=business_type,
             business_id=business_id,
             status=status,
@@ -1261,6 +1265,9 @@ class AiCallService:
         await self.record_service.repository.attach_outbound_context(
             [record], tenant_id=record.tenant_id
         )
+        await self.record_service.repository.attach_after_call_result_context(
+            [record], tenant_id=record.tenant_id
+        )
         last_event = await self.record_service.get_last_event(call_id)
         execution_config = await self.record_service.get_execution_config(record)
         exception_handling = (
@@ -1272,6 +1279,8 @@ class AiCallService:
             else None
         )
         after_call_work = None
+        handling_result = None
+        follow_up_data = None
         follow_up = None
         if record.tenant_id:
             task, source_record, callback_records = (
@@ -1318,12 +1327,59 @@ class AiCallService:
                     "resultVersion": work.result_version,
                     "submittedAt": work.submitted_at,
                 }
+            handling = (
+                await self.record_service.repository.get_follow_up_handling_result(
+                    tenant_id=record.tenant_id,
+                    call_id=call_id,
+                )
+            )
+            if handling is not None:
+                handling_result = {
+                    "id": str(handling.id),
+                    "followUpId": (
+                        str(handling.follow_up_id)
+                        if handling.follow_up_id is not None
+                        else None
+                    ),
+                    "followUpDataId": (
+                        str(handling.follow_up_data_id)
+                        if handling.follow_up_data_id is not None
+                        else None
+                    ),
+                    "contactResult": handling.contact_result,
+                    "remark": handling.remark,
+                    "classification": handling.classification,
+                    "lowValueReason": handling.low_value_reason,
+                    "nextFollowUpAt": handling.next_follow_up_at,
+                    "resultVersion": handling.result_version,
+                    "handledAt": handling.handled_at,
+                }
+            follow_up_data_id = (
+                record.follow_up_data_id
+                or (work.follow_up_data_id if work is not None else None)
+                or (handling.follow_up_data_id if handling is not None else None)
+            )
+            if follow_up_data_id is not None:
+                data = await self.record_service.repository.get_follow_up_data(
+                    tenant_id=record.tenant_id,
+                    follow_up_data_id=follow_up_data_id,
+                )
+                if data is not None:
+                    follow_up_data = {
+                        "id": str(data.id),
+                        "classification": data.classification,
+                        "lowValueReason": data.low_value_reason,
+                        "latestConclusion": data.latest_conclusion,
+                        "version": data.version,
+                    }
         return {
             "record": self.record_service.record_to_dict(record),
             "lastEvent": self.record_service.event_to_dict(last_event) if last_event else None,
             "executionConfig": execution_config,
             "exceptionHandling": exception_handling,
             "afterCallWork": after_call_work,
+            "handlingResult": handling_result,
+            "followUpData": follow_up_data,
             "followUp": follow_up,
         }
 
