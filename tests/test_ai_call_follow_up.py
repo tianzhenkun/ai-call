@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import UniqueConstraint, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
@@ -26,6 +26,8 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpAttemptModel,
+    AiCallFollowUpClassificationHistoryModel,
+    AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
@@ -272,6 +274,67 @@ async def _seed_ai_post_call_follow_up(session_factory, *, task_id: int = 102) -
 
 def _error_code(exc: CustomException) -> str | None:
     return exc.data.get("errorCode") if isinstance(exc.data, dict) else None
+
+
+def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None:
+    data_table = AiCallFollowUpDataModel.__table__
+    history_table = AiCallFollowUpClassificationHistoryModel.__table__
+    record_table = AiCallRecordModel.__table__
+    task_table = AiCallFollowUpTaskModel.__table__
+    handling_table = AiCallFollowUpHandlingResultModel.__table__
+
+    assert {
+        "tenant_id",
+        "task_id",
+        "target_id",
+        "source_call_id",
+        "classification",
+        "classification_source",
+        "suggest_review",
+        "blocking_human_call_id",
+        "version",
+    } <= set(data_table.columns.keys())
+    assert {
+        frozenset(constraint.columns.keys())
+        for constraint in data_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    } >= {frozenset({"tenant_id", "task_id", "target_id"})}
+    assert not data_table.foreign_keys
+
+    assert {
+        "follow_up_data_id",
+        "from_classification",
+        "to_classification",
+        "semantic_analysis_id",
+        "semantic_analysis_version",
+        "ai_suggested_classification",
+        "ai_adopted",
+    } <= set(history_table.columns.keys())
+    assert {
+        frozenset(constraint.columns.keys())
+        for constraint in history_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    } >= {
+        frozenset(
+            {"tenant_id", "semantic_analysis_id", "semantic_analysis_version"}
+        )
+    }
+    assert not history_table.foreign_keys
+
+    assert {"follow_up_data_id", "operator_agent_identity"} <= set(
+        record_table.columns.keys()
+    )
+    assert "follow_up_data_id" in task_table.columns
+    active_task_index = next(
+        index
+        for index in task_table.indexes
+        if index.name == "uk_ai_call_follow_up_data_active_task"
+    )
+    assert active_task_index.unique is True
+    assert {"follow_up_data_id", "request_fingerprint"} <= set(
+        handling_table.columns.keys()
+    )
+    assert handling_table.c.follow_up_id.nullable is True
 
 
 def test_task5_routes_are_registered() -> None:

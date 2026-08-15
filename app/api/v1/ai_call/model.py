@@ -39,6 +39,17 @@ class AiCallRecordModel(MappedBase):
         Index("idx_ai_call_record_entry_started", "entry_type", "started_at"),
         Index("idx_ai_call_record_business", "business_type", "business_id"),
         Index("idx_ai_call_record_follow_up", "follow_up_id"),
+        Index(
+            "idx_ai_call_record_follow_up_data",
+            "tenant_id",
+            "follow_up_data_id",
+        ),
+        Index(
+            "idx_ai_call_record_operator_started",
+            "tenant_id",
+            "operator_agent_identity",
+            "started_at",
+        ),
         Index("idx_ai_call_record_room_name", "room_name"),
         Index(
             "idx_ai_call_record_runtime_owner_lease",
@@ -110,6 +121,16 @@ class AiCallRecordModel(MappedBase):
         BigInteger,
         nullable=True,
         comment="人工回拨来源跟进任务ID",
+    )
+    follow_up_data_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="客户分类与沟通链路聚合ID",
+    )
+    operator_agent_identity: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="实际参与人工通话的坐席标识",
     )
     business_type: Mapped[str | None] = mapped_column(
         String(32),
@@ -804,6 +825,13 @@ class AiCallSemanticAnalysisModel(MappedBase):
         nullable=False,
         comment="分析状态：0待分析/1分析中/2成功/3失败/4无有效用户输入",
     )
+    analysis_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="成功语义分析版本号",
+    )
     analysis_result: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -1313,6 +1341,170 @@ class AiCallAfterCallWorkModel(MappedBase):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AiCallFollowUpDataModel(MappedBase):
+    """AI Call 客户分类与沟通链路投影。"""
+
+    __tablename__ = "ai_call_follow_up_data"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "task_id",
+            "target_id",
+            name="uk_ai_call_follow_up_data_target",
+        ),
+        Index(
+            "idx_ai_call_follow_up_data_classification",
+            "tenant_id",
+            "classification",
+            "last_contact_at",
+        ),
+        Index(
+            "idx_ai_call_follow_up_data_review",
+            "tenant_id",
+            "suggest_review",
+            "updated_at",
+        ),
+        CheckConstraint(
+            "classification is null or classification in "
+            "('interested', 'nurturing', 'low_value', 'converted')",
+            name="ck_ai_call_follow_up_data_classification",
+        ),
+        CheckConstraint(
+            "classification_source is null or classification_source in "
+            "('ai', 'human', 'system')",
+            name="ck_ai_call_follow_up_data_source",
+        ),
+        CheckConstraint(
+            "classification_confidence is null or classification_confidence in "
+            "('high', 'medium', 'low')",
+            name="ck_ai_call_follow_up_data_confidence",
+        ),
+        CheckConstraint(
+            "low_value_reason is null or low_value_reason in "
+            "('explicit_rejection', 'no_current_need', 'customer_mismatch', "
+            "'non_target_customer', 'invalid_contact', 'other')",
+            name="ck_ai_call_follow_up_data_low_value_reason",
+        ),
+        CheckConstraint(
+            "(classification is null and classification_source is null) or "
+            "(classification is not null and classification_source is not null)",
+            name="ck_ai_call_follow_up_data_classification_source",
+        ),
+        CheckConstraint(
+            "classification <> 'low_value' or low_value_reason is not null",
+            name="ck_ai_call_follow_up_data_low_value_required",
+        ),
+        CheckConstraint("version > 0", name="ck_ai_call_follow_up_data_version"),
+        {"comment": "AI Call 客户分类与沟通链路投影"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    task_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_call_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    classification: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    classification_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    classification_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    classification_confidence: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    suggest_review: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    low_value_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    latest_conclusion: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocking_human_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    classification_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    classification_updated_by: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallFollowUpClassificationHistoryModel(MappedBase):
+    """AI Call 跟进分类审计历史。"""
+
+    __tablename__ = "ai_call_follow_up_classification_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "semantic_analysis_id",
+            "semantic_analysis_version",
+            name="uk_ai_call_follow_up_history_analysis",
+        ),
+        Index(
+            "idx_ai_call_follow_up_history_data_time",
+            "tenant_id",
+            "follow_up_data_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "from_classification is null or from_classification in "
+            "('interested', 'nurturing', 'low_value', 'converted')",
+            name="ck_ai_call_follow_up_history_from",
+        ),
+        CheckConstraint(
+            "to_classification in "
+            "('interested', 'nurturing', 'low_value', 'converted')",
+            name="ck_ai_call_follow_up_history_to",
+        ),
+        CheckConstraint(
+            "source in "
+            "('ai_auto', 'handoff_after_call', 'manual_outbound', "
+            "'manual_adjustment', 'transfer_failed')",
+            name="ck_ai_call_follow_up_history_source",
+        ),
+        CheckConstraint(
+            "ai_suggested_classification is null or ai_suggested_classification in "
+            "('interested', 'nurturing', 'low_value')",
+            name="ck_ai_call_follow_up_history_ai_suggestion",
+        ),
+        CheckConstraint(
+            "ai_confidence is null or ai_confidence in ('high', 'medium', 'low')",
+            name="ck_ai_call_follow_up_history_ai_confidence",
+        ),
+        {"comment": "AI Call 跟进分类审计历史"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    follow_up_data_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    from_classification: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_classification: Mapped[str] = mapped_column(String(16), nullable=False)
+    change_reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    semantic_analysis_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    semantic_analysis_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ai_suggested_classification: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    ai_confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    ai_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    ai_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_conflict: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ai_adopted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    changed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    changed_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AiCallFollowUpTaskModel(MappedBase):
     """AI Call 人工跟进任务表。"""
 
@@ -1334,12 +1526,25 @@ class AiCallFollowUpTaskModel(MappedBase):
             "status",
         ),
         Index("idx_ai_call_follow_up_scene_status", "tenant_id", "scene_code", "status"),
+        Index(
+            "uk_ai_call_follow_up_data_active_task",
+            "tenant_id",
+            "follow_up_data_id",
+            unique=True,
+            postgresql_where=text(
+                "follow_up_data_id is not null and status in ('pending', 'processing')"
+            ),
+            sqlite_where=text(
+                "follow_up_data_id is not null and status in ('pending', 'processing')"
+            ),
+        ),
         {"comment": "AI Call 人工跟进任务表"},
     )
     __permission_strategy__ = None
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    follow_up_data_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_key: Mapped[str] = mapped_column(String(160), nullable=False)
     source_call_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1414,14 +1619,26 @@ class AiCallFollowUpHandlingResultModel(MappedBase):
             "follow_up_id",
             "handled_at",
         ),
+        Index(
+            "idx_ai_call_follow_up_handling_data_time",
+            "tenant_id",
+            "follow_up_data_id",
+            "handled_at",
+        ),
+        CheckConstraint(
+            "follow_up_id is not null or follow_up_data_id is not null",
+            name="ck_ai_call_follow_up_handling_parent",
+        ),
         {"comment": "AI Call 跟进处理结果表"},
     )
     __permission_strategy__ = None
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
-    follow_up_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    follow_up_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    follow_up_data_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     related_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     contact_channel: Mapped[str] = mapped_column(String(32), nullable=False)
     contact_result: Mapped[str] = mapped_column(String(32), nullable=False)
