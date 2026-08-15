@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
-from app.core.dependencies import db_getter, get_current_user
+from app.core.dependencies import (
+    db_getter,
+    get_ai_call_console,
+    get_ai_call_manager,
+    get_current_user,
+)
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_reconciler import (
     AiCallAgentConsoleReconciler,
@@ -45,8 +50,16 @@ from .service import (
     get_default_ai_call_service,
 )
 
-AgentConsoleRouter = APIRouter(prefix="/agent-console", tags=["AI Call 坐席工作台"])
-AgentAdminRouter = APIRouter(prefix="/admin", tags=["AI Call 坐席管理"])
+AgentConsoleRouter = APIRouter(
+    prefix="/agent-console",
+    tags=["AI Call 坐席工作台"],
+    dependencies=[Depends(get_ai_call_console)],
+)
+AgentAdminRouter = APIRouter(
+    prefix="/admin",
+    tags=["AI Call 坐席管理"],
+    dependencies=[Depends(get_ai_call_manager)],
+)
 
 AuthenticatedUser = Annotated[AuthSchema, Depends(get_current_user)]
 

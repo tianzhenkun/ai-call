@@ -28,14 +28,20 @@ from app.api.v1.ai_call.model import AiCallAgentProfileModel, AiCallAgentSceneSc
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_ai_call_console, get_ai_call_manager, get_current_user
 from app.core.exceptions import CustomException, handle_exception
 from app.services.ai_call.agent_console_reconciler import AiCallAgentConsoleReconciler
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
 
 
-def _auth(db, *, user_id: int = 20, tenant_id: str = "tenant-a"):
+def _auth(
+    db,
+    *,
+    user_id: int = 20,
+    tenant_id: str = "tenant-a",
+    permissions: frozenset[str] | None = None,
+):
     user = UserModel(
         user_id=user_id,
         tenant_id=tenant_id,
@@ -43,7 +49,16 @@ def _auth(db, *, user_id: int = 20, tenant_id: str = "tenant-a"):
         nick_name=f"坐席{user_id}",
         user_type="sys_user",
     )
-    return AuthSchema(db=db, user=user, check_data_scope=False)
+    return AuthSchema(
+        db=db,
+        user=user,
+        check_data_scope=False,
+        permissions=(
+            permissions
+            if permissions is not None
+            else frozenset({"ai_call:agent:manage", "ai_call:agent:console"})
+        ),
+    )
 
 
 @pytest.fixture
@@ -133,6 +148,19 @@ def test_task7_management_and_sse_routes_are_registered() -> None:
         "/ai-call/admin/follow-ups",
         "/ai-call/admin/follow-ups/{follow_up_id}",
     } <= paths
+
+
+def test_agent_routes_use_expected_permission_dependencies() -> None:
+    routes = {route.path: route for route in AiCallRouter.routes}
+
+    assert get_ai_call_console in {
+        dependency.call
+        for dependency in routes["/ai-call/agent-console/bootstrap"].dependant.dependencies
+    }
+    assert get_ai_call_manager in {
+        dependency.call
+        for dependency in routes["/ai-call/admin/agents"].dependant.dependencies
+    }
 
 
 @pytest.mark.anyio
@@ -522,7 +550,7 @@ async def test_event_stream_stops_before_waiting_after_browser_disconnect() -> N
 
 
 @pytest.mark.anyio
-async def test_admin_endpoints_only_require_login(db_session) -> None:
+async def test_admin_and_console_endpoints_require_their_permissions(db_session) -> None:
     service = AiCallAgentConsoleService(db_session)
 
     async def unauthenticated():
@@ -530,6 +558,13 @@ async def test_admin_endpoints_only_require_login(db_session) -> None:
 
     with _client(unauthenticated, service) as client:
         assert client.get("/ai-call/admin/agents").status_code == 401
+
+    async def without_permissions():
+        return _auth(db_session, permissions=frozenset())
+
+    with _client(without_permissions, service) as client:
+        assert client.get("/ai-call/admin/agents").status_code == 403
+        assert client.get("/ai-call/agent-console/bootstrap").status_code == 403
 
     async def authenticated():
         return _auth(db_session)

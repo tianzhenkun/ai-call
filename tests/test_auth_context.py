@@ -12,7 +12,12 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.config.setting import settings
 from app.core import dependencies
-from app.core.dependencies import get_current_user, get_voice_manager
+from app.core.dependencies import (
+    get_ai_call_console,
+    get_ai_call_manager,
+    get_current_user,
+    get_voice_manager,
+)
 from app.core.exceptions import CustomException
 from app.core.security import decode_access_token
 
@@ -208,3 +213,41 @@ def test_voice_manager_preserves_development_fallback(monkeypatch) -> None:
     auth = AuthSchema(db=AsyncSession(), permissions=frozenset())
 
     assert asyncio.run(get_voice_manager(auth)) is auth
+
+
+@pytest.mark.parametrize(
+    ("dependency", "permission"),
+    (
+        (get_ai_call_manager, "ai_call:agent:manage"),
+        (get_ai_call_console, "ai_call:agent:console"),
+    ),
+)
+def test_ai_call_agent_permissions_default_to_deny(
+    monkeypatch,
+    dependency,
+    permission: str,
+) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    auth = AuthSchema(db=AsyncSession(), permissions=frozenset())
+
+    with pytest.raises(CustomException) as error:
+        asyncio.run(dependency(auth))
+
+    assert error.value.status_code == 403
+    assert error.value.code == 10403
+    allowed = AuthSchema(db=AsyncSession(), permissions=frozenset({permission}))
+    assert asyncio.run(dependency(allowed)) is allowed
+
+
+@pytest.mark.parametrize("dependency", (get_ai_call_manager, get_ai_call_console))
+def test_ai_call_agent_permissions_allow_superuser(monkeypatch, dependency) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    superuser = UserModel(
+        user_id=1,
+        tenant_id="000000",
+        user_name="admin",
+        nick_name="超级管理员",
+    )
+    auth = AuthSchema(db=AsyncSession(), user=superuser, permissions=frozenset())
+
+    assert asyncio.run(dependency(auth)) is auth
