@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -41,3 +42,24 @@ class FollowUpDataClassificationIn(BaseModel):
         if self.classification != "low_value" and self.low_value_reason is not None:
             raise ValueError("只有低价值分类可以填写低价值原因")
         return self
+
+
+class FollowUpDataScheduleIn(BaseModel):
+    follow_up_reason: str = Field(min_length=1, max_length=500)
+    next_follow_up_at: datetime
+    expected_version: int = Field(ge=1)
+
+    @field_validator("follow_up_reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("回访原因不能为空")
+        return normalized
+
+    @field_validator("next_follow_up_at")
+    @classmethod
+    def validate_follow_up_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("计划回访时间必须包含时区")
+        return value

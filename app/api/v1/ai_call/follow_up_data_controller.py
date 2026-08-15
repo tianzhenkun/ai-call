@@ -9,11 +9,13 @@ from fastapi.responses import JSONResponse
 from app.api.v1.ai_call.follow_up_data_schema import (
     FollowUpClassification,
     FollowUpDataClassificationIn,
+    FollowUpDataScheduleIn,
 )
 from app.api.v1.ai_call.outbound.controller import _identity
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
 from app.core.dependencies import get_ai_call_manager
+from app.services.ai_call.agent_console_reconciler import publish_agent_console_event
 from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
 
 FollowUpDataRouter = APIRouter(tags=["跟进数据"])
@@ -103,3 +105,38 @@ async def adjust_follow_up_data_classification_controller(
     )
     await auth.db.commit()
     return SuccessResponse(data=result, msg="分类已更新")
+
+
+@FollowUpDataRouter.post(
+    "/follow-up-data/{follow_up_data_id}/schedule",
+    summary="安排回访",
+)
+async def schedule_follow_up_data_controller(
+    follow_up_data_id: int,
+    request: FollowUpDataScheduleIn,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ],
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    result = await AiCallFollowUpDataService.from_session(auth.db).schedule_follow_up(
+        tenant_id=tenant_id,
+        follow_up_data_id=follow_up_data_id,
+        payload=request,
+        idempotency_key=idempotency_key,
+        changed_by=str(user_id),
+        changed_by_name=(getattr(user, "nick_name", None) or getattr(user, "user_name", None)),
+    )
+    await auth.db.commit()
+    await publish_agent_console_event(
+        tenant_id,
+        "follow_up.changed",
+        {
+            "follow_up_data_id": result["follow_up_data_id"],
+            "follow_up_id": result["follow_up_id"],
+        },
+    )
+    return SuccessResponse(data=result, msg="回访已安排")

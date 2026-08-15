@@ -8,16 +8,21 @@ from typing import Any
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.follow_up_data_schema import FollowUpDataClassificationIn
+from app.api.v1.ai_call.follow_up_data_schema import (
+    FollowUpDataClassificationIn,
+    FollowUpDataScheduleIn,
+)
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
     AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
+    AiCallFollowUpScheduleRequestModel,
     AiCallFollowUpTaskModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
@@ -302,9 +307,9 @@ class AiCallFollowUpDataService:
         normalized_key = idempotency_key.strip()
         if not normalized_key:
             raise CustomException(msg="缺少 Idempotency-Key", status_code=400)
-        fingerprint = self._classification_fingerprint(
+        fingerprint = self._request_fingerprint(
             follow_up_data_id=follow_up_data_id,
-            payload=payload,
+            payload=payload.model_dump(mode="json", by_alias=True),
         )
         existing = await self._get_idempotent_history(tenant_id, normalized_key)
         if existing is not None:
@@ -333,51 +338,184 @@ class AiCallFollowUpDataService:
                 },
             )
 
-        now = datetime.now(timezone.utc)
-        from_classification = data.classification
-        data.classification = payload.classification
-        data.classification_reason = payload.reason
-        data.classification_source = "human"
-        data.classification_confidence = None
-        data.suggest_review = False
-        data.low_value_reason = payload.low_value_reason
-        data.classification_updated_at = now
-        data.classification_updated_by = changed_by
-        data.version += 1
-        data.updated_at = now
-        await self._finish_active_task_for_classification(
-            data=data,
-            reason=payload.reason,
-            low_value_reason=payload.low_value_reason,
-            now=now,
-        )
-        history = AiCallFollowUpClassificationHistoryModel(
-            id=generate_snowflake_id(),
-            tenant_id=tenant_id,
-            follow_up_data_id=data.id,
-            from_classification=from_classification,
-            to_classification=payload.classification,
-            change_reason=payload.reason,
-            source="manual_adjustment",
-            call_id=None,
-            semantic_analysis_id=None,
-            semantic_analysis_version=None,
-            ai_suggested_classification=None,
-            ai_confidence=None,
-            ai_reason=None,
-            ai_evidence_json=None,
-            ai_conflict=None,
-            ai_adopted=None,
-            idempotency_key=normalized_key,
-            request_fingerprint=fingerprint,
-            result_version=data.version,
-            changed_by=changed_by,
-            changed_by_name=changed_by_name,
-            created_at=now,
-        )
-        self.db.add(history)
-        await self.db.flush()
+        try:
+            async with self.db.begin_nested():
+                now = datetime.now(timezone.utc)
+                from_classification = data.classification
+                data.classification = payload.classification
+                data.classification_reason = payload.reason
+                data.classification_source = "human"
+                data.classification_confidence = None
+                data.suggest_review = False
+                data.low_value_reason = payload.low_value_reason
+                data.classification_updated_at = now
+                data.classification_updated_by = changed_by
+                data.version += 1
+                data.updated_at = now
+                await self._finish_active_task_for_classification(
+                    data=data,
+                    reason=payload.reason,
+                    low_value_reason=payload.low_value_reason,
+                    now=now,
+                )
+                history = AiCallFollowUpClassificationHistoryModel(
+                    id=generate_snowflake_id(),
+                    tenant_id=tenant_id,
+                    follow_up_data_id=data.id,
+                    from_classification=from_classification,
+                    to_classification=payload.classification,
+                    change_reason=payload.reason,
+                    source="manual_adjustment",
+                    call_id=None,
+                    semantic_analysis_id=None,
+                    semantic_analysis_version=None,
+                    ai_suggested_classification=None,
+                    ai_confidence=None,
+                    ai_reason=None,
+                    ai_evidence_json=None,
+                    ai_conflict=None,
+                    ai_adopted=None,
+                    idempotency_key=normalized_key,
+                    request_fingerprint=fingerprint,
+                    result_version=data.version,
+                    changed_by=changed_by,
+                    changed_by_name=changed_by_name,
+                    created_at=now,
+                )
+                self.db.add(history)
+                await self.db.flush()
+        except IntegrityError:
+            existing = await self._get_idempotent_history(tenant_id, normalized_key)
+            if existing is None:
+                raise
+            return self._replay_adjustment(existing, fingerprint)
         return self._adjustment_result(history)
+
+    async def schedule_follow_up(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+        payload: FollowUpDataScheduleIn,
+        idempotency_key: str,
+        changed_by: str,
+        changed_by_name: str | None,
+    ) -> dict[str, Any]:
+        normalized_key = idempotency_key.strip()
+        if not normalized_key:
+            raise CustomException(msg="缺少 Idempotency-Key", status_code=400)
+        fingerprint = self._request_fingerprint(
+            follow_up_data_id=follow_up_data_id,
+            payload=payload.model_dump(mode="json", by_alias=True),
+        )
+        existing = await self._get_schedule_request(tenant_id, normalized_key)
+        if existing is not None:
+            return self._replay_schedule(existing, fingerprint)
+
+        data = await self.db.scalar(
+            select(AiCallFollowUpDataModel)
+            .where(
+                AiCallFollowUpDataModel.tenant_id == tenant_id,
+                AiCallFollowUpDataModel.id == follow_up_data_id,
+            )
+            .with_for_update()
+        )
+        if data is None:
+            raise CustomException(msg="跟进数据不存在", status_code=404)
+        existing = await self._get_schedule_request(tenant_id, normalized_key)
+        if existing is not None:
+            return self._replay_schedule(existing, fingerprint)
+        if payload.next_follow_up_at <= datetime.now(timezone.utc):
+            raise CustomException(
+                msg="计划回访时间必须晚于当前时间",
+                status_code=422,
+            )
+        if data.version != payload.expected_version:
+            raise CustomException(
+                msg="跟进数据已更新，请刷新后重试",
+                status_code=409,
+                data={
+                    "errorCode": "VERSION_CONFLICT",
+                    "currentVersion": data.version,
+                },
+            )
+        if data.classification not in {"interested", "nurturing"}:
+            raise CustomException(
+                msg="当前分类不能安排回访，请先调整为有意向或持续跟进",
+                status_code=409,
+                data={"errorCode": "FOLLOW_UP_CLASSIFICATION_CONFLICT"},
+            )
+
+        context = await self._load_context(
+            tenant_id=tenant_id,
+            follow_up_data_id=follow_up_data_id,
+        )
+        if context is None:
+            raise CustomException(msg="跟进数据上下文不完整", status_code=409)
+        _, _, outbound_task, active_task, source_record = context
+        try:
+            async with self.db.begin_nested():
+                now = datetime.now(timezone.utc)
+                if active_task is None:
+                    task_id = generate_snowflake_id()
+                    active_task = AiCallFollowUpTaskModel(
+                        id=task_id,
+                        tenant_id=tenant_id,
+                        follow_up_data_id=data.id,
+                        source_type="manual_schedule",
+                        source_key=f"follow-up-data:{data.id}:schedule:{task_id}",
+                        source_call_id=data.source_call_id,
+                        source_handoff_id=None,
+                        scene_code=outbound_task.scene_code,
+                        business_type="outbound_task",
+                        business_id=str(data.task_id),
+                        contact_ref=f"call:{data.source_call_id}",
+                        masked_contact=(
+                            source_record.callee_phone_number_masked
+                            if source_record is not None
+                            and source_record.callee_phone_number_masked
+                            else "未提供"
+                        ),
+                        owner_agent_identity=None,
+                        status="pending",
+                        follow_up_reason=payload.follow_up_reason,
+                        customer_callback_at=payload.next_follow_up_at,
+                        summary=data.latest_conclusion,
+                        closed_reason=None,
+                        closed_remark=None,
+                        completed_at=None,
+                        closed_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self.db.add(active_task)
+                else:
+                    active_task.follow_up_reason = payload.follow_up_reason
+                    active_task.customer_callback_at = payload.next_follow_up_at
+                    active_task.updated_at = now
+
+                data.version += 1
+                data.updated_at = now
+                request = AiCallFollowUpScheduleRequestModel(
+                    id=generate_snowflake_id(),
+                    tenant_id=tenant_id,
+                    follow_up_data_id=data.id,
+                    follow_up_id=active_task.id,
+                    idempotency_key=normalized_key,
+                    request_fingerprint=fingerprint,
+                    result_version=data.version,
+                    changed_by=changed_by,
+                    changed_by_name=changed_by_name,
+                    created_at=now,
+                )
+                self.db.add(request)
+                await self.db.flush()
+        except IntegrityError:
+            existing = await self._get_schedule_request(tenant_id, normalized_key)
+            if existing is None:
+                raise
+            return self._replay_schedule(existing, fingerprint)
+        return self._schedule_result(request)
 
     async def _load_context(
         self,
@@ -574,15 +712,28 @@ class AiCallFollowUpDataService:
             )
         )
 
+    async def _get_schedule_request(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+    ) -> AiCallFollowUpScheduleRequestModel | None:
+        return await self.db.scalar(
+            select(AiCallFollowUpScheduleRequestModel).where(
+                AiCallFollowUpScheduleRequestModel.tenant_id == tenant_id,
+                AiCallFollowUpScheduleRequestModel.idempotency_key
+                == idempotency_key,
+            )
+        )
+
     @staticmethod
-    def _classification_fingerprint(
+    def _request_fingerprint(
         *,
         follow_up_data_id: int,
-        payload: FollowUpDataClassificationIn,
+        payload: dict[str, Any],
     ) -> str:
         body = {
             "followUpDataId": str(follow_up_data_id),
-            **payload.model_dump(mode="json", by_alias=True),
+            **payload,
         }
         return sha256(
             json.dumps(
@@ -616,6 +767,30 @@ class AiCallFollowUpDataService:
             "classification": history.to_classification,
             "reason": history.change_reason,
             "version": history.result_version,
+        }
+
+    @classmethod
+    def _replay_schedule(
+        cls,
+        request: AiCallFollowUpScheduleRequestModel,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        if request.request_fingerprint != fingerprint:
+            raise CustomException(
+                msg="Idempotency-Key 已用于其他请求",
+                status_code=409,
+                data={"errorCode": "IDEMPOTENCY_CONFLICT"},
+            )
+        return cls._schedule_result(request)
+
+    @staticmethod
+    def _schedule_result(
+        request: AiCallFollowUpScheduleRequestModel,
+    ) -> dict[str, Any]:
+        return {
+            "follow_up_data_id": str(request.follow_up_data_id),
+            "follow_up_id": str(request.follow_up_id),
+            "version": request.result_version,
         }
 
     async def _finish_active_task_for_classification(

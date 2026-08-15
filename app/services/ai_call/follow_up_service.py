@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 CLAIMABLE_UNASSIGNED_SOURCE_TYPES = {
     "handoff_unanswered",
     "ai_post_call",
+    "manual_schedule",
 }
 
 
@@ -1025,6 +1026,9 @@ class AiCallFollowUpService:
         latest_attempt = getattr(task, "_latest_attempt", None)
         payload = {
             "id": str(task.id),
+            "follow_up_data_id": (
+                str(task.follow_up_data_id) if task.follow_up_data_id else None
+            ),
             "source_type": task.source_type,
             "source_call_id": task.source_call_id,
             "source_handoff_id": task.source_handoff_id,

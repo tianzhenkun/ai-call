@@ -36,6 +36,8 @@ alter table if exists ai_call_record
     drop column if exists follow_up_data_id;
 
 drop index if exists idx_ai_call_follow_up_history_data_time;
+drop index if exists idx_ai_call_follow_up_schedule_data_time;
+drop table if exists ai_call_follow_up_schedule_request;
 drop table if exists ai_call_follow_up_classification_history;
 
 drop index if exists idx_ai_call_follow_up_data_review;

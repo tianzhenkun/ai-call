@@ -543,7 +543,13 @@ async def list_follow_ups_controller(
     status: Annotated[str | None, Query()] = None,
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     source_type: Annotated[
-        Literal["after_call_work", "handoff_unanswered", "ai_post_call"] | None,
+        Literal[
+            "after_call_work",
+            "handoff_unanswered",
+            "ai_post_call",
+            "manual_schedule",
+        ]
+        | None,
         Query(alias="sourceType"),
     ] = None,
     customer_name: Annotated[str | None, Query(alias="customerName")] = None,

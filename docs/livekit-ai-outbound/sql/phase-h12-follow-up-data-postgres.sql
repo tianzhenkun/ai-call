@@ -148,6 +148,28 @@ create index if not exists idx_ai_call_follow_up_history_data_time
     on ai_call_follow_up_classification_history
         (tenant_id, follow_up_data_id, created_at);
 
+create table if not exists ai_call_follow_up_schedule_request (
+    id bigint primary key,
+    tenant_id varchar(20) not null,
+    follow_up_data_id bigint not null,
+    follow_up_id bigint not null,
+    idempotency_key varchar(128) not null,
+    request_fingerprint varchar(64) not null,
+    result_version integer not null,
+    changed_by varchar(128) not null,
+    changed_by_name varchar(100),
+    created_at timestamptz not null,
+    constraint uk_ai_call_follow_up_schedule_key
+        unique (tenant_id, idempotency_key),
+    constraint ck_ai_call_follow_up_schedule_result_version check (
+        result_version > 0
+    )
+);
+
+create index if not exists idx_ai_call_follow_up_schedule_data_time
+    on ai_call_follow_up_schedule_request
+        (tenant_id, follow_up_data_id, created_at);
+
 alter table ai_call_record
     add column if not exists follow_up_data_id bigint,
     add column if not exists operator_agent_identity varchar(128);

@@ -29,6 +29,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
+    AiCallFollowUpScheduleRequestModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -279,6 +280,7 @@ def _error_code(exc: CustomException) -> str | None:
 def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None:
     data_table = AiCallFollowUpDataModel.__table__
     history_table = AiCallFollowUpClassificationHistoryModel.__table__
+    schedule_table = AiCallFollowUpScheduleRequestModel.__table__
     record_table = AiCallRecordModel.__table__
     task_table = AiCallFollowUpTaskModel.__table__
     handling_table = AiCallFollowUpHandlingResultModel.__table__
@@ -324,6 +326,20 @@ def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None
         frozenset({"tenant_id", "idempotency_key"}),
     }
     assert not history_table.foreign_keys
+
+    assert {
+        "follow_up_data_id",
+        "follow_up_id",
+        "idempotency_key",
+        "request_fingerprint",
+        "result_version",
+    } <= set(schedule_table.columns.keys())
+    assert {
+        frozenset(constraint.columns.keys())
+        for constraint in schedule_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    } >= {frozenset({"tenant_id", "idempotency_key"})}
+    assert not schedule_table.foreign_keys
 
     assert {"follow_up_data_id", "operator_agent_identity"} <= set(
         record_table.columns.keys()

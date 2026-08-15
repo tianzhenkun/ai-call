@@ -8,11 +8,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
-from app.api.v1.ai_call.follow_up_data_schema import FollowUpDataClassificationIn
+from app.api.v1.ai_call.follow_up_data_schema import (
+    FollowUpDataClassificationIn,
+    FollowUpDataScheduleIn,
+)
 from app.api.v1.ai_call.model import (
     AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
+    AiCallFollowUpScheduleRequestModel,
     AiCallFollowUpTaskModel,
     AiCallRecordModel,
 )
@@ -105,7 +109,7 @@ async def _seed_follow_up_data(
                 classification_source="ai",
                 classification_confidence="high",
                 suggest_review=False,
-                low_value_reason=None,
+                low_value_reason=("no_current_need" if classification == "low_value" else None),
                 latest_conclusion="客户希望下周查看产品演示。",
                 last_contact_at=now,
                 blocking_human_call_id=None,
@@ -170,6 +174,7 @@ def test_follow_up_data_routes_require_manager_permission() -> None:
         "/ai-call/follow-up-data",
         "/ai-call/follow-up-data/{follow_up_data_id}",
         "/ai-call/follow-up-data/{follow_up_data_id}/classification",
+        "/ai-call/follow-up-data/{follow_up_data_id}/schedule",
     }
     routes = {route.path: route for route in AiCallRouter.routes}
     assert expected_paths <= routes.keys()
@@ -192,6 +197,37 @@ def test_classification_payload_requires_low_value_reason_only_for_low_value() -
             low_value_reason="no_current_need",
             expected_version=1,
         )
+
+
+def test_schedule_payload_requires_zoned_time() -> None:
+    with pytest.raises(ValidationError, match="必须包含时区"):
+        FollowUpDataScheduleIn(
+            follow_up_reason="客户要求下周回访",
+            next_follow_up_at=datetime.now() + timedelta(days=1),
+            expected_version=1,
+        )
+
+
+@pytest.mark.anyio
+async def test_schedule_follow_up_rejects_past_time(session_factory) -> None:
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    payload = FollowUpDataScheduleIn(
+        follow_up_reason="客户要求回访",
+        next_follow_up_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        with pytest.raises(CustomException, match="必须晚于当前时间") as rejected:
+            await AiCallFollowUpDataService.from_session(db).schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=payload,
+                idempotency_key="schedule-in-past",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert rejected.value.status_code == 422
 
 
 @pytest.mark.anyio
@@ -365,3 +401,137 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
             )
         assert stale.value.status_code == 409
         assert stale.value.data["currentVersion"] == 2
+
+
+@pytest.mark.anyio
+async def test_schedule_follow_up_creates_one_unassigned_task_idempotently(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    payload = FollowUpDataScheduleIn(
+        follow_up_reason="客户要求下周回访",
+        next_follow_up_at=datetime.now(timezone.utc) + timedelta(days=7),
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        service = AiCallFollowUpDataService.from_session(db)
+        first = await service.schedule_follow_up(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            payload=payload,
+            idempotency_key="schedule-request-1",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+        repeated = await service.schedule_follow_up(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            payload=payload,
+            idempotency_key="schedule-request-1",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert repeated == first
+        assert first["follow_up_data_id"] == "100"
+        assert first["version"] == 2
+        task = await db.scalar(select(AiCallFollowUpTaskModel))
+        assert task is not None
+        assert first["follow_up_id"] == str(task.id)
+        assert task.follow_up_data_id == 100
+        assert task.source_type == "manual_schedule"
+        assert task.owner_agent_identity is None
+        assert task.status == "pending"
+        assert task.follow_up_reason == "客户要求下周回访"
+        assert task.customer_callback_at.replace(tzinfo=timezone.utc) == payload.next_follow_up_at
+        assert (
+            await db.scalar(select(func.count()).select_from(AiCallFollowUpScheduleRequestModel))
+            == 1
+        )
+
+        with pytest.raises(CustomException) as conflict:
+            await service.schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=payload.model_copy(update={"follow_up_reason": "另一个请求"}),
+                idempotency_key="schedule-request-1",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert conflict.value.status_code == 409
+
+        with pytest.raises(CustomException) as stale:
+            await service.schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=payload,
+                idempotency_key="schedule-request-2",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert stale.value.status_code == 409
+        assert stale.value.data["currentVersion"] == 2
+
+
+@pytest.mark.anyio
+async def test_schedule_follow_up_updates_active_task_and_preserves_owner(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(session_factory)
+    payload = FollowUpDataScheduleIn(
+        follow_up_reason="改为周五联系",
+        next_follow_up_at=datetime.now(timezone.utc) + timedelta(days=3),
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        task = await db.get(AiCallFollowUpTaskModel, 102)
+        assert task is not None
+        task.owner_agent_identity = "agent-1"
+        service = AiCallFollowUpDataService.from_session(db)
+        result = await service.schedule_follow_up(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            payload=payload,
+            idempotency_key="schedule-update-1",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert result["follow_up_id"] == "102"
+        assert task.owner_agent_identity == "agent-1"
+        assert task.follow_up_reason == "改为周五联系"
+        assert task.customer_callback_at.replace(tzinfo=timezone.utc) == payload.next_follow_up_at
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("classification", ["low_value", "converted"])
+async def test_schedule_follow_up_rejects_terminal_classification(
+    session_factory,
+    classification: str,
+) -> None:
+    await _seed_follow_up_data(
+        session_factory,
+        classification=classification,
+        with_active_task=False,
+    )
+    payload = FollowUpDataScheduleIn(
+        follow_up_reason="再次联系",
+        next_follow_up_at=datetime.now(timezone.utc) + timedelta(days=3),
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        service = AiCallFollowUpDataService.from_session(db)
+        with pytest.raises(CustomException) as rejected:
+            await service.schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=payload,
+                idempotency_key=f"schedule-{classification}",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert rejected.value.status_code == 409
