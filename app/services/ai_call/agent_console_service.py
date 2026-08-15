@@ -15,6 +15,7 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
+    AiCallFollowUpDataModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordModel,
@@ -823,6 +824,25 @@ class AiCallAgentConsoleService:
         records = await self.repository.list_records_by_call_ids(call_ids)
         dialogue_segments = await self.repository.list_dialogue_segments_by_call_ids(call_ids)
         records_by_call_id = {record.call_id: record for record in records}
+        follow_up_data_ids = {
+            record.follow_up_data_id
+            for record in records
+            if record.follow_up_data_id is not None
+        }
+        follow_up_data_by_id = (
+            {
+                data.id: data
+                for data in (
+                    await self.db.scalars(
+                        select(AiCallFollowUpDataModel).where(
+                            AiCallFollowUpDataModel.id.in_(follow_up_data_ids)
+                        )
+                    )
+                ).all()
+            }
+            if follow_up_data_ids
+            else {}
+        )
 
         customer_names_by_call_id: dict[str, str | None] = {}
         for tenant_id in dict.fromkeys(handoff.tenant_id for handoff in handoffs):
@@ -884,6 +904,13 @@ class AiCallAgentConsoleService:
                 )
 
             record = records_by_call_id.get(handoff.call_id)
+            follow_up_data = (
+                follow_up_data_by_id.get(record.follow_up_data_id)
+                if record is not None and record.follow_up_data_id is not None
+                else None
+            )
+            if follow_up_data is not None and follow_up_data.tenant_id != handoff.tenant_id:
+                follow_up_data = None
             payloads.append(
                 {
                     **self._base_handoff_payload(handoff),
@@ -895,6 +922,20 @@ class AiCallAgentConsoleService:
                     ),
                     "business_type": record.business_type if record else None,
                     "business_id": record.business_id if record else None,
+                    "follow_up_data_id": (
+                        str(follow_up_data.id) if follow_up_data else None
+                    ),
+                    "follow_up_data_version": (
+                        follow_up_data.version if follow_up_data else 0
+                    ),
+                    "classification": (
+                        follow_up_data.classification if follow_up_data else None
+                    ),
+                    "classification_reason": (
+                        follow_up_data.classification_reason
+                        if follow_up_data
+                        else None
+                    ),
                     "handoff_summary": handoff_summary,
                     "pending_items": pending_items,
                     "recent_dialogue": recent_dialogue,

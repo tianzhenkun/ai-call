@@ -16,6 +16,7 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallDialogueSegmentModel,
+    AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -536,7 +537,9 @@ async def test_handoff_payloads_include_batched_business_context_and_recent_dial
             [
                 AiCallRecordModel(
                     id=100,
+                    tenant_id="tenant-a",
                     call_id=call_id,
+                    follow_up_data_id=700,
                     business_type="lead",
                     business_id="lead-100",
                     scene_code="intro_contract",
@@ -559,6 +562,27 @@ async def test_handoff_payloads_include_batched_business_context_and_recent_dial
                     customer_name="张先生",
                     status="calling",
                     attempt_count=1,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallFollowUpDataModel(
+                    id=700,
+                    tenant_id="tenant-a",
+                    task_id=300,
+                    target_id=200,
+                    source_call_id=call_id,
+                    classification="interested",
+                    classification_reason="客户要求确认续约价格",
+                    classification_source="ai",
+                    classification_confidence="high",
+                    suggest_review=False,
+                    low_value_reason=None,
+                    latest_conclusion="客户希望确认续约",
+                    last_contact_at=now,
+                    blocking_human_call_id=call_id,
+                    version=3,
+                    classification_updated_at=now,
+                    classification_updated_by=None,
                     created_at=now,
                     updated_at=now,
                 ),
@@ -610,6 +634,10 @@ async def test_handoff_payloads_include_batched_business_context_and_recent_dial
     assert payload["masked_contact"] == "138****0000"
     assert payload["business_type"] == "lead"
     assert payload["business_id"] == "lead-100"
+    assert payload["follow_up_data_id"] == "700"
+    assert payload["follow_up_data_version"] == 3
+    assert payload["classification"] == "interested"
+    assert payload["classification_reason"] == "客户要求确认续约价格"
     assert [turn["speaker_type"] for turn in payload["recent_dialogue"]] == [
         "customer",
         "ai",
