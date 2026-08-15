@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import jwt
@@ -43,6 +44,7 @@ from app.api.v1.ai_call.service import AiCallService, configure_ai_call_offline_
 from app.api.v1.system.oss.service import OssService
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
+from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 from app.services.ai_call.dialogue_service import (
     AiCallDialoguePersistenceWorker,
@@ -1347,6 +1349,29 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+@pytest.mark.anyio
+async def test_record_access_is_scoped_to_current_tenant(b1_service) -> None:
+    service, _record_service = b1_service
+    result = await service.create_web_session(
+        voice=None,
+        prompt=None,
+        business_id=None,
+        tenant_id="tenant-a",
+    )
+
+    await service.require_record_for_tenant(
+        tenant_id="tenant-a",
+        call_id=result.call_id,
+    )
+    with pytest.raises(CustomException) as exc_info:
+        await service.require_record_for_tenant(
+            tenant_id="tenant-b",
+            call_id=result.call_id,
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 @pytest.mark.anyio
@@ -5113,6 +5138,12 @@ async def test_interrupt_summary_flags_agent_start_failure(b1_service) -> None:
 
 def test_interrupt_summary_api_returns_camel_case_response() -> None:
     class FakeInterruptSummaryService:
+        async def require_record_for_tenant(self, **query) -> None:
+            assert query == {
+                "tenant_id": "tenant-a",
+                "call_id": "call_interrupt",
+            }
+
         async def get_record_interrupt_summary(self, call_id: str) -> dict:
             return {
                 "callId": call_id,
@@ -5134,6 +5165,9 @@ def test_interrupt_summary_api_returns_camel_case_response() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: FakeInterruptSummaryService()
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
 
     with TestClient(app) as client:
         response = client.get("/ai-call/records/call_interrupt/interrupt-summary")

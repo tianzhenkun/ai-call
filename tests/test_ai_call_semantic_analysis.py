@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallDialogueSegmentModel, AiCallHandoffModel
 from app.core.base_model import MappedBase
+from app.core.dependencies import get_current_user
 from app.services.ai_call.record_service import AiCallRecordService
 
 
@@ -2502,6 +2504,12 @@ async def test_semantic_analysis_service_passes_handoffs_into_snapshot() -> None
 
 def test_semantic_analysis_record_query_endpoint_returns_existing_analysis() -> None:
     class FakeAiCallService:
+        async def require_record_for_tenant(self, **query) -> None:
+            assert query == {
+                "tenant_id": "tenant-a",
+                "call_id": "call_semantic_api",
+            }
+
         async def get_record_semantic_analysis(self, call_id: str):
             assert call_id == "call_semantic_api"
             return {
@@ -2532,6 +2540,9 @@ def test_semantic_analysis_record_query_endpoint_returns_existing_analysis() -> 
 
     app = FastAPI()
     app.dependency_overrides[get_ai_call_service] = lambda: FakeAiCallService()
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
     app.include_router(AiCallRouter)
     client = TestClient(app)
 
@@ -2635,6 +2646,12 @@ async def test_semantic_analysis_service_reanalyzes_succeeded_record() -> None:
 
 def test_semantic_analysis_reanalyze_endpoint_returns_refreshed_analysis() -> None:
     class FakeAiCallService:
+        async def require_record_for_tenant(self, **query) -> None:
+            assert query == {
+                "tenant_id": "tenant-a",
+                "call_id": "call_semantic_api",
+            }
+
         async def reanalyze_record_semantic_analysis(self, call_id: str):
             assert call_id == "call_semantic_api"
             return {
@@ -2661,6 +2678,9 @@ def test_semantic_analysis_reanalyze_endpoint_returns_refreshed_analysis() -> No
 
     app = FastAPI()
     app.dependency_overrides[get_ai_call_service] = lambda: FakeAiCallService()
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
     app.include_router(AiCallRouter)
     client = TestClient(app)
 

@@ -1240,6 +1240,19 @@ class AiCallService:
             "total": total,
         }
 
+    async def require_record_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
+        self._ensure_record_service()
+        if await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        ) is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+
     async def get_record_detail(self, call_id: str) -> dict:
         self._ensure_record_service()
         record = await self.record_service.get_record(call_id)

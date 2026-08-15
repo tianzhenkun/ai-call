@@ -439,6 +439,15 @@ async def _commit_ai_call_record_audit(service: AiCallService) -> None:
         await db.commit()
 
 
+async def _require_record_for_current_tenant(
+    call_id: Annotated[str, Path(alias="callId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> None:
+    tenant_id, _ = _identity(auth)
+    await service.require_record_for_tenant(tenant_id=tenant_id, call_id=call_id)
+
+
 @AiCallRouter.get(
     "/prompt-profiles",
     summary="查询业务提示词配置列表",
@@ -764,6 +773,7 @@ async def list_records_controller(
     "/records/{callId}",
     summary="查询通话记录详情",
     response_model=ResponseSchema[RecordDetailOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def get_record_detail_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -777,6 +787,7 @@ async def get_record_detail_controller(
     "/records/{callId}/events",
     summary="查询通话记录事件",
     response_model=ResponseSchema[RecordEventListOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def list_record_events_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -800,6 +811,7 @@ async def list_record_events_controller(
     "/records/{callId}/interrupt-summary",
     summary="查询通话打断摘要",
     response_model=ResponseSchema[InterruptSummaryOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def get_record_interrupt_summary_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -813,6 +825,7 @@ async def get_record_interrupt_summary_controller(
     "/records/{callId}/semantic-analysis",
     summary="查询通话语义分析",
     response_model=ResponseSchema[SemanticAnalysisOut | None],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def get_record_semantic_analysis_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -829,6 +842,7 @@ async def get_record_semantic_analysis_controller(
     "/records/{callId}/semantic-analysis/reanalyze",
     summary="重新生成通话语义分析",
     response_model=ResponseSchema[SemanticAnalysisOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def reanalyze_record_semantic_analysis_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -949,6 +963,7 @@ async def get_recording_controller(
     "/records/{callId}/dialogue-segments",
     summary="查询通话对话文本段",
     response_model=ResponseSchema[DialogueSegmentListOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def list_record_dialogue_segments_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -968,6 +983,7 @@ async def list_record_dialogue_segments_controller(
     "/records/{callId}/handoffs",
     summary="查询通话转人工记录",
     response_model=ResponseSchema[HandoffListOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def list_record_handoffs_controller(
     call_id: Annotated[str, Path(alias="callId")],

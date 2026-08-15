@@ -27,6 +27,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 from app.config.setting import settings
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_current_user, redis_getter
+from app.core.exceptions import CustomException
 from app.services.ai_call.record_service import AiCallRecordService
 
 
@@ -37,6 +38,65 @@ class _ListRecordsService:
     async def list_records(self, **query) -> dict:
         self.query = query
         return {"rows": [], "total": 0}
+
+
+RECORD_EVIDENCE_ENDPOINTS = (
+    ("GET", "/ai-call/records/call-secure"),
+    ("GET", "/ai-call/records/call-secure/events"),
+    ("GET", "/ai-call/records/call-secure/interrupt-summary"),
+    ("GET", "/ai-call/records/call-secure/semantic-analysis"),
+    ("POST", "/ai-call/records/call-secure/semantic-analysis/reanalyze"),
+    ("GET", "/ai-call/records/call-secure/dialogue-segments"),
+    ("GET", "/ai-call/records/call-secure/handoffs"),
+)
+
+
+@pytest.mark.parametrize(("method", "path"), RECORD_EVIDENCE_ENDPOINTS)
+def test_record_evidence_endpoints_require_current_user(method: str, path: str) -> None:
+    async def reject_unauthenticated():
+        raise CustomException(msg="认证已失效", code=10401, status_code=401)
+
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: SimpleNamespace()
+    app.dependency_overrides[get_current_user] = reject_unauthenticated
+
+    with pytest.raises(CustomException) as exc_info:
+        TestClient(app).request(method, path)
+
+    assert exc_info.value.status_code == 401
+
+
+def test_record_evidence_endpoint_checks_current_tenant_before_query() -> None:
+    class RecordEvidenceService:
+        access_query: dict | None = None
+        events_queried = False
+
+        async def require_record_for_tenant(self, **query) -> None:
+            self.access_query = query
+            raise CustomException(msg="通话记录不存在", status_code=404)
+
+        async def list_record_events(self, **_query) -> dict:
+            self.events_queried = True
+            return {"rows": [], "total": 0}
+
+    service = RecordEvidenceService()
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
+    )
+
+    with pytest.raises(CustomException) as exc_info:
+        TestClient(app).get("/ai-call/records/call-tenant-b/events")
+
+    assert exc_info.value.status_code == 404
+    assert service.access_query == {
+        "tenant_id": "tenant-a",
+        "call_id": "call-tenant-b",
+    }
+    assert service.events_queried is False
 
 
 @pytest.mark.anyio
