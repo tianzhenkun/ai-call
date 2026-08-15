@@ -1700,6 +1700,7 @@ class AiCallRecordRepository:
             return None
         now = now or datetime.now(timezone.utc)
         analysis.analysis_status = SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+        analysis.analysis_version = int(analysis.analysis_version or 0) + 1
         analysis.analysis_result = json.dumps(analysis_result, ensure_ascii=False)
         analysis.customer_intent = customer_intent
         analysis.follow_up_suggested = follow_up_suggested

@@ -1491,6 +1491,7 @@ async def test_semantic_analysis_record_status_lifecycle() -> None:
         )
         assert finished is not None
         assert finished.analysis_status == module.ANALYSIS_STATUS_SUCCEEDED
+        assert finished.analysis_version == 1
         assert finished.analysis_result_dict == result
         assert finished.analysis_finished_at is not None
 
@@ -2216,7 +2217,7 @@ def test_semantic_transcript_rejects_short_offline_question_diverging_from_realt
     } == {"offline_asr_short_question_realtime_divergence"}
 
 
-def test_semantic_analysis_result_is_normalized_to_fixed_six_fields() -> None:
+def test_semantic_analysis_result_is_normalized_to_fixed_contract_fields() -> None:
     module = _semantic_module()
 
     result = module.normalize_analysis_result({
@@ -2235,6 +2236,13 @@ def test_semantic_analysis_result_is_normalized_to_fixed_six_fields() -> None:
         "time_hint",
         "tags",
         "follow_up",
+        "classification",
+        "confidence",
+        "valid_dialogue",
+        "reason",
+        "evidence",
+        "evidence_conflict",
+        "low_value_reason",
     ]
     assert result["summary"] == "123"
     assert result["feedback_type"] == "中性"
@@ -2252,6 +2260,8 @@ def test_semantic_analysis_result_is_normalized_to_fixed_six_fields() -> None:
         "preferred_time": None,
         "confidence": "low",
     }
+    assert result["classification"] is None
+    assert result["valid_dialogue"] is False
 
 
 @pytest.mark.anyio
@@ -2632,6 +2642,7 @@ async def test_semantic_analysis_service_reanalyzes_succeeded_record() -> None:
 
         assert refreshed.id == old.id
         assert refreshed.analysis_status == module.ANALYSIS_STATUS_SUCCEEDED
+        assert refreshed.analysis_version == 2
         assert refreshed.analysis_result_dict["summary"] == "客户表示可以知道了。"
         rendered = json.dumps(refreshed.analysis_result_dict, ensure_ascii=False)
         assert "可以知道吗" not in rendered
@@ -2706,7 +2717,8 @@ async def test_openai_compatible_semantic_analyzer_posts_json_chat_completion() 
         assert request.headers["authorization"] == "Bearer test-key"
         assert payload["model"] == "qwen-plus"
         assert payload["response_format"] == {"type": "json_object"}
-        assert "六字段 JSON" in payload["messages"][0]["content"]
+        assert "客户价值分类字段" in payload["messages"][0]["content"]
+        assert "不得输出 converted" in payload["messages"][0]["content"]
         assert user_payload["reference_date"] == "2026-07-02"
         assert user_payload["transcript_json"]["call_id"] == "call_semantic_llm"
 

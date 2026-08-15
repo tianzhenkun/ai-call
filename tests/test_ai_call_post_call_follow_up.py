@@ -14,6 +14,8 @@ from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
+    AiCallFollowUpClassificationHistoryModel,
+    AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
@@ -29,6 +31,7 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.services.ai_call import post_call_follow_up_service, semantic_analysis
+from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
 
 
@@ -102,6 +105,34 @@ def test_normalize_post_call_result_maps_intent_and_follow_up() -> None:
     assert materialized["follow_up_preferred_at"].isoformat() == (
         "2026-07-31T06:00:00+00:00"
     )
+
+
+def test_normalize_post_call_result_accepts_only_ai_classifications() -> None:
+    result = semantic_analysis.normalize_analysis_result({
+        "summary": "客户明确要求下周安排产品演示。",
+        "classification": "interested",
+        "confidence": "high",
+        "valid_dialogue": True,
+        "reason": "客户提出了明确的演示安排。",
+        "evidence": ["客户：下周可以安排演示"],
+        "evidence_conflict": False,
+    })
+
+    assert result["classification"] == "interested"
+    assert result["confidence"] == "high"
+    assert result["valid_dialogue"] is True
+    assert result["reason"] == "客户提出了明确的演示安排。"
+    assert result["evidence"] == ["客户：下周可以安排演示"]
+    assert result["low_value_reason"] is None
+
+    converted = semantic_analysis.normalize_analysis_result({
+        "classification": "converted",
+        "confidence": "high",
+        "valid_dialogue": True,
+        "reason": "模型声称已经转化",
+    })
+    assert converted["classification"] is None
+    assert converted["valid_dialogue"] is False
 
 
 def test_follow_up_explicit_consent_is_downgraded_without_customer_evidence() -> None:
@@ -1034,3 +1065,186 @@ async def test_post_call_follow_up_ignores_non_formal_records(
             select(func.count()).select_from(AiCallFollowUpTaskModel)
         )
         assert count == 0
+
+
+@pytest.mark.anyio
+async def test_ai_classification_updates_follow_up_data_without_creating_task(
+    session_factory,
+) -> None:
+    call_id = "call-follow-up-data"
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id=call_id,
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(call_id=call_id)
+        assert analysis is not None
+        analysis.analysis_version = 1
+        analysis.analysis_result = json.dumps(
+            semantic_analysis.normalize_analysis_result({
+                "summary": "客户明确要求下周安排产品演示。",
+                "classification": "interested",
+                "confidence": "high",
+                "valid_dialogue": True,
+                "reason": "客户提出了明确的演示安排。",
+                "evidence": ["客户：下周可以安排演示"],
+                "evidence_conflict": False,
+            }),
+            ensure_ascii=False,
+        )
+        service = AiCallFollowUpDataService(repository)
+
+        created = await service.apply_ai_analysis(analysis)
+        duplicate = await service.apply_ai_analysis(analysis)
+
+        assert created is not None
+        assert duplicate is not None
+        assert duplicate.id == created.id
+        assert created.classification == "interested"
+        assert created.classification_source == "ai"
+        assert created.classification_confidence == "high"
+        assert created.suggest_review is False
+        record = await repository.get_record(call_id)
+        assert record is not None
+        assert record.follow_up_data_id == created.id
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpTaskModel)
+        ) == 0
+        assert await db.scalar(
+            select(func.count()).select_from(
+                AiCallFollowUpClassificationHistoryModel
+            )
+        ) == 1
+
+        created.classification_source = "human"
+        created.classification_reason = "坐席已核实客户有明确演示需求。"
+        analysis.analysis_version = 2
+        analysis.analysis_result = json.dumps(
+            semantic_analysis.normalize_analysis_result({
+                "summary": "客户本次表示暂时不考虑。",
+                "classification": "low_value",
+                "confidence": "low",
+                "valid_dialogue": True,
+                "reason": "客户表示当前暂无需求。",
+                "evidence": ["客户：现在暂时不考虑"],
+                "evidence_conflict": False,
+                "low_value_reason": "no_current_need",
+            }),
+            ensure_ascii=False,
+        )
+
+        protected = await service.apply_ai_analysis(analysis)
+
+        assert protected is not None
+        assert protected.classification == "interested"
+        assert protected.classification_source == "human"
+        assert protected.suggest_review is False
+        assert protected.latest_conclusion == "客户本次表示暂时不考虑。"
+        histories = list(
+            (
+                await db.scalars(
+                    select(AiCallFollowUpClassificationHistoryModel).order_by(
+                        AiCallFollowUpClassificationHistoryModel.semantic_analysis_version
+                    )
+                )
+            ).all()
+        )
+        assert len(histories) == 2
+        assert histories[-1].ai_suggested_classification == "low_value"
+        assert histories[-1].ai_adopted is False
+
+
+@pytest.mark.anyio
+async def test_invalid_dialogue_does_not_create_follow_up_data(session_factory) -> None:
+    call_id = "call-invalid-follow-up-data"
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id=call_id,
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(call_id=call_id)
+        assert analysis is not None
+        analysis.analysis_version = 1
+        analysis.analysis_result = json.dumps(
+            semantic_analysis.normalize_analysis_result({
+                "summary": "仅有无业务含义的简短回应。",
+                "classification": "nurturing",
+                "confidence": "low",
+                "valid_dialogue": False,
+                "reason": "没有形成有效业务对话。",
+                "evidence": [],
+                "evidence_conflict": False,
+            }),
+            ensure_ascii=False,
+        )
+
+        assert await AiCallFollowUpDataService(repository).apply_ai_analysis(
+            analysis
+        ) is None
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpDataModel)
+        ) == 0
+
+
+@pytest.mark.anyio
+async def test_semantic_analysis_creates_classification_not_callback_task(
+    session_factory,
+) -> None:
+    call_id = "call-semantic-follow-up-data"
+    now = datetime.now(timezone.utc)
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id=call_id,
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+        status="0",
+    )
+
+    class FakeAnalyzer:
+        async def analyze(self, **_kwargs):
+            return {
+                "summary": "客户希望了解产品演示。",
+                "classification": "interested",
+                "confidence": "high",
+                "valid_dialogue": True,
+                "reason": "客户主动询问产品演示。",
+                "evidence": ["客户：可以演示一下吗"],
+                "evidence_conflict": False,
+            }
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        await repository.upsert_dialogue_segment(
+            call_id=call_id,
+            segment_no=1,
+            speaker_type="customer",
+            speaker_identity="customer-1",
+            source="qwen_realtime",
+            source_segment_id="customer-1",
+            segment_text="可以演示一下吗？",
+            segment_status="final",
+            started_at=now,
+            ended_at=now,
+            duration_ms=1000,
+        )
+
+        analysis = await semantic_analysis.AiCallSemanticAnalysisService(
+            repository,
+            analyzer=FakeAnalyzer(),
+        ).analyze_call_once(call_id=call_id, scene_code="intro_geo", now=now)
+
+        assert analysis.analysis_version == 1
+        data = await db.scalar(select(AiCallFollowUpDataModel))
+        assert data is not None
+        assert data.classification == "interested"
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpTaskModel)
+        ) == 0

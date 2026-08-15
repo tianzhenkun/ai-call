@@ -32,10 +32,8 @@ from app.services.ai_call.dialogue_merge import (
     dialogue_time_ranges_touch,
     is_cross_source_customer_transcript_conflict,
 )
-from app.services.ai_call.post_call_follow_up_service import (
-    AiCallPostCallFollowUpService,
-    requires_manual_follow_up_review,
-)
+from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
+from app.services.ai_call.post_call_follow_up_service import requires_manual_follow_up_review
 
 ANALYSIS_SCENE_CODE = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE
 ANALYSIS_STATUS_PENDING = SEMANTIC_ANALYSIS_STATUS_PENDING
@@ -174,17 +172,37 @@ semantic_evidence.analysis_usage=record_only 且 key_point_candidate=false 的�
 semantic_evidence.low_confidence_source、source_conflict 或 unsupported_strong_fact_types 命中的片段，只能作为低置信背景；不得把 unsupported_strong_fact 片段改写成“客户叫某某”“客户自报姓名”“客户公司是某某”等确定事实。
 semantic_evidence.new_question_or_intent=true 的客户跳话题问题、conversation_control_intent=true 的继续/结束/稍后联系意图应保留为客户问题或关注点；semantic_evidence.weak_feedback=true 且 key_point_candidate=false 的弱反馈只能记录为弱反馈，不能扩写成强意向或业务事实。
 speaker_type=human_agent 且 transcript_quality.low_confidence_source=true 的人工坐席轮次只可作为低置信坐席上下文或音频污染风险，不能反推为客户事实，也不能作为客户诉求、异议或承诺。
-必须只返回六字段 JSON 对象，不输出 Markdown、解释或额外字段。
-JSON 字段固定为：
+必须只返回以下 JSON 字段，不输出 Markdown、解释或额外字段。
+通话摘要字段：
 - summary: 字符串，本通电话摘要，重点描述客户侧表达。
 - feedback_type: 字符串，只能是 正向、负向、中性。
 - key_points: 字符串数组，客户表达的事实、诉求、异议、承诺、风险点或约束条件。
 - time_hint: 对象，包含 time_text、time_value、original_texts。
 - tags: 字符串数组，开放中文标签。
-- follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 表示客户侧存在后续联系或业务履约需求（如回访、发送资料或试用链接）；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺跟进不能作为客户同意证据。"""
+- follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 表示客户侧存在后续联系或业务履约需求（如回访、发送资料或试用链接）；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺跟进不能作为客户同意证据。
+
+客户价值分类字段：
+- classification: 有效业务对话时只能是 interested、nurturing、low_value；无有效业务对话时为 null；不得输出 converted。
+- confidence: 分类置信度，只能是 high、medium、low。
+- valid_dialogue: 布尔值；只有客户形成了可判断销售价值的有效业务对话时为 true，通话时长短本身不能作为低价值依据。
+- reason: 分类原因，必须对应客户侧证据。
+- evidence: 字符串数组，保存支持分类的客户原话，不得使用 assistant 话术。
+- evidence_conflict: 布尔值，客户证据冲突或转写不可靠时为 true。
+- low_value_reason: classification=low_value 时只能是 explicit_rejection、no_current_need、customer_mismatch、non_target_customer、invalid_contact、other；其他分类时为 null。
+
+分类标准：interested 表示客户明确表达需求并有报价、试用、演示、采购时间等具体下一步；nurturing 表示有潜在需求但暂未准备好或要求以后联系；low_value 仅用于明确拒绝、暂无需求、客户不匹配、非目标客户或联系方式无效。不得因为无人接听、占线、技术失败、通话异常中断或仅仅通话较短而输出 low_value。"""
 
 FOLLOW_UP_CONSENTS = {"explicit", "missing", "refused"}
 FOLLOW_UP_CONFIDENCES = {"high", "medium", "low"}
+AI_FOLLOW_UP_CLASSIFICATIONS = {"interested", "nurturing", "low_value"}
+LOW_VALUE_REASONS = {
+    "explicit_rejection",
+    "no_current_need",
+    "customer_mismatch",
+    "non_target_customer",
+    "invalid_contact",
+    "other",
+}
 CUSTOMER_INTENT_BY_FEEDBACK = {
     "正向": "positive",
     "中性": "neutral",
@@ -1783,7 +1801,7 @@ class AiCallSemanticAnalysisService:
             now=now,
         )
         if succeeded is not None:
-            await AiCallPostCallFollowUpService(self.repository).apply(succeeded)
+            await AiCallFollowUpDataService(self.repository).apply_ai_analysis(succeeded)
             return succeeded
         return claimed
 
@@ -1811,6 +1829,7 @@ class AiCallSemanticAnalysisService:
             "sceneCode": analysis.scene_code,
             "analysisSceneCode": analysis.analysis_scene_code,
             "analysisStatus": analysis.analysis_status,
+            "analysisVersion": analysis.analysis_version,
             "analysisResult": analysis.analysis_result_dict,
             "analysisError": analysis.analysis_error,
             "analysisRetryCount": analysis.analysis_retry_count,
@@ -1833,6 +1852,23 @@ def normalize_analysis_result(value: dict[str, Any] | None) -> dict[str, Any]:
     feedback_type = _string_value(raw.get("feedback_type"))
     if feedback_type not in VALID_FEEDBACK_TYPES:
         feedback_type = "中性"
+    classification = _string_value(raw.get("classification")) or None
+    if classification not in AI_FOLLOW_UP_CLASSIFICATIONS:
+        classification = None
+    confidence = _string_value(raw.get("confidence"))
+    if confidence not in FOLLOW_UP_CONFIDENCES:
+        confidence = "low"
+    reason = _string_value(raw.get("reason"))
+    valid_dialogue = (
+        raw.get("valid_dialogue") is True
+        and classification is not None
+        and bool(reason)
+    )
+    low_value_reason = _string_value(raw.get("low_value_reason")) or None
+    if classification != "low_value":
+        low_value_reason = None
+    elif low_value_reason not in LOW_VALUE_REASONS:
+        low_value_reason = "other"
     return {
         "summary": _string_value(raw.get("summary")),
         "feedback_type": feedback_type,
@@ -1840,6 +1876,13 @@ def normalize_analysis_result(value: dict[str, Any] | None) -> dict[str, Any]:
         "time_hint": _normalize_time_hint(raw.get("time_hint")),
         "tags": _string_list(raw.get("tags")),
         "follow_up": _normalize_follow_up(raw.get("follow_up")),
+        "classification": classification,
+        "confidence": confidence,
+        "valid_dialogue": valid_dialogue,
+        "reason": reason,
+        "evidence": _string_list(raw.get("evidence")),
+        "evidence_conflict": raw.get("evidence_conflict") is True,
+        "low_value_reason": low_value_reason,
     }
 
 

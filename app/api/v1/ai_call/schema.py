@@ -448,6 +448,7 @@ class SemanticAnalysisOut(AiCallBaseSchema):
     scene_code: str | None = None
     analysis_scene_code: str
     analysis_status: str
+    analysis_version: int = 0
     analysis_result: dict[str, Any] | None = None
     analysis_error: str | None = None
     analysis_retry_count: int
