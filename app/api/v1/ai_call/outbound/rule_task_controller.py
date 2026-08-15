@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+from os import unlink
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Path, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.core.database import async_db_session
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_ai_call_manager, get_current_user
 
 from .controller import _identity
+from .exception_schema import (
+    ExceptionBatchOut,
+    ExceptionPolicyIn,
+    ExceptionPolicyOut,
+    ExceptionSummaryOut,
+)
+from .exception_service import OutboundExceptionService
 from .rule_task_schema import (
     AcceptedCommandOut,
     CallRuleIn,
@@ -28,10 +37,133 @@ from .service import OutboundValidationService
 
 OutboundRuleTaskRouter = APIRouter(tags=["通用外呼规则与任务"])
 _default_service = OutboundRuleTaskService(async_db_session)
+_default_exception_service = OutboundExceptionService()
 
 
 def get_outbound_rule_task_service() -> OutboundRuleTaskService:
     return _default_service
+
+
+def get_outbound_exception_service() -> OutboundExceptionService:
+    return _default_exception_service
+
+
+@OutboundRuleTaskRouter.get(
+    "/outbound-exceptions/summary",
+    summary="查询异常呼叫处理摘要",
+    response_model=ResponseSchema[ExceptionSummaryOut],
+)
+async def get_exception_summary_controller(
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[
+        OutboundExceptionService,
+        Depends(get_outbound_exception_service),
+    ],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.get_summary(auth.db, tenant_id, user_id)
+    await auth.db.commit()
+    return SuccessResponse(data=result, msg="查询成功")
+
+
+@OutboundRuleTaskRouter.get(
+    "/outbound-exceptions",
+    summary="分页查询异常呼叫号码",
+)
+async def list_exception_targets_controller(
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[
+        OutboundExceptionService,
+        Depends(get_outbound_exception_service),
+    ],
+    category: Annotated[str, Query()],
+    target_status: Annotated[str | None, Query(alias="status")] = None,
+    keyword: Annotated[str | None, Query()] = None,
+    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
+    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 20,
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    rows, total = await service.list_targets(
+        auth.db,
+        tenant_id,
+        user_id,
+        category=category,
+        target_status=target_status,
+        keyword=keyword,
+        page_num=page_num,
+        page_size=page_size,
+    )
+    await auth.db.commit()
+    return TableResponse(rows=rows, total=total, msg="查询成功")
+
+
+@OutboundRuleTaskRouter.put(
+    "/outbound-exceptions/{category}/policy",
+    summary="修改异常补呼策略",
+    response_model=ResponseSchema[ExceptionPolicyOut],
+)
+async def update_exception_policy_controller(
+    category: Annotated[str, Path()],
+    request: ExceptionPolicyIn,
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[
+        OutboundExceptionService,
+        Depends(get_outbound_exception_service),
+    ],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.update_policy(auth.db, tenant_id, user_id, category, request)
+    await auth.db.commit()
+    return SuccessResponse(data=result, msg="保存成功")
+
+
+@OutboundRuleTaskRouter.post(
+    "/outbound-exceptions/{category}/retry-batches",
+    summary="启动异常号码重新外呼批次",
+    response_model=ResponseSchema[ExceptionBatchOut],
+)
+async def start_exception_batch_controller(
+    category: Annotated[str, Path()],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[
+        OutboundExceptionService,
+        Depends(get_outbound_exception_service),
+    ],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.start_batch(
+        auth.db,
+        tenant_id,
+        user_id,
+        category,
+        idempotency_key,
+    )
+    await auth.db.commit()
+    return SuccessResponse(data=result, msg="重新外呼批次已启动")
+
+
+@OutboundRuleTaskRouter.get(
+    "/outbound-exceptions/export",
+    summary="下载异常呼叫号码",
+)
+async def export_exception_targets_controller(
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[
+        OutboundExceptionService,
+        Depends(get_outbound_exception_service),
+    ],
+    category: Annotated[str, Query()],
+) -> FileResponse:
+    tenant_id, user_id = _identity(auth)
+    path = await service.export_targets(auth.db, tenant_id, user_id, category)
+    await auth.db.commit()
+    return FileResponse(
+        path,
+        filename=f"exception-{category}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=BackgroundTask(unlink, path),
+    )
 
 
 @OutboundRuleTaskRouter.get(
@@ -174,6 +306,7 @@ async def list_tasks_controller(
     task_status: Annotated[str | None, Query(alias="status")] = None,
     begin_time: Annotated[str | None, Query(alias="beginTime")] = None,
     end_time: Annotated[str | None, Query(alias="endTime")] = None,
+    scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     rows, total = await service.list_tasks(
@@ -185,6 +318,7 @@ async def list_tasks_controller(
         task_status=task_status,
         begin_time=begin_time,
         end_time=end_time,
+        scene_code=scene_code,
     )
     return TableResponse(rows=rows, total=total, msg="查询成功")
 

@@ -5,7 +5,11 @@ from sqlalchemy import Select, and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Selectable
 
-from .model import AiCallFollowUpTaskModel, AiCallRecordModel
+from .model import (
+    AiCallFollowUpTaskModel,
+    AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
+)
 from .outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -13,13 +17,14 @@ from .outbound.rule_task_model import (
 )
 
 FORMAL_TASK_ENTRY_TYPES = ("outbound", "sip_outbound", "web")
-SIP_OUTBOUND_ENTRY_TYPES = ("outbound", "sip_outbound")
 
 
 @dataclass(frozen=True)
 class StatisticsOverviewAggregate:
     dial_attempts: int
     connected_calls: int
+    total_duration_ms: int
+    intent_leads: int
     pending_follow_ups: int
 
 
@@ -66,13 +71,20 @@ class OutboundStatisticsRepository:
         tenant_id: str,
         started_at: datetime,
         ended_at: datetime,
+        scene_code: str | None,
+        task_id: int | None,
     ) -> Select:
-        return statement.where(
+        statement = statement.where(
             AiCallOutboundAttemptModel.tenant_id == tenant_id,
             AiCallRecordModel.entry_type.in_(FORMAL_TASK_ENTRY_TYPES),
             AiCallRecordModel.started_at >= started_at,
             AiCallRecordModel.started_at < ended_at,
         )
+        if scene_code:
+            statement = statement.where(AiCallOutboundTaskModel.scene_code == scene_code)
+        if task_id is not None:
+            statement = statement.where(AiCallOutboundTaskModel.id == task_id)
+        return statement
 
     async def aggregate_overview(
         self,
@@ -81,6 +93,8 @@ class OutboundStatisticsRepository:
         started_at: datetime,
         ended_at: datetime,
         include_pending_follow_ups: bool,
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> StatisticsOverviewAggregate:
         pending_exists = (
             select(AiCallFollowUpTaskModel.id)
@@ -99,17 +113,32 @@ class OutboundStatisticsRepository:
             if include_pending_follow_ups
             else literal(0)
         )
+        positive_intent_exists = (
+            select(AiCallSemanticAnalysisModel.id)
+            .where(
+                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
+                AiCallSemanticAnalysisModel.analysis_status == "2",
+                AiCallSemanticAnalysisModel.customer_intent == "positive",
+            )
+            .exists()
+        )
+        connected = AiCallOutboundAttemptModel.call_result == "connected"
         statement = select(
             func.count(AiCallRecordModel.id),
             func.coalesce(
+                func.sum(case((connected, 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
                 func.sum(
                     case(
-                        (AiCallOutboundAttemptModel.call_result == "connected", 1),
+                        (connected, func.coalesce(AiCallRecordModel.duration_ms, 0)),
                         else_=0,
                     )
                 ),
                 0,
             ),
+            func.coalesce(func.sum(case((positive_intent_exists, 1), else_=0)), 0),
             func.coalesce(pending_expression, 0),
         ).select_from(self._formal_outbound_from())
         statement = self._apply_period(
@@ -117,12 +146,16 @@ class OutboundStatisticsRepository:
             tenant_id=tenant_id,
             started_at=started_at,
             ended_at=ended_at,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         row = (await self.db.execute(statement)).one()
         return StatisticsOverviewAggregate(
             dial_attempts=int(row[0] or 0),
             connected_calls=int(row[1] or 0),
-            pending_follow_ups=int(row[2] or 0),
+            total_duration_ms=int(row[2] or 0),
+            intent_leads=int(row[3] or 0),
+            pending_follow_ups=int(row[4] or 0),
         )
 
     async def aggregate_results(
@@ -131,38 +164,36 @@ class OutboundStatisticsRepository:
         tenant_id: str,
         started_at: datetime,
         ended_at: datetime,
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> dict[str, int]:
+        connected = AiCallOutboundAttemptModel.call_result == "connected"
+        early_hangup = and_(
+            connected,
+            AiCallRecordModel.answered_at.is_not(None),
+            func.coalesce(AiCallRecordModel.duration_ms, 0) <= 5_000,
+        )
+        rejected = or_(
+            AiCallOutboundAttemptModel.call_result == "rejected",
+            AiCallOutboundAttemptModel.provider_status_code == "603",
+            func.upper(AiCallOutboundAttemptModel.hangup_cause).in_({"CALL_REJECTED", "21"}),
+        )
+        invalid_number = or_(
+            AiCallOutboundAttemptModel.call_result == "invalid_number",
+            AiCallOutboundAttemptModel.provider_status_code.in_({"404", "410", "484", "604"}),
+            func.upper(AiCallOutboundAttemptModel.hangup_cause).in_({
+                "ADDRESS_INCOMPLETE",
+                "SUBSCRIBER_ABSENT",
+                "UNALLOCATED_NUMBER",
+                "USER_NOT_REGISTERED",
+            }),
+        )
         result_group = case(
-            (AiCallOutboundAttemptModel.call_result == "connected", "connected"),
+            (early_hangup, "early_hangup"),
+            (connected, "connected"),
             (AiCallOutboundAttemptModel.call_result == "no_answer", "no_answer"),
-            (
-                and_(
-                    AiCallOutboundAttemptModel.call_result == "busy",
-                    AiCallRecordModel.entry_type.in_(SIP_OUTBOUND_ENTRY_TYPES),
-                ),
-                "busy",
-            ),
-            (
-                and_(
-                    AiCallOutboundAttemptModel.call_result == "invalid_number",
-                    AiCallRecordModel.entry_type.in_(SIP_OUTBOUND_ENTRY_TYPES),
-                ),
-                "invalid_number",
-            ),
-            (
-                AiCallOutboundAttemptModel.call_result == "call_failed",
-                "call_failed",
-            ),
-            (
-                AiCallRecordModel.status.in_({
-                    "created",
-                    "starting",
-                    "running",
-                    "active",
-                    "ending",
-                }),
-                "processing",
-            ),
+            (rejected, "rejected"),
+            (invalid_number, "invalid_number"),
             else_="other",
         )
         statement = (
@@ -175,6 +206,8 @@ class OutboundStatisticsRepository:
             tenant_id=tenant_id,
             started_at=started_at,
             ended_at=ended_at,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         rows = (await self.db.execute(statement)).all()
         return {str(row[0]): int(row[1]) for row in rows}
@@ -184,6 +217,8 @@ class OutboundStatisticsRepository:
         *,
         tenant_id: str,
         buckets: list[tuple[datetime, datetime]],
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> list[StatisticsTrendAggregate]:
         if not buckets:
             return []
@@ -212,6 +247,8 @@ class OutboundStatisticsRepository:
                     tenant_id=tenant_id,
                     started_at=bucket_start,
                     ended_at=bucket_end,
+                    scene_code=scene_code,
+                    task_id=task_id,
                 )
             )
 

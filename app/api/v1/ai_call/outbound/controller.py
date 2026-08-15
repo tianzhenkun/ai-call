@@ -202,9 +202,14 @@ async def download_outbound_template_controller(
         OutboundValidationService,
         Depends(get_outbound_validation_service),
     ],
+    prompt_profile_id: Annotated[int | None, Form(alias="promptProfileId", gt=0)] = None,
 ) -> FileResponse:
-    _identity(auth)
-    template_path = service.create_template()
+    tenant_id, _ = _identity(auth)
+    template_path = await service.create_template(
+        auth.db,
+        tenant_id,
+        prompt_profile_id,
+    )
     return FileResponse(
         template_path,
         filename="外呼名单导入模板.xlsx",

@@ -1466,7 +1466,7 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
         },
     }
     async with b1_service.session_maker() as db:
-        db.add(
+        db.add_all([
             AiCallOutboundTaskModel(
                 id=task_id,
                 tenant_id="000000",
@@ -1502,8 +1502,23 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
                 created_by_name="管理员",
                 created_at=now,
                 updated_at=now,
-            )
-        )
+            ),
+            AiCallOutboundTargetModel(
+                id=324800000000000105,
+                tenant_id="000000",
+                task_id=task_id,
+                validation_id=324800000000000102,
+                source_validation_row_id=324800000000000106,
+                source_row_number=1,
+                phone_number="19900001001",
+                customer_name="测试客户",
+                status="COMPLETED",
+                attempt_count=1,
+                latest_result="connected",
+                created_at=now,
+                updated_at=now,
+            ),
+        ])
         await db.commit()
 
     await b1_service.record_service.create_sip_record(
@@ -1554,6 +1569,7 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
 
     await b1_service.record_service.create_sip_record(
         call_id=attempt_call_id,
+        tenant_id="000000",
         business_type="outbound_attempt",
         business_id=str(attempt_id),
         room_name="room-outbound-attempt-frozen-config",
@@ -1562,6 +1578,12 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
     )
     attempt_detail = await b1_service.service.get_record_detail(attempt_call_id)
     assert attempt_detail["executionConfig"] == response["executionConfig"]
+    assert attempt_detail["record"]["taskId"] == str(task_id)
+    attempt_response = RecordDetailOut.model_validate(attempt_detail).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    assert attempt_response["record"]["taskId"] == str(task_id)
 
 
 @pytest.mark.anyio
@@ -5291,6 +5313,7 @@ async def test_event_persistence_worker_closes_record_on_model_error(
         assert record.failure_stage == "model"
         assert record.failure_message == "Conversation already has an active response"
         assert record.ended_at is not None
+        assert record.duration_ms is None
 
 
 @pytest.mark.anyio

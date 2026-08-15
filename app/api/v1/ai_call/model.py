@@ -840,6 +840,26 @@ class AiCallSemanticAnalysisModel(MappedBase):
         nullable=True,
         comment="跟进证据置信度：high/medium/low",
     )
+    follow_up_review_status: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="人工跟进确认：created/dismissed",
+    )
+    follow_up_reviewed_by: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="人工跟进确认人 ID",
+    )
+    follow_up_reviewed_by_name: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="人工跟进确认人名称",
+    )
+    follow_up_reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="人工跟进确认时间",
+    )
     analysis_error: Mapped[str | None] = mapped_column(
         String(1000),
         nullable=True,
@@ -1419,7 +1439,12 @@ class AiCallPromptProfileModel(MappedBase):
 
     __tablename__ = "ai_call_prompt_profile"
     __table_args__ = (
-        UniqueConstraint("scene_code", name="uk_ai_call_prompt_profile_scene"),
+        UniqueConstraint(
+            "tenant_id",
+            "scene_code",
+            name="uk_ai_call_prompt_profile_tenant_scene",
+        ),
+        Index("idx_ai_call_prompt_profile_tenant_updated", "tenant_id", "updated_at"),
         {"comment": "AI Call 业务提示词配置表"},
     )
     __permission_strategy__ = None
@@ -1430,6 +1455,7 @@ class AiCallPromptProfileModel(MappedBase):
         autoincrement=False,
         comment="雪花主键",
     )
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
     scene_code: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
@@ -1442,6 +1468,20 @@ class AiCallPromptProfileModel(MappedBase):
         comment="提示词来源模式",
     )
     prompt_text: Mapped[str | None] = mapped_column(Text, nullable=True, comment="固定提示词")
+    product_info: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="",
+        server_default=text("''"),
+        comment="产品或服务信息",
+    )
+    variables_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+        comment="业务变量定义JSON",
+    )
     opening_message: Mapped[str | None] = mapped_column(
         String(1000),
         nullable=True,
@@ -1457,6 +1497,65 @@ class AiCallPromptProfileModel(MappedBase):
         nullable=False,
         comment="更新时间",
     )
+
+
+class AiCallPromptCommonConfigModel(MappedBase):
+    """AI Call 租户通用业务提示词模板。"""
+
+    __tablename__ = "ai_call_prompt_common_config"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uk_ai_call_prompt_common_tenant"),
+        {"comment": "AI Call 租户通用业务提示词模板"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="更新时间",
+    )
+
+
+class AiCallPromptProfileVersionModel(MappedBase):
+    """AI Call 场景提示词不可变版本快照。"""
+
+    __tablename__ = "ai_call_prompt_profile_version"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "profile_id",
+            "version_no",
+            name="uk_ai_call_prompt_version_number",
+        ),
+        Index(
+            "idx_ai_call_prompt_version_profile_created",
+            "tenant_id",
+            "profile_id",
+            "created_at",
+        ),
+        {"comment": "AI Call 场景提示词版本快照"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="场景配置ID")
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="版本号")
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False, comment="完整场景快照")
+    creation_method: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="manual",
+        comment="创建方式",
+    )
+    restored_from_version_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AiCallVoiceProfileModel(MappedBase):

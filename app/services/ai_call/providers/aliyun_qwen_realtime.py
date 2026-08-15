@@ -57,9 +57,10 @@ SCHEDULE_CALL_END_TOOL = {
                     "type": "string",
                     "description": (
                         "结束原因。customer_end 表示用户侧明确不再继续；"
-                        "task_completed 表示当前业务目标已完成且无需继续追问。"
+                        "task_completed 表示当前业务目标已完成且无需继续追问；"
+                        "policy_limit 表示已连续三个有效轮次偏离当前业务。"
                     ),
-                    "enum": ["customer_end", "task_completed"],
+                    "enum": ["customer_end", "task_completed", "policy_limit"],
                 },
             },
             "required": ["reason"],

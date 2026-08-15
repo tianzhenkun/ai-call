@@ -169,6 +169,12 @@ class AiCallOutboundValidationRowModel(MappedBase):
         nullable=True,
         comment="原始客户名称",
     )
+    business_params_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        comment="名单业务变量快照JSON",
+    )
     normalized_phone: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,

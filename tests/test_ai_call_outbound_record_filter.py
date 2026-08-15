@@ -111,6 +111,51 @@ def test_record_list_controller_rejects_unknown_post_call_filters() -> None:
     assert service.query is None
 
 
+def test_follow_up_review_controller_forwards_current_user_identity() -> None:
+    class ReviewService:
+        query: dict | None = None
+
+        async def review_record_follow_up(self, **query) -> dict:
+            self.query = query
+            return {
+                "callId": query["call_id"],
+                "analysisSceneCode": "ai_call_semantic_analysis",
+                "analysisStatus": "2",
+                "analysisRetryCount": 0,
+                "followUpReviewStatus": "dismissed",
+                "followUpReviewedBy": query["reviewed_by"],
+                "followUpReviewedByName": query["reviewed_by_name"],
+            }
+
+    service = ReviewService()
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(
+            tenant_id="tenant-a",
+            user_id=20,
+            nick_name="坐席20",
+            user_name="agent-20",
+        )
+    )
+
+    response = TestClient(app).post(
+        "/ai-call/records/call-review/follow-up-review",
+        json={"action": "dismiss"},
+    )
+
+    assert response.status_code == 200
+    assert service.query == {
+        "tenant_id": "tenant-a",
+        "call_id": "call-review",
+        "action": "dismiss",
+        "reviewed_by": "20",
+        "reviewed_by_name": "坐席20",
+    }
+    assert response.json()["data"]["followUpReviewStatus"] == "dismissed"
+
+
 def test_outbound_attempt_model_has_no_physical_foreign_keys() -> None:
     attempt_table = MappedBase.metadata.tables.get("ai_call_outbound_attempt")
     assert attempt_table is not None
@@ -525,6 +570,9 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
     call_cases = [
         ("call-positive-none", "positive", False, "2"),
         ("call-positive-suggested", "positive", True, "2"),
+        ("call-auto-create-pending", "positive", True, "2"),
+        ("call-refused-suggestion", "negative", True, "2"),
+        ("call-manual-dismissed", "positive", True, "2"),
         ("call-pending-task", "neutral", True, "2"),
         ("call-completed-task", "negative", True, "2"),
         ("call-analysis-running", None, False, "1"),
@@ -626,13 +674,28 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
                         customer_intent=customer_intent,
                         follow_up_suggested=follow_up_suggested,
                         follow_up_consent=(
-                            "explicit" if follow_up_suggested else "missing"
+                            "missing"
+                            if call_id == "call-positive-suggested"
+                            else "refused"
+                            if call_id == "call-refused-suggestion"
+                            else "explicit"
+                            if follow_up_suggested
+                            else "missing"
                         ),
                         follow_up_reason=(
                             "客户要求回访" if follow_up_suggested else None
                         ),
                         follow_up_confidence=(
-                            "high" if follow_up_suggested else "low"
+                            "low"
+                            if call_id == "call-positive-suggested"
+                            else "high"
+                            if follow_up_suggested
+                            else "low"
+                        ),
+                        follow_up_review_status=(
+                            "dismissed"
+                            if call_id == "call-manual-dismissed"
+                            else None
                         ),
                         analysis_retry_count=0,
                         created_at=now,
@@ -721,14 +784,14 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
         service = AiCallRecordService(AiCallRecordRepository(session))
         rows, total = await service.list_records(
             tenant_id="tenant-a",
-            page_size=10,
+            page_size=20,
         )
         payloads = {
             row.call_id: service.record_to_dict(row)
             for row in rows
         }
 
-        assert total == 8
+        assert total == 11
         assert payloads["call-pending-task"] | {
             "analysisStatus": "2",
             "customerIntent": "neutral",
@@ -738,7 +801,14 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
             "qualityScoreStatus": "completed",
             "qualityScore": 86,
             "qualityReviewResult": "fail",
+            "qualityReviewReason": "关键问题未确认",
         } == payloads["call-pending-task"]
+        assert payloads["call-positive-suggested"]["followUpRequiresReview"]
+        assert payloads["call-positive-none"]["followUpRequiresReview"]
+        assert not payloads["call-auto-create-pending"][
+            "followUpRequiresReview"
+        ]
+        assert not payloads["call-refused-suggestion"]["followUpRequiresReview"]
         assert payloads["call-positive-none"]["qualityScoreStatus"] == "pending"
         assert payloads["call-positive-none"]["qualityScore"] is None
         assert payloads["call-positive-none"]["qualityReviewResult"] is None
@@ -762,19 +832,25 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
             follow_up_status="none",
         )
 
-        assert positive_total == 2
+        assert positive_total == 4
         assert {row.call_id for row in positive_rows} == {
             "call-positive-none",
             "call-positive-suggested",
+            "call-auto-create-pending",
+            "call-manual-dismissed",
         }
-        assert suggested_total == 1
-        assert [row.call_id for row in suggested_rows] == [
-            "call-positive-suggested"
-        ]
+        assert suggested_total == 2
+        assert {row.call_id for row in suggested_rows} == {
+            "call-positive-suggested",
+            "call-positive-none",
+        }
         assert pending_total == 1
         assert [row.call_id for row in pending_rows] == ["call-pending-task"]
-        assert none_total == 1
-        assert [row.call_id for row in none_rows] == ["call-positive-none"]
+        assert none_total == 2
+        assert {row.call_id for row in none_rows} == {
+            "call-refused-suggestion",
+            "call-manual-dismissed",
+        }
 
     await engine.dispose()
 

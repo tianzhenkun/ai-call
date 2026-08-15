@@ -583,6 +583,8 @@ async def test_dial_preserves_provider_diagnostics_from_real_error_chain(databas
     [
         ("sip_busy", "busy"),
         ("sip_connect_timeout", "no_answer"),
+        ("sip_603", "rejected"),
+        ("sip_404", "invalid_number"),
         ("sip_403", "call_failed"),
         ("sip_503", "call_failed"),
         ("sip_508", "call_failed"),
@@ -593,6 +595,17 @@ def test_maps_terminal_sip_reason(end_reason, expected):
         record(answered_at=None, end_reason=end_reason)
     )
     assert result.call_result == expected
+
+
+def test_maps_q850_cause_21_to_rejected():
+    result = SipOutboundDialer.map_terminal_record(
+        record(
+            answered_at=None,
+            end_reason="sip_failure",
+            failure_message="hangup_cause=21",
+        )
+    )
+    assert result.call_result == "rejected"
 
 
 @pytest.mark.anyio

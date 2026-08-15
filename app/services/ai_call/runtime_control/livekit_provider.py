@@ -16,6 +16,7 @@ from app.services.ai_call.livekit_egress import (
 from app.services.ai_call.prompt_config import (
     PromptEffectiveConfig,
     PromptResolveContext,
+    resolve_static_prompt_snapshot,
 )
 from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
@@ -188,21 +189,27 @@ class DatabaseRuntimeProviderResourceResolver:
         business_params = payload.get("business_params")
         if not isinstance(business_params, dict):
             business_params = {}
-        result = await _build_prompt_resolver(
-            AiCallRecordRepository(session),
-            self._orchestrator,
-        ).resolve(
-            PromptResolveContext(
-                call_id=str(record.call_id),
-                business_id=(
-                    str(record.business_id) if record.business_id is not None else None
-                ),
-                scene_code=(
-                    str(record.scene_code) if record.scene_code is not None else None
-                ),
-                business_params=business_params,
-            )
+        context = PromptResolveContext(
+            call_id=str(record.call_id),
+            tenant_id=str(record.tenant_id),
+            business_id=(
+                str(record.business_id) if record.business_id is not None else None
+            ),
+            scene_code=(
+                str(record.scene_code) if record.scene_code is not None else None
+            ),
+            business_params=business_params,
         )
+        prompt_snapshot = payload.get("prompt_snapshot")
+        result = resolve_static_prompt_snapshot(
+            prompt_snapshot if isinstance(prompt_snapshot, dict) else None,
+            context,
+        )
+        if result is None:
+            result = await _build_prompt_resolver(
+                AiCallRecordRepository(session),
+                self._orchestrator,
+            ).resolve(context)
         return _build_prompt_composer(self._orchestrator).compose(result)
 
     @staticmethod

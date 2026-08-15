@@ -87,10 +87,9 @@ class OutboundStatisticsService:
     _RESULT_ORDER = (
         CallResultGroup.CONNECTED,
         CallResultGroup.NO_ANSWER,
-        CallResultGroup.BUSY,
+        CallResultGroup.REJECTED,
+        CallResultGroup.EARLY_HANGUP,
         CallResultGroup.INVALID_NUMBER,
-        CallResultGroup.CALL_FAILED,
-        CallResultGroup.PROCESSING,
         CallResultGroup.OTHER,
     )
 
@@ -105,6 +104,8 @@ class OutboundStatisticsService:
         started_at_end: datetime,
         time_zone: str,
         granularity: StatisticsGranularity | str,
+        scene_code: str | None = None,
+        task_id: int | None = None,
         now: datetime | None = None,
     ) -> OutboundStatisticsOut:
         period = StatisticsPeriodFactory.build(
@@ -119,22 +120,30 @@ class OutboundStatisticsService:
             started_at=period.current_started_at,
             ended_at=period.current_ended_at,
             include_pending_follow_ups=True,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         previous = await self.repository.aggregate_overview(
             tenant_id=tenant_id,
             started_at=period.previous_started_at,
             ended_at=period.previous_ended_at,
             include_pending_follow_ups=False,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         buckets = self._build_buckets(period)
         trend_aggregates = await self.repository.aggregate_trend(
             tenant_id=tenant_id,
             buckets=buckets,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         result_counts = await self.repository.aggregate_results(
             tenant_id=tenant_id,
             started_at=period.current_started_at,
             ended_at=period.current_ended_at,
+            scene_code=scene_code,
+            task_id=task_id,
         )
         if sum(result_counts.values()) != current.dial_attempts:
             raise RuntimeError("外呼统计结果分布与拨打次数不一致")
@@ -161,6 +170,8 @@ class OutboundStatisticsService:
                 dial_attempts=current.dial_attempts,
                 connected_calls=current.connected_calls,
                 connect_rate=current_rate,
+                total_duration_ms=current.total_duration_ms,
+                intent_leads=current.intent_leads,
                 pending_follow_ups=current.pending_follow_ups,
             ),
             comparison=self._comparison(
@@ -217,6 +228,14 @@ class OutboundStatisticsService:
             connect_rate_change_points=(
                 round((current_rate - previous_rate) * 100, 2) if previous.dial_attempts else None
             ),
+            total_duration_change_rate=self._change_rate(
+                current.total_duration_ms,
+                previous.total_duration_ms,
+            ),
+            intent_leads_change_rate=self._change_rate(
+                current.intent_leads,
+                previous.intent_leads,
+            ),
         )
 
     def _result_items(
@@ -228,15 +247,6 @@ class OutboundStatisticsService:
         items = []
         for result in self._RESULT_ORDER:
             count = counts.get(result.value, 0)
-            if (
-                result
-                in {
-                    CallResultGroup.PROCESSING,
-                    CallResultGroup.OTHER,
-                }
-                and not count
-            ):
-                continue
             items.append(
                 StatisticsResultOut(
                     result=result,

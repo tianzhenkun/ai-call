@@ -20,6 +20,7 @@ from sqlalchemy import Integer, and_, delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.v1.ai_call.model import AiCallPromptProfileModel
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.utils.id_util import generate_snowflake_id
@@ -33,7 +34,8 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 DEFAULT_PARSE_BATCH_SIZE = 500
 TEMP_FILE_PREFIX = "ai-call-outbound-"
 PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
-SUPPORTED_HEADERS = {"手机号", "客户名称"}
+PROMPT_VARIABLE_RE = re.compile(r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}")
+LEGACY_VARIABLE_LABELS = {"customerName": "客户名称"}
 
 
 def _now() -> datetime:
@@ -225,7 +227,11 @@ class OutboundValidationService:
                 )
                 return
 
-            header_map, header_reasons = self._header_map(header_values)
+            variable_columns = await self._prompt_variable_columns(db, validation)
+            header_map, header_reasons = self._header_map(
+                header_values,
+                variable_columns,
+            )
             if header_reasons:
                 await self._persist_batch(
                     db,
@@ -243,7 +249,12 @@ class OutboundValidationService:
                 if not batch_values:
                     break
                 batch = [
-                    self._build_row(row_number + offset, values, header_map)
+                    self._build_row(
+                        row_number + offset,
+                        values,
+                        header_map,
+                        variable_columns,
+                    )
                     for offset, values in enumerate(batch_values)
                     if not self._is_empty_row(values)
                 ]
@@ -262,23 +273,32 @@ class OutboundValidationService:
             await asyncio.to_thread(workbook.close)
 
     @staticmethod
-    def _header_map(values: tuple[Any, ...]) -> tuple[dict[str, int], list[str]]:
+    def _header_map(
+        values: tuple[Any, ...],
+        variable_columns: dict[str, str],
+    ) -> tuple[dict[str, int], list[str]]:
         normalized = [OutboundValidationService._cell_text(value) for value in values]
+        supported_headers = {"手机号", "客户名称", *variable_columns}
         header_map = {
-            header: index for index, header in enumerate(normalized) if header in SUPPORTED_HEADERS
+            header: index
+            for index, header in enumerate(normalized)
+            if header in supported_headers
         }
         reasons: list[str] = []
         if "手机号" not in header_map:
             reasons.append("缺少必填表头：手机号")
         unsupported = [
-            header for header in normalized if header and header not in SUPPORTED_HEADERS
+            header for header in normalized if header and header not in supported_headers
         ]
         if unsupported:
             reasons.append(f"存在不支持的表头：{'、'.join(unsupported)}")
         if len([header for header in normalized if header == "手机号"]) > 1:
             reasons.append("手机号表头重复")
-        if len([header for header in normalized if header == "客户名称"]) > 1:
-            reasons.append("客户名称表头重复")
+        for label in variable_columns:
+            if label not in header_map:
+                reasons.append(f"缺少必填表头：{label}")
+            if normalized.count(label) > 1:
+                reasons.append(f"{label}表头重复")
         return header_map, reasons
 
     def _build_row(
@@ -286,9 +306,19 @@ class OutboundValidationService:
         row_number: int,
         values: tuple[Any, ...],
         header_map: dict[str, int],
+        variable_columns: dict[str, str],
     ) -> dict[str, Any]:
         phone = self._value_at(values, header_map["手机号"])
-        customer_name = self._value_at(values, header_map.get("客户名称"))
+        business_params = {
+            key: self._value_at(values, header_map.get(label))
+            for label, key in variable_columns.items()
+        }
+        customer_name = business_params.get("customerName") or self._value_at(
+            values,
+            header_map.get("客户名称"),
+        )
+        if customer_name and "customerName" not in business_params:
+            business_params["customerName"] = customer_name
         reasons: list[str] = []
         if self._is_empty_row(values):
             reasons.append("空行")
@@ -298,6 +328,9 @@ class OutboundValidationService:
             reasons.append("手机号格式错误")
         if customer_name and len(customer_name) > 100:
             reasons.append("客户名称不能超过100个字符")
+        for label, key in variable_columns.items():
+            if not business_params.get(key):
+                reasons.append(f"{label}不能为空")
         return {
             "id": generate_snowflake_id(),
             "tenant_id": "",
@@ -305,6 +338,11 @@ class OutboundValidationService:
             "row_number": row_number,
             "phone_number": phone or None,
             "customer_name": customer_name or None,
+            "business_params_json": json.dumps(
+                business_params,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             "normalized_phone": phone if PHONE_PATTERN.fullmatch(phone) else None,
             "is_valid": not reasons,
             "reasons": reasons,
@@ -330,6 +368,7 @@ class OutboundValidationService:
             "row_number": row_number,
             "phone_number": phone_number,
             "customer_name": customer_name,
+            "business_params_json": "{}",
             "normalized_phone": None,
             "is_valid": False,
             "reasons": reasons,
@@ -677,11 +716,28 @@ class OutboundValidationService:
         except (SQLAlchemyError, OSError) as exc:
             log.warning(f"跳过通用外呼名单恢复扫描，数据表尚未就绪: {type(exc).__name__}")
 
-    @staticmethod
-    def create_template() -> str:
+    async def create_template(
+        self,
+        db: AsyncSession,
+        tenant_id: str,
+        prompt_profile_id: int | None = None,
+    ) -> str:
+        labels = ["客户名称"]
+        if prompt_profile_id is not None:
+            profile = await db.scalar(
+                select(AiCallPromptProfileModel).where(
+                    AiCallPromptProfileModel.tenant_id == tenant_id,
+                    AiCallPromptProfileModel.id == prompt_profile_id,
+                )
+            )
+            if profile is None:
+                raise CustomException(msg="提示词配置不存在", status_code=404)
+            labels = list(
+                (await self._prompt_variable_columns(db, profile=profile)).keys()
+            )
         workbook = Workbook(write_only=True)
         sheet = workbook.create_sheet("外呼名单")
-        sheet.append(["手机号", "客户名称"])
+        sheet.append(["手机号", *labels])
         descriptor, template_path = tempfile.mkstemp(
             prefix="ai-call-outbound-template-",
             suffix=".xlsx",
@@ -693,6 +749,59 @@ class OutboundValidationService:
             OutboundValidationService._delete_temp_file(template_path)
             raise
         return template_path
+
+    async def _prompt_variable_columns(
+        self,
+        db: AsyncSession,
+        validation: AiCallOutboundValidationModel | None = None,
+        *,
+        profile: AiCallPromptProfileModel | None = None,
+    ) -> dict[str, str]:
+        if profile is None:
+            config = self._load_config(validation.task_config_json if validation else "{}")
+            prompt_profile_id = config.get("promptProfileId")
+            conditions = [
+                AiCallPromptProfileModel.tenant_id == validation.tenant_id,
+                AiCallPromptProfileModel.scene_code == config.get("sceneCode"),
+            ]
+            if prompt_profile_id:
+                conditions.append(AiCallPromptProfileModel.id == int(prompt_profile_id))
+            profile = await db.scalar(select(AiCallPromptProfileModel).where(*conditions))
+        if profile is None:
+            # 兼容尚未配置提示词的旧任务；新任务在创建阶段仍会校验所选配置。
+            return {}
+        try:
+            variables = json.loads(profile.variables_json or "[]")
+        except json.JSONDecodeError:
+            variables = []
+        labels_by_key = {
+            str(item.get("key")): str(item.get("label"))
+            for item in variables
+            if isinstance(item, dict) and item.get("key") and item.get("label")
+        }
+        referenced = set(
+            PROMPT_VARIABLE_RE.findall(
+                "\n".join(
+                    [
+                        profile.opening_message or "",
+                        profile.product_info or "",
+                        profile.prompt_text or "",
+                    ]
+                )
+            )
+        )
+        return {
+            labels_by_key.get(key) or LEGACY_VARIABLE_LABELS.get(key) or key: key
+            for key in sorted(referenced)
+        }
+
+    @staticmethod
+    def _load_config(value: str) -> dict[str, Any]:
+        try:
+            result = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return result if isinstance(result, dict) else {}
 
     @staticmethod
     def result_out(validation: AiCallOutboundValidationModel) -> ValidationResultOut:

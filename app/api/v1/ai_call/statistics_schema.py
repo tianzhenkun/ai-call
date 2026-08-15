@@ -12,10 +12,9 @@ class StatisticsGranularity(StrEnum):
 class CallResultGroup(StrEnum):
     CONNECTED = "connected"
     NO_ANSWER = "no_answer"
-    BUSY = "busy"
+    REJECTED = "rejected"
+    EARLY_HANGUP = "early_hangup"
     INVALID_NUMBER = "invalid_number"
-    CALL_FAILED = "call_failed"
-    PROCESSING = "processing"
     OTHER = "other"
 
 
@@ -31,6 +30,8 @@ class StatisticsOverviewOut(AiCallBaseSchema):
     dial_attempts: int
     connected_calls: int
     connect_rate: float
+    total_duration_ms: int
+    intent_leads: int
     pending_follow_ups: int
 
 
@@ -38,6 +39,8 @@ class StatisticsComparisonOut(AiCallBaseSchema):
     dial_attempts_change_rate: float | None
     connected_calls_change_rate: float | None
     connect_rate_change_points: float | None
+    total_duration_change_rate: float | None
+    intent_leads_change_rate: float | None
 
 
 class StatisticsTrendPointOut(AiCallBaseSchema):

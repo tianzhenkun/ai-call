@@ -274,6 +274,7 @@ async def _seed_references(database) -> tuple[int, int]:
         session.add(
             AiCallPromptProfileModel(
                 id=prompt_id,
+                tenant_id="tenant-a",
                 scene_code="intro_contract",
                 name="合同审查产品介绍",
                 provider_key="static_profile",

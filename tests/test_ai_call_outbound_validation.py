@@ -10,12 +10,14 @@ from xml.sax.saxutils import escape
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.datastructures import Headers, UploadFile
 
 from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call.model import AiCallPromptProfileModel
 from app.api.v1.ai_call.outbound.controller import get_outbound_validation_service
 from app.api.v1.ai_call.outbound.model import (
     AiCallOutboundValidationModel,
@@ -170,6 +172,30 @@ async def _accept(
         return validation.id, validation.temp_file_path
 
 
+async def _seed_variable_prompt(database) -> None:
+    async with database() as session:
+        now = datetime.now(timezone.utc)
+        session.add(
+            AiCallPromptProfileModel(
+                id=1001,
+                tenant_id="tenant-a",
+                scene_code="intro_geo",
+                name="GEO 产品介绍",
+                provider_key="static_profile",
+                prompt_text="请结合{{companyName}}介绍产品。",
+                product_info="",
+                variables_json=json.dumps(
+                    [{"key": "companyName", "label": "公司名"}],
+                    ensure_ascii=False,
+                ),
+                opening_message="您好",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+
 def test_models_are_tenant_scoped_without_foreign_keys_or_jsonb() -> None:
     assert {
         "tenant_id",
@@ -236,6 +262,70 @@ async def test_valid_xlsx_is_streamed_to_rows_and_finishes_passed(database) -> N
     assert validation.valid_target_count == 3
     assert validation.issue_count == 0
     assert [row.row_number for row in rows] == [2, 3, 4]
+
+
+@pytest.mark.anyio
+async def test_prompt_variables_drive_template_and_row_snapshot(database) -> None:
+    await _seed_variable_prompt(database)
+    service = OutboundValidationService(database)
+    async with database() as session:
+        template_path = await service.create_template(session, "tenant-a", 1001)
+    try:
+        workbook = load_workbook(template_path, read_only=True)
+        assert list(workbook.active.values)[0] == ("手机号", "公司名")
+        workbook.close()
+    finally:
+        Path(template_path).unlink(missing_ok=True)
+
+    validation_id, _ = await _accept(
+        service,
+        database,
+        _xlsx([["手机号", "公司名"], ["13800138000", "星辰科技"]]),
+    )
+    await service.process_validation("tenant-a", validation_id)
+
+    async with database() as session:
+        validation = await session.get(AiCallOutboundValidationModel, validation_id)
+        row = await session.scalar(
+            select(AiCallOutboundValidationRowModel).where(
+                AiCallOutboundValidationRowModel.validation_id == validation_id,
+                AiCallOutboundValidationRowModel.row_number == 2,
+            )
+        )
+    assert validation.status == "PASSED"
+    assert json.loads(row.business_params_json) == {"companyName": "星辰科技"}
+
+
+@pytest.mark.anyio
+async def test_prompt_variable_column_and_value_are_required(database) -> None:
+    await _seed_variable_prompt(database)
+    service = OutboundValidationService(database)
+
+    missing_column_id, _ = await _accept(
+        service,
+        database,
+        _xlsx([["手机号"], ["13800138000"]]),
+    )
+    await service.process_validation("tenant-a", missing_column_id)
+    blank_value_id, _ = await _accept(
+        service,
+        database,
+        _xlsx([["手机号", "公司名"], ["13800138000", None]]),
+    )
+    await service.process_validation("tenant-a", blank_value_id)
+
+    async with database() as session:
+        reasons = (
+            await session.scalars(
+                select(AiCallOutboundValidationRowModel.reasons_json).where(
+                    AiCallOutboundValidationRowModel.validation_id.in_(
+                        [missing_column_id, blank_value_id]
+                    )
+                )
+            )
+        ).all()
+    assert any("缺少必填表头：公司名" in (reason or "") for reason in reasons)
+    assert any("公司名不能为空" in (reason or "") for reason in reasons)
 
 
 @pytest.mark.anyio

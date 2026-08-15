@@ -5572,7 +5572,7 @@ async def test_realtime_agent_runner_maps_task_completed_call_end_reason() -> No
 
     assert provider.submitted_tool_results[0][0] == "tool_2"
     assert provider.submitted_tool_results[0][1] == (
-        "请直接回复：“好的，我已经记录，稍后会有顾问联系您。”"
+        "请直接回复：“好的，相关信息我已经记录，感谢您的时间，再见。”"
         "不要添加其他内容，不要再提出问题。"
     )
     assert "call_end_scheduled" in [event.type for event in store.list("call_task_completed")]

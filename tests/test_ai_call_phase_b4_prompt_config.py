@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -15,12 +17,14 @@ from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.schema import (
     CreateWebSessionRequest,
+    PromptCommonConfigUpdateRequest,
     PromptProfileCreateRequest,
     PromptProfilePreviewRequest,
     VoiceProfileCreateRequest,
 )
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
+from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.livekit_room import BrowserRoomToken
@@ -33,6 +37,7 @@ from app.services.ai_call.prompt_config import (
     DefaultPromptProvider,
     PromptComposer,
 )
+from app.services.ai_call.prompt_optimization import OpenAICompatiblePromptOptimizer
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
 from app.services.ai_call.session_registry import (
@@ -41,6 +46,8 @@ from app.services.ai_call.session_registry import (
     InMemorySessionRegistry,
 )
 from app.services.ai_call.voice_profile import BUILTIN_QWEN_OMNI_REALTIME_VOICES
+
+TEST_TENANT_ID = "tenant_001"
 
 
 class FakeLiveKitRoomManager:
@@ -270,14 +277,14 @@ def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries()
     assert "客户要求“说简单点”时，用“先看 AI 怎么介绍企业、再整理官方资料、再改成 AI 更容易引用的内容”" in seed_sql
     assert "天气、日期、股市" in seed_sql
     assert "不回答具体内容" in seed_sql
-    assert "不要说“马上为您转接”" in seed_sql
-    assert "如果当前没有人工接入，稍后会安排顾问联系" in seed_sql
+    assert "确认意图后调用 request_handoff" in seed_sql
+    assert "转接结果由系统播报" in seed_sql
+    assert "不要自行承诺稍后联系" in seed_sql
     assert "不要列举平台名称、不要展开方法、指标、技术细节或产品名" in seed_sql
-    assert "后续方便让顾问联系您吗" in seed_sql
-    assert "没空时不要解释 GEO、AI、品牌推荐或任何产品价值" in seed_sql
+    assert "没空时礼貌结束，不主动承诺后续联系" in seed_sql
     assert "只称“其他产品线”，不要复述“合同审查”这个产品名" in seed_sql
-    assert "不要说“马上为您转接”“请稍候”或暗示顾问已经接通" in seed_sql
-    assert "我先帮您记录顾问沟通意向，如果当前没有人工接入，稍后会安排顾问联系您" in seed_sql
+    assert "工具未成功前，不得声称已经记录、预约成功或稍后一定联系" in seed_sql
+    assert "稍后会安排顾问联系您" not in seed_sql
     assert "不能承诺一定排名、一定被模型推荐或一定周期见效" in seed_sql
     assert "用户问“效果怎么看”“有什么指标”这类普通指标问题时" in seed_sql
     assert "包含“错误回答占比”" in seed_sql
@@ -332,7 +339,7 @@ def test_intro_overseas_seed_uses_overseas_growth_agent_boundaries() -> None:
     assert "不回答具体内容" in overseas_block
     assert "没空、在开会、只有半分钟" in overseas_block
     assert "回复最多 60 个汉字" in overseas_block
-    assert "如果当前没有人工接入，稍后会安排顾问联系" in overseas_block
+    assert "转接结果由系统播报，不要自行承诺稍后联系" in overseas_block
 
 
 def test_intro_contract_seed_uses_contract_intelligent_review_boundaries() -> None:
@@ -361,7 +368,7 @@ def test_intro_contract_seed_uses_contract_intelligent_review_boundaries() -> No
     assert "数据隔离、权限控制、加密存储、可控部署" in contract_block
     assert "天气、日期、股市" in contract_block
     assert "不回答具体内容" in contract_block
-    assert "如果当前没有人工接入，稍后会安排顾问联系" in contract_block
+    assert "转接结果由系统播报，不要自行承诺稍后联系" in contract_block
 
 
 def test_intro_document_seed_uses_cross_border_document_review_boundaries() -> None:
@@ -625,13 +632,16 @@ async def b4_service():
 
 
 async def create_static_profile(service: AiCallService) -> dict:
-    return await service.create_prompt_profile({
-        "scene_code": "debt_promise_repay_reminder",
-        "name": "承诺还款提醒",
-        "provider_key": "static_profile",
-        "prompt_text": "你正在联系{{customerName}}，提醒客户按承诺时间还款，语气克制。",
-        "opening_message": "您好{{customerName}}，我是灵宸智能助手，想和您确认一下还款安排。",
-    })
+    return await service.create_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        values={
+            "scene_code": "debt_promise_repay_reminder",
+            "name": "承诺还款提醒",
+            "provider_key": "static_profile",
+            "prompt_text": "你正在联系{{customerName}}，提醒客户按承诺时间还款，语气克制。",
+            "opening_message": "您好{{customerName}}，我是灵宸智能助手，想和您确认一下还款安排。",
+        },
+    )
 
 
 @pytest.mark.anyio
@@ -649,10 +659,142 @@ async def test_prompt_components_include_runtime_common_constraints(b4_service) 
     assert "当前日期：" in components["rows"][0]["content"]
     assert "Asia/Shanghai" in components["rows"][0]["content"]
     assert "暂时没有人工接入" in components["rows"][1]["content"]
-    assert "稍后安排顾问联系" in components["rows"][1]["content"]
+    assert "不要自行承诺后续联系" in components["rows"][1]["content"]
     assert "schedule_call_end" in components["rows"][2]["content"]
     assert "仅当上下文明确表明通话已适合结束" in components["rows"][2]["content"]
     assert "必须调用 schedule_call_end" in components["rows"][2]["content"]
+
+
+@pytest.mark.anyio
+async def test_common_business_prompt_is_persisted_without_implicit_binding(b4_service) -> None:
+    service, _repository, _room_manager, _agent_runner = b4_service
+
+    default_content = (
+        await service.get_prompt_common_config(tenant_id=TEST_TENANT_ID)
+    )["content"]
+    assert "一次只问一个问题" in default_content
+    assert "姓名、号码、时间、价格" in default_content
+    saved = await service.update_prompt_common_config(
+        tenant_id=TEST_TENANT_ID,
+        content="统一使用专业、克制的品牌语气。",
+    )
+    await create_static_profile(service)
+    preview = await service.preview_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        business_id="324800000000000001",
+        scene_code="debt_promise_repay_reminder",
+        business_params={"customerName": "张总"},
+        prompt=None,
+    )
+
+    assert saved["content"] == "统一使用专业、克制的品牌语气。"
+    assert "统一使用专业、克制的品牌语气。" not in preview["instructions"]
+
+
+@pytest.mark.anyio
+async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> None:
+    service, _repository, _room_manager, _agent_runner = b4_service
+    created = await create_static_profile(service)
+
+    assert created["versionNo"] == 1
+    assert created["versionCount"] == 1
+    assert (await service.list_prompt_profiles(tenant_id="tenant_other"))["total"] == 0
+    with pytest.raises(CustomException):
+        await service.get_prompt_profile(
+            tenant_id="tenant_other",
+            profile_id=int(created["id"]),
+        )
+
+    updated = await service.update_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        values={
+            "scene_code": created["sceneCode"],
+            "name": created["name"],
+            "provider_key": created["providerKey"],
+            "prompt_text": "第二版提示词",
+            "opening_message": "第二版开场白",
+        },
+    )
+    versions = await service.list_prompt_profile_versions(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    )
+
+    assert updated["versionNo"] == 2
+    assert updated["versionCount"] == 2
+    assert [row["versionNo"] for row in versions["rows"]] == [2, 1]
+
+    restored = await service.apply_prompt_profile_version(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        version_id=int(versions["rows"][1]["id"]),
+        created_by=1,
+        created_by_name="测试用户",
+    )
+    assert restored["promptText"] == created["promptText"]
+    assert restored["versionNo"] == 3
+    assert restored["versionCount"] == 3
+
+
+@pytest.mark.anyio
+async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["model"] == "qwen3.7-plus"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "candidateContent": "您好{{customerName}}，现在方便沟通吗？",
+                                    "warnings": [],
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    optimizer = OpenAICompatiblePromptOptimizer(
+        base_url="https://dashscope.test/v1",
+        api_key="test-key",
+        model="qwen3.7-plus",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await optimizer.optimize(
+        {
+            "targetType": "opening",
+            "currentContent": "您好{{customerName}}",
+            "allowedVariables": ["customerName"],
+        }
+    )
+
+    assert result == {
+        "candidateContent": "您好{{customerName}}，现在方便沟通吗？",
+        "warnings": [],
+    }
+
+
+def test_prompt_optimizer_rejects_unavailable_follow_up_promises() -> None:
+    with pytest.raises(ValueError, match="系统未支持的动作承诺"):
+        OpenAICompatiblePromptOptimizer._validate_result(
+            {"currentContent": "", "allowedVariables": []},
+            {"candidateContent": "我先记录，稍后会有顾问联系您。"},
+        )
+
+
+def test_prompt_optimizer_rejects_unchanged_candidate() -> None:
+    with pytest.raises(ValueError, match="未产生有效变化"):
+        OpenAICompatiblePromptOptimizer._validate_result(
+            {"currentContent": "您好{{customerName}}", "allowedVariables": ["customerName"]},
+            {"candidateContent": "您好{{customerName}}"},
+        )
 
 
 @pytest.mark.anyio
@@ -661,12 +803,14 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     profile = await create_static_profile(service)
 
     preview = await service.preview_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
         business_id="324800000000000001",
         scene_code="debt_promise_repay_reminder",
         business_params={"customerName": "张总"},
         prompt=None,
     )
     result = await service.create_web_session(
+        tenant_id=TEST_TENANT_ID,
         voice="Cindy",
         prompt=None,
         business_id="324800000000000001",
@@ -678,23 +822,22 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     assert "bargeInEnabled" not in profile
     assert preview["promptSourceKey"] == "debt_promise_repay_reminder"
     assert preview["bargeInEnabled"] is True
-    assert "平台关键约束" in preview["instructions"]
-    assert "当前日期：" in preview["instructions"]
-    assert "不得代替客户使用第一人称表达客户需求" in preview["instructions"]
-    assert "不要把客户未说出的" in preview["instructions"]
-    assert "转人工能力约束" in preview["instructions"]
+    assert "平台关键约束" not in preview["instructions"]
     assert "业务话术" in preview["instructions"]
     assert "你正在联系张总" in preview["instructions"]
     assert "{{customerName}}" not in preview["instructions"]
     assert preview["openingMessage"] == "您好张总，我是灵宸智能助手，想和您确认一下还款安排。"
     assert result.effective_config.prompt_source_key == "debt_promise_repay_reminder"
     assert result.effective_config.barge_in_enabled is True
-    assert result.effective_config.prompt_hash == preview["promptHash"]
-    assert agent_runner.started_sessions[0].effective_config.instructions == preview["instructions"]
+    assert "平台关键约束" in result.effective_config.instructions
+    assert "当前日期：" in result.effective_config.instructions
+    assert "转人工能力约束" in result.effective_config.instructions
+    assert result.effective_config.prompt_hash != preview["promptHash"]
+    assert "你正在联系张总" in agent_runner.started_sessions[0].effective_config.instructions
     assert agent_runner.started_sessions[0].effective_config.barge_in_enabled is True
     events = await service.orchestrator.list_events(result.call_id)
     assert events.rows[0].payload == {
-        "promptHash": preview["promptHash"],
+        "promptHash": result.effective_config.prompt_hash,
         "openingMessageHash": preview["openingMessageHash"],
         "promptSourceKey": "debt_promise_repay_reminder",
     }
@@ -710,6 +853,7 @@ async def test_static_prompt_profile_missing_placeholder_fails_before_room_creat
 
     with pytest.raises(CustomException) as preview_exc_info:
         await service.preview_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
             business_id="324800000000000001",
             scene_code="debt_promise_repay_reminder",
             business_params={},
@@ -719,6 +863,7 @@ async def test_static_prompt_profile_missing_placeholder_fails_before_room_creat
     assert preview_exc_info.value.msg == "businessParams 缺少提示词占位符：customerName"
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt=None,
             business_id="324800000000000001",
@@ -742,6 +887,7 @@ async def test_voice_profiles_seed_and_validate_session_voice(b4_service) -> Non
     female = await service.list_voice_profiles(gender="女声", page_size=200)
     await create_static_profile(service)
     result = await service.create_web_session(
+        tenant_id=TEST_TENANT_ID,
         voice="Cindy",
         prompt=None,
         business_id="324800000000000001",
@@ -775,6 +921,7 @@ async def test_create_custom_voice_profile_and_use_for_session(b4_service) -> No
     })
     await create_static_profile(service)
     result = await service.create_web_session(
+        tenant_id=TEST_TENANT_ID,
         voice="custom_voice_001",
         prompt=None,
         business_id="324800000000000001",
@@ -820,6 +967,7 @@ async def test_unknown_voice_is_rejected_before_room_create(b4_service) -> None:
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice="missing_custom_voice",
             prompt=None,
             business_id="324800000000000001",
@@ -837,6 +985,7 @@ async def test_missing_prompt_profile_fails_before_livekit_room_created(b4_servi
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt=None,
             business_id="324800000000000001",
@@ -856,6 +1005,7 @@ async def test_missing_prompt_profile_fails_before_livekit_room_created(b4_servi
 async def test_empty_resolved_prompt_fails_before_livekit_room_created(b4_service) -> None:
     service, repository, room_manager, _agent_runner = b4_service
     await repository.create_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
         scene_code="empty_prompt_scene",
         name="空提示词异常场景",
         provider_key="static_profile",
@@ -865,6 +1015,7 @@ async def test_empty_resolved_prompt_fails_before_livekit_room_created(b4_servic
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt=None,
             business_id="324800000000000001",
@@ -884,6 +1035,7 @@ async def test_empty_resolved_prompt_fails_before_livekit_room_created(b4_servic
 async def test_empty_opening_fails_before_livekit_room_created(b4_service) -> None:
     service, repository, room_manager, _agent_runner = b4_service
     await repository.create_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
         scene_code="empty_opening_scene",
         name="空开场白异常场景",
         provider_key="static_profile",
@@ -893,6 +1045,7 @@ async def test_empty_opening_fails_before_livekit_room_created(b4_service) -> No
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt=None,
             business_id="324800000000000001",
@@ -913,15 +1066,19 @@ async def test_business_query_scene_uses_recov_collection_store(
     b4_service,
 ) -> None:
     service, _repository, _room_manager, _agent_runner = b4_service
-    await service.create_prompt_profile({
-        "scene_code": "intro_collection",
-        "name": "催收产品介绍",
-        "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
-        "prompt_text": None,
-        "opening_message": None,
-    })
+    await service.create_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        values={
+            "scene_code": "intro_collection",
+            "name": "催收产品介绍",
+            "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
+            "prompt_text": None,
+            "opening_message": None,
+        },
+    )
 
     preview = await service.preview_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
         business_id="2064663837392551940",
         scene_code="intro_collection",
         business_params={"identityName": "项目员工"},
@@ -944,6 +1101,7 @@ async def test_business_query_scene_uses_recov_collection_store(
     ]
 
     result = await service.create_web_session(
+        tenant_id=TEST_TENANT_ID,
         voice=None,
         prompt=None,
         business_id="2064663837392551940",
@@ -958,16 +1116,20 @@ async def test_business_query_scene_requires_business_id_and_identity_name(
     b4_service,
 ) -> None:
     service, _repository, _room_manager, _agent_runner = b4_service
-    await service.create_prompt_profile({
-        "scene_code": "intro_collection",
-        "name": "催收还款时间确认",
-        "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
-        "prompt_text": None,
-        "opening_message": None,
-    })
+    await service.create_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        values={
+            "scene_code": "intro_collection",
+            "name": "催收还款时间确认",
+            "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
+            "prompt_text": None,
+            "opening_message": None,
+        },
+    )
 
     with pytest.raises(CustomException) as missing_business_id:
         await service.preview_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
             business_id=None,
             scene_code="intro_collection",
             business_params={"identityName": "项目员工"},
@@ -975,6 +1137,7 @@ async def test_business_query_scene_requires_business_id_and_identity_name(
         )
     with pytest.raises(CustomException) as missing_identity_name:
         await service.preview_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
             business_id="2064663837392551940",
             scene_code="intro_collection",
             business_params={},
@@ -982,6 +1145,7 @@ async def test_business_query_scene_requires_business_id_and_identity_name(
         )
     with pytest.raises(CustomException) as mismatched_debt_id:
         await service.preview_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
             business_id="2064663837392551940",
             scene_code="intro_collection",
             business_params={
@@ -1002,6 +1166,7 @@ async def test_missing_scene_code_is_rejected_before_record_create(b4_service) -
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt=None,
             business_id="324800000000000001",
@@ -1022,6 +1187,7 @@ async def test_debug_prompt_is_removed_from_business_session(b4_service) -> None
 
     with pytest.raises(CustomException) as exc_info:
         await service.create_web_session(
+            tenant_id=TEST_TENANT_ID,
             voice=None,
             prompt="临时覆盖提示词",
             business_id="324800000000000001",
@@ -1200,6 +1366,8 @@ def test_prompt_requests_reject_removed_fields() -> None:
             "displayName": "张总自定义音色",
             "voiceType": "内置",
         })
+    with pytest.raises(ValidationError):
+        PromptCommonConfigUpdateRequest.model_validate({"content": "x" * 20_001})
 
 
 def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
@@ -1234,6 +1402,13 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "total": 1,
             }
 
+        async def get_prompt_common_config(self, **kwargs):
+            _ = kwargs
+            return {"content": "统一品牌语气", "updatedAt": None}
+
+        async def update_prompt_common_config(self, **kwargs):
+            return {"content": kwargs["content"], "updatedAt": None}
+
         async def preview_prompt_profile(self, **kwargs):
             _ = kwargs
             return {
@@ -1247,10 +1422,22 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: FakePromptConfigService()
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        user=SimpleNamespace(
+            tenant_id=TEST_TENANT_ID,
+            user_id=1,
+            nick_name="测试用户",
+        )
+    )
 
     with TestClient(app) as client:
         profiles = client.get("/ai-call/prompt-profiles").json()
         components = client.get("/ai-call/prompt-components").json()
+        common_config = client.get("/ai-call/prompt-common-config").json()
+        saved_common_config = client.put(
+            "/ai-call/prompt-common-config",
+            json={"content": "新的统一品牌语气"},
+        ).json()
         preview = client.post(
             "/ai-call/prompt-profiles/preview",
             json={
@@ -1262,4 +1449,6 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert profiles["code"] == 200
     assert profiles["rows"][0]["sceneCode"] == "debt_promise_repay_reminder"
     assert components["rows"][0]["componentKey"] == "platform_constraints"
+    assert common_config["data"]["content"] == "统一品牌语气"
+    assert saved_common_config["data"]["content"] == "新的统一品牌语气"
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"

@@ -40,6 +40,8 @@ async def get_outbound_statistics_controller(
         OutboundStatisticsService,
         Depends(get_outbound_statistics_service),
     ],
+    scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
+    task_id: Annotated[int | None, Query(alias="taskId", ge=1)] = None,
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     try:
@@ -49,6 +51,8 @@ async def get_outbound_statistics_controller(
             started_at_end=started_at_end,
             time_zone=time_zone,
             granularity=granularity,
+            scene_code=scene_code,
+            task_id=task_id,
         )
     except ValueError as exc:
         raise CustomException(msg=str(exc), status_code=400) from exc

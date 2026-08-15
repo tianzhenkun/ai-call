@@ -20,7 +20,9 @@ from app.services.ai_call.runtime_control.timing import read_database_time
 from app.services.ai_call.runtime_control.types import CommandStatus, EffectStatus
 
 from .attempt_projection import (
+    apply_exception_terminal_projection,
     apply_terminal_projection,
+    enroll_terminal_exception,
     refresh_task_counters,
     terminal_attempt_decision,
 )
@@ -226,16 +228,34 @@ class OutboundAttemptReconciler:
                 media_connected=media_connected,
             )
             if decision is not None:
-                apply_terminal_projection(
-                    task=task,
-                    target=target,
-                    attempt=attempt,
-                    record=record,
-                    decision=decision,
-                    now=now,
-                )
-                await self._session.flush()
-                await refresh_task_counters(self._session, task, now)
+                if target.exception_batch_id is not None:
+                    await apply_exception_terminal_projection(
+                        self._session,
+                        task=task,
+                        target=target,
+                        attempt=attempt,
+                        record=record,
+                        decision=decision,
+                        now=now,
+                    )
+                else:
+                    apply_terminal_projection(
+                        task=task,
+                        target=target,
+                        attempt=attempt,
+                        record=record,
+                        decision=decision,
+                        now=now,
+                    )
+                    await self._session.flush()
+                    await enroll_terminal_exception(
+                        self._session,
+                        target=target,
+                        attempt=attempt,
+                        record=record,
+                        now=now,
+                    )
+                    await refresh_task_counters(self._session, task, now)
                 terminal_projected = True
         if graph_valid and not terminal_projected:
             if _dialing_facts_complete(

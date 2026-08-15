@@ -74,17 +74,24 @@ from .schema import (
     EventOut,
     FailHandoffRequest,
     FinishHandoffRequest,
+    FollowUpReviewRequest,
     HandoffAgentOut,
     HandoffAgentStatusRequest,
     HandoffListOut,
     HandoffOut,
     InterruptSummaryOut,
+    PromptCommonConfigOut,
+    PromptCommonConfigUpdateRequest,
     PromptComponentOut,
+    PromptOptimizeOut,
+    PromptOptimizeRequest,
     PromptProfileCreateRequest,
     PromptProfileOut,
     PromptProfilePreviewOut,
     PromptProfilePreviewRequest,
     PromptProfileUpdateRequest,
+    PromptProfileVersionDetailOut,
+    PromptProfileVersionOut,
     QualityDetailOut,
     QualityReviewOut,
     QualityReviewRequest,
@@ -437,12 +444,15 @@ async def _commit_ai_call_record_audit(service: AiCallService) -> None:
     summary="查询业务提示词配置列表",
 )
 async def list_prompt_profiles_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 20,
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.list_prompt_profiles(
+        tenant_id=tenant_id,
         scene_code=scene_code,
         page_num=page_num,
         page_size=page_size,
@@ -457,9 +467,11 @@ async def list_prompt_profiles_controller(
 )
 async def get_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.get_prompt_profile(profile_id)
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_profile(tenant_id=tenant_id, profile_id=profile_id)
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="查询成功")
 
 
@@ -470,9 +482,19 @@ async def get_prompt_profile_controller(
 )
 async def create_prompt_profile_controller(
     request: PromptProfileCreateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.create_prompt_profile(request.model_dump())
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    result = await service.create_prompt_profile(
+        tenant_id=tenant_id,
+        values=request.model_dump(),
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
+    )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="创建成功")
 
 
@@ -484,9 +506,20 @@ async def create_prompt_profile_controller(
 async def update_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     request: PromptProfileUpdateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.update_prompt_profile(profile_id, request.model_dump())
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    result = await service.update_prompt_profile(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        values=request.model_dump(),
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
+    )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="保存成功")
 
 
@@ -502,6 +535,56 @@ async def list_prompt_components_controller(
     return TableResponse(rows=rows, total=result["total"], msg="查询成功")
 
 
+@AiCallRouter.get(
+    "/prompt-common-config",
+    summary="查询通用业务提示词",
+    response_model=ResponseSchema[PromptCommonConfigOut],
+)
+async def get_prompt_common_config_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_common_config(tenant_id=tenant_id)
+    return SuccessResponse(data=PromptCommonConfigOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.put(
+    "/prompt-common-config",
+    summary="保存通用业务提示词",
+    response_model=ResponseSchema[PromptCommonConfigOut],
+)
+async def update_prompt_common_config_controller(
+    request: PromptCommonConfigUpdateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.update_prompt_common_config(
+        tenant_id=tenant_id,
+        content=request.content,
+    )
+    return SuccessResponse(data=PromptCommonConfigOut.model_validate(result), msg="保存成功")
+
+
+@AiCallRouter.post(
+    "/prompt-profiles/ai-optimize",
+    summary="AI 生成或优化业务提示词",
+    response_model=ResponseSchema[PromptOptimizeOut],
+)
+async def optimize_prompt_profile_controller(
+    request: PromptOptimizeRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.optimize_prompt(
+        tenant_id=tenant_id,
+        values=request.model_dump(),
+    )
+    return SuccessResponse(data=PromptOptimizeOut.model_validate(result), msg="生成成功")
+
+
 @AiCallRouter.post(
     "/prompt-profiles/preview",
     summary="预览最终提示词",
@@ -509,15 +592,106 @@ async def list_prompt_components_controller(
 )
 async def preview_prompt_profile_controller(
     request: PromptProfilePreviewRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.preview_prompt_profile(
+        tenant_id=tenant_id,
         business_id=request.business_id,
         scene_code=request.scene_code,
         business_params=request.business_params,
         prompt=None,
+        prompt_text=request.prompt_text,
+        opening_message=request.opening_message,
+        product_info=request.product_info,
     )
     return SuccessResponse(data=PromptProfilePreviewOut.model_validate(result), msg="预览成功")
+
+
+@AiCallRouter.get(
+    "/prompt-profiles/{profileId}/versions",
+    summary="查询业务提示词历史版本",
+)
+async def list_prompt_profile_versions_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.list_prompt_profile_versions(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    rows = [PromptProfileVersionOut.model_validate(row) for row in result["rows"]]
+    return TableResponse(rows=rows, total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/prompt-profiles/{profileId}/versions/{versionId}",
+    summary="查询业务提示词版本详情",
+    response_model=ResponseSchema[PromptProfileVersionDetailOut],
+)
+async def get_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+    )
+    return SuccessResponse(
+        data=PromptProfileVersionDetailOut.model_validate(result),
+        msg="查询成功",
+    )
+
+
+@AiCallRouter.post(
+    "/prompt-profiles/{profileId}/versions/{versionId}/apply",
+    summary="应用业务提示词历史版本",
+    response_model=ResponseSchema[PromptProfileOut],
+)
+async def apply_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    result = await service.apply_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
+    )
+    return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="应用成功")
+
+
+@AiCallRouter.delete(
+    "/prompt-profiles/{profileId}/versions/{versionId}",
+    summary="删除业务提示词历史版本",
+)
+async def delete_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    await service.delete_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+    )
+    return SuccessResponse(data=None, msg="删除成功")
 
 
 @AiCallRouter.get(
@@ -662,6 +836,35 @@ async def reanalyze_record_semantic_analysis_controller(
 ) -> JSONResponse:
     result = await service.reanalyze_record_semantic_analysis(call_id)
     return SuccessResponse(data=SemanticAnalysisOut.model_validate(result), msg="重分析完成")
+
+
+@AiCallRouter.post(
+    "/records/{callId}/follow-up-review",
+    summary="确认 AI 通话后跟进建议",
+    response_model=ResponseSchema[SemanticAnalysisOut],
+)
+async def review_record_follow_up_controller(
+    call_id: Annotated[str, Path(alias="callId")],
+    request: FollowUpReviewRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    reviewed_by_name = (
+        getattr(user, "nick_name", None)
+        or getattr(user, "user_name", None)
+        if user is not None
+        else None
+    )
+    result = await service.review_record_follow_up(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        action=request.action,
+        reviewed_by=str(user_id),
+        reviewed_by_name=reviewed_by_name,
+    )
+    return SuccessResponse(data=SemanticAnalysisOut.model_validate(result), msg="确认成功")
 
 
 @AiCallRouter.get(

@@ -75,7 +75,7 @@ class LinphoneTestDialer:
                     business_id=str(request.task_id),
                     scene_code=request.scene_code,
                     business_params={
-                        "customerName": request.customer_name or "",
+                        **request.business_params,
                         "targetId": str(request.target_id),
                     },
                 )

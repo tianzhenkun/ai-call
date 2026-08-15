@@ -152,6 +152,13 @@ class AiCallOutboundTargetModel(MappedBase):
             "status",
             "next_attempt_at",
         ),
+        Index(
+            "idx_outbound_target_exception",
+            "tenant_id",
+            "exception_category",
+            "exception_batch_id",
+            "exception_entered_at",
+        ),
         {"comment": "通用外呼正式任务对象"},
     )
     __permission_strategy__ = None
@@ -164,10 +171,89 @@ class AiCallOutboundTargetModel(MappedBase):
     source_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
     phone_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255))
+    business_params_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default="{}",
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latest_result: Mapped[str | None] = mapped_column(String(128))
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exception_category: Mapped[str | None] = mapped_column(String(32))
+    exception_source_result: Mapped[str | None] = mapped_column(String(64))
+    exception_original_attempt_count: Mapped[int | None] = mapped_column(Integer)
+    exception_batch_id: Mapped[int | None] = mapped_column(BigInteger)
+    exception_entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallOutboundExceptionPolicyModel(MappedBase):
+    """租户异常补呼策略。"""
+
+    __tablename__ = "ai_call_outbound_exception_policy"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "category",
+            name="uk_outbound_exception_policy_tenant_category",
+        ),
+        {"comment": "租户异常补呼策略"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    interval_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallOutboundExceptionBatchModel(MappedBase):
+    """一次由用户明确启动的异常补呼批次。"""
+
+    __tablename__ = "ai_call_outbound_exception_batch"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uk_outbound_exception_batch_tenant_idempotency",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "active_slot",
+            name="uk_outbound_exception_batch_tenant_active",
+        ),
+        Index(
+            "idx_outbound_exception_batch_tenant_category",
+            "tenant_id",
+            "category",
+            "created_at",
+        ),
+        {"comment": "异常补呼批次"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    interval_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    target_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    active_slot: Mapped[str | None] = mapped_column(String(32))
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

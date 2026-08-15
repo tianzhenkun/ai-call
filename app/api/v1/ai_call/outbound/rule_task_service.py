@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import (
     AiCallPromptProfileModel,
+    AiCallPromptProfileVersionModel,
     AiCallRecordModel,
     AiCallVoiceProfileModel,
 )
@@ -20,9 +21,11 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.utils.id_util import generate_snowflake_id
 
+from .attempt_projection import complete_exception_batch_if_done, refresh_task_counters
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
     AiCallOutboundRuleModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
@@ -87,7 +90,7 @@ class OutboundRuleTaskService:
             retryable_results=[
                 RetryableResultMeta(value="no_answer", label="无人接听"),
                 RetryableResultMeta(value="busy", label="忙线"),
-                RetryableResultMeta(value="call_failed", label="呼叫失败"),
+                RetryableResultMeta(value="rejected", label="拒接"),
             ],
         )
 
@@ -121,7 +124,7 @@ class OutboundRuleTaskService:
                 ],
                 retry_count=2,
                 retry_intervals_minutes=[30, 60],
-                retryable_results=["no_answer", "busy", "call_failed"],
+                retryable_results=["no_answer", "busy"],
             ),
         )
 
@@ -305,6 +308,11 @@ class OutboundRuleTaskService:
             row_number=1,
             phone_number=request.phone_number,
             customer_name=request.customer_name,
+            business_params_json=_json(
+                {"customerName": request.customer_name}
+                if request.customer_name
+                else {}
+            ),
             normalized_phone=request.phone_number,
             is_valid=True,
             reasons_json=None,
@@ -393,6 +401,16 @@ class OutboundRuleTaskService:
             if request.execution_mode == "scheduled"
             else None
         )
+        prompt_version = await db.scalar(
+            select(AiCallPromptProfileVersionModel)
+            .where(
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == prompt.id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+            .limit(1)
+        )
         snapshot = {
             "request": request_config,
             "prompt": {
@@ -400,6 +418,12 @@ class OutboundRuleTaskService:
                 "sceneCode": prompt.scene_code,
                 "name": prompt.name,
                 "providerKey": prompt.provider_key,
+                "promptText": prompt.prompt_text,
+                "openingMessage": prompt.opening_message,
+                "productInfo": prompt.product_info,
+                "variables": self._load_list(prompt.variables_json),
+                "versionId": str(prompt_version.id) if prompt_version is not None else None,
+                "versionNo": prompt_version.version_no if prompt_version is not None else 1,
             },
             "voice": {
                 "scope": (
@@ -548,6 +572,7 @@ class OutboundRuleTaskService:
                     source_row_number=row.row_number,
                     phone_number=row.normalized_phone or row.phone_number,
                     customer_name=row.customer_name,
+                    business_params_json=row.business_params_json,
                     status="PENDING",
                     attempt_count=0,
                     latest_result=None,
@@ -571,6 +596,7 @@ class OutboundRuleTaskService:
         task_status: str | None,
         begin_time: str | None,
         end_time: str | None,
+        scene_code: str | None = None,
     ) -> tuple[list[OutboundTaskOut], int]:
         conditions = [AiCallOutboundTaskModel.tenant_id == tenant_id]
         if task_name and task_name.strip():
@@ -583,6 +609,8 @@ class OutboundRuleTaskService:
             )
         if end_time:
             conditions.append(AiCallOutboundTaskModel.created_at <= self._parse_datetime(end_time))
+        if scene_code and scene_code.strip():
+            conditions.append(AiCallOutboundTaskModel.scene_code == scene_code.strip())
         total = int(
             await db.scalar(select(func.count(AiCallOutboundTaskModel.id)).where(*conditions)) or 0
         )
@@ -710,6 +738,29 @@ class OutboundRuleTaskService:
                 )
             )
             await db.flush()
+            batch_ids = (
+                await db.scalars(
+                    select(AiCallOutboundTargetModel.exception_batch_id)
+                    .where(
+                        AiCallOutboundTargetModel.tenant_id == tenant_id,
+                        AiCallOutboundTargetModel.task_id == task_id,
+                        AiCallOutboundTargetModel.exception_batch_id.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+            for batch_id in batch_ids:
+                batch = await db.scalar(
+                    select(AiCallOutboundExceptionBatchModel)
+                    .where(
+                        AiCallOutboundExceptionBatchModel.tenant_id == tenant_id,
+                        AiCallOutboundExceptionBatchModel.id == batch_id,
+                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                    )
+                    .with_for_update()
+                )
+                if batch is not None:
+                    await complete_exception_batch_if_done(db, batch, now)
             if action == "stop":
                 has_active_target = bool(
                     await self._active_target_count(db, tenant_id, task_id)
@@ -746,38 +797,7 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         task: AiCallOutboundTaskModel,
     ) -> None:
-        status_rows = (
-            await db.execute(
-                select(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                    func.count(AiCallOutboundTargetModel.id),
-                )
-                .where(
-                    AiCallOutboundTargetModel.tenant_id == task.tenant_id,
-                    AiCallOutboundTargetModel.task_id == task.id,
-                )
-                .group_by(
-                    AiCallOutboundTargetModel.status,
-                    AiCallOutboundTargetModel.latest_result,
-                )
-            )
-        ).all()
-        task.completed_targets = sum(
-            int(count)
-            for target_status, _, count in status_rows
-            if target_status in {"COMPLETED", "CANCELLED"}
-        )
-        task.connected_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result == "connected"
-        )
-        task.failed_targets = sum(
-            int(count)
-            for target_status, latest_result, count in status_rows
-            if target_status == "COMPLETED" and latest_result != "connected"
-        )
+        await refresh_task_counters(db, task, _now())
 
     async def list_targets(
         self,
@@ -871,7 +891,10 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
-        prompt_conditions = [AiCallPromptProfileModel.scene_code == request.scene_code]
+        prompt_conditions = [
+            AiCallPromptProfileModel.tenant_id == tenant_id,
+            AiCallPromptProfileModel.scene_code == request.scene_code,
+        ]
         if request.prompt_profile_id:
             prompt_conditions.append(
                 AiCallPromptProfileModel.id

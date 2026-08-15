@@ -42,6 +42,10 @@ def test_post_call_models_keep_portable_scalar_contract() -> None:
     assert semantic_columns["follow_up_reason"].type.length == 500
     assert semantic_columns["follow_up_confidence"].type.length == 16
     assert "follow_up_preferred_at" in semantic_columns
+    assert semantic_columns["follow_up_review_status"].type.length == 16
+    assert semantic_columns["follow_up_reviewed_by"].type.length == 64
+    assert semantic_columns["follow_up_reviewed_by_name"].type.length == 64
+    assert "follow_up_reviewed_at" in semantic_columns
 
     task_columns = {
         column.key: column for column in sa_inspect(AiCallFollowUpTaskModel).columns
@@ -323,6 +327,46 @@ def test_post_call_follow_up_decision_matrix(
     assert decision.action == expected_action
 
 
+def test_ai_suggested_no_follow_up_requires_manual_review_unless_refused() -> None:
+    suggested = SimpleNamespace(
+        analysis_status="2",
+        follow_up_review_status=None,
+        follow_up_suggested=True,
+        follow_up_consent="missing",
+        follow_up_confidence="low",
+        follow_up_reason="客户询问试用",
+        follow_up_preferred_at=None,
+    )
+    automatic = SimpleNamespace(
+        **{
+            **suggested.__dict__,
+            "follow_up_consent": "explicit",
+            "follow_up_confidence": "high",
+        }
+    )
+    no_follow_up = SimpleNamespace(
+        **{
+            **suggested.__dict__,
+            "follow_up_suggested": False,
+            "follow_up_consent": "missing",
+            "follow_up_reason": None,
+        }
+    )
+    refused = SimpleNamespace(
+        **{
+            **no_follow_up.__dict__,
+            "follow_up_consent": "refused",
+        }
+    )
+
+    assert post_call_follow_up_service.requires_manual_follow_up_review(suggested)
+    assert post_call_follow_up_service.requires_manual_follow_up_review(no_follow_up)
+    assert not post_call_follow_up_service.requires_manual_follow_up_review(
+        automatic
+    )
+    assert not post_call_follow_up_service.requires_manual_follow_up_review(refused)
+
+
 @pytest.fixture
 async def session_factory(tmp_path):
     database_path = tmp_path / "post-call-follow-up.db"
@@ -551,6 +595,194 @@ async def test_post_call_follow_up_is_idempotent_for_same_formal_call(
             .where(AiCallFollowUpTaskModel.source_call_id == "call-formal-1")
         )
         assert count == 1
+
+
+@pytest.mark.anyio
+async def test_manual_review_creates_follow_up_for_suggested_formal_call(
+    session_factory,
+) -> None:
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id="call-manual-review-create",
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(
+            call_id="call-manual-review-create"
+        )
+        assert analysis is not None
+        analysis.follow_up_consent = "missing"
+        analysis.follow_up_confidence = "medium"
+
+        created = await post_call_follow_up_service.AiCallPostCallFollowUpService(
+            repository
+        ).review(
+            analysis,
+            action="create",
+            reviewed_by="20",
+            reviewed_by_name="坐席20",
+        )
+
+        assert created is not None
+        assert created.status == "pending"
+        assert analysis.follow_up_review_status == "created"
+        assert analysis.follow_up_reviewed_by == "20"
+        assert analysis.follow_up_reviewed_by_name == "坐席20"
+        assert analysis.follow_up_reviewed_at is not None
+
+
+@pytest.mark.anyio
+async def test_manual_review_creates_follow_up_when_ai_suggests_none(
+    session_factory,
+) -> None:
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id="call-manual-review-ai-none",
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(
+            call_id="call-manual-review-ai-none"
+        )
+        assert analysis is not None
+        analysis.follow_up_suggested = False
+        analysis.follow_up_consent = "missing"
+        analysis.follow_up_confidence = "low"
+        analysis.follow_up_reason = None
+
+        created = await post_call_follow_up_service.AiCallPostCallFollowUpService(
+            repository
+        ).review(
+            analysis,
+            action="create",
+            reviewed_by="20",
+            reviewed_by_name="坐席20",
+        )
+
+        assert created is not None
+        assert created.follow_up_reason == "人工确认需要跟进"
+        assert analysis.follow_up_review_status == "created"
+
+
+@pytest.mark.anyio
+async def test_manual_review_dismissal_prevents_later_automatic_creation(
+    session_factory,
+) -> None:
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id="call-manual-review-dismiss",
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as db, db.begin():
+        repository = AiCallRecordRepository(db)
+        analysis = await repository.get_semantic_analysis(
+            call_id="call-manual-review-dismiss"
+        )
+        assert analysis is not None
+        analysis.follow_up_consent = "missing"
+        analysis.follow_up_confidence = "low"
+        service = post_call_follow_up_service.AiCallPostCallFollowUpService(
+            repository
+        )
+
+        dismissed = await service.review(
+            analysis,
+            action="dismiss",
+            reviewed_by="20",
+            reviewed_by_name="坐席20",
+        )
+
+        assert dismissed is None
+        assert analysis.follow_up_review_status == "dismissed"
+        assert analysis.follow_up_reviewed_at is not None
+
+        with pytest.raises(ValueError, match="已确认无需跟进"):
+            await service.review(
+                analysis,
+                action="create",
+                reviewed_by="20",
+                reviewed_by_name="坐席20",
+            )
+
+        analysis.follow_up_consent = "explicit"
+        analysis.follow_up_confidence = "high"
+        assert await service.apply(analysis) is None
+        count = await db.scalar(
+            select(func.count())
+            .select_from(AiCallFollowUpTaskModel)
+            .where(
+                AiCallFollowUpTaskModel.source_call_id
+                == "call-manual-review-dismiss"
+            )
+        )
+        assert count == 0
+
+
+@pytest.mark.anyio
+async def test_manual_review_rechecks_persisted_status_before_accepting_action(
+    session_factory,
+) -> None:
+    await _seed_post_call_analysis(
+        session_factory,
+        call_id="call-manual-review-stale",
+        entry_type="sip_outbound",
+        with_formal_attempt=True,
+    )
+
+    async with session_factory() as stale_db:
+        stored_analysis = await AiCallRecordRepository(
+            stale_db
+        ).get_semantic_analysis(call_id="call-manual-review-stale")
+        assert stored_analysis is not None
+        stale_analysis = SimpleNamespace(
+            call_id=stored_analysis.call_id,
+            analysis_status="2",
+            follow_up_review_status=None,
+            follow_up_suggested=True,
+            follow_up_consent="missing",
+            follow_up_confidence="low",
+            follow_up_reason="客户询问试用",
+            follow_up_preferred_at=None,
+            analysis_result_dict={},
+            scene_code=stored_analysis.scene_code,
+        )
+        await stale_db.rollback()
+
+        async with session_factory() as current_db, current_db.begin():
+            current_repository = AiCallRecordRepository(current_db)
+            current_analysis = await current_repository.get_semantic_analysis(
+                call_id="call-manual-review-stale"
+            )
+            assert current_analysis is not None
+            current_analysis.follow_up_consent = "missing"
+            current_analysis.follow_up_confidence = "low"
+            await post_call_follow_up_service.AiCallPostCallFollowUpService(
+                current_repository
+            ).review(
+                current_analysis,
+                action="dismiss",
+                reviewed_by="20",
+                reviewed_by_name="坐席20",
+            )
+
+        async with stale_db.begin():
+            with pytest.raises(ValueError, match="已确认无需跟进"):
+                await post_call_follow_up_service.AiCallPostCallFollowUpService(
+                    AiCallRecordRepository(stale_db)
+                ).review(
+                    stale_analysis,
+                    action="create",
+                    reviewed_by="21",
+                    reviewed_by_name="坐席21",
+                )
 
 
 @pytest.mark.anyio

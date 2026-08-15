@@ -18,7 +18,9 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptCommonConfigModel,
     AiCallPromptProfileModel,
+    AiCallPromptProfileVersionModel,
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
     AiCallRecordingModel,
@@ -29,6 +31,8 @@ from app.api.v1.ai_call.model import (
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
+    AiCallOutboundExceptionPolicyModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -144,6 +148,94 @@ class AiCallRecordRepository:
             )
         )
         return result.scalar_one_or_none()
+
+    async def get_exception_handling(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> dict | None:
+        row = (
+            await self.db.execute(
+                select(
+                    AiCallOutboundTargetModel,
+                    AiCallOutboundExceptionBatchModel,
+                )
+                .join(
+                    AiCallOutboundAttemptModel,
+                    (
+                        AiCallOutboundAttemptModel.tenant_id
+                        == AiCallOutboundTargetModel.tenant_id
+                    )
+                    & (
+                        AiCallOutboundAttemptModel.target_id
+                        == AiCallOutboundTargetModel.id
+                    ),
+                )
+                .outerjoin(
+                    AiCallOutboundExceptionBatchModel,
+                    (
+                        AiCallOutboundExceptionBatchModel.tenant_id
+                        == AiCallOutboundTargetModel.tenant_id
+                    )
+                    & (
+                        AiCallOutboundExceptionBatchModel.id
+                        == AiCallOutboundTargetModel.exception_batch_id
+                    ),
+                )
+                .where(
+                    AiCallOutboundTargetModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.call_id == call_id,
+                    AiCallOutboundTargetModel.exception_category.is_not(None),
+                )
+                .limit(1)
+            )
+        ).first()
+        if row is None:
+            return None
+        target, batch = row
+        original_count = target.exception_original_attempt_count or target.attempt_count
+        retry_count = max(0, target.attempt_count - original_count)
+        max_retry_count = batch.max_retry_count if batch is not None else 0
+        if batch is None and target.exception_category != "invalid_number":
+            max_retry_count = int(
+                await self.db.scalar(
+                    select(AiCallOutboundExceptionPolicyModel.max_retry_count).where(
+                        AiCallOutboundExceptionPolicyModel.tenant_id == tenant_id,
+                        AiCallOutboundExceptionPolicyModel.category
+                        == target.exception_category,
+                    )
+                )
+                or {
+                    "no_answer": 3,
+                    "rejected": 2,
+                    "early_hangup": 2,
+                }.get(target.exception_category, 0)
+            )
+        if target.exception_category == "invalid_number":
+            display_status = "UNAVAILABLE"
+        elif target.exception_batch_id is None:
+            display_status = "PENDING"
+        elif target.status in {"DIALING", "IN_CALL"}:
+            display_status = "CALLING"
+        elif target.status == "RETRY_WAIT":
+            display_status = "WAITING"
+        elif target.status == "CANCELLED":
+            display_status = "STOPPED"
+        elif target.latest_result == "connected":
+            display_status = "CONNECTED"
+        elif retry_count >= max_retry_count:
+            display_status = "MAXED"
+        else:
+            display_status = "STOPPED"
+        return {
+            "category": target.exception_category,
+            "status": display_status,
+            "originalAttemptCount": original_count,
+            "retryCount": retry_count,
+            "maxRetryCount": max_retry_count,
+            "lastResult": target.latest_result,
+        }
 
     async def get_follow_up_relation(
         self,
@@ -498,7 +590,7 @@ class AiCallRecordRepository:
             .limit(safe_page_size)
         )
         rows = (await self.db.execute(stmt)).scalars().all()
-        await self._attach_outbound_context(rows, tenant_id=tenant_id)
+        await self.attach_outbound_context(rows, tenant_id=tenant_id)
         await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_semantic_analysis(rows)
         await self._attach_follow_up_context(rows, tenant_id=tenant_id)
@@ -558,6 +650,7 @@ class AiCallRecordRepository:
                     else None
                 ),
                 "qualityReviewResult": review.quality_result if review else None,
+                "qualityReviewReason": review.quality_reason if review else None,
             }
 
     async def _attach_semantic_analysis(
@@ -575,6 +668,9 @@ class AiCallRecordRepository:
                     AiCallSemanticAnalysisModel.analysis_result,
                     AiCallSemanticAnalysisModel.customer_intent,
                     AiCallSemanticAnalysisModel.follow_up_suggested,
+                    AiCallSemanticAnalysisModel.follow_up_consent,
+                    AiCallSemanticAnalysisModel.follow_up_confidence,
+                    AiCallSemanticAnalysisModel.follow_up_review_status,
                 ).where(
                     AiCallSemanticAnalysisModel.call_id.in_(call_ids),
                     AiCallSemanticAnalysisModel.analysis_scene_code
@@ -588,6 +684,17 @@ class AiCallRecordRepository:
                 "analysisResult": row.analysis_result,
                 "customerIntent": row.customer_intent,
                 "followUpSuggested": bool(row.follow_up_suggested),
+                "followUpRequiresReview": (
+                    row.analysis_status == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+                    and row.follow_up_review_status is None
+                    and row.follow_up_consent != "refused"
+                    and not (
+                        row.follow_up_suggested
+                        and row.follow_up_consent == "explicit"
+                        and row.follow_up_confidence == "high"
+                    )
+                ),
+                "followUpReviewStatus": row.follow_up_review_status,
             }
             for row in analysis_rows
         }
@@ -653,7 +760,7 @@ class AiCallRecordRepository:
                 else {}
             )
 
-    async def _attach_outbound_context(
+    async def attach_outbound_context(
         self,
         records: list[AiCallRecordModel],
         *,
@@ -1517,6 +1624,23 @@ class AiCallRecordRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_semantic_analysis_for_update(
+        self,
+        *,
+        call_id: str,
+        analysis_scene_code: str = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+    ) -> AiCallSemanticAnalysisModel | None:
+        result = await self.db.execute(
+            select(AiCallSemanticAnalysisModel)
+            .where(
+                AiCallSemanticAnalysisModel.call_id == call_id,
+                AiCallSemanticAnalysisModel.analysis_scene_code
+                == analysis_scene_code,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def claim_semantic_analysis(
         self,
         *,
@@ -1943,21 +2067,64 @@ class AiCallRecordRepository:
         await self.db.refresh(profile)
         return profile
 
+    async def get_prompt_common_config(
+        self,
+        *,
+        tenant_id: str,
+    ) -> AiCallPromptCommonConfigModel | None:
+        return await self.db.scalar(
+            select(AiCallPromptCommonConfigModel).where(
+                AiCallPromptCommonConfigModel.tenant_id == tenant_id
+            )
+        )
+
+    async def save_prompt_common_config(
+        self,
+        *,
+        tenant_id: str,
+        content: str,
+    ) -> AiCallPromptCommonConfigModel:
+        config = await self.get_prompt_common_config(tenant_id=tenant_id)
+        now = datetime.now(timezone.utc)
+        if config is None:
+            config = AiCallPromptCommonConfigModel(
+                id=generate_snowflake_id(),
+                tenant_id=tenant_id,
+                content=content,
+                updated_at=now,
+            )
+            self.db.add(config)
+        else:
+            config.content = content
+            config.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(config)
+        return config
+
     async def get_prompt_profile(
         self,
         profile_id: int,
+        *,
+        tenant_id: str,
+        for_update: bool = False,
     ) -> AiCallPromptProfileModel | None:
-        result = await self.db.execute(
-            select(AiCallPromptProfileModel).where(AiCallPromptProfileModel.id == profile_id)
+        stmt = select(AiCallPromptProfileModel).where(
+            AiCallPromptProfileModel.id == profile_id,
+            AiCallPromptProfileModel.tenant_id == tenant_id,
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_prompt_profile_by_scene(
         self,
         *,
+        tenant_id: str,
         scene_code: str,
     ) -> AiCallPromptProfileModel | None:
         stmt = select(AiCallPromptProfileModel).where(
+            AiCallPromptProfileModel.tenant_id == tenant_id,
             AiCallPromptProfileModel.scene_code == scene_code,
         )
         result = await self.db.execute(stmt.limit(1))
@@ -1966,16 +2133,19 @@ class AiCallRecordRepository:
     async def list_prompt_profiles(
         self,
         *,
+        tenant_id: str,
         scene_code: str | None = None,
         page_num: int = 1,
         page_size: int = 20,
     ) -> tuple[list[AiCallPromptProfileModel], int]:
         stmt = self._prompt_profile_filters(
             select(AiCallPromptProfileModel),
+            tenant_id=tenant_id,
             scene_code=scene_code,
         )
         count_stmt = self._prompt_profile_filters(
             select(func.count()).select_from(AiCallPromptProfileModel),
+            tenant_id=tenant_id,
             scene_code=scene_code,
         )
         total = int((await self.db.execute(count_stmt)).scalar_one())
@@ -1992,9 +2162,15 @@ class AiCallRecordRepository:
     async def update_prompt_profile(
         self,
         profile_id: int,
+        *,
+        tenant_id: str,
         **values,
     ) -> AiCallPromptProfileModel | None:
-        profile = await self.get_prompt_profile(profile_id)
+        profile = await self.get_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            for_update=True,
+        )
         if profile is None:
             return None
         for key, value in values.items():
@@ -2004,6 +2180,142 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(profile)
         return profile
+
+    async def create_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        snapshot_json: str,
+        creation_method: str,
+        created_by: int | None,
+        created_by_name: str | None,
+        restored_from_version_id: int | None = None,
+    ) -> AiCallPromptProfileVersionModel:
+        version_no = int(
+            await self.db.scalar(
+                select(func.max(AiCallPromptProfileVersionModel.version_no)).where(
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id == profile_id,
+                )
+            )
+            or 0
+        ) + 1
+        version = AiCallPromptProfileVersionModel(
+            id=generate_snowflake_id(),
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_no=version_no,
+            snapshot_json=snapshot_json,
+            creation_method=creation_method,
+            restored_from_version_id=restored_from_version_id,
+            created_by=created_by,
+            created_by_name=created_by_name,
+            created_at=datetime.now(timezone.utc),
+            deleted_at=None,
+        )
+        self.db.add(version)
+        await self.db.flush()
+        await self.db.refresh(version)
+        return version
+
+    async def list_prompt_profile_versions(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> list[AiCallPromptProfileVersionModel]:
+        result = await self.db.execute(
+            select(AiCallPromptProfileVersionModel)
+            .where(
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == profile_id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_prompt_profile_version_summaries(
+        self,
+        *,
+        tenant_id: str,
+        profile_ids: list[int],
+    ) -> dict[int, tuple[int, int]]:
+        if not profile_ids:
+            return {}
+        rows = (
+            await self.db.execute(
+                select(
+                    AiCallPromptProfileVersionModel.profile_id,
+                    func.max(AiCallPromptProfileVersionModel.version_no),
+                    func.count(AiCallPromptProfileVersionModel.id),
+                )
+                .where(
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id.in_(profile_ids),
+                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
+                )
+                .group_by(AiCallPromptProfileVersionModel.profile_id)
+            )
+        ).all()
+        return {
+            int(profile_id): (int(version_no), int(version_count))
+            for profile_id, version_no, version_count in rows
+        }
+
+    async def get_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+        include_deleted: bool = False,
+    ) -> AiCallPromptProfileVersionModel | None:
+        stmt = select(AiCallPromptProfileVersionModel).where(
+            AiCallPromptProfileVersionModel.id == version_id,
+            AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+            AiCallPromptProfileVersionModel.profile_id == profile_id,
+        )
+        if not include_deleted:
+            stmt = stmt.where(AiCallPromptProfileVersionModel.deleted_at.is_(None))
+        return await self.db.scalar(stmt)
+
+    async def get_latest_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> AiCallPromptProfileVersionModel | None:
+        return await self.db.scalar(
+            select(AiCallPromptProfileVersionModel)
+            .where(
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == profile_id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+            .limit(1)
+        )
+
+    async def soft_delete_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+    ) -> AiCallPromptProfileVersionModel | None:
+        version = await self.get_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if version is None:
+            return None
+        version.deleted_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        await self.db.refresh(version)
+        return version
 
     async def ensure_builtin_voice_profiles(
         self,
@@ -2667,19 +2979,56 @@ class AiCallRecordRepository:
             }:
                 stmt = stmt.where(selected_task_status == follow_up_status)
             elif follow_up_status in {"suggested", "none"}:
-                suggested = follow_up_status == "suggested"
                 semantic_conditions = [
                     AiCallSemanticAnalysisModel.call_id
                     == AiCallRecordModel.call_id,
                     AiCallSemanticAnalysisModel.analysis_scene_code
                     == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
-                    AiCallSemanticAnalysisModel.follow_up_suggested
-                    == suggested,
                 ]
-                if follow_up_status == "none":
+                if follow_up_status == "suggested":
+                    semantic_conditions.extend(
+                        [
+                            AiCallSemanticAnalysisModel.analysis_status
+                            == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED,
+                            AiCallSemanticAnalysisModel.follow_up_review_status.is_(
+                                None
+                            ),
+                            or_(
+                                AiCallSemanticAnalysisModel.follow_up_consent.is_(
+                                    None
+                                ),
+                                AiCallSemanticAnalysisModel.follow_up_consent
+                                != "refused",
+                            ),
+                            or_(
+                                AiCallSemanticAnalysisModel.follow_up_suggested.is_(
+                                    False
+                                ),
+                                AiCallSemanticAnalysisModel.follow_up_consent.is_(
+                                    None
+                                ),
+                                AiCallSemanticAnalysisModel.follow_up_consent
+                                != "explicit",
+                                AiCallSemanticAnalysisModel.follow_up_confidence.is_(
+                                    None
+                                ),
+                                AiCallSemanticAnalysisModel.follow_up_confidence
+                                != "high",
+                            ),
+                        ]
+                    )
+                else:
                     semantic_conditions.append(
                         AiCallSemanticAnalysisModel.analysis_status
                         == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+                    )
+                    semantic_conditions.append(
+                        or_(
+                            AiCallSemanticAnalysisModel.follow_up_consent
+                            == "refused",
+                            AiCallSemanticAnalysisModel.follow_up_review_status
+                            == "dismissed",
+                        )
                     )
                 stmt = stmt.where(
                     select(AiCallSemanticAnalysisModel.id)
@@ -2695,6 +3044,10 @@ class AiCallRecordRepository:
 
     @staticmethod
     def _prompt_profile_filters(stmt: Select, **filters) -> Select:
+        if filters.get("tenant_id"):
+            stmt = stmt.where(
+                AiCallPromptProfileModel.tenant_id == filters["tenant_id"]
+            )
         if filters.get("scene_code"):
             stmt = stmt.where(AiCallPromptProfileModel.scene_code == filters["scene_code"])
         return stmt

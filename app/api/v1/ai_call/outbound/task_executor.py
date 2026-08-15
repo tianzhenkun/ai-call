@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Protocol
 from uuid import uuid4
@@ -19,7 +19,12 @@ from app.utils.id_util import generate_snowflake_id
 
 from .attempt_projection import (
     BUSY_END_REASONS,
+    INVALID_NUMBER_END_REASONS,
     NO_ANSWER_END_REASONS,
+    REJECTED_END_REASONS,
+    AttemptTerminalDecision,
+    apply_exception_terminal_projection,
+    enroll_terminal_exception,
     outbound_retry_interval,
     refresh_task_counters,
 )
@@ -32,6 +37,7 @@ from .queue_control import (
 )
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -54,6 +60,8 @@ class OutboundDialRequest:
     scene_code: str
     voice: str
     prompt_profile_id: str | None
+    business_params: dict = field(default_factory=dict)
+    prompt_snapshot: dict | None = None
     line: SipLineSnapshot | None = None
     answer_mode: Literal["linphone", "web"] = "linphone"
 
@@ -187,6 +195,19 @@ class OutboundTaskExecutor:
                 if self.owner_runtime_start is None:
                     await self.execute_claimed(claimed)
                 processed += 1
+        exception_task_keys = await self._list_exception_task_keys(now)
+        for task_key in exception_task_keys:
+            for _ in range(self.target_batch_size):
+                claimed = await self._claim_target(
+                    task_key,
+                    self.now_provider(),
+                    exception_batch=True,
+                )
+                if claimed is None:
+                    break
+                if self.owner_runtime_start is None:
+                    await self.execute_claimed(claimed)
+                processed += 1
         return processed
 
     async def claim_manual_test(
@@ -270,9 +291,11 @@ class OutboundTaskExecutor:
                 attempt_no=attempt_no,
                 phone_number=target.phone_number,
                 customer_name=target.customer_name,
+                business_params=self._target_business_params(target),
                 scene_code=task.scene_code,
                 voice=task.voice,
                 prompt_profile_id=task.prompt_profile_id,
+                prompt_snapshot=self._task_prompt_snapshot(task),
                 line=self._task_line_snapshot(task),
             )
             call_id = uuid4().hex
@@ -457,9 +480,11 @@ class OutboundTaskExecutor:
                     attempt_no=attempt.attempt_no,
                     phone_number=target.phone_number,
                     customer_name=target.customer_name,
+                    business_params=self._target_business_params(target),
                     scene_code=task.scene_code,
                     voice=task.voice,
                     prompt_profile_id=task.prompt_profile_id,
+                    prompt_snapshot=self._task_prompt_snapshot(task),
                     line=self._task_line_snapshot(task),
                     answer_mode=task.answer_mode,
                 )
@@ -692,6 +717,43 @@ class OutboundTaskExecutor:
             await db.commit()
             return task_keys
 
+    async def _list_exception_task_keys(self, now: datetime) -> list[TaskKey]:
+        async with self.session_factory() as db:
+            tasks = (
+                await db.scalars(
+                    select(AiCallOutboundTaskModel)
+                    .join(
+                        AiCallOutboundTargetModel,
+                        (AiCallOutboundTargetModel.tenant_id == AiCallOutboundTaskModel.tenant_id)
+                        & (AiCallOutboundTargetModel.task_id == AiCallOutboundTaskModel.id),
+                    )
+                    .join(
+                        AiCallOutboundExceptionBatchModel,
+                        (
+                            AiCallOutboundExceptionBatchModel.tenant_id
+                            == AiCallOutboundTargetModel.tenant_id
+                        )
+                        & (
+                            AiCallOutboundExceptionBatchModel.id
+                            == AiCallOutboundTargetModel.exception_batch_id
+                        ),
+                    )
+                    .where(
+                        AiCallOutboundTaskModel.status.in_({"RUNNING", "COMPLETED"}),
+                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                        AiCallOutboundTargetModel.status == "RETRY_WAIT",
+                        AiCallOutboundTargetModel.next_attempt_at <= now,
+                    )
+                    .order_by(AiCallOutboundTaskModel.id)
+                    .limit(self.task_batch_size * 4)
+                )
+            ).unique().all()
+            return [
+                TaskKey(task.tenant_id, task.id)
+                for task in tasks
+                if self._within_call_window(task, now)
+            ][: self.task_batch_size]
+
     @staticmethod
     async def _target_work_counts(
         db: AsyncSession,
@@ -704,6 +766,7 @@ class OutboundTaskExecutor:
                 select(func.count(AiCallOutboundTargetModel.id)).where(
                     AiCallOutboundTargetModel.tenant_id == tenant_id,
                     AiCallOutboundTargetModel.task_id == task_id,
+                    AiCallOutboundTargetModel.exception_batch_id.is_(None),
                     AiCallOutboundTargetModel.status.in_(
                         ["PENDING", "DIALING", "IN_CALL", "RETRY_WAIT"]
                     ),
@@ -716,6 +779,7 @@ class OutboundTaskExecutor:
                 select(func.count(AiCallOutboundTargetModel.id)).where(
                     AiCallOutboundTargetModel.tenant_id == tenant_id,
                     AiCallOutboundTargetModel.task_id == task_id,
+                    AiCallOutboundTargetModel.exception_batch_id.is_(None),
                     or_(
                         AiCallOutboundTargetModel.status == "PENDING",
                         (
@@ -739,6 +803,7 @@ class OutboundTaskExecutor:
             select(func.min(AiCallOutboundTargetModel.next_attempt_at)).where(
                 AiCallOutboundTargetModel.tenant_id == tenant_id,
                 AiCallOutboundTargetModel.task_id == task_id,
+                AiCallOutboundTargetModel.exception_batch_id.is_(None),
                 AiCallOutboundTargetModel.status == "RETRY_WAIT",
             )
         )
@@ -747,6 +812,8 @@ class OutboundTaskExecutor:
         self,
         task_key: TaskKey,
         now: datetime,
+        *,
+        exception_batch: bool = False,
     ) -> ClaimedAttempt | None:
         async with self.session_factory() as db:
             task = await db.scalar(
@@ -759,7 +826,8 @@ class OutboundTaskExecutor:
             )
             if (
                 task is None
-                or task.status != "RUNNING"
+                or task.status
+                not in ({"RUNNING", "COMPLETED"} if exception_batch else {"RUNNING"})
                 or not self._within_call_window(task, now)
             ):
                 return None
@@ -834,12 +902,32 @@ class OutboundTaskExecutor:
                     .where(
                         AiCallOutboundTargetModel.tenant_id == task_key.tenant_id,
                         AiCallOutboundTargetModel.task_id == task_key.task_id,
-                        or_(
-                            AiCallOutboundTargetModel.status == "PENDING",
+                        (
                             (
-                                (AiCallOutboundTargetModel.status == "RETRY_WAIT")
+                                AiCallOutboundTargetModel.exception_batch_id.is_not(None)
+                                & (AiCallOutboundTargetModel.status == "RETRY_WAIT")
                                 & (AiCallOutboundTargetModel.next_attempt_at <= now)
-                            ),
+                                & exists(
+                                    select(AiCallOutboundExceptionBatchModel.id).where(
+                                        AiCallOutboundExceptionBatchModel.tenant_id
+                                        == task_key.tenant_id,
+                                        AiCallOutboundExceptionBatchModel.id
+                                        == AiCallOutboundTargetModel.exception_batch_id,
+                                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                                    )
+                                )
+                            )
+                            if exception_batch
+                            else (
+                                AiCallOutboundTargetModel.exception_batch_id.is_(None)
+                                & or_(
+                                    AiCallOutboundTargetModel.status == "PENDING",
+                                    (
+                                        (AiCallOutboundTargetModel.status == "RETRY_WAIT")
+                                        & (AiCallOutboundTargetModel.next_attempt_at <= now)
+                                    ),
+                                )
+                            )
                         ),
                     )
                     .order_by(
@@ -861,15 +949,39 @@ class OutboundTaskExecutor:
                                 AiCallOutboundTaskModel.tenant_id
                                 == task_key.tenant_id,
                                 AiCallOutboundTaskModel.id == task_key.task_id,
-                                AiCallOutboundTaskModel.status == "RUNNING",
+                                AiCallOutboundTaskModel.status.in_(
+                                    {"RUNNING", "COMPLETED"}
+                                    if exception_batch
+                                    else {"RUNNING"}
+                                ),
                             )
                         ),
-                        or_(
-                            AiCallOutboundTargetModel.status == "PENDING",
+                        (
                             (
-                                (AiCallOutboundTargetModel.status == "RETRY_WAIT")
+                                AiCallOutboundTargetModel.exception_batch_id.is_not(None)
+                                & (AiCallOutboundTargetModel.status == "RETRY_WAIT")
                                 & (AiCallOutboundTargetModel.next_attempt_at <= now)
-                            ),
+                                & exists(
+                                    select(AiCallOutboundExceptionBatchModel.id).where(
+                                        AiCallOutboundExceptionBatchModel.tenant_id
+                                        == task_key.tenant_id,
+                                        AiCallOutboundExceptionBatchModel.id
+                                        == AiCallOutboundTargetModel.exception_batch_id,
+                                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                                    )
+                                )
+                            )
+                            if exception_batch
+                            else (
+                                AiCallOutboundTargetModel.exception_batch_id.is_(None)
+                                & or_(
+                                    AiCallOutboundTargetModel.status == "PENDING",
+                                    (
+                                        (AiCallOutboundTargetModel.status == "RETRY_WAIT")
+                                        & (AiCallOutboundTargetModel.next_attempt_at <= now)
+                                    ),
+                                )
+                            )
                         ),
                     )
                     .values(
@@ -897,9 +1009,11 @@ class OutboundTaskExecutor:
                     attempt_no=target.attempt_count,
                     phone_number=target.phone_number,
                     customer_name=target.customer_name,
+                    business_params=self._target_business_params(target),
                     scene_code=task.scene_code,
                     voice=task.voice,
                     prompt_profile_id=task.prompt_profile_id,
+                    prompt_snapshot=self._task_prompt_snapshot(task),
                     line=line,
                     answer_mode=task.answer_mode,
                 )
@@ -1012,6 +1126,18 @@ class OutboundTaskExecutor:
                 error_message=error_message,
                 duration_ms=duration_ms,
             )
+        if reason in REJECTED_END_REASONS:
+            return DialResult(
+                call_result="rejected",
+                error_message=error_message,
+                duration_ms=duration_ms,
+            )
+        if reason in INVALID_NUMBER_END_REASONS:
+            return DialResult(
+                call_result="invalid_number",
+                error_message=error_message,
+                duration_ms=duration_ms,
+            )
         return DialResult(
             call_result="call_failed",
             error_message=error_message or "SIP 外呼失败",
@@ -1074,12 +1200,12 @@ class OutboundTaskExecutor:
             attempt.ended_at = now
             attempt.updated_at = now
 
-            if attempt.dialer_type in {None, "mock"}:
-                record = await db.scalar(
-                    select(AiCallRecordModel).where(
-                        AiCallRecordModel.call_id == call_id
-                    )
+            record = await db.scalar(
+                select(AiCallRecordModel).where(
+                    AiCallRecordModel.call_id == call_id
                 )
+            )
+            if attempt.dialer_type in {None, "mock"}:
                 if record is not None:
                     record.status = "completed" if connected else "failed"
                     record.end_reason = result.call_result
@@ -1091,29 +1217,56 @@ class OutboundTaskExecutor:
                     record.ended_at = now
                     record.duration_ms = max(0, result.duration_ms)
 
-            target.latest_result = result.call_result
-            target.updated_at = now
-            task.next_dispatch_at = None
-            if connected:
-                target.status = "COMPLETED"
-                target.next_attempt_at = None
-            else:
-                retry_interval = (
-                    None
-                    if (
-                        not result.retry_allowed
-                        or task.status in {"STOPPING", "STOPPED", "CANCELLED"}
-                    )
-                    else self._retry_interval(task, request.attempt_no, result.call_result)
+            if target.exception_batch_id is not None:
+                await apply_exception_terminal_projection(
+                    db,
+                    task=task,
+                    target=target,
+                    attempt=attempt,
+                    record=record,
+                    decision=AttemptTerminalDecision(
+                        attempt_status="COMPLETED" if connected else "FAILED",
+                        call_result=result.call_result,
+                        error_message=result.error_message,
+                    ),
+                    now=now,
+                    retry_allowed=result.retry_allowed,
                 )
-                if retry_interval is None:
+            else:
+                target.latest_result = result.call_result
+                target.updated_at = now
+                task.next_dispatch_at = None
+                if connected:
                     target.status = "COMPLETED"
                     target.next_attempt_at = None
                 else:
-                    target.status = "RETRY_WAIT"
-                    target.next_attempt_at = now + timedelta(minutes=retry_interval)
-            await db.flush()
-            await self._refresh_task_counters_in_session(db, task, now)
+                    retry_interval = (
+                        None
+                        if (
+                            not result.retry_allowed
+                            or task.status in {"STOPPING", "STOPPED", "CANCELLED"}
+                        )
+                        else self._retry_interval(
+                            task,
+                            request.attempt_no,
+                            result.call_result,
+                        )
+                    )
+                    if retry_interval is None:
+                        target.status = "COMPLETED"
+                        target.next_attempt_at = None
+                    else:
+                        target.status = "RETRY_WAIT"
+                        target.next_attempt_at = now + timedelta(minutes=retry_interval)
+                await db.flush()
+                await enroll_terminal_exception(
+                    db,
+                    target=target,
+                    attempt=attempt,
+                    record=record,
+                    now=now,
+                )
+                await self._refresh_task_counters_in_session(db, task, now)
             await db.commit()
 
     async def _finish_attempt_with_retry(
@@ -1223,6 +1376,22 @@ class OutboundTaskExecutor:
             return line
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _task_prompt_snapshot(task: AiCallOutboundTaskModel) -> dict | None:
+        try:
+            prompt = json.loads(task.config_snapshot_json).get("prompt")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return None
+        return prompt if isinstance(prompt, dict) else None
+
+    @staticmethod
+    def _target_business_params(target: AiCallOutboundTargetModel) -> dict:
+        try:
+            params = json.loads(target.business_params_json or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return params if isinstance(params, dict) else {}
 
     def _next_call_window_at(
         self,

@@ -488,11 +488,16 @@ class AiCallRecordService:
             "followUpSuggested": bool(
                 semantic_context.get("followUpSuggested", False)
             ),
+            "followUpRequiresReview": bool(
+                semantic_context.get("followUpRequiresReview", False)
+            ),
+            "followUpReviewStatus": semantic_context.get("followUpReviewStatus"),
             "followUpId": follow_up_context.get("followUpId"),
             "followUpStatus": follow_up_context.get("followUpStatus"),
             "qualityScoreStatus": quality_context.get("qualityScoreStatus"),
             "qualityScore": quality_context.get("qualityScore"),
             "qualityReviewResult": quality_context.get("qualityReviewResult"),
+            "qualityReviewReason": quality_context.get("qualityReviewReason"),
             "businessType": record.business_type,
             "businessId": record.business_id,
             "sceneCode": record.scene_code,
@@ -537,10 +542,14 @@ class AiCallRecordService:
         if record.ended_at is not None:
             return record
         final_ended_at = ended_at or utc_now()
-        duration_start = record.answered_at or record.started_at
         final_ended_at = self._ensure_utc(final_ended_at)
-        duration_start = self._ensure_utc(duration_start)
-        duration_ms = max(0, int((final_ended_at - duration_start).total_seconds() * 1000))
+        duration_ms = record.duration_ms
+        if duration_ms is None and record.answered_at is not None:
+            duration_start = self._ensure_utc(record.answered_at)
+            duration_ms = max(
+                0,
+                int((final_ended_at - duration_start).total_seconds() * 1000),
+            )
         return await self.repository.update_record(
             call_id,
             status=status,
@@ -548,7 +557,7 @@ class AiCallRecordService:
             failure_stage=failure_stage,
             failure_message=failure_message,
             ended_at=record.ended_at or final_ended_at,
-            duration_ms=record.duration_ms if record.duration_ms is not None else duration_ms,
+            duration_ms=duration_ms,
         )
 
     @classmethod

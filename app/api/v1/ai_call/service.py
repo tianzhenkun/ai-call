@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -48,6 +49,7 @@ from app.services.ai_call.orchestrator import (
 )
 from app.services.ai_call.prompt_config import (
     CALL_END_TOOL_INSTRUCTIONS,
+    DEFAULT_COMMON_BUSINESS_PROMPT,
     PROMPT_PROVIDER_STATIC_PROFILE,
     BusinessPromptResolver,
     DebugPromptProvider,
@@ -57,6 +59,11 @@ from app.services.ai_call.prompt_config import (
     PromptEffectiveConfig,
     PromptResolveContext,
     normalize_scene_code,
+    resolve_static_prompt_snapshot,
+)
+from app.services.ai_call.prompt_optimization import (
+    PromptOptimizerProtocol,
+    build_prompt_optimizer,
 )
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
@@ -117,6 +124,7 @@ class AiCallService:
         prompt_composer: PromptComposer | None = None,
         sip_client: LiveKitSipClient | None = None,
         quality_scorer: Any | None = None,
+        prompt_optimizer: PromptOptimizerProtocol | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.record_service = record_service
@@ -131,6 +139,7 @@ class AiCallService:
         self.prompt_composer = prompt_composer
         self.sip_client = sip_client
         self.quality_scorer = quality_scorer
+        self.prompt_optimizer = prompt_optimizer
 
     async def create_web_session(
         self,
@@ -171,6 +180,7 @@ class AiCallService:
         try:
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=call_id,
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
@@ -223,6 +233,7 @@ class AiCallService:
         ringing_timeout_seconds: int | None = None,
         before_sip_invite: Callable[[], Awaitable[None]] | None = None,
         tenant_id: str | None = None,
+        prompt_snapshot: dict | None = None,
     ) -> CreateSipSessionResult:
         self._ensure_legacy_entry_allowed("direct_sip")
         self._ensure_record_service()
@@ -264,10 +275,12 @@ class AiCallService:
             )
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=resolved_call_id,
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
                 debug_prompt=None,
+                prompt_snapshot=prompt_snapshot,
             )
             await self.record_service.update_prompt_context(
                 resolved_call_id,
@@ -439,46 +452,105 @@ class AiCallService:
     async def list_prompt_profiles(
         self,
         *,
+        tenant_id: str,
         scene_code: str | None = None,
         page_num: int = 1,
         page_size: int = 20,
     ) -> dict:
         repository = self._ensure_prompt_repository()
         rows, total = await repository.list_prompt_profiles(
+            tenant_id=tenant_id,
             scene_code=normalize_scene_code(scene_code),
             page_num=page_num,
             page_size=page_size,
         )
+        summaries = await repository.get_prompt_profile_version_summaries(
+            tenant_id=tenant_id,
+            profile_ids=[row.id for row in rows],
+        )
         return {
-            "rows": [self._prompt_profile_to_dict(row) for row in rows],
+            "rows": [
+                self._prompt_profile_to_dict(row, summaries.get(row.id)) for row in rows
+            ],
             "total": total,
         }
 
-    async def get_prompt_profile(self, profile_id: int) -> dict:
+    async def get_prompt_profile(self, *, tenant_id: str, profile_id: int) -> dict:
         repository = self._ensure_prompt_repository()
-        profile = await repository.get_prompt_profile(profile_id)
+        profile = await repository.get_prompt_profile(profile_id, tenant_id=tenant_id)
         if profile is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
-        return self._prompt_profile_to_dict(profile)
+        summaries = await repository.get_prompt_profile_version_summaries(
+            tenant_id=tenant_id,
+            profile_ids=[profile.id],
+        )
+        return self._prompt_profile_to_dict(profile, summaries.get(profile.id))
 
-    async def create_prompt_profile(self, values: dict) -> dict:
+    async def create_prompt_profile(
+        self,
+        *,
+        tenant_id: str,
+        values: dict,
+        created_by: int | None = None,
+        created_by_name: str | None = None,
+    ) -> dict:
         repository = self._ensure_prompt_repository()
         values = self._normalize_prompt_profile_values(values)
-        await self._ensure_prompt_profile_unique(repository, values)
+        values["tenant_id"] = tenant_id
+        await self._ensure_prompt_profile_unique(repository, tenant_id, values)
         profile = await repository.create_prompt_profile(**values)
-        return self._prompt_profile_to_dict(profile)
+        version = await self._append_prompt_profile_version(
+            repository,
+            profile,
+            creation_method="manual",
+            created_by=created_by,
+            created_by_name=created_by_name,
+        )
+        return self._prompt_profile_to_dict(profile, (version.version_no, 1))
 
-    async def update_prompt_profile(self, profile_id: int, values: dict) -> dict:
+    async def update_prompt_profile(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        values: dict,
+        created_by: int | None = None,
+        created_by_name: str | None = None,
+    ) -> dict:
         repository = self._ensure_prompt_repository()
         values = self._normalize_prompt_profile_values(values)
-        existing = await repository.get_prompt_profile(profile_id)
+        existing = await repository.get_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            for_update=True,
+        )
         if existing is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
-        await self._ensure_prompt_profile_unique(repository, values, current_id=profile_id)
-        profile = await repository.update_prompt_profile(profile_id, **values)
+        await self._ensure_prompt_profile_unique(
+            repository,
+            tenant_id,
+            values,
+            current_id=profile_id,
+        )
+        profile = await repository.update_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            **values,
+        )
         if profile is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
-        return self._prompt_profile_to_dict(profile)
+        await self._append_prompt_profile_version(
+            repository,
+            profile,
+            creation_method="manual",
+            created_by=created_by,
+            created_by_name=created_by_name,
+        )
+        summaries = await repository.get_prompt_profile_version_summaries(
+            tenant_id=tenant_id,
+            profile_ids=[profile.id],
+        )
+        return self._prompt_profile_to_dict(profile, summaries.get(profile.id))
 
     async def list_prompt_components(self) -> dict:
         composer = self._ensure_prompt_composer()
@@ -500,13 +572,35 @@ class AiCallService:
         ]
         return {"rows": rows, "total": len(rows)}
 
+    async def get_prompt_common_config(self, *, tenant_id: str) -> dict:
+        config = await self._ensure_prompt_repository().get_prompt_common_config(
+            tenant_id=tenant_id
+        )
+        return {
+            "content": (
+                config.content if config is not None else DEFAULT_COMMON_BUSINESS_PROMPT
+            ),
+            "updatedAt": config.updated_at if config is not None else None,
+        }
+
+    async def update_prompt_common_config(self, *, tenant_id: str, content: str) -> dict:
+        config = await self._ensure_prompt_repository().save_prompt_common_config(
+            tenant_id=tenant_id,
+            content=str(content or "").strip(),
+        )
+        return {"content": config.content, "updatedAt": config.updated_at}
+
     async def preview_prompt_profile(
         self,
         *,
+        tenant_id: str,
         business_id: str | None,
         scene_code: str | None,
         business_params: dict | None,
         prompt: str | None,
+        prompt_text: str | None = None,
+        opening_message: str | None = None,
+        product_info: str | None = None,
     ) -> dict:
         scene_code = self._require_scene_code(scene_code)
         if _strip_or_none(prompt):
@@ -516,13 +610,43 @@ class AiCallService:
                 status_code=400,
             )
         try:
-            effective_config = await self._resolve_prompt_effective_config(
-                call_id="preview",
-                business_id=business_id,
-                scene_code=scene_code,
-                business_params=business_params or {},
-                debug_prompt=None,
-            )
+            if prompt_text is not None or opening_message is not None or product_info is not None:
+                from app.services.ai_call.prompt_config import (
+                    BusinessPromptResult,
+                    render_prompt_template,
+                )
+
+                params = business_params or {}
+                draft_prompt = render_prompt_template(prompt_text or "", params).strip()
+                draft_opening = render_prompt_template(opening_message or "", params).strip()
+                if not draft_prompt:
+                    raise AiCallError("prompt_empty", "业务提示词不能为空", 400)
+                if not draft_opening:
+                    raise AiCallError("opening_message_empty", "开场白不能为空", 400)
+                result = BusinessPromptResult(
+                    prompt=draft_prompt,
+                    opening_message=draft_opening,
+                    product_info=render_prompt_template(product_info or "", params).strip(),
+                    source_key=scene_code,
+                )
+                effective_config = self._ensure_prompt_composer().compose(
+                    result,
+                    include_system_constraints=False,
+                )
+            else:
+                result = await self.prompt_resolver.resolve(
+                    PromptResolveContext(
+                        call_id="preview",
+                        tenant_id=tenant_id,
+                        business_id=business_id,
+                        scene_code=scene_code,
+                        business_params=business_params or {},
+                    )
+                )
+                effective_config = self._ensure_prompt_composer().compose(
+                    result,
+                    include_system_constraints=False,
+                )
         except AiCallError as exc:
             raise self._to_custom_exception(exc) from exc
         return {
@@ -533,6 +657,117 @@ class AiCallService:
             "promptSourceKey": effective_config.prompt_source_key,
             "bargeInEnabled": self.orchestrator.config.barge_in_enabled,
         }
+
+    async def list_prompt_profile_versions(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> dict:
+        repository = self._ensure_prompt_repository()
+        await self.get_prompt_profile(tenant_id=tenant_id, profile_id=profile_id)
+        rows = await repository.list_prompt_profile_versions(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+        )
+        return {"rows": [self._prompt_version_to_dict(row) for row in rows], "total": len(rows)}
+
+    async def get_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+    ) -> dict:
+        version = await self._ensure_prompt_repository().get_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if version is None:
+            raise CustomException(msg="提示词版本不存在", status_code=404)
+        return self._prompt_version_to_dict(version, include_snapshot=True)
+
+    async def apply_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+        created_by: int | None,
+        created_by_name: str | None,
+    ) -> dict:
+        repository = self._ensure_prompt_repository()
+        version = await repository.get_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if version is None:
+            raise CustomException(msg="提示词版本不存在", status_code=404)
+        snapshot = json.loads(version.snapshot_json)
+        profile = await repository.update_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            **self._profile_values_from_snapshot(snapshot),
+        )
+        if profile is None:
+            raise CustomException(msg="提示词配置不存在", status_code=404)
+        await self._append_prompt_profile_version(
+            repository,
+            profile,
+            creation_method="restored",
+            created_by=created_by,
+            created_by_name=created_by_name,
+            restored_from_version_id=version.id,
+        )
+        summaries = await repository.get_prompt_profile_version_summaries(
+            tenant_id=tenant_id,
+            profile_ids=[profile.id],
+        )
+        return self._prompt_profile_to_dict(profile, summaries.get(profile.id))
+
+    async def delete_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+    ) -> None:
+        repository = self._ensure_prompt_repository()
+        latest = await repository.get_latest_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+        )
+        if latest is None or latest.id == version_id:
+            raise CustomException(msg="当前版本不能删除", status_code=409)
+        deleted = await repository.soft_delete_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if deleted is None:
+            raise CustomException(msg="提示词版本不存在", status_code=404)
+
+    async def optimize_prompt(self, *, tenant_id: str, values: dict) -> dict:
+        del tenant_id
+        if self.prompt_optimizer is None:
+            raise CustomException(msg="提示词 AI 优化服务未配置", status_code=503)
+        scene_context = values.get("scene_context") or {}
+        variables = scene_context.get("variables") or []
+        payload = {
+            "targetType": values.get("target_type"),
+            "currentContent": values.get("current_content") or "",
+            "sceneName": scene_context.get("scene_name") or "",
+            "productInfo": scene_context.get("product_info") or "",
+            "commonPrompt": scene_context.get("common_prompt") or "",
+            "allowedVariables": [item.get("key") for item in variables],
+            "instruction": values.get("instruction") or "",
+        }
+        try:
+            return await self.prompt_optimizer.optimize(payload)
+        except Exception as exc:
+            raise CustomException(msg=f"提示词 AI 优化失败：{exc}", status_code=502) from exc
 
     async def reissue_browser_token(self, call_id: str) -> ReissueTokenResult:
         try:
@@ -1010,8 +1245,19 @@ class AiCallService:
         record = await self.record_service.get_record(call_id)
         if record is None:
             raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        await self.record_service.repository.attach_outbound_context(
+            [record], tenant_id=record.tenant_id
+        )
         last_event = await self.record_service.get_last_event(call_id)
         execution_config = await self.record_service.get_execution_config(record)
+        exception_handling = (
+            await self.record_service.repository.get_exception_handling(
+                tenant_id=record.tenant_id,
+                call_id=record.call_id,
+            )
+            if record.tenant_id
+            else None
+        )
         after_call_work = None
         follow_up = None
         if record.tenant_id:
@@ -1054,6 +1300,7 @@ class AiCallService:
             "record": self.record_service.record_to_dict(record),
             "lastEvent": self.record_service.event_to_dict(last_event) if last_event else None,
             "executionConfig": execution_config,
+            "exceptionHandling": exception_handling,
             "afterCallWork": after_call_work,
             "followUp": follow_up,
         }
@@ -1113,6 +1360,49 @@ class AiCallService:
             reference_date=date.today().isoformat(),
             now=datetime.now(timezone.utc),
         )
+        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+
+    async def review_record_follow_up(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        action: str,
+        reviewed_by: str,
+        reviewed_by_name: str | None,
+    ) -> dict:
+        self._ensure_record_service()
+        assert self.record_service is not None
+        record = await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        analysis = await self.record_service.repository.get_semantic_analysis(
+            call_id=call_id,
+        )
+        if analysis is None:
+            raise CustomException(msg="暂无可确认的 AI 跟进建议", code=RET.ERROR.code, status_code=404)
+        from app.services.ai_call.post_call_follow_up_service import (
+            AiCallPostCallFollowUpService,
+        )
+
+        try:
+            await AiCallPostCallFollowUpService(
+                self.record_service.repository
+            ).review(
+                analysis,
+                action=action,
+                reviewed_by=reviewed_by,
+                reviewed_by_name=reviewed_by_name,
+            )
+        except ValueError as exc:
+            raise CustomException(
+                msg=str(exc),
+                code=RET.BAD_REQUEST.code,
+                status_code=status.HTTP_400_BAD_REQUEST,
+            ) from exc
         return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
 
     async def get_record_quality(self, *, tenant_id: str, call_id: str) -> dict:
@@ -1867,22 +2157,26 @@ class AiCallService:
         self,
         *,
         call_id: str,
+        tenant_id: str | None,
         business_id: str | None,
         scene_code: str | None,
         business_params: dict,
         debug_prompt: str | None,
+        prompt_snapshot: dict | None = None,
     ) -> PromptEffectiveConfig | None:
         if self.prompt_resolver is None or self.prompt_composer is None:
             return None
-        prompt_result = await self.prompt_resolver.resolve(
-            PromptResolveContext(
-                call_id=call_id,
-                business_id=business_id,
-                scene_code=scene_code,
-                business_params=business_params,
-                debug_prompt=debug_prompt,
-            )
+        context = PromptResolveContext(
+            call_id=call_id,
+            tenant_id=tenant_id,
+            business_id=business_id,
+            scene_code=scene_code,
+            business_params=business_params,
+            debug_prompt=debug_prompt,
         )
+        prompt_result = resolve_static_prompt_snapshot(prompt_snapshot, context)
+        if prompt_result is None:
+            prompt_result = await self.prompt_resolver.resolve(context)
         return self.prompt_composer.compose(prompt_result)
 
     @staticmethod
@@ -1895,6 +2189,12 @@ class AiCallService:
             ).strip(),
             "prompt_text": _strip_or_none(values.get("prompt_text")),
             "opening_message": _strip_or_none(values.get("opening_message")),
+            "product_info": str(values.get("product_info") or "").strip(),
+            "variables_json": json.dumps(
+                values.get("variables") or [],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
         }
         if not normalized["scene_code"]:
             raise CustomException(msg="sceneCode 不能为空", code=RET.ERROR.code, status_code=400)
@@ -1915,18 +2215,24 @@ class AiCallService:
     @staticmethod
     async def _ensure_prompt_profile_unique(
         repository: AiCallRecordRepository,
+        tenant_id: str,
         values: dict,
         *,
         current_id: int | None = None,
     ) -> None:
         existing_scene = await repository.get_prompt_profile_by_scene(
+            tenant_id=tenant_id,
             scene_code=values["scene_code"],
         )
         if existing_scene is not None and existing_scene.id != current_id:
             raise CustomException(msg="场景编码已存在配置", code=RET.ERROR.code, status_code=409)
 
     @staticmethod
-    def _prompt_profile_to_dict(profile) -> dict:
+    def _prompt_profile_to_dict(
+        profile,
+        version_summary: tuple[int, int] | None = None,
+    ) -> dict:
+        version_no, version_count = version_summary or (None, 0)
         return {
             "id": str(profile.id),
             "sceneCode": profile.scene_code,
@@ -1934,9 +2240,81 @@ class AiCallService:
             "providerKey": profile.provider_key,
             "promptText": profile.prompt_text,
             "openingMessage": profile.opening_message,
+            "productInfo": profile.product_info,
+            "variables": json.loads(profile.variables_json or "[]"),
+            "versionNo": version_no,
+            "versionCount": version_count,
             "createdAt": profile.created_at,
             "updatedAt": profile.updated_at,
         }
+
+    async def _append_prompt_profile_version(
+        self,
+        repository: AiCallRecordRepository,
+        profile,
+        *,
+        creation_method: str,
+        created_by: int | None,
+        created_by_name: str | None,
+        restored_from_version_id: int | None = None,
+    ):
+        return await repository.create_prompt_profile_version(
+            tenant_id=profile.tenant_id,
+            profile_id=profile.id,
+            snapshot_json=json.dumps(
+                self._prompt_profile_snapshot(profile),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            creation_method=creation_method,
+            created_by=created_by,
+            created_by_name=created_by_name,
+            restored_from_version_id=restored_from_version_id,
+        )
+
+    @staticmethod
+    def _prompt_profile_snapshot(profile) -> dict:
+        return {
+            "sceneCode": profile.scene_code,
+            "name": profile.name,
+            "providerKey": profile.provider_key,
+            "promptText": profile.prompt_text,
+            "openingMessage": profile.opening_message,
+            "productInfo": profile.product_info,
+            "variables": json.loads(profile.variables_json or "[]"),
+        }
+
+    @staticmethod
+    def _profile_values_from_snapshot(snapshot: dict) -> dict:
+        return AiCallService._normalize_prompt_profile_values({
+            "scene_code": snapshot.get("sceneCode"),
+            "name": snapshot.get("name"),
+            "provider_key": snapshot.get("providerKey"),
+            "prompt_text": snapshot.get("promptText"),
+            "opening_message": snapshot.get("openingMessage"),
+            "product_info": snapshot.get("productInfo"),
+            "variables": snapshot.get("variables"),
+        })
+
+    @staticmethod
+    def _prompt_version_to_dict(version, *, include_snapshot: bool = False) -> dict:
+        data = {
+            "id": str(version.id),
+            "profileId": str(version.profile_id),
+            "versionNo": version.version_no,
+            "creationMethod": version.creation_method,
+            "restoredFromVersionId": (
+                str(version.restored_from_version_id)
+                if version.restored_from_version_id is not None
+                else None
+            ),
+            "createdBy": str(version.created_by) if version.created_by is not None else None,
+            "createdByName": version.created_by_name,
+            "createdAt": version.created_at,
+        }
+        if include_snapshot:
+            data["snapshot"] = json.loads(version.snapshot_json)
+        return data
 
     @staticmethod
     def _voice_profile_to_dict(profile) -> dict:
@@ -2376,6 +2754,12 @@ def get_default_ai_call_service(
         prompt_resolver=_build_prompt_resolver(repository, _default_orchestrator),
         prompt_composer=_build_prompt_composer(_default_orchestrator),
         sip_client=_build_sip_client(config=sip_config),
+        prompt_optimizer=build_prompt_optimizer(
+            base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+            api_key=settings.EFFECTIVE_LLM_API_KEY,
+            model=settings.AI_CALL_PROMPT_OPTIMIZE_MODEL,
+            timeout_seconds=settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS,
+        ),
     )
 
 

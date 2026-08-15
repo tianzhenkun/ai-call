@@ -15,28 +15,17 @@ from app.api.v1.ai_call.service import get_default_ai_call_service
 from app.config.setting import Settings, settings
 from app.services.ai_call.livekit_sip import SipOutboundConfig
 
+from .attempt_projection import (
+    BUSY_END_REASONS,
+    INVALID_NUMBER_END_REASONS,
+    NO_ANSWER_END_REASONS,
+    REJECTED_END_REASONS,
+)
 from .media_evidence import has_persisted_media_evidence
 from .sip_line_schema import SipLineSnapshot
 from .task_executor import ConnectedCallback, DialResult, OutboundDialRequest
 
 TERMINAL_STATUSES = {"completed", "failed"}
-BUSY_END_REASONS = {
-    "busy",
-    "busy_here",
-    "callee_busy",
-    "sip_busy",
-    "user_busy",
-    "sip_486",
-}
-NO_ANSWER_END_REASONS = {
-    "connect_timeout",
-    "no_answer",
-    "ringing_timeout",
-    "sip_connect_timeout",
-    "user_unavailable",
-    "sip_408",
-    "sip_480",
-}
 
 
 class AiCallServiceLike(Protocol):
@@ -108,6 +97,7 @@ class SipOutboundDialer:
             service = self.ai_call_service_factory(db, config)
             try:
                 await service.create_sip_session(
+                    tenant_id=request.tenant_id,
                     callee_phone_number=request.phone_number,
                     voice=request.voice,
                     call_id=call_id,
@@ -115,7 +105,7 @@ class SipOutboundDialer:
                     business_id=str(request.task_id),
                     scene_code=request.scene_code,
                     business_params={
-                        "customerName": request.customer_name or "",
+                        **request.business_params,
                         "targetId": str(request.target_id),
                         "attemptNo": request.attempt_no,
                         "lineId": line.line_id,
@@ -123,6 +113,7 @@ class SipOutboundDialer:
                     },
                     ringing_timeout_seconds=line.originate_timeout_seconds,
                     before_sip_invite=db.commit,
+                    prompt_snapshot=request.prompt_snapshot,
                 )
             except Exception as exc:
                 create_error = exc
@@ -380,6 +371,38 @@ class SipOutboundDialer:
                 provider_reason=provider_reason,
                 hangup_cause=hangup_cause,
             )
+        if (
+            reason in REJECTED_END_REASONS
+            or provider_status_code == "603"
+            or hangup_cause in {"CALL_REJECTED", "21"}
+        ):
+            return DialResult(
+                call_result="rejected",
+                error_message=error_message,
+                duration_ms=max(0, int(record.duration_ms or 0)),
+                provider_status_code=provider_status_code,
+                provider_reason=provider_reason,
+                hangup_cause=hangup_cause,
+            )
+        if (
+            reason in INVALID_NUMBER_END_REASONS
+            or provider_status_code in {"404", "410", "484", "604"}
+            or hangup_cause
+            in {
+                "ADDRESS_INCOMPLETE",
+                "SUBSCRIBER_ABSENT",
+                "UNALLOCATED_NUMBER",
+                "USER_NOT_REGISTERED",
+            }
+        ):
+            return DialResult(
+                call_result="invalid_number",
+                error_message=error_message,
+                duration_ms=max(0, int(record.duration_ms or 0)),
+                provider_status_code=provider_status_code,
+                provider_reason=provider_reason,
+                hangup_cause=hangup_cause,
+            )
         return DialResult(
             call_result="call_failed",
             error_message=error_message or "SIP 外呼失败",
@@ -454,10 +477,20 @@ class SipOutboundDialer:
         )
         call_result = result.call_result
         if call_result == "call_failed":
-            if provider_status_code == "486":
+            hangup_cause = str(details.get("hangupCause") or "").upper()
+            if provider_status_code in {"486", "600"}:
                 call_result = "busy"
             elif provider_status_code in {"408", "480"}:
                 call_result = "no_answer"
+            elif provider_status_code == "603" or hangup_cause in {"CALL_REJECTED", "21"}:
+                call_result = "rejected"
+            elif provider_status_code in {"404", "410", "484", "604"} or hangup_cause in {
+                "ADDRESS_INCOMPLETE",
+                "SUBSCRIBER_ABSENT",
+                "UNALLOCATED_NUMBER",
+                "USER_NOT_REGISTERED",
+            }:
+                call_result = "invalid_number"
         return replace(
             result,
             call_result=call_result,

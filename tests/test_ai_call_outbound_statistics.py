@@ -212,6 +212,8 @@ def _record(
     entry_type: str = "sip_outbound",
     status: str = "completed",
     follow_up_id: int | None = None,
+    answered_at: datetime | None = None,
+    duration_ms: int | None = None,
 ) -> AiCallRecordModel:
     return AiCallRecordModel(
         id=row_id,
@@ -222,6 +224,8 @@ def _record(
         participant_identity=f"sip-{row_id}",
         status=status,
         started_at=started_at,
+        answered_at=answered_at,
+        duration_ms=duration_ms,
     )
 
 
@@ -293,7 +297,7 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
             "busy",
             "invalid_number",
             "call_failed",
-            "provider_unknown",
+            "rejected",
             None,
         ]
         for row_id, call_result in enumerate(formal_results, start=1):
@@ -311,6 +315,8 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
                     entry_type="outbound" if row_id == 1 else "sip_outbound",
                     status="running" if row_id == 8 else "completed",
                     follow_up_id=9001 if row_id == 1 else None,
+                    answered_at=started_at if row_id in {1, 2} else None,
+                    duration_ms={1: 4_000, 2: 10_000}.get(row_id),
                 ),
                 _attempt(
                     row_id=row_id,
@@ -422,15 +428,16 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
 
     assert overview.dial_attempts == 12
     assert overview.connected_calls == 3
+    assert overview.total_duration_ms == 14_000
+    assert overview.intent_leads == 0
     assert overview.pending_follow_ups == 2
     assert result_counts == {
-        "connected": 3,
+        "connected": 2,
         "no_answer": 2,
-        "busy": 1,
-        "invalid_number": 1,
-        "call_failed": 1,
-        "processing": 1,
-        "other": 3,
+        "rejected": 1,
+        "early_hangup": 1,
+        "invalid_number": 2,
+        "other": 4,
     }
     assert [(item.dial_attempts, item.connected_calls) for item in trend] == [
         (8, 3),
@@ -449,17 +456,23 @@ class _StatisticsRepositoryStub:
         started_at: datetime,
         ended_at: datetime,
         include_pending_follow_ups: bool,
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> StatisticsOverviewAggregate:
-        del tenant_id, started_at, ended_at
+        del tenant_id, started_at, ended_at, scene_code, task_id
         if include_pending_follow_ups:
             return StatisticsOverviewAggregate(
                 dial_attempts=8,
                 connected_calls=2,
+                total_duration_ms=60_000,
+                intent_leads=1,
                 pending_follow_ups=2,
             )
         return StatisticsOverviewAggregate(
             dial_attempts=4,
             connected_calls=2,
+            total_duration_ms=30_000,
+            intent_leads=0,
             pending_follow_ups=0,
         )
 
@@ -469,13 +482,16 @@ class _StatisticsRepositoryStub:
         tenant_id: str,
         started_at: datetime,
         ended_at: datetime,
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> dict[str, int]:
-        del tenant_id, started_at, ended_at
+        del tenant_id, started_at, ended_at, scene_code, task_id
         return {
             "connected": 2,
-            "no_answer": 3,
-            "busy": 1,
-            "processing": 1,
+            "no_answer": 2,
+            "rejected": 1,
+            "early_hangup": 1,
+            "invalid_number": 1,
             "other": 1,
         }
 
@@ -484,8 +500,10 @@ class _StatisticsRepositoryStub:
         *,
         tenant_id: str,
         buckets: list[tuple[datetime, datetime]],
+        scene_code: str | None = None,
+        task_id: int | None = None,
     ) -> list[StatisticsTrendAggregate]:
-        del tenant_id
+        del tenant_id, scene_code, task_id
         self.buckets = buckets
         return [
             StatisticsTrendAggregate(
@@ -514,18 +532,21 @@ async def test_service_builds_comparison_buckets_and_ordered_results() -> None:
     assert result.generated_at == NOW
     assert result.overview.dial_attempts == 8
     assert result.overview.connect_rate == 0.25
+    assert result.overview.total_duration_ms == 60_000
+    assert result.overview.intent_leads == 1
     assert result.comparison.dial_attempts_change_rate == 1.0
     assert result.comparison.connected_calls_change_rate == 0.0
     assert result.comparison.connect_rate_change_points == -25.0
+    assert result.comparison.total_duration_change_rate == 1.0
+    assert result.comparison.intent_leads_change_rate is None
     assert len(repository.buckets) == 7
     assert repository.buckets[-1][1] == NOW
     assert [item.result for item in result.results] == [
         "connected",
         "no_answer",
-        "busy",
+        "rejected",
+        "early_hangup",
         "invalid_number",
-        "call_failed",
-        "processing",
         "other",
     ]
     assert sum(item.count for item in result.results) == 8
@@ -537,8 +558,8 @@ async def test_service_returns_null_comparison_when_previous_period_is_empty() -
 
     async def empty_previous(**kwargs) -> StatisticsOverviewAggregate:
         if kwargs["include_pending_follow_ups"]:
-            return StatisticsOverviewAggregate(1, 1, 0)
-        return StatisticsOverviewAggregate(0, 0, 0)
+            return StatisticsOverviewAggregate(1, 1, 1_000, 1, 0)
+        return StatisticsOverviewAggregate(0, 0, 0, 0, 0)
 
     repository.aggregate_overview = empty_previous
     repository.aggregate_results = AsyncMock(return_value={"connected": 1})
@@ -586,6 +607,8 @@ def test_statistics_controller_uses_camel_case_contract() -> None:
             "startedAtEnd": "2026-08-01T00:00:00+08:00",
             "timeZone": "Asia/Shanghai",
             "granularity": "hour",
+            "sceneCode": "product_intro",
+            "taskId": "100",
         },
     )
 
@@ -594,3 +617,12 @@ def test_statistics_controller_uses_camel_case_contract() -> None:
     assert payload["period"]["timeZone"] == "Asia/Shanghai"
     assert payload["overview"]["dialAttempts"] == 8
     assert "dial_attempts" not in payload["overview"]
+    service.get_statistics.assert_awaited_once_with(
+        tenant_id="tenant-a",
+        started_at_begin=datetime.fromisoformat("2026-07-31T00:00:00+08:00"),
+        started_at_end=datetime.fromisoformat("2026-08-01T00:00:00+08:00"),
+        time_zone="Asia/Shanghai",
+        granularity="hour",
+        scene_code="product_intro",
+        task_id=100,
+    )

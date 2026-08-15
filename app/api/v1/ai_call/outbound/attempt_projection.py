@@ -8,9 +8,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
+from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -23,6 +25,7 @@ BUSY_END_REASONS = {
     "sip_busy",
     "user_busy",
     "sip_486",
+    "sip_600",
 }
 NO_ANSWER_END_REASONS = {
     "browser_disconnect",
@@ -34,6 +37,33 @@ NO_ANSWER_END_REASONS = {
     "sip_408",
     "sip_480",
 }
+REJECTED_END_REASONS = {
+    "call_rejected",
+    "decline",
+    "rejected",
+    "sip_603",
+}
+INVALID_NUMBER_END_REASONS = {
+    "address_incomplete",
+    "invalid_number",
+    "subscriber_absent",
+    "unallocated_number",
+    "user_not_registered",
+    "sip_404",
+    "sip_410",
+    "sip_484",
+    "sip_604",
+}
+
+
+def exception_category_for(call_result: str | None) -> str | None:
+    if call_result in {"no_answer", "busy"}:
+        return "no_answer"
+    if call_result == "rejected":
+        return "rejected"
+    if call_result == "invalid_number":
+        return "invalid_number"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +74,7 @@ class AttemptTerminalDecision:
 
 
 def terminal_attempt_decision(
-    record: AiCallRecordModel,
+    record: AiCallRecordModel | None,
     *,
     media_connected: bool,
 ) -> AttemptTerminalDecision | None:
@@ -62,6 +92,10 @@ def terminal_attempt_decision(
         call_result = "busy"
     elif reason in NO_ANSWER_END_REASONS:
         call_result = "no_answer"
+    elif reason in REJECTED_END_REASONS:
+        call_result = "rejected"
+    elif reason in INVALID_NUMBER_END_REASONS:
+        call_result = "invalid_number"
     else:
         call_result = "call_failed"
     return AttemptTerminalDecision(
@@ -84,7 +118,7 @@ def apply_terminal_projection(
     attempt.call_result = decision.call_result
     attempt.error_message = decision.error_message
     attempt.active_slot = None
-    attempt.ended_at = record.ended_at or now
+    attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
 
     target.latest_result = decision.call_result
@@ -108,11 +142,196 @@ def apply_terminal_projection(
         target.next_attempt_at = now + timedelta(minutes=retry_interval)
 
 
+async def enroll_terminal_exception(
+    db: AsyncSession,
+    *,
+    target: AiCallOutboundTargetModel,
+    attempt: AiCallOutboundAttemptModel,
+    record: AiCallRecordModel | None,
+    now: datetime,
+) -> str | None:
+    if (
+        target.status != "COMPLETED"
+        or target.next_attempt_at is not None
+        or target.exception_category is not None
+    ):
+        return None
+    active_attempt_count = int(
+        await db.scalar(
+            select(func.count(AiCallOutboundAttemptModel.id)).where(
+                AiCallOutboundAttemptModel.tenant_id == target.tenant_id,
+                AiCallOutboundAttemptModel.target_id == target.id,
+                AiCallOutboundAttemptModel.status.in_({"DIALING", "IN_CALL"}),
+            )
+        )
+        or 0
+    )
+    if active_attempt_count:
+        return None
+    category = exception_category_for(attempt.call_result)
+    if category is None and await _is_customer_early_hangup(
+        db,
+        tenant_id=target.tenant_id,
+        call_id=attempt.call_id,
+        record=record,
+    ):
+        category = "early_hangup"
+    if category is None:
+        return None
+    target.exception_category = category
+    target.exception_source_result = (
+        "early_hangup" if category == "early_hangup" else attempt.call_result
+    )
+    target.exception_original_attempt_count = target.attempt_count
+    target.exception_batch_id = None
+    target.exception_entered_at = now
+    if category == "early_hangup":
+        target.latest_result = "early_hangup"
+    target.updated_at = now
+    return category
+
+
+async def apply_exception_terminal_projection(
+    db: AsyncSession,
+    *,
+    task: AiCallOutboundTaskModel,
+    target: AiCallOutboundTargetModel,
+    attempt: AiCallOutboundAttemptModel,
+    record: AiCallRecordModel | None,
+    decision: AttemptTerminalDecision,
+    now: datetime,
+    retry_allowed: bool = True,
+) -> None:
+    attempt.status = decision.attempt_status
+    attempt.call_result = decision.call_result
+    attempt.error_message = decision.error_message
+    attempt.active_slot = None
+    attempt.ended_at = (record.ended_at if record is not None else None) or now
+    attempt.updated_at = now
+
+    category = exception_category_for(decision.call_result)
+    if category is None and await _is_customer_early_hangup(
+        db,
+        tenant_id=target.tenant_id,
+        call_id=attempt.call_id,
+        record=record,
+    ):
+        category = "early_hangup"
+    target.latest_result = (
+        "early_hangup" if category == "early_hangup" else decision.call_result
+    )
+    target.updated_at = now
+    target.next_attempt_at = None
+
+    batch = await db.scalar(
+        select(AiCallOutboundExceptionBatchModel)
+        .where(
+            AiCallOutboundExceptionBatchModel.tenant_id == target.tenant_id,
+            AiCallOutboundExceptionBatchModel.id == target.exception_batch_id,
+        )
+        .with_for_update()
+    )
+    original_count = target.exception_original_attempt_count or target.attempt_count
+    retry_count = max(0, target.attempt_count - original_count)
+    if task.status in {"STOPPING", "STOPPED", "CANCELLED"}:
+        target.status = "CANCELLED"
+    elif (
+        not retry_allowed
+        or category is None
+        or category == "invalid_number"
+        or batch is None
+    ):
+        target.status = "COMPLETED"
+    elif retry_count >= batch.max_retry_count:
+        target.status = "COMPLETED"
+    else:
+        target.status = "RETRY_WAIT"
+        target.next_attempt_at = now + timedelta(days=batch.interval_days)
+    await db.flush()
+    if batch is not None:
+        await complete_exception_batch_if_done(db, batch, now)
+
+
+async def complete_exception_batch_if_done(
+    db: AsyncSession,
+    batch: AiCallOutboundExceptionBatchModel,
+    now: datetime,
+) -> bool:
+    active_count = int(
+        await db.scalar(
+            select(func.count(AiCallOutboundTargetModel.id)).where(
+                AiCallOutboundTargetModel.tenant_id == batch.tenant_id,
+                AiCallOutboundTargetModel.exception_batch_id == batch.id,
+                AiCallOutboundTargetModel.status.not_in(TERMINAL_TARGET_STATUSES),
+            )
+        )
+        or 0
+    )
+    if active_count:
+        return False
+    batch.status = "COMPLETED"
+    batch.active_slot = None
+    batch.ended_at = now
+    batch.updated_at = now
+    return True
+
+
+async def _is_customer_early_hangup(
+    db: AsyncSession,
+    *,
+    tenant_id: str,
+    call_id: str,
+    record: AiCallRecordModel | None,
+) -> bool:
+    if (
+        record is None
+        or record.entry_type != "direct_sip"
+        or record.answered_at is None
+        or record.duration_ms is None
+        or record.duration_ms > 5_000
+    ):
+        return False
+    evidence = await db.scalar(
+        select(AiCallEndEvidenceModel)
+        .where(
+            AiCallEndEvidenceModel.tenant_id == tenant_id,
+            AiCallEndEvidenceModel.call_id == call_id,
+        )
+        .order_by(
+            func.coalesce(
+                AiCallEndEvidenceModel.event_at,
+                AiCallEndEvidenceModel.received_at,
+            ),
+            AiCallEndEvidenceModel.id,
+        )
+        .limit(1)
+    )
+    if (
+        evidence is None
+        or evidence.source != "livekit_webhook"
+        or evidence.end_reason != "sip_participant_left"
+        or not evidence.evidence_json
+    ):
+        return False
+    try:
+        payload = json.loads(evidence.evidence_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    participant = payload.get("participant")
+    participant_data = participant if isinstance(participant, dict) else {}
+    disconnect_reason = payload.get("disconnectReason") or participant_data.get(
+        "disconnectReason"
+    )
+    return str(disconnect_reason or "").upper() == "CLIENT_INITIATED"
+
+
 def outbound_retry_interval(
     task: AiCallOutboundTaskModel,
     attempt_no: int,
     call_result: str,
 ) -> int | None:
+    if call_result == "call_failed":
+        return None
     try:
         snapshot = json.loads(task.config_snapshot_json)
         rule = snapshot["rule"]
@@ -141,6 +360,8 @@ async def refresh_task_counters(
             select(
                 AiCallOutboundTargetModel.status,
                 AiCallOutboundTargetModel.latest_result,
+                AiCallOutboundTargetModel.exception_category,
+                AiCallOutboundTargetModel.exception_source_result,
                 func.count(AiCallOutboundTargetModel.id),
             )
             .where(
@@ -150,33 +371,39 @@ async def refresh_task_counters(
             .group_by(
                 AiCallOutboundTargetModel.status,
                 AiCallOutboundTargetModel.latest_result,
+                AiCallOutboundTargetModel.exception_category,
+                AiCallOutboundTargetModel.exception_source_result,
             )
         )
     ).all()
     task.completed_targets = sum(
         int(count)
-        for target_status, _, count in status_rows
-        if target_status in TERMINAL_TARGET_STATUSES
+        for target_status, _, exception_category, _, count in status_rows
+        if exception_category is not None or target_status in TERMINAL_TARGET_STATUSES
     )
     task.connected_targets = sum(
         int(count)
-        for target_status, latest_result, count in status_rows
-        if target_status == "COMPLETED" and latest_result == "connected"
+        for target_status, latest_result, exception_category, source_result, count in status_rows
+        if (exception_category is not None or target_status == "COMPLETED")
+        and (source_result if exception_category else latest_result)
+        in {"connected", "early_hangup"}
     )
     task.failed_targets = sum(
         int(count)
-        for target_status, latest_result, count in status_rows
-        if target_status == "COMPLETED" and latest_result != "connected"
+        for target_status, latest_result, exception_category, source_result, count in status_rows
+        if (exception_category is not None or target_status == "COMPLETED")
+        and (source_result if exception_category else latest_result)
+        not in {"connected", "early_hangup"}
     )
     active_count = sum(
         int(count)
-        for target_status, _, count in status_rows
-        if target_status not in TERMINAL_TARGET_STATUSES
+        for target_status, _, exception_category, _, count in status_rows
+        if exception_category is None and target_status not in TERMINAL_TARGET_STATUSES
     )
     dialing_count = sum(
         int(count)
-        for target_status, _, count in status_rows
-        if target_status in {"DIALING", "IN_CALL"}
+        for target_status, _, exception_category, _, count in status_rows
+        if exception_category is None and target_status in {"DIALING", "IN_CALL"}
     )
     if task.status == "PAUSING" and dialing_count == 0:
         if active_count == 0:

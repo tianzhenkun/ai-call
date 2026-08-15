@@ -34,6 +34,7 @@ from app.services.ai_call.dialogue_merge import (
 )
 from app.services.ai_call.post_call_follow_up_service import (
     AiCallPostCallFollowUpService,
+    requires_manual_follow_up_review,
 )
 
 ANALYSIS_SCENE_CODE = DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE
@@ -1813,6 +1814,11 @@ class AiCallSemanticAnalysisService:
             "analysisResult": analysis.analysis_result_dict,
             "analysisError": analysis.analysis_error,
             "analysisRetryCount": analysis.analysis_retry_count,
+            "followUpReviewStatus": analysis.follow_up_review_status,
+            "followUpRequiresReview": requires_manual_follow_up_review(analysis),
+            "followUpReviewedBy": analysis.follow_up_reviewed_by,
+            "followUpReviewedByName": analysis.follow_up_reviewed_by_name,
+            "followUpReviewedAt": analysis.follow_up_reviewed_at,
             "analysisStartedAt": analysis.analysis_started_at,
             "analysisFinishedAt": analysis.analysis_finished_at,
             "transcriptHash": analysis.transcript_hash,

@@ -93,11 +93,27 @@ CallEndScheduler = Callable[[str, str], None]
 
 AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS = 60_000
 AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT = 80
+CALL_POLICY_WRAP_UP_SECONDS = 240
+CALL_POLICY_FINAL_RESPONSE_SECONDS = 290
+CALL_POLICY_SAFETY_END_SECONDS = 300
+CALL_POLICY_MAX_CUSTOMER_TURNS = 15
+CALL_POLICY_SILENCE_SECONDS = 8
+CALL_POLICY_MAX_SILENCE_PROMPTS = 3
+CALL_POLICY_WRAP_UP_INPUT = "通话即将达到时长上限，请从当前话题自然收尾，不要开启新问题。"
+CALL_POLICY_FINAL_INPUT = (
+    "请只说：感谢您的时间，今天先沟通到这里，祝您生活愉快，再见。"
+    "不要添加其他内容，不要再提出问题。"
+)
+CALL_POLICY_SILENCE_INPUTS = (
+    "客户暂未回应，请简短询问一次是否还在听，不要重复之前的长内容。",
+    "客户仍未回应，请最后确认一次是否方便继续沟通，保持一句话。",
+)
 
 
 CALL_END_REASON_MAPPING = {
     "customer_end": "customer_end",
     "task_completed": "normal_completed",
+    "policy_limit": "policy_limit",
 }
 
 HANDOFF_REASON_VALUES = {"customer_request", "business_escalation"}
@@ -127,9 +143,10 @@ CALL_END_FINAL_RESPONSE_TOOL_RESULTS_BY_REASON = {
         "不要添加其他内容，不要再提出问题。"
     ),
     "task_completed": (
-        "请直接回复：“好的，我已经记录，稍后会有顾问联系您。”"
+        "请直接回复：“好的，相关信息我已经记录，感谢您的时间，再见。”"
         "不要添加其他内容，不要再提出问题。"
     ),
+    "policy_limit": CALL_POLICY_FINAL_INPUT,
 }
 CALL_END_USER_TURN_GRACE_SECONDS = 1.0
 AI_QUESTION_ANSWER_WINDOW_SECONDS = 3.0
@@ -936,6 +953,10 @@ class RealtimeCallAgentRunner:
         self._pending_call_ends: dict[str, PendingCallEnd] = {}
         self._pending_call_end_intents: dict[str, PendingCallEndIntent] = {}
         self._pending_call_end_defer_tasks: dict[str, asyncio.Task[None]] = {}
+        self._call_policy_tasks: dict[str, asyncio.Task[None]] = {}
+        self._silence_watchdog_tasks: dict[str, asyncio.Task[None]] = {}
+        self._silence_prompt_counts: dict[str, int] = {}
+        self._customer_turn_counts: dict[str, int] = {}
         self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
         self._sip_barge_in_tasks: dict[str, asyncio.Task[None]] = {}
@@ -976,6 +997,8 @@ class RealtimeCallAgentRunner:
             )
 
     async def stop(self, call_id: str) -> None:
+        await self._cancel_call_policy_task(call_id)
+        await self._cancel_silence_watchdog(call_id)
         await self._cancel_playout_task(call_id)
         await self._cancel_turn_response_task(call_id)
         await self._cancel_pending_call_end_defer_task(call_id)
@@ -1046,6 +1069,8 @@ class RealtimeCallAgentRunner:
         self._playback_guards.pop(call_id, None)
         self._pending_call_ends.pop(call_id, None)
         self._pending_call_end_intents.pop(call_id, None)
+        self._silence_prompt_counts.pop(call_id, None)
+        self._customer_turn_counts.pop(call_id, None)
         self._provider_transport_diagnostics.pop(call_id, None)
         self._last_ai_question_completed_at.pop(call_id, None)
         self._audio_playout_queues.pop(call_id, None)
@@ -1120,6 +1145,186 @@ class RealtimeCallAgentRunner:
             input_text=input_text,
             opening_response=True,
         )
+        if self._is_sip_participant(session):
+            self._start_call_policy_task(call_id)
+
+    def _start_call_policy_task(self, call_id: str) -> None:
+        task = self._call_policy_tasks.get(call_id)
+        if task is not None and not task.done():
+            return
+        self._call_policy_tasks[call_id] = asyncio.create_task(
+            self._run_call_policy(call_id),
+            name=f"ai-call-policy-{call_id}",
+        )
+
+    async def _run_call_policy(self, call_id: str) -> None:
+        try:
+            await asyncio.sleep(CALL_POLICY_WRAP_UP_SECONDS)
+            if not self._call_policy_is_running(call_id):
+                return
+            provider = self._providers.get(call_id)
+            if provider is None:
+                return
+            self._append_event(
+                call_id,
+                "call_policy_wrap_up_requested",
+                "agent",
+                {"elapsedSeconds": CALL_POLICY_WRAP_UP_SECONDS},
+            )
+            await self._request_response(
+                call_id,
+                provider,
+                input_text=CALL_POLICY_WRAP_UP_INPUT,
+            )
+
+            await asyncio.sleep(
+                CALL_POLICY_FINAL_RESPONSE_SECONDS - CALL_POLICY_WRAP_UP_SECONDS
+            )
+            if not self._call_policy_is_running(call_id):
+                return
+            await self._begin_policy_call_end(
+                call_id,
+                provider,
+                end_reason="policy_duration_limit",
+            )
+
+            await asyncio.sleep(
+                CALL_POLICY_SAFETY_END_SECONDS - CALL_POLICY_FINAL_RESPONSE_SECONDS
+            )
+            pending = self._pending_call_ends.get(call_id)
+            if (
+                not self._call_policy_is_running(call_id)
+                or pending is None
+                or pending.scheduled
+                or self.call_end_scheduler is None
+            ):
+                return
+            pending.scheduled = True
+            self._append_event(
+                call_id,
+                "call_policy_safety_end",
+                "agent",
+                {"elapsedSeconds": CALL_POLICY_SAFETY_END_SECONDS},
+            )
+            self.call_end_scheduler(call_id, pending.end_reason)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._call_policy_tasks.get(call_id) is asyncio.current_task():
+                self._call_policy_tasks.pop(call_id, None)
+
+    def _call_policy_is_running(self, call_id: str) -> bool:
+        try:
+            status = self.registry.get(call_id).status
+        except Exception:
+            return False
+        return status not in {
+            CallSessionStatus.ENDING,
+            CallSessionStatus.COMPLETED,
+            CallSessionStatus.FAILED,
+        }
+
+    async def _begin_policy_call_end(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        *,
+        end_reason: str,
+    ) -> bool:
+        if call_id in self._pending_call_ends or not self._call_policy_is_running(call_id):
+            return False
+        self._pending_call_ends[call_id] = PendingCallEnd(
+            tool_call_id=f"local_policy:{end_reason}",
+            tool_reason="policy_limit",
+            end_reason=end_reason,
+        )
+        self._cancel_silence_watchdog_nowait(call_id)
+        self._append_event(
+            call_id,
+            "call_policy_end_requested",
+            "agent",
+            {"endReason": end_reason},
+        )
+        await self._request_response(
+            call_id,
+            provider,
+            input_text=CALL_POLICY_FINAL_INPUT,
+        )
+        return True
+
+    def _arm_silence_watchdog(self, call_id: str) -> None:
+        session = self.registry.get(call_id)
+        if (
+            not self._is_sip_participant(session)
+            or call_id in self._pending_call_ends
+            or not self._call_policy_is_running(call_id)
+        ):
+            return
+        self._cancel_silence_watchdog_nowait(call_id)
+        self._silence_watchdog_tasks[call_id] = asyncio.create_task(
+            self._handle_silence_timeout(call_id),
+            name=f"ai-call-silence-{call_id}",
+        )
+
+    async def _handle_silence_timeout(self, call_id: str) -> None:
+        try:
+            await asyncio.sleep(CALL_POLICY_SILENCE_SECONDS)
+            session = self.registry.get(call_id)
+            if (
+                not self._call_policy_is_running(call_id)
+                or self._playback_guard(call_id).user_speech_active
+                or session.status == CallSessionStatus.USER_SPEAKING
+            ):
+                return
+            provider = self._providers.get(call_id)
+            if provider is None:
+                return
+            prompt_count = self._silence_prompt_counts.get(call_id, 0) + 1
+            self._silence_prompt_counts[call_id] = prompt_count
+            self._append_event(
+                call_id,
+                "call_policy_silence_timeout",
+                "agent",
+                {"count": prompt_count},
+            )
+            if prompt_count >= CALL_POLICY_MAX_SILENCE_PROMPTS:
+                await self._begin_policy_call_end(
+                    call_id,
+                    provider,
+                    end_reason="policy_no_response",
+                )
+                return
+            await self._request_response(
+                call_id,
+                provider,
+                input_text=CALL_POLICY_SILENCE_INPUTS[prompt_count - 1],
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._silence_watchdog_tasks.get(call_id) is asyncio.current_task():
+                self._silence_watchdog_tasks.pop(call_id, None)
+
+    def _cancel_silence_watchdog_nowait(self, call_id: str) -> None:
+        task = self._silence_watchdog_tasks.pop(call_id, None)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _cancel_silence_watchdog(self, call_id: str) -> None:
+        task = self._silence_watchdog_tasks.pop(call_id, None)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _cancel_call_policy_task(self, call_id: str) -> None:
+        task = self._call_policy_tasks.pop(call_id, None)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     async def _consume_room_audio(
         self,
@@ -5575,6 +5780,8 @@ class RealtimeCallAgentRunner:
         provider: RealtimeProviderProtocol,
         timestamp: datetime,
     ) -> None:
+        self._cancel_silence_watchdog_nowait(call_id)
+        self._silence_prompt_counts[call_id] = 0
         session = self.registry.get(call_id)
         if session.status == CallSessionStatus.READY:
             session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
@@ -5934,7 +6141,28 @@ class RealtimeCallAgentRunner:
         if should_queue_no_barge_followup:
             self._queue_no_barge_followup_response(call_id, text)
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
+        if (
+            provider_event.type == "user_transcript_done"
+            and self._record_customer_turn(call_id) >= CALL_POLICY_MAX_CUSTOMER_TURNS
+        ):
+            await self._begin_policy_call_end(
+                call_id,
+                provider,
+                end_reason="policy_turn_limit",
+            )
+            return
         await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
+
+    def _record_customer_turn(self, call_id: str) -> int:
+        count = self._customer_turn_counts.get(call_id, 0) + 1
+        self._customer_turn_counts[call_id] = count
+        self._append_event(
+            call_id,
+            "call_policy_customer_turn",
+            "agent",
+            {"count": count, "limit": CALL_POLICY_MAX_CUSTOMER_TURNS},
+        )
+        return count
 
     def _record_call_end_intent(
         self,
@@ -6170,6 +6398,8 @@ class RealtimeCallAgentRunner:
         )
 
     def _accepts_call_end_tool(self, call_id: str, tool_reason: str) -> bool:
+        if tool_reason == "policy_limit":
+            return self._customer_turn_counts.get(call_id, 0) >= 3
         if tool_reason == "task_completed":
             return self._accepts_task_completed_tool(call_id)
         if tool_reason != "customer_end":
@@ -6180,6 +6410,8 @@ class RealtimeCallAgentRunner:
 
     @staticmethod
     def _call_end_tool_rejection_reason(tool_reason: str) -> str:
+        if tool_reason == "policy_limit":
+            return "policy_limit_before_three_customer_turns"
         if tool_reason == "task_completed":
             return "task_completed_without_next_step_signal"
         return "customer_end_without_terminal_user_signal"
@@ -6192,6 +6424,8 @@ class RealtimeCallAgentRunner:
     ) -> str:
         if tool_reason == "task_completed":
             return TASK_COMPLETED_REJECTED_TOOL_RESULT
+        if tool_reason == "policy_limit":
+            return "尚未达到连续三轮沟通策略上限，请继续回应当前话题。"
         if rejection_reason == "customer_end_without_terminal_user_signal":
             return CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT
         return CALL_END_REJECTED_TOOL_RESULT
@@ -9355,6 +9589,7 @@ class RealtimeCallAgentRunner:
         ):
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
             self._schedule_pending_call_end_nowait(call_id)
+            self._arm_silence_watchdog(call_id)
             return
         self._cancel_playout_task_nowait(call_id)
         self._playout_tasks[call_id] = asyncio.create_task(
@@ -9378,6 +9613,7 @@ class RealtimeCallAgentRunner:
             if session.status == CallSessionStatus.AI_SPEAKING:
                 self.registry.transition(call_id, CallSessionStatus.CONNECTED)
             self._schedule_pending_call_end_nowait(call_id)
+            self._arm_silence_watchdog(call_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

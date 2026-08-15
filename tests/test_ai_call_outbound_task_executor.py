@@ -10,13 +10,22 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallEventModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
 )
+from app.api.v1.ai_call.outbound.attempt_projection import (
+    enroll_terminal_exception,
+    exception_category_for,
+    outbound_retry_interval,
+)
+from app.api.v1.ai_call.outbound.exception_service import OutboundExceptionService
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
+    AiCallOutboundExceptionPolicyModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -32,6 +41,7 @@ from app.api.v1.ai_call.outbound.task_executor import (
 )
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
+from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 from app.utils.id_util import generate_snowflake_id
 
 
@@ -55,6 +65,40 @@ def test_outbound_target_persists_next_attempt_at_and_migration() -> None:
     assert "idx_outbound_task_scheduled_dispatch" in migration
     assert "idx_outbound_task_running_dispatch" in migration
     assert "idx_outbound_attempt_stale" in migration
+
+
+def test_outbound_exception_models_and_migration() -> None:
+    assert {"tenant_id", "category", "interval_days", "max_retry_count"} <= {
+        column.name for column in AiCallOutboundExceptionPolicyModel.__table__.columns
+    }
+    assert {
+        "tenant_id",
+        "category",
+        "status",
+        "interval_days",
+        "max_retry_count",
+        "cutoff_at",
+        "active_slot",
+    } <= {column.name for column in AiCallOutboundExceptionBatchModel.__table__.columns}
+    assert {
+        "exception_category",
+        "exception_source_result",
+        "exception_original_attempt_count",
+        "exception_batch_id",
+        "exception_entered_at",
+    } <= {column.name for column in AiCallOutboundTargetModel.__table__.columns}
+
+    migration = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "livekit-ai-outbound"
+        / "sql"
+        / "phase-h11-outbound-exception-retry-postgres.sql"
+    ).read_text(encoding="utf-8").lower()
+    assert "create table if not exists ai_call_outbound_exception_policy" in migration
+    assert "create table if not exists ai_call_outbound_exception_batch" in migration
+    assert "add column if not exists exception_category" in migration
+    assert "uk_outbound_exception_batch_tenant_active" in migration
 
 
 @pytest.fixture
@@ -268,6 +312,27 @@ def _snapshot(
     )
 
 
+def test_retry_policy_uses_explicit_results_and_never_retries_generic_failure() -> None:
+    task = AiCallOutboundTaskModel(
+        config_snapshot_json=_snapshot(
+            retry_count=1,
+            retry_intervals_minutes=[30],
+            retryable_results=["rejected", "call_failed"],
+        )
+    )
+
+    assert outbound_retry_interval(task, 1, "rejected") == 30
+    assert outbound_retry_interval(task, 1, "call_failed") is None
+
+
+def test_exception_category_groups_busy_with_no_answer() -> None:
+    assert exception_category_for("no_answer") == "no_answer"
+    assert exception_category_for("busy") == "no_answer"
+    assert exception_category_for("rejected") == "rejected"
+    assert exception_category_for("invalid_number") == "invalid_number"
+    assert exception_category_for("call_failed") is None
+
+
 def available_line_snapshot() -> dict:
     return {
         "lineId": "340700000000000001",
@@ -409,6 +474,223 @@ async def _seed_task(
             )
         await session.commit()
     return task_id, target_ids
+
+
+@pytest.mark.anyio
+async def test_exception_batch_claims_only_current_pending_targets(database) -> None:
+    now = datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now, target_count=2)
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        first = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        second = await session.get(AiCallOutboundTargetModel, target_ids[1])
+        assert task is not None and first is not None and second is not None
+        task.status = "COMPLETED"
+        task.completed_targets = 2
+        task.ended_at = now
+        for target in (first, second):
+            target.status = "COMPLETED"
+            target.attempt_count = 2
+            target.latest_result = "no_answer"
+            target.exception_category = "no_answer"
+            target.exception_source_result = "no_answer"
+            target.exception_original_attempt_count = 2
+            target.exception_entered_at = now
+        second.exception_batch_id = generate_snowflake_id()
+        await session.commit()
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        batch = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "exception-batch-1",
+        )
+        await session.commit()
+        first = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        second = await session.get(AiCallOutboundTargetModel, target_ids[1])
+        assert first is not None and second is not None
+        assert batch.accepted is True
+        assert batch.target_count == 1
+        assert first.exception_batch_id == int(batch.batch_id)
+        assert first.status == "RETRY_WAIT"
+        assert first.next_attempt_at is not None
+        assert second.exception_batch_id != int(batch.batch_id)
+
+    async with database() as session:
+        replay = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "exception-batch-1",
+        )
+        assert replay.batch_id == batch.batch_id
+
+
+@pytest.mark.anyio
+async def test_terminal_original_failure_enters_exception_pool(database) -> None:
+    now = datetime(2026, 8, 13, 2, 0, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="busy")]),
+        now_provider=lambda: now,
+    )
+
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None
+        assert target.status == "COMPLETED"
+        assert target.latest_result == "busy"
+        assert target.exception_category == "no_answer"
+        assert target.exception_source_result == "busy"
+        assert target.exception_original_attempt_count == 1
+        assert target.exception_batch_id is None
+
+
+@pytest.mark.anyio
+async def test_early_hangup_requires_customer_disconnect_evidence(database) -> None:
+    now = datetime(2026, 8, 13, 2, 30, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="connected", duration_ms=3_000)]),
+        now_provider=lambda: now,
+    )
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.target_id == target_ids[0]
+            )
+        )
+        assert target is not None and attempt is not None
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == attempt.call_id)
+        )
+        assert record is not None
+        assert target.exception_category is None
+        record.entry_type = "direct_sip"
+        session.add(
+            AiCallEndEvidenceModel(
+                id=generate_snowflake_id(),
+                tenant_id="tenant-a",
+                call_id=attempt.call_id,
+                command_id=None,
+                source="livekit_webhook",
+                end_reason="sip_participant_left",
+                provider="livekit",
+                provider_namespace="test",
+                provider_event_id="event-1",
+                event_at=now,
+                received_at=now,
+                dedupe_key="early-hangup-event-1",
+                evidence_json=json.dumps(
+                    {
+                        "event": "participant_left",
+                        "disconnectReason": "CLIENT_INITIATED",
+                    }
+                ),
+            )
+        )
+        await session.flush()
+        assert (
+            await enroll_terminal_exception(
+                session,
+                target=target,
+                attempt=attempt,
+                record=record,
+                now=now,
+            )
+            == "early_hangup"
+        )
+        assert target.latest_result == "early_hangup"
+
+
+@pytest.mark.anyio
+async def test_exception_batch_executes_without_reopening_source_task(database) -> None:
+    now = datetime(2026, 8, 13, 3, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert task is not None and target is not None
+        task.status = "COMPLETED"
+        task.completed_targets = 1
+        task.failed_targets = 1
+        task.ended_at = now
+        target.status = "COMPLETED"
+        target.attempt_count = 1
+        target.latest_result = "no_answer"
+        target.exception_category = "no_answer"
+        target.exception_source_result = "no_answer"
+        target.exception_original_attempt_count = 1
+        target.exception_entered_at = now
+        await session.commit()
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        batch_out = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "completed-task-exception",
+        )
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None
+        target.next_attempt_at = now
+        await session.commit()
+
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="connected", duration_ms=8_000)]),
+        now_provider=lambda: now,
+    )
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        batch = await session.get(
+            AiCallOutboundExceptionBatchModel,
+            int(batch_out.batch_id),
+        )
+        assert task is not None and target is not None and batch is not None
+        assert task.status == "COMPLETED"
+        assert target.status == "COMPLETED"
+        assert target.attempt_count == 2
+        assert target.latest_result == "connected"
+        assert batch.status == "COMPLETED"
+        assert batch.active_slot is None
+        latest_attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel)
+            .where(AiCallOutboundAttemptModel.target_id == target.id)
+            .order_by(AiCallOutboundAttemptModel.attempt_no.desc())
+            .limit(1)
+        )
+        assert latest_attempt is not None
+        exception_handling = await AiCallRecordRepository(
+            session
+        ).get_exception_handling(
+            tenant_id="tenant-a",
+            call_id=latest_attempt.call_id,
+        )
+        assert exception_handling == {
+            "category": "no_answer",
+            "status": "CONNECTED",
+            "originalAttemptCount": 1,
+            "retryCount": 1,
+            "maxRetryCount": 3,
+            "lastResult": "connected",
+        }
 
 
 @pytest.mark.anyio

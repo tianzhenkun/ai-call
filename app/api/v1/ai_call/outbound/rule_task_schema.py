@@ -8,7 +8,8 @@ from pydantic import Field, field_validator, model_validator
 from .schema import OutboundSchema
 
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-SUPPORTED_RETRY_RESULTS = {"no_answer", "busy", "call_failed"}
+# 保留 call_failed 只为兼容已有规则快照；运行时不会据此自动重拨。
+SUPPORTED_RETRY_RESULTS = {"no_answer", "busy", "rejected", "call_failed"}
 MAX_RETRY_COUNT = 5
 
 
@@ -67,7 +68,7 @@ class CallRuleOut(CallRuleIn):
 
 
 class RetryableResultMeta(OutboundSchema):
-    value: Literal["no_answer", "busy", "call_failed"]
+    value: Literal["no_answer", "busy", "rejected"]
     label: str
 
 
