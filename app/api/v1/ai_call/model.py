@@ -1322,7 +1322,36 @@ class AiCallAfterCallWorkModel(MappedBase):
     __table_args__ = (
         UniqueConstraint("tenant_id", "work_id", name="uk_ai_call_acw_work"),
         UniqueConstraint("tenant_id", "handoff_id", name="uk_ai_call_acw_handoff"),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uk_ai_call_acw_idempotency",
+        ),
         Index("idx_ai_call_acw_tenant_call", "tenant_id", "call_id"),
+        CheckConstraint(
+            "classification is null or classification in "
+            "('interested', 'nurturing', 'low_value')",
+            name="ck_ai_call_acw_classification",
+        ),
+        CheckConstraint(
+            "low_value_reason is null or low_value_reason in "
+            "('explicit_rejection', 'no_current_need', 'customer_mismatch', "
+            "'non_target_customer', 'other')",
+            name="ck_ai_call_acw_low_value_reason",
+        ),
+        CheckConstraint(
+            "classification <> 'low_value' or low_value_reason is not null",
+            name="ck_ai_call_acw_low_value_required",
+        ),
+        CheckConstraint(
+            "(idempotency_key is null and request_fingerprint is null) or "
+            "(idempotency_key is not null and request_fingerprint is not null)",
+            name="ck_ai_call_acw_idempotency",
+        ),
+        CheckConstraint(
+            "result_version is null or result_version > 0",
+            name="ck_ai_call_acw_result_version",
+        ),
         {"comment": "AI Call 快速话后处理表"},
     )
     __permission_strategy__ = None
@@ -1333,9 +1362,18 @@ class AiCallAfterCallWorkModel(MappedBase):
     call_id: Mapped[str] = mapped_column(String(64), nullable=False)
     handoff_id: Mapped[str] = mapped_column(String(64), nullable=False)
     agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
-    disposition_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    follow_up_data_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    disposition_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    needs_follow_up: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    needs_follow_up: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    classification: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    low_value_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    next_follow_up_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    result_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1687,6 +1725,25 @@ class AiCallFollowUpHandlingResultModel(MappedBase):
             "follow_up_id is not null or follow_up_data_id is not null",
             name="ck_ai_call_follow_up_handling_parent",
         ),
+        CheckConstraint(
+            "classification is null or classification in "
+            "('interested', 'nurturing', 'low_value', 'converted')",
+            name="ck_ai_call_follow_up_handling_classification",
+        ),
+        CheckConstraint(
+            "low_value_reason is null or low_value_reason in "
+            "('explicit_rejection', 'no_current_need', 'customer_mismatch', "
+            "'non_target_customer', 'invalid_contact', 'other')",
+            name="ck_ai_call_follow_up_handling_low_value_reason",
+        ),
+        CheckConstraint(
+            "classification <> 'low_value' or low_value_reason is not null",
+            name="ck_ai_call_follow_up_handling_low_value_required",
+        ),
+        CheckConstraint(
+            "result_version is null or result_version > 0",
+            name="ck_ai_call_follow_up_handling_result_version",
+        ),
         {"comment": "AI Call 跟进处理结果表"},
     )
     __permission_strategy__ = None
@@ -1700,10 +1757,13 @@ class AiCallFollowUpHandlingResultModel(MappedBase):
     related_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     contact_channel: Mapped[str] = mapped_column(String(32), nullable=False)
     contact_result: Mapped[str] = mapped_column(String(32), nullable=False)
-    remark: Mapped[str] = mapped_column(String(500), nullable=False)
+    remark: Mapped[str] = mapped_column(Text, nullable=False)
     next_action: Mapped[str] = mapped_column(String(16), nullable=False)
     next_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closed_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    classification: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    low_value_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    result_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_identity: Mapped[str] = mapped_column(String(128), nullable=False)
     handled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -396,9 +396,14 @@ class RecordExceptionHandlingOut(AiCallBaseSchema):
 
 class RecordAfterCallWorkOut(AiCallBaseSchema):
     agent_identity: str
-    disposition_code: str
+    follow_up_data_id: str | None = None
+    disposition_code: str | None = None
     summary: str | None = None
-    needs_follow_up: bool
+    needs_follow_up: bool | None = None
+    classification: str | None = None
+    low_value_reason: str | None = None
+    next_follow_up_at: datetime | None = None
+    result_version: int | None = None
     submitted_at: datetime
 
 

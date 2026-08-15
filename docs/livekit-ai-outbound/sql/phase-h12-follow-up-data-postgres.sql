@@ -190,13 +190,90 @@ where analysis_status = '2'
 alter table ai_call_follow_up_task
     add column if not exists follow_up_data_id bigint;
 
+alter table ai_call_after_call_work
+    add column if not exists follow_up_data_id bigint,
+    add column if not exists idempotency_key varchar(128),
+    add column if not exists request_fingerprint varchar(64),
+    add column if not exists classification varchar(16),
+    add column if not exists low_value_reason varchar(32),
+    add column if not exists next_follow_up_at timestamptz,
+    add column if not exists result_version integer,
+    alter column disposition_code drop not null,
+    alter column needs_follow_up drop not null;
+
+create unique index if not exists uk_ai_call_acw_idempotency
+    on ai_call_after_call_work (tenant_id, idempotency_key);
+
 alter table ai_call_follow_up_handling_result
     add column if not exists follow_up_data_id bigint,
     add column if not exists request_fingerprint varchar(64),
+    add column if not exists classification varchar(16),
+    add column if not exists low_value_reason varchar(32),
+    add column if not exists result_version integer,
+    alter column remark type text,
     alter column follow_up_id drop not null;
 
 do $$
 begin
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_acw_classification'
+          and conrelid = 'ai_call_after_call_work'::regclass
+    ) then
+        alter table ai_call_after_call_work
+            add constraint ck_ai_call_acw_classification check (
+                classification is null or classification in
+                    ('interested', 'nurturing', 'low_value')
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_acw_low_value_reason'
+          and conrelid = 'ai_call_after_call_work'::regclass
+    ) then
+        alter table ai_call_after_call_work
+            add constraint ck_ai_call_acw_low_value_reason check (
+                low_value_reason is null or low_value_reason in
+                    ('explicit_rejection', 'no_current_need', 'customer_mismatch',
+                     'non_target_customer', 'other')
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_acw_low_value_required'
+          and conrelid = 'ai_call_after_call_work'::regclass
+    ) then
+        alter table ai_call_after_call_work
+            add constraint ck_ai_call_acw_low_value_required check (
+                classification <> 'low_value' or low_value_reason is not null
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_acw_idempotency'
+          and conrelid = 'ai_call_after_call_work'::regclass
+    ) then
+        alter table ai_call_after_call_work
+            add constraint ck_ai_call_acw_idempotency check (
+                (idempotency_key is null and request_fingerprint is null)
+                or (idempotency_key is not null and request_fingerprint is not null)
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_acw_result_version'
+          and conrelid = 'ai_call_after_call_work'::regclass
+    ) then
+        alter table ai_call_after_call_work
+            add constraint ck_ai_call_acw_result_version check (
+                result_version is null or result_version > 0
+            );
+    end if;
     if not exists (
         select 1
         from pg_constraint
@@ -206,6 +283,53 @@ begin
         alter table ai_call_follow_up_handling_result
             add constraint ck_ai_call_follow_up_handling_parent check (
                 follow_up_id is not null or follow_up_data_id is not null
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_handling_classification'
+          and conrelid = 'ai_call_follow_up_handling_result'::regclass
+    ) then
+        alter table ai_call_follow_up_handling_result
+            add constraint ck_ai_call_follow_up_handling_classification check (
+                classification is null or classification in
+                    ('interested', 'nurturing', 'low_value', 'converted')
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_handling_low_value_reason'
+          and conrelid = 'ai_call_follow_up_handling_result'::regclass
+    ) then
+        alter table ai_call_follow_up_handling_result
+            add constraint ck_ai_call_follow_up_handling_low_value_reason check (
+                low_value_reason is null or low_value_reason in
+                    ('explicit_rejection', 'no_current_need', 'customer_mismatch',
+                     'non_target_customer', 'invalid_contact', 'other')
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_handling_low_value_required'
+          and conrelid = 'ai_call_follow_up_handling_result'::regclass
+    ) then
+        alter table ai_call_follow_up_handling_result
+            add constraint ck_ai_call_follow_up_handling_low_value_required check (
+                classification <> 'low_value' or low_value_reason is not null
+            );
+    end if;
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname = 'ck_ai_call_follow_up_handling_result_version'
+          and conrelid = 'ai_call_follow_up_handling_result'::regclass
+    ) then
+        alter table ai_call_follow_up_handling_result
+            add constraint ck_ai_call_follow_up_handling_result_version check (
+                result_version is null or result_version > 0
             );
     end if;
 end

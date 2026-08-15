@@ -242,6 +242,120 @@ async def _seed_unanswered_follow_up(
         )
 
 
+async def _seed_outbound_context(session_factory, *, call_id: str = "call-1") -> None:
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        record = await db.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        assert record is not None
+        record.tenant_id = "tenant-a"
+        db.add_all(
+            [
+                AiCallOutboundTaskModel(
+                    id=300,
+                    tenant_id="tenant-a",
+                    validation_id=1,
+                    idempotency_key="acw-outbound-task",
+                    request_fingerprint="acw-outbound-fingerprint",
+                    task_name="AI 外呼任务",
+                    task_mode="single",
+                    status="COMPLETED",
+                    total_targets=1,
+                    completed_targets=1,
+                    connected_targets=1,
+                    failed_targets=0,
+                    execution_mode="immediate",
+                    prompt_name="产品介绍",
+                    scene_code="intro_contract",
+                    voice="Tina",
+                    rule_id=1,
+                    rule_name="工作日规则",
+                    rule_summary="全天",
+                    config_snapshot_json="{}",
+                    created_by=1,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundTargetModel(
+                    id=301,
+                    tenant_id="tenant-a",
+                    task_id=300,
+                    validation_id=1,
+                    source_validation_row_id=1,
+                    source_row_number=1,
+                    phone_number="13800000000",
+                    customer_name="测试客户",
+                    status="COMPLETED",
+                    attempt_count=1,
+                    latest_result="connected",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallOutboundAttemptModel(
+                    id=302,
+                    tenant_id="tenant-a",
+                    task_id=300,
+                    target_id=301,
+                    attempt_no=1,
+                    call_id=call_id,
+                    dialer_type="sip",
+                    status="COMPLETED",
+                    call_result="connected",
+                    started_at=now,
+                    ended_at=now,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+
+
+async def _link_follow_up_data(
+    session_factory,
+    *,
+    follow_up_id: int,
+    classification: str = "interested",
+) -> int:
+    now = datetime.now(timezone.utc)
+    data_id = follow_up_id + 20_000
+    async with session_factory() as db, db.begin():
+        task = await db.get(AiCallFollowUpTaskModel, follow_up_id)
+        assert task is not None
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == task.source_call_id
+            )
+        )
+        assert record is not None
+        task.follow_up_data_id = data_id
+        record.follow_up_data_id = data_id
+        db.add(
+            AiCallFollowUpDataModel(
+                id=data_id,
+                tenant_id="tenant-a",
+                task_id=follow_up_id + 30_000,
+                target_id=follow_up_id + 40_000,
+                source_call_id=task.source_call_id,
+                classification=classification,
+                classification_reason="AI 初始分类",
+                classification_source="ai",
+                classification_confidence="high",
+                suggest_review=False,
+                low_value_reason=None,
+                latest_conclusion="客户希望继续了解",
+                last_contact_at=now,
+                blocking_human_call_id=None,
+                version=1,
+                classification_updated_at=now,
+                classification_updated_by="ai",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return data_id
+
+
 async def _seed_ai_post_call_follow_up(session_factory, *, task_id: int = 102) -> None:
     now = datetime.now(timezone.utc)
     async with session_factory() as db, db.begin():
@@ -275,6 +389,24 @@ async def _seed_ai_post_call_follow_up(session_factory, *, task_id: int = 102) -
 
 def _error_code(exc: CustomException) -> str | None:
     return exc.data.get("errorCode") if isinstance(exc.data, dict) else None
+
+
+def test_classification_contract_rejects_mixed_or_invalid_after_call_fields() -> None:
+    with pytest.raises(ValidationError, match="新旧话后结果字段不能混用"):
+        AfterCallWorkIn(
+            disposition_code="resolved",
+            classification="interested",
+            conclusion="客户有意向",
+            schedule_follow_up=False,
+            expected_version=0,
+        )
+    with pytest.raises(ValidationError):
+        AfterCallWorkIn(
+            classification="converted",
+            conclusion="客户已签约",
+            schedule_follow_up=False,
+            expected_version=0,
+        )
 
 
 def test_follow_up_data_models_keep_classification_separate_from_tasks() -> None:
@@ -512,6 +644,108 @@ async def test_handling_result_produces_completed_and_closed_terminal_states(
         assert closed.status == "closed"
         assert closed.closed_reason == "customer_refused"
         assert closed.closed_remark == "客户明确拒绝继续联系"
+
+
+@pytest.mark.anyio
+async def test_classification_handling_result_updates_data_and_completes_task(
+    session_factory,
+) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(
+        session_factory, task_id=100, owner_agent_identity="agent-20"
+    )
+    data_id = await _link_follow_up_data(session_factory, follow_up_id=100)
+    payload = FollowUpHandlingResultIn(
+        contact_channel="wechat",
+        contact_result="connected",
+        classification="converted",
+        conclusion="客户已确认采购并完成签约。",
+        schedule_follow_up=False,
+        expected_version=1,
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        task, first = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=payload,
+            idempotency_key="handling-classification-1",
+        )
+        replay_task, replay = await service.submit_handling_result(
+            auth,
+            follow_up_id=100,
+            payload=payload,
+            idempotency_key="handling-classification-1",
+        )
+        with pytest.raises(CustomException, match="幂等键已用于其他请求"):
+            await service.submit_handling_result(
+                auth,
+                follow_up_id=100,
+                payload=payload.model_copy(
+                    update={"conclusion": "同一幂等键对应了不同结论。"}
+                ),
+                idempotency_key="handling-classification-1",
+            )
+        await db.commit()
+
+        data = await db.get(AiCallFollowUpDataModel, data_id)
+        history_count = await db.scalar(
+            select(func.count()).select_from(
+                AiCallFollowUpClassificationHistoryModel
+            )
+        )
+        assert task.status == "completed"
+        assert replay_task.status == "completed"
+        assert first.id == replay.id
+        assert first.follow_up_data_id == data_id
+        assert first.classification == "converted"
+        assert first.result_version == 2
+        assert data.classification == "converted"
+        assert data.latest_conclusion == payload.conclusion
+        assert data.version == 2
+        assert history_count == 1
+
+
+@pytest.mark.anyio
+async def test_unconnected_classification_result_keeps_classification_and_can_finish_task(
+    session_factory,
+) -> None:
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20")
+    await _seed_unanswered_follow_up(
+        session_factory, task_id=100, owner_agent_identity="agent-20"
+    )
+    data_id = await _link_follow_up_data(session_factory, follow_up_id=100)
+
+    async with session_factory() as db:
+        task, result = await AiCallFollowUpService(db).submit_handling_result(
+            _auth(db, user_id=20),
+            follow_up_id=100,
+            payload=FollowUpHandlingResultIn(
+                contact_channel="wechat",
+                contact_result="no_answer",
+                remark="本次未取得联系，暂不安排再次回访。",
+                schedule_follow_up=False,
+                expected_version=1,
+            ),
+            idempotency_key="handling-unconnected-1",
+        )
+        await db.commit()
+
+        data = await db.get(AiCallFollowUpDataModel, data_id)
+        history_count = await db.scalar(
+            select(func.count()).select_from(
+                AiCallFollowUpClassificationHistoryModel
+            )
+        )
+        assert task.status == "completed"
+        assert result.next_action == "complete"
+        assert result.classification is None
+        assert data.classification == "interested"
+        assert data.latest_conclusion == result.remark
+        assert data.version == 2
+        assert history_count == 0
 
 
 @pytest.mark.anyio
@@ -901,6 +1135,99 @@ async def test_repeated_acw_submission_does_not_duplicate_work_or_follow_up(sess
         assert task_count == 1
         assert first[0].id == second[0].id
         assert first[1].id == second[1].id
+
+
+@pytest.mark.anyio
+async def test_classification_acw_updates_follow_up_data_without_creating_task(
+    session_factory,
+) -> None:
+    await _seed_completed_handoff(session_factory)
+    await _seed_outbound_context(session_factory)
+    payload = AfterCallWorkIn(
+        classification="interested",
+        conclusion="客户希望先查看方案，本次暂不安排回访。",
+        schedule_follow_up=False,
+        expected_version=0,
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db)
+        auth = _auth(db, user_id=20)
+        first = await service.submit_after_call_work(
+            auth,
+            call_id="call-1",
+            payload=payload,
+            idempotency_key="acw-classification-1",
+        )
+        second = await service.submit_after_call_work(
+            auth,
+            call_id="call-1",
+            payload=payload,
+            idempotency_key="acw-classification-1",
+        )
+        with pytest.raises(CustomException, match="幂等键已用于其他请求"):
+            await service.submit_after_call_work(
+                auth,
+                call_id="call-1",
+                payload=payload.model_copy(
+                    update={"conclusion": "同一幂等键对应了不同结论。"}
+                ),
+                idempotency_key="acw-classification-1",
+            )
+        await db.commit()
+
+        data = await db.scalar(select(AiCallFollowUpDataModel))
+        history_count = await db.scalar(
+            select(func.count()).select_from(
+                AiCallFollowUpClassificationHistoryModel
+            )
+        )
+        task_count = await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpTaskModel)
+        )
+        record = await db.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == "call-1")
+        )
+
+        assert first[0].id == second[0].id
+        assert first[1] is None
+        assert data is not None
+        assert data.classification == "interested"
+        assert data.latest_conclusion == payload.conclusion
+        assert data.version == 1
+        assert history_count == 1
+        assert task_count == 0
+        assert record.follow_up_data_id == data.id
+        assert record.operator_agent_identity == "agent-20"
+
+
+@pytest.mark.anyio
+async def test_classification_acw_creates_task_only_when_callback_is_scheduled(
+    session_factory,
+) -> None:
+    await _seed_completed_handoff(session_factory)
+    await _seed_outbound_context(session_factory)
+    callback_at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    async with session_factory() as db:
+        work, follow_up = await AiCallFollowUpService(db).submit_after_call_work(
+            _auth(db, user_id=20),
+            call_id="call-1",
+            payload=AfterCallWorkIn(
+                classification="nurturing",
+                conclusion="客户希望明天下午再沟通。",
+                schedule_follow_up=True,
+                next_follow_up_at=callback_at,
+                expected_version=0,
+            ),
+            idempotency_key="acw-schedule-1",
+        )
+        await db.commit()
+
+        assert follow_up is not None
+        assert follow_up.follow_up_data_id == work.follow_up_data_id
+        assert follow_up.owner_agent_identity == "agent-20"
+        assert follow_up.customer_callback_at == callback_at
 
 
 @pytest.mark.anyio

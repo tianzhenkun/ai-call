@@ -1304,9 +1304,18 @@ class AiCallService:
             if work is not None:
                 after_call_work = {
                     "agentIdentity": work.agent_identity,
+                    "followUpDataId": (
+                        str(work.follow_up_data_id)
+                        if work.follow_up_data_id is not None
+                        else None
+                    ),
                     "dispositionCode": work.disposition_code,
                     "summary": work.summary,
                     "needsFollowUp": work.needs_follow_up,
+                    "classification": work.classification,
+                    "lowValueReason": work.low_value_reason,
+                    "nextFollowUpAt": work.next_follow_up_at,
+                    "resultVersion": work.result_version,
                     "submittedAt": work.submitted_at,
                 }
         return {

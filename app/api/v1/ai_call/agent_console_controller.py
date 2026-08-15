@@ -510,11 +510,16 @@ async def submit_after_call_work_controller(
     payload: AfterCallWorkIn,
     auth: AuthenticatedUser,
     service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ] = None,
 ):
     work, follow_up = await service.submit_after_call_work(
         auth,
         call_id=call_id,
         payload=payload,
+        idempotency_key=idempotency_key,
     )
     await _publish(
         auth,
@@ -522,6 +527,11 @@ async def submit_after_call_work_controller(
         {
             "call_id": call_id,
             "follow_up_id": str(follow_up.id) if follow_up else None,
+            "follow_up_data_id": (
+                str(work.follow_up_data_id) if work.follow_up_data_id else None
+            ),
+            "classification": work.classification,
+            "result_version": work.result_version,
             "status": follow_up.status if follow_up else None,
         },
     )
@@ -633,7 +643,15 @@ async def submit_follow_up_handling_result_controller(
     await _publish(
         auth,
         "follow_up.changed",
-        {"follow_up_id": str(task.id), "status": task.status},
+        {
+            "follow_up_id": str(task.id),
+            "follow_up_data_id": (
+                str(result.follow_up_data_id) if result.follow_up_data_id else None
+            ),
+            "classification": result.classification,
+            "result_version": result.result_version,
+            "status": task.status,
+        },
     )
     response = service.follow_up_payload(task)
     response["handling_result"] = service.handling_result_payload(result)
