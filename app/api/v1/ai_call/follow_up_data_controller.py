@@ -25,7 +25,7 @@ FollowUpDataRouter = APIRouter(tags=["跟进数据"])
 async def list_follow_up_data_controller(
     auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
     classification: Annotated[FollowUpClassification | None, Query()] = None,
-    keyword: Annotated[str | None, Query()] = None,
+    customer_name: Annotated[str | None, Query(alias="customerName")] = None,
     task_id: Annotated[int | None, Query(alias="taskId")] = None,
     last_contact_at_begin: Annotated[
         datetime | None,
@@ -35,15 +35,6 @@ async def list_follow_up_data_controller(
         datetime | None,
         Query(alias="lastContactAtEnd"),
     ] = None,
-    next_follow_up_at_begin: Annotated[
-        datetime | None,
-        Query(alias="nextFollowUpAtBegin"),
-    ] = None,
-    next_follow_up_at_end: Annotated[
-        datetime | None,
-        Query(alias="nextFollowUpAtEnd"),
-    ] = None,
-    suggest_review: Annotated[bool | None, Query(alias="suggestReview")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 20,
 ) -> JSONResponse:
@@ -51,13 +42,10 @@ async def list_follow_up_data_controller(
     rows, total = await AiCallFollowUpDataService.from_session(auth.db).list_page(
         tenant_id=tenant_id,
         classification=classification,
-        keyword=keyword,
+        customer_name=customer_name,
         task_id=task_id,
         last_contact_at_begin=last_contact_at_begin,
         last_contact_at_end=last_contact_at_end,
-        next_follow_up_at_begin=next_follow_up_at_begin,
-        next_follow_up_at_end=next_follow_up_at_end,
-        suggest_review=suggest_review,
         page_num=page_num,
         page_size=page_size,
     )

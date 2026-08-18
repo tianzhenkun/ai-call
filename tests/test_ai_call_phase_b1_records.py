@@ -2410,7 +2410,7 @@ async def test_handoff_availability_routes_requested_pool(
 
 
 @pytest.mark.anyio
-async def test_handoff_without_online_agent_fails_and_creates_one_follow_up(
+async def test_handoff_without_online_agent_fails_without_creating_follow_up(
     b1_service,
 ) -> None:
     service, record_service = b1_service
@@ -2481,9 +2481,7 @@ async def test_handoff_without_online_agent_fails_and_creates_one_follow_up(
             .scalars()
             .all()
         )
-        assert len(follow_ups) == 1
-        assert follow_ups[0].source_type == "handoff_unanswered"
-        assert follow_ups[0].status == "pending"
+        assert follow_ups == []
     finally:
         worker.detach_all()
         await worker.stop()
@@ -2562,7 +2560,7 @@ async def test_same_turn_transcript_and_tool_create_only_one_terminal_handoff(
             .scalars()
             .all()
         )
-        assert len(follow_ups) == 1
+        assert follow_ups == []
     finally:
         worker.detach_all()
         await worker.stop()
@@ -2637,7 +2635,7 @@ async def test_handoff_availability_failure_is_not_reported_as_agent_busy(
             .scalars()
             .all()
         )
-        assert len(follow_ups) == 1
+        assert follow_ups == []
     finally:
         worker.detach_all()
         await worker.stop()

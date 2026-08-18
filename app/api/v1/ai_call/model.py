@@ -871,7 +871,7 @@ class AiCallSemanticAnalysisModel(MappedBase):
     follow_up_review_status: Mapped[str | None] = mapped_column(
         String(16),
         nullable=True,
-        comment="人工跟进确认：created/dismissed",
+        comment="人工确认结果：created/dismissed/confirmed/adjusted",
     )
     follow_up_reviewed_by: Mapped[str | None] = mapped_column(
         String(64),

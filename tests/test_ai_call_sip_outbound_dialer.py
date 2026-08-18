@@ -103,6 +103,8 @@ def dial_request():
         voice="Tina",
         prompt_profile_id=None,
         line=line_snapshot(),
+        business_params={},
+        prompt_snapshot=None,
     )
 
 

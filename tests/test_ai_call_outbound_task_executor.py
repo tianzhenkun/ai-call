@@ -21,6 +21,7 @@ from app.api.v1.ai_call.outbound.attempt_projection import (
     exception_category_for,
     outbound_retry_interval,
 )
+from app.api.v1.ai_call.outbound.exception_schema import ExceptionPolicyIn
 from app.api.v1.ai_call.outbound.exception_service import OutboundExceptionService
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
@@ -41,6 +42,7 @@ from app.api.v1.ai_call.outbound.task_executor import (
 )
 from app.config.setting import Settings
 from app.core.base_model import MappedBase
+from app.core.exceptions import CustomException
 from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 from app.utils.id_util import generate_snowflake_id
 
@@ -2562,3 +2564,244 @@ async def test_worker_survives_one_poll_error_and_stops_cleanly() -> None:
     calls_after_stop = executor.calls
     await asyncio.sleep(0.03)
     assert executor.calls == calls_after_stop
+
+
+@pytest.mark.anyio
+async def test_original_retry_must_finish_before_target_enters_exception_pool(
+    database,
+) -> None:
+    now = datetime(2026, 8, 13, 2, 15, tzinfo=timezone.utc)
+    clock = [now]
+    _, target_ids = await _seed_task(
+        database,
+        now=now,
+        snapshot=_snapshot(
+            retry_count=1,
+            retry_intervals_minutes=[30],
+            retryable_results=["busy"],
+        ),
+    )
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer(
+            [DialResult(call_result="busy"), DialResult(call_result="busy")]
+        ),
+        now_provider=lambda: clock[0],
+    )
+
+    assert await executor.run_once() == 1
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None
+        assert target.status == "RETRY_WAIT"
+        assert target.next_attempt_at == _sqlite_time(now + timedelta(minutes=30))
+        assert target.exception_category is None
+
+    clock[0] = now + timedelta(minutes=31)
+    assert await executor.run_once() == 1
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None
+        assert target.status == "COMPLETED"
+        assert target.next_attempt_at is None
+        assert target.exception_category == "no_answer"
+        assert target.exception_source_result == "busy"
+        assert target.exception_original_attempt_count == 2
+
+
+@pytest.mark.anyio
+async def test_exception_batch_snapshots_policy_and_uses_last_attempt_end_time(
+    database,
+) -> None:
+    now = datetime(2026, 8, 13, 2, 20, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now)
+    executor = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="busy")]),
+        now_provider=lambda: now,
+    )
+    assert await executor.run_once() == 1
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        await service.update_policy(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            ExceptionPolicyIn(interval_days=7, max_retry_count=2),
+        )
+        batch_out = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "snapshot-policy-batch",
+        )
+        await session.commit()
+
+    async with database() as session:
+        await service.update_policy(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            ExceptionPolicyIn(interval_days=14, max_retry_count=5),
+        )
+        await session.commit()
+        batch = await session.get(
+            AiCallOutboundExceptionBatchModel,
+            int(batch_out.batch_id),
+        )
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert batch is not None and target is not None
+        assert (batch.interval_days, batch.max_retry_count) == (7, 2)
+        assert target.next_attempt_at == _sqlite_time(now + timedelta(days=7))
+
+
+@pytest.mark.anyio
+async def test_active_exception_batch_blocks_same_category_only(database) -> None:
+    now = datetime(2026, 8, 13, 2, 25, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now, target_count=2)
+    async with database() as session:
+        for target_id, category in zip(
+            target_ids,
+            ("no_answer", "rejected"),
+            strict=True,
+        ):
+            target = await session.get(AiCallOutboundTargetModel, target_id)
+            assert target is not None
+            target.status = "COMPLETED"
+            target.attempt_count = 1
+            target.latest_result = category
+            target.exception_category = category
+            target.exception_source_result = category
+            target.exception_original_attempt_count = 1
+            target.exception_entered_at = now
+        await session.commit()
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        first = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "active-no-answer",
+        )
+        await session.commit()
+
+    async with database() as session:
+        with pytest.raises(CustomException) as error:
+            await service.start_batch(
+                session,
+                "tenant-a",
+                1,
+                "no_answer",
+                "second-no-answer",
+            )
+        assert error.value.status_code == 409
+        assert error.value.data == {"activeBatchId": first.batch_id}
+
+    async with database() as session:
+        rejected = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "rejected",
+            "active-rejected",
+        )
+        await session.commit()
+        assert rejected.category == "rejected"
+
+
+@pytest.mark.anyio
+async def test_exception_retry_stops_at_batch_limit_and_is_tenant_isolated(
+    database,
+) -> None:
+    now = datetime(2026, 8, 13, 3, 30, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now)
+    original = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="busy")]),
+        now_provider=lambda: now,
+    )
+    assert await original.run_once() == 1
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        await service.update_policy(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            ExceptionPolicyIn(interval_days=1, max_retry_count=2),
+        )
+        batch_out = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "max-two-batch",
+        )
+        await session.commit()
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None and target.next_attempt_at is not None
+        first_retry_at = target.next_attempt_at
+
+    clock = [first_retry_at]
+    retries = OutboundTaskExecutor(
+        database,
+        SequenceDialer(
+            [DialResult(call_result="busy"), DialResult(call_result="busy")]
+        ),
+        now_provider=lambda: clock[0],
+    )
+    assert await retries.run_once() == 1
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None and target.next_attempt_at is not None
+        assert target.status == "RETRY_WAIT"
+        second_retry_at = target.next_attempt_at
+
+    clock[0] = second_retry_at
+    assert await retries.run_once() == 1
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        batch = await session.get(
+            AiCallOutboundExceptionBatchModel,
+            int(batch_out.batch_id),
+        )
+        assert target is not None and batch is not None
+        assert target.status == "COMPLETED"
+        assert target.next_attempt_at is None
+        assert target.attempt_count - target.exception_original_attempt_count == 2
+        assert batch.status == "COMPLETED"
+        assert batch.active_slot is None
+
+        rows, total = await service.list_targets(
+            session,
+            "tenant-a",
+            1,
+            category="no_answer",
+            target_status="MAXED",
+            keyword=None,
+            page_num=1,
+            page_size=20,
+        )
+        assert total == 1
+        assert rows[0].status == "MAXED"
+        assert rows[0].phone_number == "138****8001"
+
+        other_rows, other_total = await service.list_targets(
+            session,
+            "tenant-b",
+            2,
+            category="no_answer",
+            target_status=None,
+            keyword=None,
+            page_num=1,
+            page_size=20,
+        )
+        assert other_rows == []
+        assert other_total == 0

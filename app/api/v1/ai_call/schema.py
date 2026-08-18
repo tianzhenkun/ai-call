@@ -433,6 +433,9 @@ class RecordFollowUpDataOut(AiCallBaseSchema):
     classification: str | None = None
     low_value_reason: str | None = None
     latest_conclusion: str | None = None
+    active_follow_up_id: str | None = None
+    active_follow_up_status: str | None = None
+    next_follow_up_at: datetime | None = None
     version: int
 
 
@@ -489,10 +492,14 @@ class SemanticAnalysisOut(AiCallBaseSchema):
     analysis_error: str | None = None
     analysis_retry_count: int
     follow_up_requires_review: bool = False
-    follow_up_review_status: Literal["created", "dismissed"] | None = None
+    follow_up_review_status: Literal[
+        "created", "dismissed", "confirmed", "adjusted"
+    ] | None = None
     follow_up_reviewed_by: str | None = None
     follow_up_reviewed_by_name: str | None = None
     follow_up_reviewed_at: datetime | None = None
+    classification_requires_review: bool = False
+    classification_review_status: Literal["suggested", "reviewed"] | None = None
     analysis_started_at: datetime | None = None
     analysis_finished_at: datetime | None = None
     transcript_hash: str | None = None

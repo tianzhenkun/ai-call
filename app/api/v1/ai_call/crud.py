@@ -15,6 +15,7 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
+    AiCallFollowUpClassificationHistoryModel,
     AiCallFollowUpDataModel,
     AiCallFollowUpHandlingResultModel,
     AiCallFollowUpTaskModel,
@@ -38,6 +39,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.services.ai_call.classification_review import requires_classification_review
 from app.utils.id_util import generate_snowflake_id
 
 DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE = "ai_call_semantic_analysis"
@@ -335,6 +337,26 @@ class AiCallRecordRepository:
             )
         )
 
+    async def get_active_follow_up_for_data(
+        self,
+        *,
+        tenant_id: str,
+        follow_up_data_id: int,
+    ) -> AiCallFollowUpTaskModel | None:
+        return await self.db.scalar(
+            select(AiCallFollowUpTaskModel)
+            .where(
+                AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                AiCallFollowUpTaskModel.follow_up_data_id == follow_up_data_id,
+                AiCallFollowUpTaskModel.status.in_({"pending", "processing"}),
+            )
+            .order_by(
+                AiCallFollowUpTaskModel.updated_at.desc(),
+                AiCallFollowUpTaskModel.id.desc(),
+            )
+            .limit(1)
+        )
+
     async def list_records_by_call_ids(
         self,
         call_ids: list[str],
@@ -561,6 +583,7 @@ class AiCallRecordRepository:
         customer_name: str | None = None,
         call_result: str | None = None,
         customer_intent: str | None = None,
+        classification_review_status: str | None = None,
         follow_up_status: str | None = None,
         after_call_result_status: str | None = None,
         operator_agent_identity: str | None = None,
@@ -584,6 +607,7 @@ class AiCallRecordRepository:
             customer_name=customer_name,
             call_result=call_result,
             customer_intent=customer_intent,
+            classification_review_status=classification_review_status,
             follow_up_status=follow_up_status,
             after_call_result_status=after_call_result_status,
             operator_agent_identity=operator_agent_identity,
@@ -605,6 +629,7 @@ class AiCallRecordRepository:
             customer_name=customer_name,
             call_result=call_result,
             customer_intent=customer_intent,
+            classification_review_status=classification_review_status,
             follow_up_status=follow_up_status,
             after_call_result_status=after_call_result_status,
             operator_agent_identity=operator_agent_identity,
@@ -756,8 +781,22 @@ class AiCallRecordRepository:
                 )
             )
         ).all()
-        analysis_by_call_id = {
-            row.call_id: {
+        analysis_by_call_id = {}
+        for row in analysis_rows:
+            try:
+                analysis_result = (
+                    row.analysis_result
+                    if isinstance(row.analysis_result, dict)
+                    else json.loads(row.analysis_result or "{}")
+                )
+            except (TypeError, ValueError):
+                analysis_result = {}
+            classification_requires_review = requires_classification_review(
+                analysis_status=row.analysis_status,
+                analysis_result=analysis_result,
+                review_status=row.follow_up_review_status,
+            )
+            analysis_by_call_id[row.call_id] = {
                 "analysisStatus": row.analysis_status,
                 "analysisResult": row.analysis_result,
                 "customerIntent": row.customer_intent,
@@ -773,9 +812,15 @@ class AiCallRecordRepository:
                     )
                 ),
                 "followUpReviewStatus": row.follow_up_review_status,
+                "classificationRequiresReview": classification_requires_review,
+                "classificationReviewStatus": (
+                    "reviewed"
+                    if row.follow_up_review_status in {"confirmed", "adjusted"}
+                    else "suggested"
+                    if classification_requires_review
+                    else None
+                ),
             }
-            for row in analysis_rows
-        }
         for record in records:
             context = analysis_by_call_id.get(record.call_id, {})
             record._semantic_analysis_context = context
@@ -2855,6 +2900,10 @@ class AiCallRecordRepository:
         customer_intent = (
             str(filters.get("customer_intent") or "").strip() or None
         )
+        classification_review_status = (
+            str(filters.get("classification_review_status") or "").strip()
+            or None
+        )
         follow_up_status = (
             str(filters.get("follow_up_status") or "").strip() or None
         )
@@ -3007,6 +3056,59 @@ class AiCallRecordRepository:
                 )
                 .exists()
             )
+        if classification_review_status == "suggested":
+            latest_classification_call = (
+                select(AiCallFollowUpClassificationHistoryModel.call_id)
+                .where(
+                    AiCallFollowUpClassificationHistoryModel.tenant_id
+                    == tenant_id,
+                    AiCallFollowUpClassificationHistoryModel.follow_up_data_id
+                    == AiCallRecordModel.follow_up_data_id,
+                )
+                .order_by(
+                    AiCallFollowUpClassificationHistoryModel.created_at.desc(),
+                    AiCallFollowUpClassificationHistoryModel.id.desc(),
+                )
+                .correlate(AiCallRecordModel)
+                .limit(1)
+                .scalar_subquery()
+            )
+            stmt = stmt.where(
+                select(AiCallFollowUpDataModel.id)
+                .where(
+                    AiCallFollowUpDataModel.tenant_id == tenant_id,
+                    AiCallFollowUpDataModel.id
+                    == AiCallRecordModel.follow_up_data_id,
+                    AiCallFollowUpDataModel.suggest_review.is_(True),
+                )
+                .exists(),
+                latest_classification_call == AiCallRecordModel.call_id,
+                select(AiCallSemanticAnalysisModel.id)
+                .where(
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.analysis_status
+                    == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED,
+                    AiCallSemanticAnalysisModel.follow_up_review_status.is_(None),
+                )
+                .exists(),
+            )
+        elif classification_review_status == "reviewed":
+            stmt = stmt.where(
+                select(AiCallSemanticAnalysisModel.id)
+                .where(
+                    AiCallSemanticAnalysisModel.call_id
+                    == AiCallRecordModel.call_id,
+                    AiCallSemanticAnalysisModel.analysis_scene_code
+                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
+                    AiCallSemanticAnalysisModel.follow_up_review_status.in_(
+                        {"confirmed", "adjusted"}
+                    ),
+                )
+                .exists()
+            )
         if follow_up_status:
             exact_task_status = (
                 select(AiCallFollowUpTaskModel.status)
@@ -3063,64 +3165,8 @@ class AiCallRecordRepository:
                 "closed",
             }:
                 stmt = stmt.where(selected_task_status == follow_up_status)
-            elif follow_up_status in {"suggested", "none"}:
-                semantic_conditions = [
-                    AiCallSemanticAnalysisModel.call_id
-                    == AiCallRecordModel.call_id,
-                    AiCallSemanticAnalysisModel.analysis_scene_code
-                    == DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE,
-                ]
-                if follow_up_status == "suggested":
-                    semantic_conditions.extend(
-                        [
-                            AiCallSemanticAnalysisModel.analysis_status
-                            == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED,
-                            AiCallSemanticAnalysisModel.follow_up_review_status.is_(
-                                None
-                            ),
-                            or_(
-                                AiCallSemanticAnalysisModel.follow_up_consent.is_(
-                                    None
-                                ),
-                                AiCallSemanticAnalysisModel.follow_up_consent
-                                != "refused",
-                            ),
-                            or_(
-                                AiCallSemanticAnalysisModel.follow_up_suggested.is_(
-                                    False
-                                ),
-                                AiCallSemanticAnalysisModel.follow_up_consent.is_(
-                                    None
-                                ),
-                                AiCallSemanticAnalysisModel.follow_up_consent
-                                != "explicit",
-                                AiCallSemanticAnalysisModel.follow_up_confidence.is_(
-                                    None
-                                ),
-                                AiCallSemanticAnalysisModel.follow_up_confidence
-                                != "high",
-                            ),
-                        ]
-                    )
-                else:
-                    semantic_conditions.append(
-                        AiCallSemanticAnalysisModel.analysis_status
-                        == SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
-                    )
-                    semantic_conditions.append(
-                        or_(
-                            AiCallSemanticAnalysisModel.follow_up_consent
-                            == "refused",
-                            AiCallSemanticAnalysisModel.follow_up_review_status
-                            == "dismissed",
-                        )
-                    )
-                stmt = stmt.where(
-                    select(AiCallSemanticAnalysisModel.id)
-                    .where(*semantic_conditions)
-                    .exists(),
-                    selected_task_status.is_(None),
-                )
+            elif follow_up_status == "none":
+                stmt = stmt.where(selected_task_status.is_(None))
         if operator_agent_identity:
             stmt = stmt.where(
                 AiCallRecordModel.operator_agent_identity

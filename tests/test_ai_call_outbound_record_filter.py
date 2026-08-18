@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -13,6 +15,8 @@ from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
+    AiCallFollowUpClassificationHistoryModel,
+    AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
@@ -125,7 +129,8 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
             "customerName": "客户甲",
             "callResult": "no_answer",
             "customerIntent": "positive",
-            "followUpStatus": "suggested",
+            "classificationReviewStatus": "suggested",
+            "followUpStatus": "none",
             "formalOutboundOnly": "true",
         },
     )
@@ -140,7 +145,8 @@ def test_record_list_controller_forwards_outbound_filters() -> None:
         "customer_name": "客户甲",
         "call_result": "no_answer",
         "customer_intent": "positive",
-        "follow_up_status": "suggested",
+        "classification_review_status": "suggested",
+        "follow_up_status": "none",
         "after_call_result_status": None,
         "operator_agent_identity": None,
         "business_type": None,
@@ -173,18 +179,22 @@ def test_record_list_controller_rejects_unknown_post_call_filters() -> None:
     assert service.query is None
 
 
-def test_follow_up_review_controller_forwards_current_user_identity() -> None:
+def test_classification_review_controller_forwards_current_user_identity() -> None:
     class ReviewService:
         query: dict | None = None
 
-        async def review_record_follow_up(self, **query) -> dict:
+        async def require_record_for_tenant(self, **_query) -> None:
+            return None
+
+        async def review_record_classification(self, **query) -> dict:
             self.query = query
             return {
                 "callId": query["call_id"],
                 "analysisSceneCode": "ai_call_semantic_analysis",
                 "analysisStatus": "2",
                 "analysisRetryCount": 0,
-                "followUpReviewStatus": "dismissed",
+                "followUpReviewStatus": "confirmed",
+                "classificationReviewStatus": "reviewed",
                 "followUpReviewedBy": query["reviewed_by"],
                 "followUpReviewedByName": query["reviewed_by_name"],
             }
@@ -193,7 +203,9 @@ def test_follow_up_review_controller_forwards_current_user_identity() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: service
+    commit = AsyncMock()
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        db=SimpleNamespace(commit=commit),
         user=SimpleNamespace(
             tenant_id="tenant-a",
             user_id=20,
@@ -203,19 +215,27 @@ def test_follow_up_review_controller_forwards_current_user_identity() -> None:
     )
 
     response = TestClient(app).post(
-        "/ai-call/records/call-review/follow-up-review",
-        json={"action": "dismiss"},
+        "/ai-call/records/call-review/classification-review",
+        headers={"Idempotency-Key": "review-1"},
+        json={
+            "classification": "interested",
+            "reason": "客户询问产品演示",
+            "expected_version": 1,
+        },
     )
 
     assert response.status_code == 200
     assert service.query == {
         "tenant_id": "tenant-a",
         "call_id": "call-review",
-        "action": "dismiss",
+        "request": service.query["request"],
+        "idempotency_key": "review-1",
         "reviewed_by": "20",
         "reviewed_by_name": "坐席20",
     }
-    assert response.json()["data"]["followUpReviewStatus"] == "dismissed"
+    assert service.query["request"].classification == "interested"
+    assert response.json()["data"]["classificationReviewStatus"] == "reviewed"
+    commit.assert_awaited_once()
 
 
 def test_outbound_attempt_model_has_no_physical_foreign_keys() -> None:
@@ -707,6 +727,11 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
                         status="completed",
                         started_at=now,
                         ended_at=now,
+                        follow_up_data_id=(
+                            1301
+                            if call_id == "call-positive-suggested"
+                            else None
+                        ),
                         follow_up_id=(
                             1002 if call_id == "call-completed-task" else None
                         ),
@@ -732,7 +757,22 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
                         scene_code="intro_geo",
                         analysis_scene_code="ai_call_semantic_analysis",
                         analysis_status=analysis_status,
-                        analysis_result='{"summary":"结构化摘要"}',
+                        analysis_result=(
+                            json.dumps(
+                                {
+                                    "summary": "结构化摘要",
+                                    "classification": "interested",
+                                    "confidence": "low",
+                                    "valid_dialogue": True,
+                                    "reason": "客户询问产品详情",
+                                    "evidence": ["客户：想了解一下"],
+                                    "evidence_conflict": False,
+                                },
+                                ensure_ascii=False,
+                            )
+                            if call_id == "call-positive-suggested"
+                            else '{"summary":"结构化摘要"}'
+                        ),
                         customer_intent=customer_intent,
                         follow_up_suggested=follow_up_suggested,
                         follow_up_consent=(
@@ -755,7 +795,7 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
                             else "low"
                         ),
                         follow_up_review_status=(
-                            "dismissed"
+                            "confirmed"
                             if call_id == "call-manual-dismissed"
                             else None
                         ),
@@ -767,6 +807,51 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
             )
         session.add_all(
             [
+                AiCallFollowUpDataModel(
+                    id=1301,
+                    tenant_id="tenant-a",
+                    task_id=501,
+                    target_id=602,
+                    source_call_id="call-positive-suggested",
+                    classification="interested",
+                    classification_reason="客户询问产品详情",
+                    classification_source="ai",
+                    classification_confidence="low",
+                    suggest_review=True,
+                    low_value_reason=None,
+                    latest_conclusion="结构化摘要",
+                    last_contact_at=now,
+                    blocking_human_call_id=None,
+                    version=1,
+                    classification_updated_at=now,
+                    classification_updated_by="ai",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                AiCallFollowUpClassificationHistoryModel(
+                    id=1302,
+                    tenant_id="tenant-a",
+                    follow_up_data_id=1301,
+                    from_classification=None,
+                    to_classification="interested",
+                    change_reason="客户询问产品详情",
+                    source="ai_auto",
+                    call_id="call-positive-suggested",
+                    semantic_analysis_id=902,
+                    semantic_analysis_version=0,
+                    ai_suggested_classification="interested",
+                    ai_confidence="low",
+                    ai_reason="客户询问产品详情",
+                    ai_evidence_json='["客户：想了解一下"]',
+                    ai_conflict=False,
+                    ai_adopted=True,
+                    idempotency_key=None,
+                    request_fingerprint=None,
+                    result_version=1,
+                    changed_by="ai",
+                    changed_by_name="AI",
+                    created_at=now,
+                ),
                 AiCallFollowUpTaskModel(
                     id=1001,
                     tenant_id="tenant-a",
@@ -883,7 +968,11 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
         )
         suggested_rows, suggested_total = await service.list_records(
             tenant_id="tenant-a",
-            follow_up_status="suggested",
+            classification_review_status="suggested",
+        )
+        reviewed_rows, reviewed_total = await service.list_records(
+            tenant_id="tenant-a",
+            classification_review_status="reviewed",
         )
         pending_rows, pending_total = await service.list_records(
             tenant_id="tenant-a",
@@ -901,18 +990,20 @@ async def test_record_list_aggregates_and_filters_post_call_statuses() -> None:
             "call-auto-create-pending",
             "call-manual-dismissed",
         }
-        assert suggested_total == 2
-        assert {row.call_id for row in suggested_rows} == {
-            "call-positive-suggested",
-            "call-positive-none",
-        }
+        assert suggested_total == 1
+        assert [row.call_id for row in suggested_rows] == [
+            "call-positive-suggested"
+        ]
+        assert reviewed_total == 1
+        assert [row.call_id for row in reviewed_rows] == [
+            "call-manual-dismissed"
+        ]
         assert pending_total == 1
         assert [row.call_id for row in pending_rows] == ["call-pending-task"]
-        assert none_total == 2
-        assert {row.call_id for row in none_rows} == {
-            "call-refused-suggestion",
-            "call-manual-dismissed",
-        }
+        assert none_total == 9
+        assert {row.call_id for row in none_rows}.isdisjoint(
+            {"call-pending-task", "call-completed-task"}
+        )
 
     await engine.dispose()
 

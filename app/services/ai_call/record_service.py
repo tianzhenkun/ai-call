@@ -404,6 +404,7 @@ class AiCallRecordService:
         customer_name: str | None = None,
         call_result: str | None = None,
         customer_intent: str | None = None,
+        classification_review_status: str | None = None,
         follow_up_status: str | None = None,
         after_call_result_status: str | None = None,
         operator_agent_identity: str | None = None,
@@ -426,6 +427,7 @@ class AiCallRecordService:
             customer_name=customer_name,
             call_result=call_result,
             customer_intent=customer_intent,
+            classification_review_status=classification_review_status,
             follow_up_status=follow_up_status,
             after_call_result_status=after_call_result_status,
             operator_agent_identity=operator_agent_identity,
@@ -510,6 +512,12 @@ class AiCallRecordService:
                 semantic_context.get("followUpRequiresReview", False)
             ),
             "followUpReviewStatus": semantic_context.get("followUpReviewStatus"),
+            "classificationRequiresReview": bool(
+                semantic_context.get("classificationRequiresReview", False)
+            ),
+            "classificationReviewStatus": semantic_context.get(
+                "classificationReviewStatus"
+            ),
             "followUpId": follow_up_context.get("followUpId"),
             "followUpStatus": follow_up_context.get("followUpStatus"),
             "followUpDataId": (

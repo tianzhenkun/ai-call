@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call import AiCallRouter, follow_up_data_controller
 from app.api.v1.ai_call.follow_up_data_schema import (
     FollowUpDataClassificationIn,
     FollowUpDataScheduleIn,
@@ -18,12 +21,17 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpHandlingResultModel,
     AiCallFollowUpScheduleRequestModel,
     AiCallFollowUpTaskModel,
+    AiCallHandoffModel,
     AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.system.auth.schema import AuthSchema
+from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_ai_call_manager
 from app.core.exceptions import CustomException
@@ -50,6 +58,7 @@ async def _seed_follow_up_data(
     call_id: str = "call-source-1",
     classification: str = "interested",
     with_active_task: bool = True,
+    with_data: bool = True,
 ) -> None:
     now = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
     async with session_factory() as db, db.begin():
@@ -97,35 +106,36 @@ async def _seed_follow_up_data(
                 updated_at=now,
             )
         )
-        db.add(
-            AiCallFollowUpDataModel(
-                id=data_id,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                target_id=target_id,
-                source_call_id=call_id,
-                classification=classification,
-                classification_reason="客户明确希望了解产品演示。",
-                classification_source="ai",
-                classification_confidence="high",
-                suggest_review=False,
-                low_value_reason=("no_current_need" if classification == "low_value" else None),
-                latest_conclusion="客户希望下周查看产品演示。",
-                last_contact_at=now,
-                blocking_human_call_id=None,
-                version=1,
-                classification_updated_at=now,
-                classification_updated_by="ai",
-                created_at=now,
-                updated_at=now,
+        if with_data:
+            db.add(
+                AiCallFollowUpDataModel(
+                    id=data_id,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    target_id=target_id,
+                    source_call_id=call_id,
+                    classification=classification,
+                    classification_reason="客户明确希望了解产品演示。",
+                    classification_source="ai",
+                    classification_confidence="high",
+                    suggest_review=False,
+                    low_value_reason=("no_current_need" if classification == "low_value" else None),
+                    latest_conclusion="客户希望下周查看产品演示。",
+                    last_contact_at=now,
+                    blocking_human_call_id=None,
+                    version=1,
+                    classification_updated_at=now,
+                    classification_updated_by="ai",
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-        )
         db.add(
             AiCallRecordModel(
                 id=data_id + 1,
                 tenant_id=tenant_id,
                 call_id=call_id,
-                follow_up_data_id=data_id,
+                follow_up_data_id=data_id if with_data else None,
                 business_type="outbound_task",
                 business_id=str(task_id),
                 scene_code="intro_product",
@@ -139,7 +149,28 @@ async def _seed_follow_up_data(
                 duration_ms=180000,
             )
         )
-        if with_active_task:
+        db.add(
+            AiCallOutboundAttemptModel(
+                id=data_id + 3,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                target_id=target_id,
+                attempt_no=1,
+                call_id=call_id,
+                dialer_type="sip",
+                test_scenario=None,
+                command_idempotency_key=f"command-{call_id}",
+                active_slot=None,
+                status="COMPLETED",
+                call_result="connected",
+                error_message=None,
+                started_at=now,
+                ended_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        if with_data and with_active_task:
             db.add(
                 AiCallFollowUpTaskModel(
                     id=data_id + 2,
@@ -167,6 +198,66 @@ async def _seed_follow_up_data(
                     updated_at=now,
                 )
             )
+
+
+@pytest.mark.anyio
+async def test_transfer_failure_creates_nurturing_data_without_task(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(
+        session_factory,
+        with_data=False,
+        with_active_task=False,
+    )
+    now = datetime(2026, 8, 15, 10, 5, tzinfo=timezone.utc)
+
+    async with session_factory() as db, db.begin():
+        handoff = AiCallHandoffModel(
+            id=104,
+            tenant_id="tenant-a",
+            handoff_id="handoff-failed-1",
+            call_id="call-source-1",
+            room_name="room-call-source-1",
+            scene_code="intro_product",
+            status="failed",
+            request_source="customer",
+            request_reason="customer_requested_human",
+            request_message="请转人工",
+            requested_at=now,
+            ended_at=now,
+            end_reason="no_online_agent",
+            failure_stage="availability_check",
+        )
+        db.add(handoff)
+        await db.flush()
+
+        service = AiCallFollowUpDataService.from_session(db)
+        created = await service.apply_transfer_failure(
+            handoff,
+            reason="转人工时当前场景没有在线坐席",
+        )
+        repeated = await service.apply_transfer_failure(
+            handoff,
+            reason="转人工时当前场景没有在线坐席",
+        )
+
+        assert created is not None
+        assert repeated is not None
+        assert repeated.id == created.id
+        assert created.classification == "nurturing"
+        assert created.classification_source == "system"
+        assert created.latest_conclusion == "转人工时当前场景没有在线坐席"
+        record = await db.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == "call-source-1")
+        )
+        assert record is not None
+        assert record.follow_up_data_id == created.id
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
+        history = list(
+            (await db.execute(select(AiCallFollowUpClassificationHistoryModel))).scalars().all()
+        )
+        assert len(history) == 1
+        assert history[0].source == "transfer_failed"
 
 
 def test_follow_up_data_routes_require_manager_permission() -> None:
@@ -277,6 +368,33 @@ async def test_follow_up_data_list_and_detail_are_tenant_scoped(session_factory)
 
 
 @pytest.mark.anyio
+async def test_follow_up_data_searches_customer_name_only(session_factory) -> None:
+    await _seed_follow_up_data(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpDataService.from_session(db)
+        rows, total = await service.list_page(
+            tenant_id="tenant-a",
+            classification="interested",
+            customer_name="科技",
+            page_num=1,
+            page_size=10,
+        )
+        assert total == 1
+        assert rows[0]["customer_name"] == "科技公司"
+
+        rows, total = await service.list_page(
+            tenant_id="tenant-a",
+            classification="interested",
+            customer_name="13800001001",
+            page_num=1,
+            page_size=10,
+        )
+        assert total == 0
+        assert rows == []
+
+
+@pytest.mark.anyio
 async def test_follow_up_data_projects_pending_and_submitted_after_call_status(
     session_factory,
 ) -> None:
@@ -328,10 +446,17 @@ async def test_follow_up_data_projects_pending_and_submitted_after_call_status(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("classification", "low_value_reason", "expected_task_status"),
+    (
+        "classification",
+        "low_value_reason",
+        "expected_task_status",
+        "keeps_callback_at",
+    ),
     [
-        ("low_value", "no_current_need", "closed"),
-        ("converted", None, "completed"),
+        ("interested", None, "pending", True),
+        ("nurturing", None, "pending", True),
+        ("low_value", "no_current_need", "closed", False),
+        ("converted", None, "completed", False),
     ],
 )
 async def test_manual_classification_is_atomic_idempotent_and_versioned(
@@ -339,6 +464,7 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
     classification: str,
     low_value_reason: str | None,
     expected_task_status: str,
+    keeps_callback_at: bool,
 ) -> None:
     await _seed_follow_up_data(session_factory)
     payload = FollowUpDataClassificationIn(
@@ -373,7 +499,7 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
         task = await db.scalar(select(AiCallFollowUpTaskModel))
         assert task is not None
         assert task.status == expected_task_status
-        assert task.customer_callback_at is None
+        assert (task.customer_callback_at is not None) is keeps_callback_at
         assert (
             await db.scalar(
                 select(func.count()).select_from(AiCallFollowUpClassificationHistoryModel)
@@ -404,6 +530,203 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
             )
         assert stale.value.status_code == 409
         assert stale.value.data["currentVersion"] == 2
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_http_flow_keeps_classification_and_task_separate(
+    session_factory,
+    monkeypatch,
+) -> None:
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    await _seed_follow_up_data(
+        session_factory,
+        tenant_id="tenant-b",
+        data_id=110,
+        task_id=210,
+        target_id=310,
+        call_id="call-tenant-b",
+        with_active_task=False,
+    )
+
+    async def ignore_console_event(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(
+        follow_up_data_controller,
+        "publish_agent_console_event",
+        ignore_console_event,
+    )
+    app = FastAPI()
+    app.include_router(follow_up_data_controller.FollowUpDataRouter, prefix="/ai-call")
+
+    async with session_factory() as db:
+        auth = AuthSchema(
+            db=db,
+            user=UserModel(
+                user_id=20,
+                tenant_id="tenant-a",
+                user_name="manager",
+                nick_name="管理员",
+            ),
+            permissions=frozenset({"ai_call:agent:manage"}),
+        )
+        app.dependency_overrides[get_ai_call_manager] = lambda: auth
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            listed = await client.get(
+                "/ai-call/follow-up-data",
+                params={"classification": "interested"},
+            )
+            assert listed.status_code == 200
+            assert listed.json()["total"] == 1
+            assert listed.json()["rows"][0]["follow_up_data_id"] == "100"
+
+            adjusted = await client.put(
+                "/ai-call/follow-up-data/100/classification",
+                headers={"Idempotency-Key": "http-adjust-1"},
+                json={
+                    "classification": "nurturing",
+                    "reason": "客户希望稍后再联系。",
+                    "expected_version": 1,
+                },
+            )
+            assert adjusted.status_code == 200
+            assert adjusted.json()["data"]["classification"] == "nurturing"
+            assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
+
+            callback_at = datetime.now(timezone.utc) + timedelta(days=2)
+            scheduled = await client.post(
+                "/ai-call/follow-up-data/100/schedule",
+                headers={"Idempotency-Key": "http-schedule-1"},
+                json={
+                    "follow_up_reason": "客户要求两天后回访。",
+                    "next_follow_up_at": callback_at.isoformat(),
+                    "expected_version": 2,
+                },
+            )
+            assert scheduled.status_code == 200
+            assert scheduled.json()["data"]["follow_up_data_id"] == "100"
+            task = await db.scalar(select(AiCallFollowUpTaskModel))
+            assert task is not None
+            assert task.follow_up_data_id == 100
+            assert task.status == "pending"
+
+
+@pytest.mark.anyio
+async def test_classification_review_updates_classification_without_creating_task(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    now = datetime.now(timezone.utc)
+    analysis_result = {
+        "classification": "interested",
+        "confidence": "low",
+        "valid_dialogue": True,
+        "reason": "客户询问产品演示。",
+        "evidence": ["客户：可以先看看演示"],
+        "evidence_conflict": False,
+    }
+    payload = FollowUpDataClassificationIn(
+        classification="interested",
+        reason="客户询问产品演示。",
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        data = await db.get(AiCallFollowUpDataModel, 100)
+        assert data is not None
+        data.classification_confidence = "low"
+        data.suggest_review = True
+        analysis = AiCallSemanticAnalysisModel(
+            id=500,
+            call_id="call-source-1",
+            scene_code="intro_product",
+            analysis_scene_code="ai_call_semantic_analysis",
+            analysis_status="2",
+            analysis_version=1,
+            analysis_result=json.dumps(analysis_result, ensure_ascii=False),
+            customer_intent="positive",
+            follow_up_suggested=False,
+            follow_up_consent=None,
+            follow_up_reason=None,
+            follow_up_preferred_at=None,
+            follow_up_confidence=None,
+            follow_up_review_status=None,
+            follow_up_reviewed_by=None,
+            follow_up_reviewed_by_name=None,
+            follow_up_reviewed_at=None,
+            analysis_error=None,
+            analysis_retry_count=0,
+            analysis_started_at=now,
+            analysis_finished_at=now,
+            transcript_hash=None,
+            transcript_snapshot_json=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(analysis)
+        db.add(
+            AiCallFollowUpClassificationHistoryModel(
+                id=501,
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                from_classification=None,
+                to_classification="interested",
+                change_reason=analysis_result["reason"],
+                source="ai_auto",
+                call_id="call-source-1",
+                semantic_analysis_id=500,
+                semantic_analysis_version=1,
+                ai_suggested_classification="interested",
+                ai_confidence="low",
+                ai_reason=analysis_result["reason"],
+                ai_evidence_json=json.dumps(analysis_result["evidence"]),
+                ai_conflict=False,
+                ai_adopted=True,
+                idempotency_key=None,
+                request_fingerprint=None,
+                result_version=1,
+                changed_by="ai",
+                changed_by_name="AI",
+                created_at=now,
+            )
+        )
+        await db.flush()
+
+        service = AiCallFollowUpDataService.from_session(db)
+        first = await service.review_classification(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            analysis=analysis,
+            payload=payload,
+            idempotency_key="classification-review-1",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+        repeated = await service.review_classification(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            analysis=analysis,
+            payload=payload,
+            idempotency_key="classification-review-1",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert repeated == first
+        assert data.classification == "interested"
+        assert data.classification_source == "human"
+        assert data.suggest_review is False
+        assert analysis.follow_up_review_status == "confirmed"
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
+        assert (
+            await db.scalar(
+                select(func.count()).select_from(AiCallFollowUpClassificationHistoryModel)
+            )
+            == 2
+        )
 
 
 @pytest.mark.anyio

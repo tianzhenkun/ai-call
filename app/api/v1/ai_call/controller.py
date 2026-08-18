@@ -19,6 +19,7 @@ from livekit import api
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.follow_up_data_schema import FollowUpDataClassificationIn
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallHandoffModel,
@@ -78,7 +79,6 @@ from .schema import (
     EventOut,
     FailHandoffRequest,
     FinishHandoffRequest,
-    FollowUpReviewRequest,
     HandoffAgentOut,
     HandoffAgentStatusRequest,
     HandoffListOut,
@@ -751,9 +751,12 @@ async def list_records_controller(
         Literal["positive", "neutral", "negative", "pending", "failed"] | None,
         Query(alias="customerIntent"),
     ] = None,
+    classification_review_status: Annotated[
+        Literal["suggested", "reviewed"] | None,
+        Query(alias="classificationReviewStatus"),
+    ] = None,
     follow_up_status: Annotated[
         Literal[
-            "suggested",
             "pending",
             "processing",
             "completed",
@@ -790,6 +793,7 @@ async def list_records_controller(
         customer_name=customer_name,
         call_result=call_result,
         customer_intent=customer_intent,
+        classification_review_status=classification_review_status,
         follow_up_status=follow_up_status,
         after_call_result_status=after_call_result_status,
         operator_agent_identity=(
@@ -894,13 +898,18 @@ async def reanalyze_record_semantic_analysis_controller(
 
 
 @AiCallRouter.post(
-    "/records/{callId}/follow-up-review",
-    summary="确认 AI 通话后跟进建议",
+    "/records/{callId}/classification-review",
+    summary="复核 AI 客户分类",
     response_model=ResponseSchema[SemanticAnalysisOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
-async def review_record_follow_up_controller(
+async def review_record_classification_controller(
     call_id: Annotated[str, Path(alias="callId")],
-    request: FollowUpReviewRequest,
+    request: FollowUpDataClassificationIn,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ],
     auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
@@ -912,13 +921,15 @@ async def review_record_follow_up_controller(
         if user is not None
         else None
     )
-    result = await service.review_record_follow_up(
+    result = await service.review_record_classification(
         tenant_id=tenant_id,
         call_id=call_id,
-        action=request.action,
+        request=request,
+        idempotency_key=idempotency_key,
         reviewed_by=str(user_id),
         reviewed_by_name=reviewed_by_name,
     )
+    await auth.db.commit()
     return SuccessResponse(data=SemanticAnalysisOut.model_validate(result), msg="确认成功")
 
 

@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.follow_up_data_schema import FollowUpDataClassificationIn
 from app.common.constant import RET
 from app.config.setting import settings
 from app.core.database import async_db_session
@@ -1203,6 +1204,7 @@ class AiCallService:
         customer_name: str | None = None,
         call_result: str | None = None,
         customer_intent: str | None = None,
+        classification_review_status: str | None = None,
         follow_up_status: str | None = None,
         after_call_result_status: str | None = None,
         operator_agent_identity: str | None = None,
@@ -1226,6 +1228,7 @@ class AiCallService:
             customer_name=customer_name,
             call_result=call_result,
             customer_intent=customer_intent,
+            classification_review_status=classification_review_status,
             follow_up_status=follow_up_status,
             after_call_result_status=after_call_result_status,
             operator_agent_identity=operator_agent_identity,
@@ -1365,11 +1368,30 @@ class AiCallService:
                     follow_up_data_id=follow_up_data_id,
                 )
                 if data is not None:
+                    active_follow_up = await self.record_service.repository.get_active_follow_up_for_data(
+                        tenant_id=record.tenant_id,
+                        follow_up_data_id=follow_up_data_id,
+                    )
                     follow_up_data = {
                         "id": str(data.id),
                         "classification": data.classification,
                         "lowValueReason": data.low_value_reason,
                         "latestConclusion": data.latest_conclusion,
+                        "activeFollowUpId": (
+                            str(active_follow_up.id)
+                            if active_follow_up is not None
+                            else None
+                        ),
+                        "activeFollowUpStatus": (
+                            active_follow_up.status
+                            if active_follow_up is not None
+                            else None
+                        ),
+                        "nextFollowUpAt": (
+                            active_follow_up.customer_callback_at
+                            if active_follow_up is not None
+                            else None
+                        ),
                         "version": data.version,
                     }
         return {
@@ -1481,6 +1503,49 @@ class AiCallService:
                 code=RET.BAD_REQUEST.code,
                 status_code=status.HTTP_400_BAD_REQUEST,
             ) from exc
+        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+
+    async def review_record_classification(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        request: FollowUpDataClassificationIn,
+        idempotency_key: str,
+        reviewed_by: str,
+        reviewed_by_name: str | None,
+    ) -> dict:
+        self._ensure_record_service()
+        assert self.record_service is not None
+        record = await self.record_service.get_record_for_tenant(
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if record is None:
+            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        if record.follow_up_data_id is None:
+            raise CustomException(msg="该通话没有可复核的跟进分类", status_code=409)
+        analysis = await self.record_service.repository.get_semantic_analysis_for_update(
+            call_id=call_id,
+        )
+        if analysis is None:
+            raise CustomException(msg="暂无可复核的 AI 分类", code=RET.ERROR.code, status_code=404)
+
+        from app.services.ai_call.follow_up_data_service import (
+            AiCallFollowUpDataService,
+        )
+
+        await AiCallFollowUpDataService(
+            self.record_service.repository
+        ).review_classification(
+            tenant_id=tenant_id,
+            follow_up_data_id=record.follow_up_data_id,
+            analysis=analysis,
+            payload=request,
+            idempotency_key=idempotency_key,
+            changed_by=reviewed_by,
+            changed_by_name=reviewed_by_name,
+        )
         return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
 
     async def get_record_quality(self, *, tenant_id: str, call_id: str) -> dict:

@@ -1155,7 +1155,7 @@ async def test_claim_timeout_requeues_before_total_wait_deadline(session_factory
 
 
 @pytest.mark.anyio
-async def test_total_wait_timeout_creates_one_unanswered_follow_up(session_factory) -> None:
+async def test_total_wait_timeout_does_not_create_follow_up_task(session_factory) -> None:
     await _seed_handoff(
         session_factory,
         row_id=1,
@@ -1175,10 +1175,7 @@ async def test_total_wait_timeout_creates_one_unanswered_follow_up(session_facto
         ).scalar_one()
         follow_ups = list((await db.execute(select(AiCallFollowUpTaskModel))).scalars().all())
     assert handoff.status == "expired"
-    assert len(follow_ups) == 1
-    assert follow_ups[0].source_type == "handoff_unanswered"
-    assert follow_ups[0].status == "pending"
-    assert follow_ups[0].customer_callback_at is None
+    assert follow_ups == []
 
 
 @pytest.mark.anyio

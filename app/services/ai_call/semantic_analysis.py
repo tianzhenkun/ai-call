@@ -28,6 +28,7 @@ from app.api.v1.ai_call.model import (
     AiCallSemanticAnalysisModel,
 )
 from app.core.logger import log
+from app.services.ai_call.classification_review import requires_classification_review
 from app.services.ai_call.dialogue_merge import (
     dialogue_time_ranges_touch,
     is_cross_source_customer_transcript_conflict,
@@ -1823,6 +1824,11 @@ class AiCallSemanticAnalysisService:
 
     @staticmethod
     def analysis_to_dict(analysis: AiCallSemanticAnalysisModel) -> dict[str, Any]:
+        classification_requires_review = requires_classification_review(
+            analysis_status=analysis.analysis_status,
+            analysis_result=analysis.analysis_result_dict,
+            review_status=analysis.follow_up_review_status,
+        )
         return {
             "id": str(analysis.id),
             "callId": analysis.call_id,
@@ -1838,6 +1844,14 @@ class AiCallSemanticAnalysisService:
             "followUpReviewedBy": analysis.follow_up_reviewed_by,
             "followUpReviewedByName": analysis.follow_up_reviewed_by_name,
             "followUpReviewedAt": analysis.follow_up_reviewed_at,
+            "classificationRequiresReview": classification_requires_review,
+            "classificationReviewStatus": (
+                "reviewed"
+                if analysis.follow_up_review_status in {"confirmed", "adjusted"}
+                else "suggested"
+                if classification_requires_review
+                else None
+            ),
             "analysisStartedAt": analysis.analysis_started_at,
             "analysisFinishedAt": analysis.analysis_finished_at,
             "transcriptHash": analysis.transcript_hash,

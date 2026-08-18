@@ -24,6 +24,9 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.services.ai_call.handoff_unanswered_service import (
+    AiCallHandoffUnansweredService,
+)
 from app.services.ai_call.runtime_control.handoff_repository import (
     HandoffAcceptIntent,
     HandoffClaimConflictError,
@@ -506,36 +509,11 @@ class AiCallAgentConsoleService:
             handoff.ended_at = current
             handoff.end_reason = "handoff_unanswered"
             await self._set_claimed_presence(handoff, status_value="available", release=True)
-            record = await self.repository.get_record(handoff.call_id)
-            await self.repository.create_unanswered_follow_up_if_missing(
-                {
-                    "id": generate_snowflake_id(),
-                    "tenant_id": handoff.tenant_id,
-                    "source_type": "handoff_unanswered",
-                    "source_key": f"handoff:{handoff.handoff_id}",
-                    "source_call_id": handoff.call_id,
-                    "source_handoff_id": handoff.handoff_id,
-                    "scene_code": handoff.scene_code,
-                    "business_type": record.business_type if record is not None else None,
-                    "business_id": record.business_id if record is not None else None,
-                    "contact_ref": f"call:{handoff.call_id}",
-                    "masked_contact": (
-                        record.callee_phone_number_masked
-                        if record is not None and record.callee_phone_number_masked
-                        else "未提供"
-                    ),
-                    "owner_agent_identity": None,
-                    "status": "pending",
-                    "follow_up_reason": "首次人工接通等待超时",
-                    "customer_callback_at": None,
-                    "summary": None,
-                    "closed_reason": None,
-                    "closed_remark": None,
-                    "completed_at": None,
-                    "closed_at": None,
-                    "created_at": current,
-                    "updated_at": current,
-                }
+            await AiCallHandoffUnansweredService(
+                self.repository
+            ).ensure_for_handoff(
+                handoff,
+                reason="首次人工接通等待超时",
             )
             await self.db.flush()
             await self._publish_handoff_state(handoff)
