@@ -78,6 +78,7 @@ class BusinessPromptResult:
     prompt: str
     opening_message: str
     source_key: str
+    product_info: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,10 @@ class StaticProfilePromptProvider:
         return BusinessPromptResult(
             prompt=render_prompt_template(
                 profile.prompt_text or "",
+                context.business_params,
+            ).strip(),
+            product_info=render_prompt_template(
+                profile.product_info or "",
                 context.business_params,
             ).strip(),
             opening_message=render_prompt_template(
@@ -363,10 +368,20 @@ class PromptComposer:
             )
         return components
 
-    def compose(self, prompt_result: BusinessPromptResult) -> PromptEffectiveConfig:
-        parts = [
-            f"{component.name}：\n{component.content}" for component in self.public_components()
-        ]
+    def compose(
+        self,
+        prompt_result: BusinessPromptResult,
+        *,
+        include_system_constraints: bool = True,
+    ) -> PromptEffectiveConfig:
+        parts = []
+        if include_system_constraints:
+            parts.extend(
+                f"{component.name}：\n{component.content}"
+                for component in self.public_components()
+            )
+        if prompt_result.product_info.strip():
+            parts.append(f"产品或服务信息：\n{prompt_result.product_info.strip()}")
         parts.append(f"业务话术：\n{prompt_result.prompt.strip()}")
 
         opening_message = prompt_result.opening_message.strip()

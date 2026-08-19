@@ -87,6 +87,8 @@ from .schema import (
     PromptProfilePreviewOut,
     PromptProfilePreviewRequest,
     PromptProfileUpdateRequest,
+    PromptProfileVersionDetailOut,
+    PromptProfileVersionOut,
     QualityDetailOut,
     QualityReviewOut,
     QualityReviewRequest,
@@ -480,10 +482,15 @@ async def create_prompt_profile_controller(
     auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
     result = await service.create_prompt_profile(
         tenant_id=tenant_id,
         values=request.model_dump(),
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
     )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="创建成功")
 
@@ -499,11 +506,19 @@ async def update_prompt_profile_controller(
     auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    values = request.model_dump()
+    knowledge_snapshot_hash = values.pop("knowledge_version_snapshot_hash")
     result = await service.update_prompt_profile(
         tenant_id=tenant_id,
         profile_id=profile_id,
-        values=request.model_dump(),
+        values=values,
+        knowledge_version_snapshot_hash=knowledge_snapshot_hash,
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
     )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="保存成功")
 
@@ -569,8 +584,96 @@ async def preview_prompt_profile_controller(
         scene_code=request.scene_code,
         business_params=request.business_params,
         prompt=None,
+        prompt_text=request.prompt_text,
+        opening_message=request.opening_message,
+        product_info=request.product_info,
     )
     return SuccessResponse(data=PromptProfilePreviewOut.model_validate(result), msg="预览成功")
+
+
+@AiCallRouter.get(
+    "/prompt-profiles/{profileId}/versions",
+    summary="查询业务提示词历史版本",
+)
+async def list_prompt_profile_versions_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.list_prompt_profile_versions(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    rows = [PromptProfileVersionOut.model_validate(row) for row in result["rows"]]
+    return TableResponse(rows=rows, total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/prompt-profiles/{profileId}/versions/{versionId}",
+    summary="查询业务提示词版本详情",
+    response_model=ResponseSchema[PromptProfileVersionDetailOut],
+)
+async def get_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+    )
+    return SuccessResponse(
+        data=PromptProfileVersionDetailOut.model_validate(result),
+        msg="查询成功",
+    )
+
+
+@AiCallRouter.post(
+    "/prompt-profiles/{profileId}/versions/{versionId}/apply",
+    summary="应用业务提示词历史版本",
+    response_model=ResponseSchema[PromptProfileOut],
+)
+async def apply_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    user = auth.user
+    result = await service.apply_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+        created_by=user_id,
+        created_by_name=(
+            getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+        ),
+    )
+    return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="应用成功")
+
+
+@AiCallRouter.delete(
+    "/prompt-profiles/{profileId}/versions/{versionId}",
+    summary="删除业务提示词历史版本",
+)
+async def delete_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    await service.delete_prompt_profile_version(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+    )
+    return SuccessResponse(data=None, msg="删除成功")
 
 
 @AiCallRouter.get(

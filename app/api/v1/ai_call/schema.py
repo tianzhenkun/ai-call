@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -578,6 +579,13 @@ class DialogueSegmentListOut(AiCallBaseSchema):
 PROMPT_PROVIDER_STATIC_PROFILE = "static_profile"
 
 
+class PromptVariableDefinition(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    label: str = Field(min_length=1, max_length=100)
+
+
 class PromptProfileBaseRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
@@ -591,6 +599,8 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
     )
     prompt_text: str | None = Field(default=None, description="固定提示词")
     opening_message: str | None = Field(default=None, max_length=1000, description="固定开场白")
+    product_info: str = Field(default="", max_length=20_000, description="产品或服务信息")
+    variables: list[PromptVariableDefinition] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def validate_static_content(self) -> "PromptProfileBaseRequest":
@@ -604,6 +614,27 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
             and not (self.opening_message or "").strip()
         ):
             raise ValueError("固定开场白不能为空")
+        keys = [item.key for item in self.variables]
+        labels = [item.label.strip() for item in self.variables]
+        if len(keys) != len(set(keys)):
+            raise ValueError("变量 key 不能重复")
+        if len(labels) != len(set(labels)):
+            raise ValueError("变量名称不能重复")
+        referenced = set(
+            re.findall(
+                r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}",
+                "\n".join(
+                    [
+                        self.opening_message or "",
+                        self.product_info,
+                        self.prompt_text or "",
+                    ]
+                ),
+            )
+        )
+        undefined = sorted(referenced.difference(keys))
+        if undefined:
+            raise ValueError(f"提示词引用了未定义变量：{'、'.join(undefined)}")
         return self
 
 
@@ -628,8 +659,27 @@ class PromptProfileOut(AiCallBaseSchema):
     provider_key: str
     prompt_text: str | None = None
     opening_message: str | None = None
+    product_info: str = ""
+    variables: list[PromptVariableDefinition] = Field(default_factory=list)
+    version_no: int | None = None
+    version_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class PromptProfileVersionOut(AiCallBaseSchema):
+    id: str
+    profile_id: str
+    version_no: int
+    creation_method: Literal["manual", "ai_generated", "ai_optimized", "restored"]
+    restored_from_version_id: str | None = None
+    created_by: str | None = None
+    created_by_name: str | None = None
+    created_at: datetime
+
+
+class PromptProfileVersionDetailOut(PromptProfileVersionOut):
+    snapshot: dict[str, Any]
 
 
 class VoiceProfileCreateRequest(AiCallBaseSchema):
@@ -685,6 +735,9 @@ class PromptProfilePreviewRequest(AiCallBaseSchema):
     business_id: str | None = Field(default=None, description="业务ID")
     scene_code: str = Field(description="业务场景编码")
     business_params: dict[str, Any] = Field(default_factory=dict, description="业务侧上下文参数")
+    prompt_text: str | None = Field(default=None, description="未保存的场景提示词")
+    opening_message: str | None = Field(default=None, max_length=1000)
+    product_info: str | None = Field(default=None, max_length=20_000)
 
 
 class PromptProfilePreviewOut(AiCallBaseSchema):

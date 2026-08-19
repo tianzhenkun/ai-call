@@ -20,6 +20,7 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffModel,
     AiCallPromptCommonConfigModel,
     AiCallPromptProfileModel,
+    AiCallPromptProfileVersionModel,
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
     AiCallRecordingModel,
@@ -1979,13 +1980,15 @@ class AiCallRecordRepository:
         profile_id: int,
         *,
         tenant_id: str,
+        for_update: bool = False,
     ) -> AiCallPromptProfileModel | None:
-        result = await self.db.execute(
-            select(AiCallPromptProfileModel).where(
-                AiCallPromptProfileModel.id == profile_id,
-                AiCallPromptProfileModel.tenant_id == tenant_id,
-            )
+        stmt = select(AiCallPromptProfileModel).where(
+            AiCallPromptProfileModel.id == profile_id,
+            AiCallPromptProfileModel.tenant_id == tenant_id,
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_prompt_profile_by_scene(
@@ -2037,7 +2040,11 @@ class AiCallRecordRepository:
         tenant_id: str,
         **values,
     ) -> AiCallPromptProfileModel | None:
-        profile = await self.get_prompt_profile(profile_id, tenant_id=tenant_id)
+        profile = await self.get_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            for_update=True,
+        )
         if profile is None:
             return None
         for key, value in values.items():
@@ -2047,6 +2054,141 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(profile)
         return profile
+
+    async def create_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        snapshot_json: str,
+        creation_method: str,
+        created_by: int | None,
+        created_by_name: str | None,
+        restored_from_version_id: int | None = None,
+    ) -> AiCallPromptProfileVersionModel:
+        version_no = int(
+            await self.db.scalar(
+                select(func.max(AiCallPromptProfileVersionModel.version_no)).where(
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id == profile_id,
+                )
+            )
+            or 0
+        ) + 1
+        version = AiCallPromptProfileVersionModel(
+            id=generate_snowflake_id(),
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_no=version_no,
+            snapshot_json=snapshot_json,
+            creation_method=creation_method,
+            restored_from_version_id=restored_from_version_id,
+            created_by=created_by,
+            created_by_name=created_by_name,
+            created_at=datetime.now(timezone.utc),
+            deleted_at=None,
+        )
+        self.db.add(version)
+        await self.db.flush()
+        await self.db.refresh(version)
+        return version
+
+    async def list_prompt_profile_versions(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> list[AiCallPromptProfileVersionModel]:
+        result = await self.db.execute(
+            select(AiCallPromptProfileVersionModel)
+            .where(
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == profile_id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_prompt_profile_version_summaries(
+        self,
+        *,
+        tenant_id: str,
+        profile_ids: list[int],
+    ) -> dict[int, tuple[int, int]]:
+        if not profile_ids:
+            return {}
+        rows = (
+            await self.db.execute(
+                select(
+                    AiCallPromptProfileVersionModel.profile_id,
+                    func.max(AiCallPromptProfileVersionModel.version_no),
+                    func.count(AiCallPromptProfileVersionModel.id),
+                )
+                .where(
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id.in_(profile_ids),
+                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
+                )
+                .group_by(AiCallPromptProfileVersionModel.profile_id)
+            )
+        ).all()
+        return {
+            int(profile_id): (int(version_no), int(version_count))
+            for profile_id, version_no, version_count in rows
+        }
+
+    async def get_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+    ) -> AiCallPromptProfileVersionModel | None:
+        return await self.db.scalar(
+            select(AiCallPromptProfileVersionModel).where(
+                AiCallPromptProfileVersionModel.id == version_id,
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == profile_id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+        )
+
+    async def get_latest_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> AiCallPromptProfileVersionModel | None:
+        return await self.db.scalar(
+            select(AiCallPromptProfileVersionModel)
+            .where(
+                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionModel.profile_id == profile_id,
+                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+            )
+            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+            .limit(1)
+        )
+
+    async def soft_delete_prompt_profile_version(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+    ) -> AiCallPromptProfileVersionModel | None:
+        version = await self.get_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if version is None:
+            return None
+        version.deleted_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        await self.db.refresh(version)
+        return version
 
     async def ensure_builtin_voice_profiles(
         self,

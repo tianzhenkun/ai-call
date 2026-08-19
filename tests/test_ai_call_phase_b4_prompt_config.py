@@ -686,6 +686,50 @@ async def test_common_business_prompt_is_tenant_scoped_and_persisted(b4_service)
 
 
 @pytest.mark.anyio
+async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> None:
+    service, _repository, _room_manager, _agent_runner = b4_service
+    created = await create_static_profile(service)
+
+    assert created["versionNo"] == 1
+    assert created["versionCount"] == 1
+    assert (await service.list_prompt_profiles(tenant_id="tenant_other"))["total"] == 0
+
+    updated = await service.update_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        values={
+            "scene_code": created["sceneCode"],
+            "name": created["name"],
+            "provider_key": created["providerKey"],
+            "prompt_text": "第二版提示词",
+            "opening_message": "第二版开场白",
+            "product_info": "第二版产品信息",
+            "variables": [],
+        },
+    )
+    versions = await service.list_prompt_profile_versions(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    )
+
+    assert updated["productInfo"] == "第二版产品信息"
+    assert updated["versionNo"] == 2
+    assert updated["versionCount"] == 2
+    assert [row["versionNo"] for row in versions["rows"]] == [2, 1]
+
+    restored = await service.apply_prompt_profile_version(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        version_id=int(versions["rows"][1]["id"]),
+        created_by=1,
+        created_by_name="测试用户",
+    )
+    assert restored["promptText"] == created["promptText"]
+    assert restored["versionNo"] == 3
+    assert restored["versionCount"] == 3
+
+
+@pytest.mark.anyio
 async def test_static_prompt_profile_composes_effective_instructions(b4_service) -> None:
     service, _repository, _room_manager, agent_runner = b4_service
     profile = await create_static_profile(service)
@@ -1330,6 +1374,21 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
         async def update_prompt_common_config(self, **kwargs):
             return {"content": kwargs["content"], "updatedAt": None}
 
+        async def list_prompt_profile_versions(self, **kwargs):
+            _ = kwargs
+            return {
+                "rows": [
+                    {
+                        "id": "2",
+                        "profileId": "1",
+                        "versionNo": 1,
+                        "creationMethod": "manual",
+                        "createdAt": "2026-06-17T00:00:00Z",
+                    }
+                ],
+                "total": 1,
+            }
+
         async def preview_prompt_profile(self, **kwargs):
             _ = kwargs
             return {
@@ -1355,6 +1414,7 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
             "/ai-call/prompt-common-config",
             json={"content": "新的统一品牌语气"},
         ).json()
+        versions = client.get("/ai-call/prompt-profiles/1/versions").json()
         preview = client.post(
             "/ai-call/prompt-profiles/preview",
             json={
@@ -1368,4 +1428,5 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert components["rows"][0]["componentKey"] == "platform_constraints"
     assert common_config["data"]["content"] == "统一品牌语气"
     assert saved_common_config["data"]["content"] == "新的统一品牌语气"
+    assert versions["rows"][0]["versionNo"] == 1
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"
