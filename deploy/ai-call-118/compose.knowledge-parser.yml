@@ -1,6 +1,7 @@
 services:
   api:
     environment:
+      AI_CALL_KNOWLEDGE_WORKER_ENABLED: "true"
       AI_CALL_KNOWLEDGE_PARSER_SOCKET: /run/ai-call-parser/parser.sock
       AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS: "30"
     volumes:
@@ -10,7 +11,7 @@ services:
         condition: service_healthy
 
   knowledge-parser:
-    image: ai-call-transfer/knowledge-parser:20260819
+    image: ai-call-transfer/knowledge-parser:${AI_CALL_KNOWLEDGE_PARSER_TAG:-20260819}
     platform: linux/amd64
     restart: unless-stopped
     read_only: true

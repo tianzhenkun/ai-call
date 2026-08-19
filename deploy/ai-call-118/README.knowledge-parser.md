@@ -10,7 +10,19 @@ docker build --platform linux/amd64 \
   -t ai-call-transfer/knowledge-parser:20260819 .
 ```
 
-部署包合并当前知识分支与 `codex/ai-call-118-deploy` 后，验证并启动：
+部署前先备份数据库，并将
+`docs/livekit-ai-outbound/sql/phase-j1-knowledge-lexical-postgres.sql`
+上传到运行目录后执行：
+
+```bash
+docker compose -f compose.yml exec -T postgres sh -lc \
+  'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > pre-knowledge.sql
+docker compose -f compose.yml exec -T postgres sh -lc \
+  'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < phase-j1-knowledge-lexical-postgres.sql
+```
+
+随后验证配置，只重建解析器和 API，不重启现有媒体服务：
 
 ```bash
 docker compose --env-file .env \
@@ -19,7 +31,7 @@ docker compose --env-file .env \
 
 docker compose --env-file .env \
   -f compose.yml \
-  -f compose.knowledge-parser.yml up -d
+  -f compose.knowledge-parser.yml up -d --no-deps knowledge-parser api
 ```
 
 解析器固定为非 root、只读根文件系统、`network_mode: none`、`cap_drop: ALL`，不加载 `.env`、数据库、COS、Redis 或 DashScope 凭证。API 只通过共享 Unix Socket 传递只读文件描述符；解析器不挂载知识原文件目录。单次解析在进程内强制 25 秒截止，早于 API 的 30 秒等待上限。

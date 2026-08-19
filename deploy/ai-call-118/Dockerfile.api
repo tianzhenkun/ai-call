@@ -16,4 +16,6 @@ RUN pip install . \
  && mkdir -p /app/logs /app/static/upload /app/static/download \
  && chown -R ai-call:ai-call /app /opt/ai-call
 
+COPY --chown=ai-call:ai-call static/ai-call/audio ./static/ai-call/audio
+
 USER ai-call

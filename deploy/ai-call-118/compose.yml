@@ -37,7 +37,7 @@ services:
     networks: [ai-call]
 
   init-db:
-    image: ai-call-transfer/api:20260807
+    image: ai-call-transfer/api:${AI_CALL_RELEASE_TAG:-20260807-r2}
     env_file: .env
     command: ["python", "/opt/ai-call/bootstrap_db.py"]
     depends_on:
@@ -50,7 +50,7 @@ services:
     networks: [ai-call]
 
   api:
-    image: ai-call-transfer/api:20260807
+    image: ai-call-transfer/api:${AI_CALL_RELEASE_TAG:-20260807-r2}
     restart: unless-stopped
     env_file: .env
     command: ["uvicorn", "main:create_app", "--factory", "--host", "0.0.0.0", "--port", "19011"]
@@ -102,7 +102,7 @@ services:
     networks: [ai-call]
 
   freeswitch:
-    image: ai-call-transfer/freeswitch:20260807-r1
+    image: ai-call-transfer/freeswitch:${AI_CALL_RELEASE_TAG:-20260807-r2}
     restart: unless-stopped
     env_file: .env
     ports:
