@@ -1,0 +1,44 @@
+services:
+  api:
+    environment:
+      AI_CALL_KNOWLEDGE_PARSER_SOCKET: /run/ai-call-parser/parser.sock
+      AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS: "30"
+    volumes:
+      - knowledge-parser-socket:/run/ai-call-parser
+    depends_on:
+      knowledge-parser:
+        condition: service_healthy
+
+  knowledge-parser:
+    image: ai-call-transfer/knowledge-parser:20260819
+    platform: linux/amd64
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    network_mode: none
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 32
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=1700
+    volumes:
+      - knowledge-parser-socket:/run/ai-call-parser
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "from pathlib import Path; raise SystemExit(not Path('/run/ai-call-parser/parser.sock').is_socket())"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    stop_grace_period: 10s
+
+volumes:
+  knowledge-parser-socket:
+    name: ai-call-118-knowledge-parser-socket

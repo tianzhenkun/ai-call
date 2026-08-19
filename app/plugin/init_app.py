@@ -35,6 +35,7 @@ class AiCallRoleWorkerHandles:
     recording_reconcile_worker: Any = None
     handoff_trigger_worker: Any = None
     runtime_webhook_worker: Any = None
+    knowledge_worker: Any = None
     outbound_task_worker: Any = None
     linphone_test_worker: Any = None
     voice_worker: Any = None
@@ -139,6 +140,7 @@ async def _start_ai_call_role_workers(
             handles.runtime_webhook_worker = (
                 await _start_ai_call_runtime_webhook_worker()
             )
+            handles.knowledge_worker = await _start_ai_call_knowledge_worker()
             if start_voice:
                 handles.voice_worker = await _start_ai_call_voice_worker(app)
     except Exception:
@@ -169,6 +171,8 @@ async def _stop_ai_call_role_workers(
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
     if handles.runtime_webhook_worker is not None:
         await _stop_ai_call_runtime_webhook_worker(handles.runtime_webhook_worker)
+    if handles.knowledge_worker is not None:
+        await _stop_ai_call_knowledge_worker(handles.knowledge_worker)
     if handles.event_worker is not None:
         await _stop_ai_call_event_worker(handles.event_worker)
     if handles.recording_reconcile_worker is not None:
@@ -350,6 +354,50 @@ async def _start_ai_call_runtime_webhook_worker():
 async def _stop_ai_call_runtime_webhook_worker(worker) -> None:
     await worker.stop()
     log.info("✅ AI Call Runtime webhook worker 已关闭")
+
+
+async def _start_ai_call_knowledge_worker():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_KNOWLEDGE_WORKER_ENABLED:
+        return None
+    from app.core.database import async_db_session
+    from app.services.ai_call.knowledge import (
+        KnowledgeWorker,
+        build_cos_knowledge_store,
+    )
+    from app.services.ai_call.knowledge_binary_parser import (
+        KnowledgeBinaryParserClient,
+    )
+
+    parser_socket = settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
+
+    worker = KnowledgeWorker(
+        async_db_session,
+        build_cos_knowledge_store(settings),
+        worker_id=f"jobs:knowledge:{uuid4().hex}",
+        poll_interval_seconds=(
+            settings.AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS
+        ),
+        lease_seconds=settings.AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS,
+        upload_reconcile_after_seconds=(
+            settings.AI_CALL_KNOWLEDGE_UPLOAD_RECONCILE_AFTER_SECONDS
+        ),
+        binary_parser=(
+            KnowledgeBinaryParserClient(
+                parser_socket,
+                timeout_seconds=settings.AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS,
+            )
+            if parser_socket
+            else None
+        ),
+    )
+    await worker.start()
+    log.info("✅ AI Call Knowledge worker 已启动")
+    return worker
+
+
+async def _stop_ai_call_knowledge_worker(worker) -> None:
+    await worker.stop()
+    log.info("✅ AI Call Knowledge worker 已关闭")
 
 
 def _start_ai_call_voice_preview_service(app: FastAPI) -> None:

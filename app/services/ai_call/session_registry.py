@@ -99,6 +99,16 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@dataclass(frozen=True, slots=True)
+class KnowledgeRuntimeContext:
+    tenant_id: str
+    task_id: int
+    prompt_profile_id: int
+    version_ids: tuple[int, ...]
+    version_snapshot_hash: str
+    retriever_version: str
+
+
 @dataclass(slots=True)
 class CallSession:
     call_id: str
@@ -106,6 +116,7 @@ class CallSession:
     participant_identity: str
     status: CallSessionStatus
     effective_config: Any
+    knowledge_context: KnowledgeRuntimeContext | None = None
     local_participant_identity: str | None = None
     started_at: datetime = field(default_factory=utc_now)
     last_event_at: datetime = field(default_factory=utc_now)

@@ -12,7 +12,12 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.config.setting import settings
 from app.core import dependencies
-from app.core.dependencies import get_current_user, get_voice_manager
+from app.core.dependencies import (
+    get_current_user,
+    get_knowledge_manager,
+    get_knowledge_viewer,
+    get_voice_manager,
+)
 from app.core.exceptions import CustomException
 from app.core.security import decode_access_token
 
@@ -208,3 +213,27 @@ def test_voice_manager_preserves_development_fallback(monkeypatch) -> None:
     auth = AuthSchema(db=AsyncSession(), permissions=frozenset())
 
     assert asyncio.run(get_voice_manager(auth)) is auth
+
+
+def test_knowledge_permissions_separate_view_and_manage(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    denied = AuthSchema(db=AsyncSession(), permissions=frozenset())
+    viewer = AuthSchema(
+        db=AsyncSession(),
+        permissions=frozenset({"ai_call:knowledge:view"}),
+    )
+    manager = AuthSchema(
+        db=AsyncSession(),
+        permissions=frozenset({"ai_call:knowledge:manage"}),
+    )
+
+    with pytest.raises(CustomException) as forbidden:
+        asyncio.run(get_knowledge_viewer(denied))
+    assert forbidden.value.status_code == 403
+    assert asyncio.run(get_knowledge_viewer(viewer)) is viewer
+    assert asyncio.run(get_knowledge_viewer(manager)) is manager
+
+    with pytest.raises(CustomException) as forbidden:
+        asyncio.run(get_knowledge_manager(viewer))
+    assert forbidden.value.status_code == 403
+    assert asyncio.run(get_knowledge_manager(manager)) is manager

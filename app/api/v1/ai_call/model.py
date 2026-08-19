@@ -1529,3 +1529,262 @@ class AiCallVoiceProfileModel(MappedBase):
         nullable=False,
         comment="更新时间",
     )
+
+
+class AiCallKnowledgeItemModel(MappedBase):
+    """AI Call 租户知识条目。"""
+
+    __tablename__ = "ai_call_knowledge_item"
+    __table_args__ = (
+        Index(
+            "idx_ai_call_knowledge_item_tenant_updated",
+            "tenant_id",
+            "deleted_at",
+            "updated_at",
+        ),
+        CheckConstraint(
+            "content_category in "
+            "('PRODUCT_SERVICE', 'FAQ', 'PROFESSIONAL', 'INDUSTRY', 'OTHER')",
+            name="ck_ai_call_knowledge_item_category",
+        ),
+        {"comment": "AI Call 租户知识条目"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_category: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    current_ready_version_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AiCallKnowledgeVersionModel(MappedBase):
+    """AI Call 知识条目的不可变版本。"""
+
+    __tablename__ = "ai_call_knowledge_version"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_item_id",
+            "version_no",
+            name="uk_ai_call_knowledge_version_number",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "upload_operation",
+            "upload_idempotency_key",
+            name="uk_ai_call_knowledge_version_upload_key",
+        ),
+        Index(
+            "idx_ai_call_knowledge_version_item_created",
+            "tenant_id",
+            "knowledge_item_id",
+            "created_at",
+        ),
+        Index(
+            "idx_ai_call_knowledge_version_claim",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+        CheckConstraint(
+            "status in ('UPLOADING', 'PROCESSING', 'READY', 'FAILED')",
+            name="ck_ai_call_knowledge_version_status",
+        ),
+        CheckConstraint("version_no > 0", name="ck_ai_call_knowledge_version_number"),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_ai_call_knowledge_version_attempt_count",
+        ),
+        CheckConstraint("chunk_count >= 0", name="ck_ai_call_knowledge_version_chunk_count"),
+        CheckConstraint(
+            "status <> 'READY' or "
+            "(chunk_count > 0 and chunk_set_sha256 is not null and ready_at is not null)",
+            name="ck_ai_call_knowledge_version_ready",
+        ),
+        {"comment": "AI Call 知识不可变版本"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    knowledge_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="UPLOADING",
+        server_default=text("'UPLOADING'"),
+    )
+    source_object_key: Mapped[str] = mapped_column(String(1000), nullable=False)
+    source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    extension: Mapped[str] = mapped_column(String(20), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    upload_operation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    upload_idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    upload_request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    parser_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chunk_strategy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chunk_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    chunk_set_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    processing_warning_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    failure_retryable: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AiCallKnowledgeChunkModel(MappedBase):
+    """AI Call 知识版本的不可变证据切片。"""
+
+    __tablename__ = "ai_call_knowledge_chunk"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_version_id",
+            "chunk_index",
+            name="uk_ai_call_knowledge_chunk_position",
+        ),
+        Index(
+            "idx_ai_call_knowledge_chunk_scope",
+            "tenant_id",
+            "knowledge_version_id",
+            "chunk_index",
+        ),
+        CheckConstraint("chunk_index >= 0", name="ck_ai_call_knowledge_chunk_index"),
+        CheckConstraint(
+            "length(content) > 0",
+            name="ck_ai_call_knowledge_chunk_content",
+        ),
+        {"comment": "AI Call 知识证据切片"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    knowledge_version_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    source_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    start_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    speaker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallPromptKnowledgeBindingModel(MappedBase):
+    """AI Call 提示词场景与知识条目绑定。"""
+
+    __tablename__ = "ai_call_prompt_knowledge_binding"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "prompt_profile_id",
+            "knowledge_item_id",
+            name="uk_ai_call_prompt_knowledge_binding",
+        ),
+        {"comment": "AI Call 提示词场景与知识条目绑定"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    prompt_profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AiCallKnowledgeUsageModel(MappedBase):
+    """AI Call 知识提取与通话检索审计。"""
+
+    __tablename__ = "ai_call_knowledge_usage"
+    __table_args__ = (
+        Index(
+            "idx_ai_call_knowledge_usage_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+        Index(
+            "idx_ai_call_knowledge_usage_call_created",
+            "tenant_id",
+            "call_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "purpose in ('PRODUCT_SUMMARY', 'REALTIME_ANSWER')",
+            name="ck_ai_call_knowledge_usage_purpose",
+        ),
+        CheckConstraint(
+            "status in ('OK', 'NO_HIT', 'TIMEOUT', 'FAILED')",
+            name="ck_ai_call_knowledge_usage_status",
+        ),
+        {"comment": "AI Call 知识使用审计"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt_profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    customer_transcript_event_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tool_result_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    answer_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qwen_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    query_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    query_excerpt_redacted: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    knowledge_version_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    version_snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    retriever_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
