@@ -16,6 +16,7 @@ from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.schema import (
     CreateWebSessionRequest,
+    PromptCommonConfigUpdateRequest,
     PromptProfileCreateRequest,
     PromptProfilePreviewRequest,
     VoiceProfileCreateRequest,
@@ -663,6 +664,28 @@ async def test_prompt_components_include_runtime_common_constraints(b4_service) 
 
 
 @pytest.mark.anyio
+async def test_common_business_prompt_is_tenant_scoped_and_persisted(b4_service) -> None:
+    service, _repository, _room_manager, _agent_runner = b4_service
+
+    default_content = (
+        await service.get_prompt_common_config(tenant_id=TEST_TENANT_ID)
+    )["content"]
+    saved = await service.update_prompt_common_config(
+        tenant_id=TEST_TENANT_ID,
+        content="  统一使用专业、克制的品牌语气。  ",
+    )
+
+    assert "一次只问一个问题" in default_content
+    assert saved["content"] == "统一使用专业、克制的品牌语气。"
+    assert (
+        await service.get_prompt_common_config(tenant_id=TEST_TENANT_ID)
+    )["content"] == saved["content"]
+    assert (
+        await service.get_prompt_common_config(tenant_id="tenant-b")
+    )["content"] == default_content
+
+
+@pytest.mark.anyio
 async def test_static_prompt_profile_composes_effective_instructions(b4_service) -> None:
     service, _repository, _room_manager, agent_runner = b4_service
     profile = await create_static_profile(service)
@@ -1264,6 +1287,8 @@ def test_prompt_requests_reject_removed_fields() -> None:
             "displayName": "张总自定义音色",
             "voiceType": "内置",
         })
+    with pytest.raises(ValidationError):
+        PromptCommonConfigUpdateRequest.model_validate({"content": "x" * 20_001})
 
 
 def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
@@ -1298,6 +1323,13 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "total": 1,
             }
 
+        async def get_prompt_common_config(self, **kwargs):
+            _ = kwargs
+            return {"content": "统一品牌语气", "updatedAt": None}
+
+        async def update_prompt_common_config(self, **kwargs):
+            return {"content": kwargs["content"], "updatedAt": None}
+
         async def preview_prompt_profile(self, **kwargs):
             _ = kwargs
             return {
@@ -1318,6 +1350,11 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     with TestClient(app) as client:
         profiles = client.get("/ai-call/prompt-profiles").json()
         components = client.get("/ai-call/prompt-components").json()
+        common_config = client.get("/ai-call/prompt-common-config").json()
+        saved_common_config = client.put(
+            "/ai-call/prompt-common-config",
+            json={"content": "新的统一品牌语气"},
+        ).json()
         preview = client.post(
             "/ai-call/prompt-profiles/preview",
             json={
@@ -1329,4 +1366,6 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert profiles["code"] == 200
     assert profiles["rows"][0]["sceneCode"] == "debt_promise_repay_reminder"
     assert components["rows"][0]["componentKey"] == "platform_constraints"
+    assert common_config["data"]["content"] == "统一品牌语气"
+    assert saved_common_config["data"]["content"] == "新的统一品牌语气"
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"

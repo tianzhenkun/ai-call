@@ -18,6 +18,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptCommonConfigModel,
     AiCallPromptProfileModel,
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
@@ -1938,6 +1939,40 @@ class AiCallRecordRepository:
         await self.db.flush()
         await self.db.refresh(profile)
         return profile
+
+    async def get_prompt_common_config(
+        self,
+        *,
+        tenant_id: str,
+    ) -> AiCallPromptCommonConfigModel | None:
+        return await self.db.scalar(
+            select(AiCallPromptCommonConfigModel).where(
+                AiCallPromptCommonConfigModel.tenant_id == tenant_id
+            )
+        )
+
+    async def save_prompt_common_config(
+        self,
+        *,
+        tenant_id: str,
+        content: str,
+    ) -> AiCallPromptCommonConfigModel:
+        config = await self.get_prompt_common_config(tenant_id=tenant_id)
+        now = datetime.now(timezone.utc)
+        if config is None:
+            config = AiCallPromptCommonConfigModel(
+                id=generate_snowflake_id(),
+                tenant_id=tenant_id,
+                content=content,
+                updated_at=now,
+            )
+            self.db.add(config)
+        else:
+            config.content = content
+            config.updated_at = now
+        await self.db.flush()
+        await self.db.refresh(config)
+        return config
 
     async def get_prompt_profile(
         self,

@@ -668,6 +668,17 @@ class PromptComponentOut(AiCallBaseSchema):
     content: str
 
 
+class PromptCommonConfigUpdateRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(default="", max_length=20_000)
+
+
+class PromptCommonConfigOut(AiCallBaseSchema):
+    content: str
+    updated_at: datetime | None = None
+
+
 class PromptProfilePreviewRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 

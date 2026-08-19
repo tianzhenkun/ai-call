@@ -79,6 +79,8 @@ from .schema import (
     HandoffListOut,
     HandoffOut,
     InterruptSummaryOut,
+    PromptCommonConfigOut,
+    PromptCommonConfigUpdateRequest,
     PromptComponentOut,
     PromptProfileCreateRequest,
     PromptProfileOut,
@@ -516,6 +518,38 @@ async def list_prompt_components_controller(
     result = await service.list_prompt_components()
     rows = [PromptComponentOut.model_validate(row) for row in result["rows"]]
     return TableResponse(rows=rows, total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get(
+    "/prompt-common-config",
+    summary="查询通用业务提示词",
+    response_model=ResponseSchema[PromptCommonConfigOut],
+)
+async def get_prompt_common_config_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_common_config(tenant_id=tenant_id)
+    return SuccessResponse(data=PromptCommonConfigOut.model_validate(result), msg="查询成功")
+
+
+@AiCallRouter.put(
+    "/prompt-common-config",
+    summary="保存通用业务提示词",
+    response_model=ResponseSchema[PromptCommonConfigOut],
+)
+async def update_prompt_common_config_controller(
+    request: PromptCommonConfigUpdateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.update_prompt_common_config(
+        tenant_id=tenant_id,
+        content=request.content,
+    )
+    return SuccessResponse(data=PromptCommonConfigOut.model_validate(result), msg="保存成功")
 
 
 @AiCallRouter.post(

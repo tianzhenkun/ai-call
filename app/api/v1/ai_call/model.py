@@ -1465,6 +1465,26 @@ class AiCallPromptProfileModel(MappedBase):
     )
 
 
+class AiCallPromptCommonConfigModel(MappedBase):
+    """AI Call 租户通用业务提示词模板。"""
+
+    __tablename__ = "ai_call_prompt_common_config"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uk_ai_call_prompt_common_tenant"),
+        {"comment": "AI Call 租户通用业务提示词模板"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="更新时间",
+    )
+
+
 class AiCallVoiceProfileModel(MappedBase):
     """AI Call 端到端音色配置表。"""
 

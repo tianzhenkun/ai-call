@@ -48,6 +48,7 @@ from app.services.ai_call.orchestrator import (
 )
 from app.services.ai_call.prompt_config import (
     CALL_END_TOOL_INSTRUCTIONS,
+    DEFAULT_COMMON_BUSINESS_PROMPT,
     PROMPT_PROVIDER_STATIC_PROFILE,
     BusinessPromptResolver,
     DebugPromptProvider,
@@ -529,6 +530,24 @@ class AiCallService:
             for component in components
         ]
         return {"rows": rows, "total": len(rows)}
+
+    async def get_prompt_common_config(self, *, tenant_id: str) -> dict:
+        config = await self._ensure_prompt_repository().get_prompt_common_config(
+            tenant_id=tenant_id
+        )
+        return {
+            "content": (
+                config.content if config is not None else DEFAULT_COMMON_BUSINESS_PROMPT
+            ),
+            "updatedAt": config.updated_at if config is not None else None,
+        }
+
+    async def update_prompt_common_config(self, *, tenant_id: str, content: str) -> dict:
+        config = await self._ensure_prompt_repository().save_prompt_common_config(
+            tenant_id=tenant_id,
+            content=str(content or "").strip(),
+        )
+        return {"content": config.content, "updatedAt": config.updated_at}
 
     async def preview_prompt_profile(
         self,
