@@ -33,6 +33,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
 )
+from app.config.setting import Settings
 from app.core.dependencies import get_knowledge_manager, get_knowledge_viewer
 from app.core.exceptions import CustomException
 from app.services.ai_call.knowledge import (
@@ -73,6 +74,13 @@ def test_knowledge_module_imports_before_ai_call_router() -> None:
         cwd=Path(__file__).parents[1],
         check=True,
     )
+
+
+def test_product_info_extractor_settings_match_controller_contract() -> None:
+    runtime_settings = Settings(_env_file=None)
+
+    assert runtime_settings.AI_CALL_PROMPT_OPTIMIZE_MODEL == "qwen3.7-plus"
+    assert runtime_settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS == 30.0
 
 
 def test_knowledge_models_freeze_tenant_version_and_chunk_contract() -> None:
@@ -142,6 +150,7 @@ def test_knowledge_routes_use_explicit_view_and_manage_permissions() -> None:
         ("PUT", "/ai-call/knowledge/items/{itemId}/scene-bindings"),
         ("DELETE", "/ai-call/knowledge/items/{itemId}"),
         ("POST", "/ai-call/knowledge/versions/{versionId}/retry"),
+        ("POST", "/ai-call/prompt-profiles/{profileId}/product-info:extract"),
     ):
         calls = dependency_calls(method, path)
         assert get_knowledge_manager in calls
