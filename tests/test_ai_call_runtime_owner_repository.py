@@ -92,6 +92,9 @@ def test_outbound_start_refs_accept_only_canonical_positive_identifiers() -> Non
         attempt_id=13,
         line_id=14,
     )
+    assert parse_outbound_start_refs(
+        json.dumps({**payload, "prompt_snapshot": {"id": "prompt-1"}})
+    ) == OutboundStartRefs(task_id=11, target_id=12, attempt_id=13, line_id=14)
 
     invalid_payloads = [
         {**payload, "attempt_id": True},
@@ -100,6 +103,7 @@ def test_outbound_start_refs_accept_only_canonical_positive_identifiers() -> Non
         {**payload, "attempt_no": True},
         {**payload, "attempt_no": 0},
         {**payload, "line_id": "0"},
+        {**payload, "prompt_snapshot": "invalid"},
         {key: value for key, value in payload.items() if key != "target_id"},
         {**payload, "unexpected": "value"},
     ]

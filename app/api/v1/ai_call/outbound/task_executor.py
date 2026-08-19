@@ -1390,8 +1390,11 @@ class OutboundTaskExecutor:
         try:
             params = json.loads(target.business_params_json or "{}")
         except json.JSONDecodeError:
-            return {}
-        return params if isinstance(params, dict) else {}
+            params = {}
+        normalized = dict(params) if isinstance(params, dict) else {}
+        if target.customer_name:
+            normalized.setdefault("customerName", target.customer_name)
+        return normalized
 
     def _next_call_window_at(
         self,

@@ -50,6 +50,7 @@ from .sip_line_schema import SipLineSnapshot
 from .sip_line_service import SipLineService
 
 DEFAULT_TARGET_COPY_BATCH_SIZE = 500
+MAX_FROZEN_KNOWLEDGE_CHUNKS = 100
 
 
 def _now() -> datetime:
@@ -411,6 +412,12 @@ class OutboundRuleTaskService:
             .order_by(AiCallPromptProfileVersionModel.version_no.desc())
             .limit(1)
         )
+        knowledge_snapshot = await self._freeze_knowledge(
+            db,
+            tenant_id=tenant_id,
+            prompt_profile_id=prompt.id,
+            frozen_at=now,
+        )
         snapshot = {
             "request": request_config,
             "prompt": {
@@ -436,6 +443,7 @@ class OutboundRuleTaskService:
                 "targetModel": voice.target_model,
             },
             "rule": self.rule_out(rule).model_dump(mode="json", by_alias=True),
+            "knowledge": knowledge_snapshot,
         }
         if line_snapshot is not None:
             snapshot["sipLine"] = line_snapshot.model_dump(mode="json", by_alias=True)
@@ -491,6 +499,42 @@ class OutboundRuleTaskService:
             )
         await db.flush()
         return task, True
+
+    @staticmethod
+    async def _freeze_knowledge(
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        prompt_profile_id: int,
+        frozen_at: datetime,
+    ) -> dict[str, object]:
+        from app.services.ai_call.knowledge import (
+            RETRIEVER_VERSION,
+            knowledge_version_snapshot_hash,
+            load_current_ready_knowledge_versions,
+        )
+
+        versions = await load_current_ready_knowledge_versions(
+            db,
+            tenant_id=tenant_id,
+            prompt_profile_id=prompt_profile_id,
+        )
+        chunk_count = sum(version.chunk_count for version in versions)
+        if chunk_count > MAX_FROZEN_KNOWLEDGE_CHUNKS:
+            raise CustomException(
+                msg=(
+                    f"当前场景关联知识共 {chunk_count} 个切片，超过单任务 "
+                    f"{MAX_FROZEN_KNOWLEDGE_CHUNKS} 个上限，请减少资料后重试"
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return {
+            "promptProfileId": str(prompt_profile_id),
+            "versionIds": [str(version.id) for version in versions],
+            "versionSnapshotHash": knowledge_version_snapshot_hash(versions),
+            "retrieverVersion": RETRIEVER_VERSION,
+            "frozenAt": frozen_at.isoformat(),
+        }
 
     async def _resolve_validation_line(
         self,

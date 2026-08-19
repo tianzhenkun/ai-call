@@ -1691,6 +1691,7 @@ async def test_dial_starts_stable_sip_session_then_waits_for_terminal_record() -
     assert session_factory.sessions[0].commit_count == 1
     assert service.create_calls == [
         {
+            "tenant_id": "tenant-a",
             "callee_phone_number": "13800000000",
             "voice": "Cherry",
             "call_id": "stable-call-id",
@@ -1701,6 +1702,7 @@ async def test_dial_starts_stable_sip_session_then_waits_for_terminal_record() -
                 "customerName": "张三",
                 "targetId": "2001",
             },
+            "prompt_snapshot": None,
         }
     ]
     assert len(session_factory.sessions) == 3

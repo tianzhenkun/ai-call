@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.controller import get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.model import (
+    AiCallKnowledgeItemModel,
+    AiCallKnowledgeVersionModel,
+    AiCallPromptKnowledgeBindingModel,
+)
 from app.api.v1.ai_call.schema import (
     CreateWebSessionRequest,
     PromptCommonConfigUpdateRequest,
@@ -27,6 +33,7 @@ from app.core.base_model import MappedBase
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 from app.services.ai_call.event_store import InMemoryEventStore
+from app.services.ai_call.knowledge import knowledge_version_snapshot_hash
 from app.services.ai_call.livekit_room import BrowserRoomToken
 from app.services.ai_call.orchestrator import AiCallOrchestrator, AiCallRuntimeConfig
 from app.services.ai_call.prompt_config import (
@@ -735,6 +742,105 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
     assert restored["promptText"] == created["promptText"]
     assert restored["versionNo"] == 3
     assert restored["versionCount"] == 3
+
+
+@pytest.mark.anyio
+async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service) -> None:
+    service, repository, _room_manager, _agent_runner = b4_service
+    created = await create_static_profile(service)
+    now = datetime.now(timezone.utc)
+    item = AiCallKnowledgeItemModel(
+        id=101,
+        tenant_id=TEST_TENANT_ID,
+        display_name="产品资料.md",
+        content_category="PRODUCT_SERVICE",
+        current_ready_version_id=11,
+        created_at=now,
+        updated_at=now,
+    )
+    version = AiCallKnowledgeVersionModel(
+        id=11,
+        tenant_id=TEST_TENANT_ID,
+        knowledge_item_id=101,
+        version_no=1,
+        status="READY",
+        source_object_key="knowledge/101/11.md",
+        source_filename="产品资料.md",
+        extension="md",
+        mime_type="text/markdown",
+        byte_size=10,
+        sha256="1" * 64,
+        chunk_count=1,
+        chunk_set_sha256="a" * 64,
+        created_at=now,
+        ready_at=now,
+    )
+    repository.db.add_all([
+        item,
+        version,
+        AiCallPromptKnowledgeBindingModel(
+            id=201,
+            tenant_id=TEST_TENANT_ID,
+            prompt_profile_id=int(created["id"]),
+            knowledge_item_id=item.id,
+            created_at=now,
+        ),
+    ])
+    await repository.db.flush()
+    snapshot_hash = knowledge_version_snapshot_hash([version])
+    values = {
+        "scene_code": created["sceneCode"],
+        "name": created["name"],
+        "provider_key": created["providerKey"],
+        "prompt_text": created["promptText"],
+        "opening_message": created["openingMessage"],
+        "product_info": "已确认草稿",
+        "variables": created["variables"],
+    }
+
+    saved = await service.update_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        values=values,
+        knowledge_version_snapshot_hash=snapshot_hash,
+    )
+    assert saved["productInfo"] == "已确认草稿"
+
+    item.current_ready_version_id = 12
+    repository.db.add(
+        AiCallKnowledgeVersionModel(
+            id=12,
+            tenant_id=TEST_TENANT_ID,
+            knowledge_item_id=item.id,
+            version_no=2,
+            status="READY",
+            source_object_key="knowledge/101/12.md",
+            source_filename="产品资料-v2.md",
+            extension="md",
+            mime_type="text/markdown",
+            byte_size=12,
+            sha256="2" * 64,
+            chunk_count=1,
+            chunk_set_sha256="b" * 64,
+            created_at=now,
+            ready_at=now,
+        )
+    )
+    await repository.db.flush()
+
+    with pytest.raises(CustomException, match="知识资料已变化") as stale:
+        await service.update_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
+            profile_id=int(created["id"]),
+            values={**values, "product_info": "过期草稿"},
+            knowledge_version_snapshot_hash=snapshot_hash,
+        )
+    assert stale.value.status_code == 409
+    current = await service.get_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    )
+    assert current["productInfo"] == "已确认草稿"
 
 
 @pytest.mark.anyio

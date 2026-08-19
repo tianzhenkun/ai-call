@@ -33,7 +33,11 @@ from app.services.ai_call.runtime_control.handoff_handlers import (
     AgentMediaObservation,
 )
 from app.services.ai_call.runtime_control.owner_repository import RuntimeOwnerRepository
-from app.services.ai_call.session_registry import CallSession, CallSessionStatus
+from app.services.ai_call.session_registry import (
+    CallSession,
+    CallSessionStatus,
+    KnowledgeRuntimeContext,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +54,7 @@ class RuntimeProviderResource:
     runtime_fencing_token: int | None = None
     egress_scope: str | None = None
     prompt_effective_config: PromptEffectiveConfig | None = None
+    knowledge_context: KnowledgeRuntimeContext | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -119,11 +124,16 @@ class DatabaseRuntimeProviderResourceResolver:
                 getattr(command, "payload_json", None) if command is not None else None
             )
             prompt_effective_config = None
+            knowledge_context = None
             if claim.effect_type == "ATTACH_AGENT_PARTICIPANT":
                 prompt_effective_config = await self._resolve_prompt_effective_config(
                     session,
                     record,
                     command,
+                )
+                knowledge_context = await self._resolve_knowledge_context(
+                    session,
+                    record,
                 )
             egress_scope = "main"
             track_effect = current_effect
@@ -174,6 +184,7 @@ class DatabaseRuntimeProviderResourceResolver:
                 runtime_fencing_token=claim.processing_fencing_token,
                 egress_scope=egress_scope,
                 prompt_effective_config=prompt_effective_config,
+                knowledge_context=knowledge_context,
             )
 
     async def _resolve_prompt_effective_config(self, session, record, command):
@@ -211,6 +222,38 @@ class DatabaseRuntimeProviderResourceResolver:
                 self._orchestrator,
             ).resolve(context)
         return _build_prompt_composer(self._orchestrator).compose(result)
+
+    @staticmethod
+    async def _resolve_knowledge_context(
+        session: Any,
+        record: Any,
+    ) -> KnowledgeRuntimeContext | None:
+        if getattr(record, "business_type", None) != "outbound_attempt":
+            return None
+        business_id = str(getattr(record, "business_id", "") or "")
+        if (
+            not business_id.isdecimal()
+            or str(int(business_id)) != business_id
+        ):
+            return None
+        from app.api.v1.ai_call.crud import AiCallRecordRepository
+        from app.services.ai_call.knowledge import parse_knowledge_runtime_context
+
+        tenant_id = str(record.tenant_id)
+        task_snapshot = await AiCallRecordRepository(
+            session
+        ).get_outbound_attempt_task_snapshot(
+            int(business_id),
+            tenant_id=tenant_id,
+        )
+        if task_snapshot is None:
+            return None
+        task_id, snapshot_json = task_snapshot
+        return parse_knowledge_runtime_context(
+            snapshot_json,
+            tenant_id=tenant_id,
+            task_id=task_id,
+        )
 
     @staticmethod
     def _payload_voice(payload_json: str | None) -> str | None:
@@ -370,6 +413,7 @@ class OwnerRuntimeAgentManager:
             participant_identity=resource.customer_participant_identity,
             status=CallSessionStatus.READY,
             effective_config=effective_config,
+            knowledge_context=resource.knowledge_context,
             local_participant_identity=resource.agent_participant_identity,
         )
         self._orchestrator.registry.add(session)

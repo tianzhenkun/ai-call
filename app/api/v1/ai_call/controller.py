@@ -551,10 +551,13 @@ async def update_prompt_profile_controller(
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
     user = auth.user
+    values = request.model_dump()
+    knowledge_snapshot_hash = values.pop("knowledge_version_snapshot_hash")
     result = await service.update_prompt_profile(
         tenant_id=tenant_id,
         profile_id=profile_id,
-        values=request.model_dump(),
+        values=values,
+        knowledge_version_snapshot_hash=knowledge_snapshot_hash,
         created_by=user_id,
         created_by_name=(
             getattr(user, "nick_name", None) or getattr(user, "user_name", None)

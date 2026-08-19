@@ -1148,6 +1148,7 @@ _OUTBOUND_START_PAYLOAD_KEYS = frozenset({
     "line_code",
     "line_id",
     "prompt_profile_id",
+    "prompt_snapshot",
     "scene_code",
     "target_id",
     "task_id",
@@ -1162,10 +1163,12 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         payload = json.loads(payload_json)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or set(payload) not in {
-        _OUTBOUND_START_PAYLOAD_KEYS,
-        _OUTBOUND_START_PAYLOAD_KEYS - {"business_params"},
-    }:
+    if (
+        not isinstance(payload, dict)
+        or not _OUTBOUND_START_PAYLOAD_KEYS - {"business_params", "prompt_snapshot"}
+        <= set(payload)
+        or not set(payload) <= _OUTBOUND_START_PAYLOAD_KEYS
+    ):
         return None
     if type(payload["attempt_no"]) is not int or payload["attempt_no"] <= 0:
         return None
@@ -1177,6 +1180,9 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
             return None
         if not isinstance(business_params["customerName"], str):
             return None
+    prompt_snapshot = payload.get("prompt_snapshot")
+    if prompt_snapshot is not None and not isinstance(prompt_snapshot, dict):
+        return None
     if not all(
         isinstance(payload[key], str) and payload[key].strip()
         for key in ("scene_code", "voice")

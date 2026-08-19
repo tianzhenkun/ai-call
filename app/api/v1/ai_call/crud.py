@@ -466,12 +466,43 @@ class AiCallRecordRepository:
         )
         return dict(result.all())
 
-    async def get_outbound_task_config_snapshot(self, task_id: int) -> str | None:
-        return await self.db.scalar(
-            select(AiCallOutboundTaskModel.config_snapshot_json).where(
-                AiCallOutboundTaskModel.id == task_id
-            )
+    async def get_outbound_task_config_snapshot(
+        self,
+        task_id: int,
+        *,
+        tenant_id: str | None = None,
+    ) -> str | None:
+        statement = select(AiCallOutboundTaskModel.config_snapshot_json).where(
+            AiCallOutboundTaskModel.id == task_id
         )
+        if tenant_id:
+            statement = statement.where(AiCallOutboundTaskModel.tenant_id == tenant_id)
+        return await self.db.scalar(statement)
+
+    async def get_outbound_attempt_task_snapshot(
+        self,
+        attempt_id: int,
+        *,
+        tenant_id: str,
+    ) -> tuple[int, str] | None:
+        row = (
+            await self.db.execute(
+                select(
+                    AiCallOutboundTaskModel.id,
+                    AiCallOutboundTaskModel.config_snapshot_json,
+                )
+                .join(
+                    AiCallOutboundAttemptModel,
+                    AiCallOutboundAttemptModel.task_id == AiCallOutboundTaskModel.id,
+                )
+                .where(
+                    AiCallOutboundAttemptModel.id == attempt_id,
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundTaskModel.tenant_id == tenant_id,
+                )
+            )
+        ).one_or_none()
+        return (int(row[0]), str(row[1])) if row is not None else None
 
     async def get_outbound_attempt_task_config_snapshot(
         self,

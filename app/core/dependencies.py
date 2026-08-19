@@ -275,6 +275,34 @@ async def get_ai_call_console(
     return auth
 
 
+async def get_knowledge_viewer(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if auth.user and auth.user.is_superuser:
+        return auth
+
+    allowed_permissions = {
+        "ai_call:knowledge:view",
+        "ai_call:knowledge:manage",
+        "*:*:*",
+    }
+    if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
+        raise CustomException(msg="无权限操作", code=10403, status_code=403)
+    return auth
+
+
+async def get_knowledge_manager(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if auth.user and auth.user.is_superuser:
+        return auth
+
+    allowed_permissions = {"ai_call:knowledge:manage", "*:*:*"}
+    if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
+        raise CustomException(msg="无权限操作", code=10403, status_code=403)
+    return auth
+
+
 class AuthPermission:
     """权限验证类"""
 

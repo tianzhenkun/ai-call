@@ -1,0 +1,15 @@
+FROM ai-call-transfer/python:3.12.9-slim-amd64
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY app/services/ai_call/knowledge_binary_parser.py /opt/ai-call/knowledge_binary_parser.py
+
+RUN useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin ai-call-parser \
+ && mkdir -p /run/ai-call-parser \
+ && chown ai-call-parser:ai-call-parser /run/ai-call-parser
+
+USER ai-call-parser
+
+ENTRYPOINT ["python", "-I", "/opt/ai-call/knowledge_binary_parser.py"]
+CMD ["--socket", "/run/ai-call-parser/parser.sock", "--require-isolation"]

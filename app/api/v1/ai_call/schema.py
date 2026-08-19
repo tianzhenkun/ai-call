@@ -710,7 +710,13 @@ class PromptProfileCreateRequest(PromptProfileBaseRequest):
 
 
 class PromptProfileUpdateRequest(PromptProfileBaseRequest):
-    pass
+    knowledge_version_snapshot_hash: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="从知识草稿应用时的来源版本快照",
+    )
 
 
 class PromptProfileOut(AiCallBaseSchema):
@@ -831,3 +837,30 @@ class PromptOptimizeRequest(AiCallBaseSchema):
 class PromptOptimizeOut(AiCallBaseSchema):
     candidate_content: str
     warnings: list[str] = Field(default_factory=list)
+
+
+class ProductInfoSourceOut(AiCallBaseSchema):
+    claim: str
+    chunk_id: str
+    version_id: str
+    version_no: int
+    source_filename: str
+    page_no: int | None = None
+    section_path: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    excerpt: str
+
+
+class ProductInfoConflictOut(AiCallBaseSchema):
+    topic: str
+    description: str
+    source_chunk_ids: list[str]
+
+
+class ProductInfoExtractOut(AiCallBaseSchema):
+    draft_text: str
+    sources: list[ProductInfoSourceOut]
+    conflicts: list[ProductInfoConflictOut]
+    source_version_ids: list[str]
+    version_snapshot_hash: str

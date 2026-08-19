@@ -13,6 +13,7 @@ dependencies = [
     "bcrypt==5.0.0",
     "bleach==6.3.0",
     "cryptography==46.0.5",
+    "cos-python-sdk-v5==1.9.44",
     "fastapi==0.135.1",
     "greenlet==3.1.1",
     "httpx==0.28.1",
@@ -54,6 +55,15 @@ dev = [
 [[tool.uv.index]]
 name = "tuna"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+ignore-error-codes = [403]
+
+[[tool.uv.index]]
+name = "pypi-cos"
+url = "https://pypi.org/simple"
+explicit = true
+
+[tool.uv.sources]
+cos-python-sdk-v5 = { index = "pypi-cos" }
 
 [tool.ruff]
 line-length = 100

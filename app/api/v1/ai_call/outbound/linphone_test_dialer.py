@@ -68,6 +68,7 @@ class LinphoneTestDialer:
             service = self.ai_call_service_factory(db)
             try:
                 await service.create_sip_session(
+                    tenant_id=request.tenant_id,
                     callee_phone_number=request.phone_number,
                     voice=request.voice,
                     call_id=call_id,
@@ -76,8 +77,14 @@ class LinphoneTestDialer:
                     scene_code=request.scene_code,
                     business_params={
                         **request.business_params,
+                        **(
+                            {"customerName": request.customer_name}
+                            if request.customer_name
+                            else {}
+                        ),
                         "targetId": str(request.target_id),
                     },
+                    prompt_snapshot=request.prompt_snapshot,
                 )
             except Exception as exc:
                 create_error = exc

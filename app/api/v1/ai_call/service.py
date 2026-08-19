@@ -79,7 +79,11 @@ from app.services.ai_call.semantic_analysis import (
     SemanticTranscriptBuilder,
     build_default_semantic_analyzer,
 )
-from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
+from app.services.ai_call.session_registry import (
+    RUNNING_STATUSES,
+    CallSessionStatus,
+    KnowledgeRuntimeContext,
+)
 from app.services.ai_call.system_prompt_player import LiveKitSystemPromptPlayer
 from app.services.ai_call.voice_profile import (
     VOICE_GENDER_FEMALE,
@@ -292,11 +296,17 @@ class AiCallService:
                     else None
                 ),
             )
+            knowledge_context = await self._resolve_legacy_knowledge_context(
+                tenant_id=tenant_id,
+                business_type=business_type,
+                business_id=business_id,
+            )
             room_session = await self.orchestrator.create_sip_session(
                 voice=resolved_voice,
                 prompt=None,
                 call_id=resolved_call_id,
                 prompt_effective_config=prompt_effective_config,
+                knowledge_context=knowledge_context,
             )
             await self.record_service.mark_status(resolved_call_id, room_session.status)
             self._record_sip_event(
@@ -515,6 +525,7 @@ class AiCallService:
         tenant_id: str,
         profile_id: int,
         values: dict,
+        knowledge_version_snapshot_hash: str | None = None,
         created_by: int | None = None,
         created_by_name: str | None = None,
     ) -> dict:
@@ -527,6 +538,28 @@ class AiCallService:
         )
         if existing is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
+        if knowledge_version_snapshot_hash is not None:
+            from app.services.ai_call.knowledge import (
+                knowledge_version_snapshot_hash as calculate_snapshot_hash,
+            )
+            from app.services.ai_call.knowledge import (
+                load_current_ready_knowledge_versions,
+            )
+
+            current_versions = await load_current_ready_knowledge_versions(
+                repository.db,
+                tenant_id=tenant_id,
+                prompt_profile_id=profile_id,
+            )
+            if (
+                knowledge_version_snapshot_hash
+                != calculate_snapshot_hash(current_versions)
+            ):
+                raise CustomException(
+                    msg="知识资料已变化，请重新生成产品与服务草稿",
+                    code=RET.CONFLICT.code,
+                    status_code=409,
+                )
         await self._ensure_prompt_profile_unique(
             repository,
             tenant_id,
@@ -2321,6 +2354,35 @@ class AiCallService:
         if prompt_result is None:
             prompt_result = await self.prompt_resolver.resolve(context)
         return self.prompt_composer.compose(prompt_result)
+
+    async def _resolve_legacy_knowledge_context(
+        self,
+        *,
+        tenant_id: str | None,
+        business_type: str | None,
+        business_id: str | None,
+    ) -> KnowledgeRuntimeContext | None:
+        if (
+            self.prompt_repository is None
+            or business_type != "outbound_task"
+            or not tenant_id
+            or not business_id
+            or not business_id.isdecimal()
+            or str(int(business_id)) != business_id
+        ):
+            return None
+        task_id = int(business_id)
+        snapshot_json = await self.prompt_repository.get_outbound_task_config_snapshot(
+            task_id,
+            tenant_id=tenant_id,
+        )
+        from app.services.ai_call.knowledge import parse_knowledge_runtime_context
+
+        return parse_knowledge_runtime_context(
+            snapshot_json,
+            tenant_id=tenant_id,
+            task_id=task_id,
+        )
 
     @staticmethod
     def _normalize_prompt_profile_values(values: dict) -> dict:
