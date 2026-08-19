@@ -71,7 +71,11 @@ from app.services.ai_call.semantic_analysis import (
     SemanticTranscriptBuilder,
     build_default_semantic_analyzer,
 )
-from app.services.ai_call.session_registry import RUNNING_STATUSES, CallSessionStatus
+from app.services.ai_call.session_registry import (
+    RUNNING_STATUSES,
+    CallSessionStatus,
+    KnowledgeRuntimeContext,
+)
 from app.services.ai_call.system_prompt_player import LiveKitSystemPromptPlayer
 from app.services.ai_call.voice_profile import (
     VOICE_GENDER_FEMALE,
@@ -171,6 +175,7 @@ class AiCallService:
         try:
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=call_id,
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
@@ -264,10 +269,16 @@ class AiCallService:
             )
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=resolved_call_id,
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
                 debug_prompt=None,
+            )
+            knowledge_context = await self._resolve_legacy_knowledge_context(
+                tenant_id=tenant_id,
+                business_type=business_type,
+                business_id=business_id,
             )
             await self.record_service.update_prompt_context(
                 resolved_call_id,
@@ -283,6 +294,7 @@ class AiCallService:
                 prompt=None,
                 call_id=resolved_call_id,
                 prompt_effective_config=prompt_effective_config,
+                knowledge_context=knowledge_context,
             )
             await self.record_service.mark_status(resolved_call_id, room_session.status)
             self._record_sip_event(
@@ -439,12 +451,14 @@ class AiCallService:
     async def list_prompt_profiles(
         self,
         *,
+        tenant_id: str,
         scene_code: str | None = None,
         page_num: int = 1,
         page_size: int = 20,
     ) -> dict:
         repository = self._ensure_prompt_repository()
         rows, total = await repository.list_prompt_profiles(
+            tenant_id=tenant_id,
             scene_code=normalize_scene_code(scene_code),
             page_num=page_num,
             page_size=page_size,
@@ -454,28 +468,44 @@ class AiCallService:
             "total": total,
         }
 
-    async def get_prompt_profile(self, profile_id: int) -> dict:
+    async def get_prompt_profile(self, *, tenant_id: str, profile_id: int) -> dict:
         repository = self._ensure_prompt_repository()
-        profile = await repository.get_prompt_profile(profile_id)
+        profile = await repository.get_prompt_profile(profile_id, tenant_id=tenant_id)
         if profile is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
         return self._prompt_profile_to_dict(profile)
 
-    async def create_prompt_profile(self, values: dict) -> dict:
+    async def create_prompt_profile(self, *, tenant_id: str, values: dict) -> dict:
         repository = self._ensure_prompt_repository()
         values = self._normalize_prompt_profile_values(values)
-        await self._ensure_prompt_profile_unique(repository, values)
+        values["tenant_id"] = tenant_id
+        await self._ensure_prompt_profile_unique(repository, tenant_id, values)
         profile = await repository.create_prompt_profile(**values)
         return self._prompt_profile_to_dict(profile)
 
-    async def update_prompt_profile(self, profile_id: int, values: dict) -> dict:
+    async def update_prompt_profile(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        values: dict,
+    ) -> dict:
         repository = self._ensure_prompt_repository()
         values = self._normalize_prompt_profile_values(values)
-        existing = await repository.get_prompt_profile(profile_id)
+        existing = await repository.get_prompt_profile(profile_id, tenant_id=tenant_id)
         if existing is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
-        await self._ensure_prompt_profile_unique(repository, values, current_id=profile_id)
-        profile = await repository.update_prompt_profile(profile_id, **values)
+        await self._ensure_prompt_profile_unique(
+            repository,
+            tenant_id,
+            values,
+            current_id=profile_id,
+        )
+        profile = await repository.update_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            **values,
+        )
         if profile is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
         return self._prompt_profile_to_dict(profile)
@@ -503,6 +533,7 @@ class AiCallService:
     async def preview_prompt_profile(
         self,
         *,
+        tenant_id: str,
         business_id: str | None,
         scene_code: str | None,
         business_params: dict | None,
@@ -518,6 +549,7 @@ class AiCallService:
         try:
             effective_config = await self._resolve_prompt_effective_config(
                 call_id="preview",
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params or {},
@@ -1867,6 +1899,7 @@ class AiCallService:
         self,
         *,
         call_id: str,
+        tenant_id: str | None,
         business_id: str | None,
         scene_code: str | None,
         business_params: dict,
@@ -1877,6 +1910,7 @@ class AiCallService:
         prompt_result = await self.prompt_resolver.resolve(
             PromptResolveContext(
                 call_id=call_id,
+                tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
                 business_params=business_params,
@@ -1884,6 +1918,35 @@ class AiCallService:
             )
         )
         return self.prompt_composer.compose(prompt_result)
+
+    async def _resolve_legacy_knowledge_context(
+        self,
+        *,
+        tenant_id: str | None,
+        business_type: str | None,
+        business_id: str | None,
+    ) -> KnowledgeRuntimeContext | None:
+        if (
+            self.prompt_repository is None
+            or business_type != "outbound_task"
+            or not tenant_id
+            or not business_id
+            or not business_id.isdecimal()
+            or str(int(business_id)) != business_id
+        ):
+            return None
+        task_id = int(business_id)
+        snapshot_json = await self.prompt_repository.get_outbound_task_config_snapshot(
+            task_id,
+            tenant_id=tenant_id,
+        )
+        from app.services.ai_call.knowledge import parse_knowledge_runtime_context
+
+        return parse_knowledge_runtime_context(
+            snapshot_json,
+            tenant_id=tenant_id,
+            task_id=task_id,
+        )
 
     @staticmethod
     def _normalize_prompt_profile_values(values: dict) -> dict:
@@ -1915,11 +1978,13 @@ class AiCallService:
     @staticmethod
     async def _ensure_prompt_profile_unique(
         repository: AiCallRecordRepository,
+        tenant_id: str,
         values: dict,
         *,
         current_id: int | None = None,
     ) -> None:
         existing_scene = await repository.get_prompt_profile_by_scene(
+            tenant_id=tenant_id,
             scene_code=values["scene_code"],
         )
         if existing_scene is not None and existing_scene.id != current_id:

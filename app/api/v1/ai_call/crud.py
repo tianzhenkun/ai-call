@@ -322,12 +322,18 @@ class AiCallRecordRepository:
         )
         return dict(result.all())
 
-    async def get_outbound_task_config_snapshot(self, task_id: int) -> str | None:
-        return await self.db.scalar(
-            select(AiCallOutboundTaskModel.config_snapshot_json).where(
-                AiCallOutboundTaskModel.id == task_id
-            )
+    async def get_outbound_task_config_snapshot(
+        self,
+        task_id: int,
+        *,
+        tenant_id: str | None = None,
+    ) -> str | None:
+        statement = select(AiCallOutboundTaskModel.config_snapshot_json).where(
+            AiCallOutboundTaskModel.id == task_id
         )
+        if tenant_id:
+            statement = statement.where(AiCallOutboundTaskModel.tenant_id == tenant_id)
+        return await self.db.scalar(statement)
 
     async def get_outbound_attempt_task_config_snapshot(
         self,
@@ -349,6 +355,31 @@ class AiCallRecordRepository:
                 AiCallOutboundTaskModel.tenant_id == tenant_id,
             )
         return await self.db.scalar(statement)
+
+    async def get_outbound_attempt_task_snapshot(
+        self,
+        attempt_id: int,
+        *,
+        tenant_id: str,
+    ) -> tuple[int, str] | None:
+        row = (
+            await self.db.execute(
+                select(
+                    AiCallOutboundTaskModel.id,
+                    AiCallOutboundTaskModel.config_snapshot_json,
+                )
+                .join(
+                    AiCallOutboundAttemptModel,
+                    AiCallOutboundAttemptModel.task_id == AiCallOutboundTaskModel.id,
+                )
+                .where(
+                    AiCallOutboundAttemptModel.id == attempt_id,
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundTaskModel.tenant_id == tenant_id,
+                )
+            )
+        ).one_or_none()
+        return (int(row[0]), str(row[1])) if row is not None else None
 
     async def get_outbound_attempt_by_call_id(
         self,
@@ -1911,18 +1942,25 @@ class AiCallRecordRepository:
     async def get_prompt_profile(
         self,
         profile_id: int,
+        *,
+        tenant_id: str,
     ) -> AiCallPromptProfileModel | None:
         result = await self.db.execute(
-            select(AiCallPromptProfileModel).where(AiCallPromptProfileModel.id == profile_id)
+            select(AiCallPromptProfileModel).where(
+                AiCallPromptProfileModel.id == profile_id,
+                AiCallPromptProfileModel.tenant_id == tenant_id,
+            )
         )
         return result.scalar_one_or_none()
 
     async def get_prompt_profile_by_scene(
         self,
         *,
+        tenant_id: str,
         scene_code: str,
     ) -> AiCallPromptProfileModel | None:
         stmt = select(AiCallPromptProfileModel).where(
+            AiCallPromptProfileModel.tenant_id == tenant_id,
             AiCallPromptProfileModel.scene_code == scene_code,
         )
         result = await self.db.execute(stmt.limit(1))
@@ -1931,16 +1969,19 @@ class AiCallRecordRepository:
     async def list_prompt_profiles(
         self,
         *,
+        tenant_id: str,
         scene_code: str | None = None,
         page_num: int = 1,
         page_size: int = 20,
     ) -> tuple[list[AiCallPromptProfileModel], int]:
         stmt = self._prompt_profile_filters(
             select(AiCallPromptProfileModel),
+            tenant_id=tenant_id,
             scene_code=scene_code,
         )
         count_stmt = self._prompt_profile_filters(
             select(func.count()).select_from(AiCallPromptProfileModel),
+            tenant_id=tenant_id,
             scene_code=scene_code,
         )
         total = int((await self.db.execute(count_stmt)).scalar_one())
@@ -1957,9 +1998,11 @@ class AiCallRecordRepository:
     async def update_prompt_profile(
         self,
         profile_id: int,
+        *,
+        tenant_id: str,
         **values,
     ) -> AiCallPromptProfileModel | None:
-        profile = await self.get_prompt_profile(profile_id)
+        profile = await self.get_prompt_profile(profile_id, tenant_id=tenant_id)
         if profile is None:
             return None
         for key, value in values.items():
@@ -2658,6 +2701,10 @@ class AiCallRecordRepository:
 
     @staticmethod
     def _prompt_profile_filters(stmt: Select, **filters) -> Select:
+        if filters.get("tenant_id"):
+            stmt = stmt.where(
+                AiCallPromptProfileModel.tenant_id == filters["tenant_id"]
+            )
         if filters.get("scene_code"):
             stmt = stmt.where(AiCallPromptProfileModel.scene_code == filters["scene_code"])
         return stmt

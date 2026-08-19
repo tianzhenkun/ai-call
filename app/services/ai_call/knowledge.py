@@ -1751,11 +1751,47 @@ class KnowledgeService:
         prompt_profile_ids: list[int],
         user_id: int,
     ) -> list[dict[str, str]]:
-        del db, tenant_id, item_id, prompt_profile_ids, user_id
-        raise CustomException(
-            msg="场景提示词完成租户归属迁移后才能绑定知识",
-            status_code=503,
+        await self._get_item_record(db, tenant_id, item_id, for_update=True)
+        profile_ids = sorted({int(profile_id) for profile_id in prompt_profile_ids})
+        if len(profile_ids) > 100 or any(profile_id <= 0 for profile_id in profile_ids):
+            raise CustomException(msg="提示词配置 ID 不合法", status_code=400)
+        profiles = (
+            list(
+                (
+                    await db.scalars(
+                        select(AiCallPromptProfileModel).where(
+                            AiCallPromptProfileModel.tenant_id == tenant_id,
+                            AiCallPromptProfileModel.id.in_(profile_ids),
+                        )
+                    )
+                ).all()
+            )
+            if profile_ids
+            else []
         )
+        if {profile.id for profile in profiles} != set(profile_ids):
+            raise CustomException(msg="提示词配置不存在或无权管理", status_code=400)
+
+        await db.execute(
+            delete(AiCallPromptKnowledgeBindingModel).where(
+                AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
+                AiCallPromptKnowledgeBindingModel.knowledge_item_id == item_id,
+            )
+        )
+        now = datetime.now(timezone.utc)
+        db.add_all([
+            AiCallPromptKnowledgeBindingModel(
+                id=generate_snowflake_id(),
+                tenant_id=tenant_id,
+                prompt_profile_id=profile.id,
+                knowledge_item_id=item_id,
+                created_by=user_id,
+                created_at=now,
+            )
+            for profile in profiles
+        ])
+        await db.commit()
+        return await self._scene_bindings(db, tenant_id, item_id)
 
     async def delete_item(
         self,
@@ -1843,8 +1879,12 @@ class KnowledgeService:
                 )
                 .join(
                     AiCallPromptProfileModel,
-                    AiCallPromptProfileModel.id
-                    == AiCallPromptKnowledgeBindingModel.prompt_profile_id,
+                    and_(
+                        AiCallPromptProfileModel.id
+                        == AiCallPromptKnowledgeBindingModel.prompt_profile_id,
+                        AiCallPromptProfileModel.tenant_id
+                        == AiCallPromptKnowledgeBindingModel.tenant_id,
+                    ),
                 )
                 .where(
                     AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,

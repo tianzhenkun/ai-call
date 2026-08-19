@@ -47,6 +47,7 @@ from .sip_line_schema import SipLineSnapshot
 from .sip_line_service import SipLineService
 
 DEFAULT_TARGET_COPY_BATCH_SIZE = 500
+MAX_FROZEN_KNOWLEDGE_CHUNKS = 500
 
 
 def _now() -> datetime:
@@ -388,6 +389,12 @@ class OutboundRuleTaskService:
             lock_tenant_voice=True,
         )
         now = _now()
+        knowledge_snapshot = await self._freeze_knowledge(
+            db,
+            tenant_id=tenant_id,
+            prompt_profile_id=prompt.id,
+            frozen_at=now,
+        )
         scheduled_at = (
             self._parse_datetime(request.scheduled_at)
             if request.execution_mode == "scheduled"
@@ -401,6 +408,7 @@ class OutboundRuleTaskService:
                 "name": prompt.name,
                 "providerKey": prompt.provider_key,
             },
+            "knowledge": knowledge_snapshot,
             "voice": {
                 "scope": (
                     "TENANT" if isinstance(voice, AiCallTenantVoiceProfileModel) else "BUILTIN"
@@ -467,6 +475,42 @@ class OutboundRuleTaskService:
             )
         await db.flush()
         return task, True
+
+    @staticmethod
+    async def _freeze_knowledge(
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        prompt_profile_id: int,
+        frozen_at: datetime,
+    ) -> dict[str, object]:
+        from app.services.ai_call.knowledge import (
+            RETRIEVER_VERSION,
+            knowledge_version_snapshot_hash,
+            load_current_ready_knowledge_versions,
+        )
+
+        versions = await load_current_ready_knowledge_versions(
+            db,
+            tenant_id=tenant_id,
+            prompt_profile_id=prompt_profile_id,
+        )
+        chunk_count = sum(version.chunk_count for version in versions)
+        if chunk_count > MAX_FROZEN_KNOWLEDGE_CHUNKS:
+            raise CustomException(
+                msg=(
+                    f"当前场景关联知识共 {chunk_count} 个切片，超过单任务 "
+                    f"{MAX_FROZEN_KNOWLEDGE_CHUNKS} 个上限，请减少资料后重试"
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return {
+            "promptProfileId": str(prompt_profile_id),
+            "versionIds": [str(version.id) for version in versions],
+            "versionSnapshotHash": knowledge_version_snapshot_hash(versions),
+            "retrieverVersion": RETRIEVER_VERSION,
+            "frozenAt": frozen_at.isoformat(),
+        }
 
     async def _resolve_validation_line(
         self,
@@ -871,7 +915,10 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
-        prompt_conditions = [AiCallPromptProfileModel.scene_code == request.scene_code]
+        prompt_conditions = [
+            AiCallPromptProfileModel.tenant_id == tenant_id,
+            AiCallPromptProfileModel.scene_code == request.scene_code,
+        ]
         if request.prompt_profile_id:
             prompt_conditions.append(
                 AiCallPromptProfileModel.id

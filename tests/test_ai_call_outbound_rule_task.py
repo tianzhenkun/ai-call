@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,12 +9,18 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import func, select, text
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
-from app.api.v1.ai_call.model import AiCallPromptProfileModel, AiCallVoiceProfileModel
+from app.api.v1.ai_call.model import (
+    AiCallKnowledgeItemModel,
+    AiCallKnowledgeVersionModel,
+    AiCallPromptKnowledgeBindingModel,
+    AiCallPromptProfileModel,
+    AiCallVoiceProfileModel,
+)
 from app.api.v1.ai_call.outbound.model import (
     AiCallOutboundValidationModel,
     AiCallOutboundValidationRowModel,
@@ -274,6 +281,7 @@ async def _seed_references(database) -> tuple[int, int]:
         session.add(
             AiCallPromptProfileModel(
                 id=prompt_id,
+                tenant_id="tenant-a",
                 scene_code="intro_contract",
                 name="合同审查产品介绍",
                 provider_key="static_profile",
@@ -300,6 +308,60 @@ async def _seed_references(database) -> tuple[int, int]:
         )
         await session.commit()
     return prompt_id, voice_id
+
+
+async def _seed_ready_knowledge(
+    database,
+    *,
+    prompt_id: int,
+    chunk_count: int,
+) -> tuple[int, str, str]:
+    item_id = generate_snowflake_id()
+    version_id = generate_snowflake_id()
+    source_sha256 = hashlib.sha256(f"source:{version_id}".encode()).hexdigest()
+    chunk_set_sha256 = hashlib.sha256(f"chunks:{version_id}".encode()).hexdigest()
+    async with database() as session:
+        now = _now()
+        session.add_all([
+            AiCallKnowledgeItemModel(
+                id=item_id,
+                tenant_id="tenant-a",
+                display_name=f"知识-{item_id}.md",
+                content_category="FAQ",
+                current_ready_version_id=version_id,
+                created_by=10,
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallKnowledgeVersionModel(
+                id=version_id,
+                tenant_id="tenant-a",
+                knowledge_item_id=item_id,
+                version_no=1,
+                status="READY",
+                source_object_key=f"knowledge/tenant-a/{item_id}/{version_id}/source.md",
+                source_filename=f"知识-{item_id}.md",
+                extension="md",
+                mime_type="text/markdown",
+                byte_size=100,
+                sha256=source_sha256,
+                chunk_count=chunk_count,
+                chunk_set_sha256=chunk_set_sha256,
+                created_by=10,
+                created_at=now,
+                ready_at=now,
+            ),
+            AiCallPromptKnowledgeBindingModel(
+                id=generate_snowflake_id(),
+                tenant_id="tenant-a",
+                prompt_profile_id=prompt_id,
+                knowledge_item_id=item_id,
+                created_by=10,
+                created_at=now,
+            ),
+        ])
+        await session.commit()
+    return version_id, source_sha256, chunk_set_sha256
 
 
 async def _seed_tenant_voice(
@@ -1417,6 +1479,103 @@ async def test_batch_task_creation_copies_targets_in_batches_and_is_idempotent(d
                 "idem-create-batch",
                 other_request,
             )
+
+
+@pytest.mark.anyio
+async def test_task_creation_freezes_current_ready_knowledge_versions(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    version_id, source_sha256, chunk_set_sha256 = await _seed_ready_knowledge(
+        database,
+        prompt_id=prompt_id,
+        chunk_count=5,
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="batch",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("13800138000", "客户")],
+    )
+
+    async with database() as session:
+        task, created = await service.create_task(
+            session,
+            "tenant-a",
+            10,
+            "管理员",
+            "idem-knowledge-snapshot",
+            _create_task_request(config, validation_id),
+        )
+        await session.commit()
+        frozen = json.loads(task.config_snapshot_json)["knowledge"]
+
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            [{
+                "id": str(version_id),
+                "sha256": source_sha256,
+                "chunkSetSha256": chunk_set_sha256,
+            }],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    assert created is True
+    assert frozen == {
+        "promptProfileId": str(prompt_id),
+        "versionIds": [str(version_id)],
+        "versionSnapshotHash": expected_hash,
+        "retrieverVersion": "postgres-ngram-tsvector-v1",
+        "frozenAt": frozen["frozenAt"],
+    }
+    assert datetime.fromisoformat(frozen["frozenAt"]).tzinfo is not None
+
+
+@pytest.mark.anyio
+async def test_task_creation_rejects_more_than_five_hundred_frozen_chunks(database) -> None:
+    prompt_id, _ = await _seed_references(database)
+    await _seed_ready_knowledge(
+        database,
+        prompt_id=prompt_id,
+        chunk_count=501,
+    )
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="batch",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("13800138000", "客户")],
+    )
+
+    async with database() as session:
+        with pytest.raises(CustomException, match="500") as exc_info:
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-knowledge-over-limit",
+                _create_task_request(config, validation_id),
+            )
+        assert exc_info.value.status_code == 409
+        assert await session.scalar(select(func.count(AiCallOutboundTaskModel.id))) == 0
 
 
 @pytest.mark.anyio

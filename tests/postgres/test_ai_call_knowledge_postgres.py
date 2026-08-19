@@ -30,6 +30,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_PATH = (
     PROJECT_ROOT / "docs/livekit-ai-outbound/sql/phase-j1-knowledge-lexical-postgres.sql"
 )
+PROMPT_TENANT_MIGRATION_PATH = (
+    PROJECT_ROOT
+    / "docs/livekit-ai-outbound/sql/phase-j2-prompt-profile-tenant-postgres.sql"
+)
 
 
 def _dsn() -> str:
@@ -309,3 +313,59 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
     assert "idx_ai_call_knowledge_usage_call_created" in usage_indexes
     assert "ck_ai_call_knowledge_usage_purpose" in usage_constraints
     assert "ck_ai_call_knowledge_usage_status" in usage_constraints
+
+
+async def test_prompt_profile_tenant_migration_is_fail_closed_and_idempotent() -> None:
+    _execute(
+        """
+        drop table if exists ai_call_prompt_knowledge_binding cascade;
+        drop table if exists ai_call_prompt_profile cascade;
+        create table ai_call_prompt_profile (
+            id bigint primary key,
+            scene_code varchar(64) not null,
+            name varchar(128) not null,
+            provider_key varchar(64) not null,
+            prompt_text text,
+            opening_message varchar(1000),
+            created_at timestamptz not null,
+            updated_at timestamptz not null,
+            constraint uk_ai_call_prompt_profile_scene unique (scene_code)
+        );
+        insert into ai_call_prompt_profile (
+            id, scene_code, name, provider_key, created_at, updated_at
+        ) values (1, 'default', '默认场景', 'aliyun-qwen-realtime', now(), now());
+        """
+    )
+    migration = PROMPT_TENANT_MIGRATION_PATH.read_text(encoding="utf-8")
+
+    with pytest.raises(psycopg.errors.RaiseException, match="尚未指定租户"):
+        _execute(f"begin; {migration} commit;")
+
+    _execute(
+        f"""
+        begin;
+        set local ai_call.prompt_tenant_id = 'tenant-a';
+        {migration}
+        {migration}
+        commit;
+        """
+    )
+    with psycopg.connect(_psycopg_dsn(), cursor_factory=ClientCursor) as connection:
+        assert connection.execute(
+            "select tenant_id from ai_call_prompt_profile where id = 1"
+        ).fetchone() == ("tenant-a",)
+        assert connection.execute(
+            """
+            select is_nullable
+            from information_schema.columns
+            where table_name = 'ai_call_prompt_profile' and column_name = 'tenant_id'
+            """
+        ).fetchone() == ("NO",)
+        connection.execute(
+            """
+            insert into ai_call_prompt_profile (
+                id, tenant_id, scene_code, name, provider_key, created_at, updated_at
+            ) values (2, 'tenant-b', 'default', '其他租户默认场景',
+                      'aliyun-qwen-realtime', now(), now())
+            """
+        )

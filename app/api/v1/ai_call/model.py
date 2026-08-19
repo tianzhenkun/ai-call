@@ -1419,7 +1419,12 @@ class AiCallPromptProfileModel(MappedBase):
 
     __tablename__ = "ai_call_prompt_profile"
     __table_args__ = (
-        UniqueConstraint("scene_code", name="uk_ai_call_prompt_profile_scene"),
+        UniqueConstraint(
+            "tenant_id",
+            "scene_code",
+            name="uk_ai_call_prompt_profile_tenant_scene",
+        ),
+        Index("idx_ai_call_prompt_profile_tenant_updated", "tenant_id", "updated_at"),
         {"comment": "AI Call 业务提示词配置表"},
     )
     __permission_strategy__ = None
@@ -1430,6 +1435,7 @@ class AiCallPromptProfileModel(MappedBase):
         autoincrement=False,
         comment="雪花主键",
     )
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
     scene_code: Mapped[str] = mapped_column(
         String(64),
         nullable=False,

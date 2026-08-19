@@ -437,12 +437,15 @@ async def _commit_ai_call_record_audit(service: AiCallService) -> None:
     summary="查询业务提示词配置列表",
 )
 async def list_prompt_profiles_controller(
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 20,
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.list_prompt_profiles(
+        tenant_id=tenant_id,
         scene_code=scene_code,
         page_num=page_num,
         page_size=page_size,
@@ -457,9 +460,11 @@ async def list_prompt_profiles_controller(
 )
 async def get_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.get_prompt_profile(profile_id)
+    tenant_id, _ = _identity(auth)
+    result = await service.get_prompt_profile(tenant_id=tenant_id, profile_id=profile_id)
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="查询成功")
 
 
@@ -470,9 +475,14 @@ async def get_prompt_profile_controller(
 )
 async def create_prompt_profile_controller(
     request: PromptProfileCreateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.create_prompt_profile(request.model_dump())
+    tenant_id, _ = _identity(auth)
+    result = await service.create_prompt_profile(
+        tenant_id=tenant_id,
+        values=request.model_dump(),
+    )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="创建成功")
 
 
@@ -484,9 +494,15 @@ async def create_prompt_profile_controller(
 async def update_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     request: PromptProfileUpdateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    result = await service.update_prompt_profile(profile_id, request.model_dump())
+    tenant_id, _ = _identity(auth)
+    result = await service.update_prompt_profile(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        values=request.model_dump(),
+    )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="保存成功")
 
 
@@ -509,9 +525,12 @@ async def list_prompt_components_controller(
 )
 async def preview_prompt_profile_controller(
     request: PromptProfilePreviewRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
     result = await service.preview_prompt_profile(
+        tenant_id=tenant_id,
         business_id=request.business_id,
         scene_code=request.scene_code,
         business_params=request.business_params,

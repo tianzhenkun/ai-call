@@ -59,6 +59,7 @@ MAX_BUSINESS_PARAMS_BYTES = 8 * 1024
 @dataclass(frozen=True, slots=True)
 class PromptResolveContext:
     call_id: str
+    tenant_id: str | None
     business_id: str | None
     scene_code: str | None
     business_params: dict[str, Any] = field(default_factory=dict)
@@ -255,6 +256,7 @@ class BusinessPromptResolver:
         profile = None
         for scene_code in _candidate_scene_codes(context.scene_code):
             profile = await self.repository.get_prompt_profile_by_scene(
+                tenant_id=context.tenant_id,
                 scene_code=scene_code,
             )
             if profile is not None:
@@ -312,6 +314,7 @@ class BusinessPromptResolver:
     def _normalize_context(self, context: PromptResolveContext) -> PromptResolveContext:
         return PromptResolveContext(
             call_id=context.call_id.strip(),
+            tenant_id=_blank_to_none(context.tenant_id),
             business_id=_blank_to_none(context.business_id),
             scene_code=normalize_scene_code(context.scene_code),
             business_params=context.business_params or {},
@@ -320,6 +323,8 @@ class BusinessPromptResolver:
 
     def _validate_context(self, context: PromptResolveContext) -> None:
         validate_business_params(context.business_params)
+        if context.scene_code and not context.tenant_id:
+            raise _prompt_error("prompt_tenant_required", "租户上下文缺失", 401)
 
     @staticmethod
     def _validate_result(result: BusinessPromptResult) -> None:

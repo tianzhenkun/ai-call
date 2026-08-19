@@ -624,6 +624,28 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
 
     async with sessions() as db:
         db.add_all([
+            AiCallPromptProfileModel(
+                id=101,
+                tenant_id="tenant-a",
+                scene_code="intro_contract",
+                name="合同介绍",
+                provider_key="static_profile",
+                prompt_text="合同介绍",
+                opening_message="您好",
+                created_at=now,
+                updated_at=now,
+            ),
+            AiCallPromptProfileModel(
+                id=201,
+                tenant_id="tenant-b",
+                scene_code="intro_contract",
+                name="其他租户合同介绍",
+                provider_key="static_profile",
+                prompt_text="合同介绍",
+                opening_message="您好",
+                created_at=now,
+                updated_at=now,
+            ),
             AiCallKnowledgeItemModel(
                 id=1,
                 tenant_id="tenant-a",
@@ -744,15 +766,28 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         assert updated["displayName"] == "正式合同知识"
         assert updated["note"] == "已审核"
 
+        bindings = await service.replace_scene_bindings(
+            db,
+            tenant_id="tenant-a",
+            item_id=1,
+            prompt_profile_ids=[101, 101],
+            user_id=7,
+        )
+        assert bindings == [{
+            "promptProfileId": "101",
+            "sceneCode": "intro_contract",
+            "name": "合同介绍",
+        }]
+
         with pytest.raises(CustomException) as unavailable_binding:
             await service.replace_scene_bindings(
                 db,
                 tenant_id="tenant-a",
                 item_id=1,
-                prompt_profile_ids=[101],
+                prompt_profile_ids=[201],
                 user_id=7,
             )
-        assert unavailable_binding.value.status_code == 503
+        assert unavailable_binding.value.status_code == 400
 
         versions = await service.list_versions(db, tenant_id="tenant-a", item_id=1)
         assert [version["id"] for version in versions] == ["12", "11"]

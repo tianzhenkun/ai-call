@@ -28,6 +28,7 @@ from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
     InMemorySessionRegistry,
+    KnowledgeRuntimeContext,
     utc_now,
 )
 from app.services.ai_call.sip_barge_in import SipBargeInConfig, WebRtcVadAdapter
@@ -357,6 +358,9 @@ class AiCallOrchestrator:
         return cls(config=AiCallRuntimeConfig.from_settings(settings))
 
     def _build_default_agent_runner(self) -> RealtimeAgentRunnerProtocol:
+        from app.core.database import async_db_session
+        from app.services.ai_call.knowledge import KnowledgeRealtimeSearchService
+
         audio_transport = LiveKitRoomAudioTransport(
             livekit_url=self.config.livekit_url,
             api_key=self.config.livekit_api_key,
@@ -388,6 +392,10 @@ class AiCallOrchestrator:
             sip_vad_shadow_enabled=self.config.sip_vad_shadow_enabled,
             sip_vad_shadow_detector=self._build_sip_vad_shadow_detector(),
             call_end_scheduler=self._schedule_auto_end_session,
+            knowledge_search_service=KnowledgeRealtimeSearchService(
+                async_db_session,
+                model_name=self.config.qwen_realtime_model,
+            ),
         )
 
     def _build_sip_vad_shadow_detector(self) -> SipVadShadowDetectorProtocol | None:
@@ -566,6 +574,7 @@ class AiCallOrchestrator:
         prompt: str | None,
         call_id: str | None = None,
         prompt_effective_config: PromptEffectiveConfig | None = None,
+        knowledge_context: KnowledgeRuntimeContext | None = None,
     ) -> CreateSipRoomSessionResult:
         self.config.ensure_ready()
         call_id = call_id or self._new_call_id()
@@ -582,6 +591,7 @@ class AiCallOrchestrator:
             participant_identity=participant_identity,
             status=CallSessionStatus.CREATED,
             effective_config=effective_config,
+            knowledge_context=knowledge_context,
         )
         self.registry.add(session)
         self.metrics_by_call_id[call_id] = CallMetrics()

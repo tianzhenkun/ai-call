@@ -90,6 +90,30 @@ REQUEST_HANDOFF_TOOL = {
     },
 }
 
+
+SEARCH_SCENE_KNOWLEDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_scene_knowledge",
+        "description": (
+            "客户询问当前产品或服务的 FAQ、价格、政策、案例、周期或具体参数时，"
+            "查询本次任务已冻结的知识证据。只传客户当前问题，不要添加租户、任务或版本。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "客户需要核实的当前业务问题，最多 500 个字符。",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 DEFAULT_REALTIME_TOOLS = [SCHEDULE_CALL_END_TOOL, REQUEST_HANDOFF_TOOL]
 QWEN_WEBSOCKET_PING_INTERVAL_SECONDS = 20.0
 QWEN_WEBSOCKET_PING_TIMEOUT_SECONDS = 120.0
