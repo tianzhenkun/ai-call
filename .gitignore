@@ -80,6 +80,7 @@ alembic/versions/*
 env/.env.dev
 env/.env.local
 env/.env.prod
+deploy/ai-call-118/.env
 
 # DevOps
 devops/nginx/ssl

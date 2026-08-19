@@ -1,0 +1,20 @@
+<profile name="sip-provider-sandbox">
+  <gateways/>
+  <aliases/>
+  <domains><domain name="all" alias="false" parse="true"/></domains>
+  <settings>
+    <param name="sip-port" value="5089"/>
+    <param name="dialplan" value="XML"/>
+    <param name="context" value="sip_provider_sandbox"/>
+    <param name="inbound-codec-prefs" value="PCMA,PCMU"/>
+    <param name="outbound-codec-prefs" value="PCMA,PCMU"/>
+    <param name="auth-calls" value="false"/>
+    <param name="rtp-ip" value="$${local_ip_v4}"/>
+    <param name="sip-ip" value="$${local_ip_v4}"/>
+    <param name="ext-rtp-ip" value="$${local_ip_v4}"/>
+    <param name="ext-sip-ip" value="$${local_ip_v4}"/>
+    <param name="rtp-timeout-sec" value="60"/>
+    <param name="rtp-hold-timeout-sec" value="180"/>
+    <param name="tls" value="false"/>
+  </settings>
+</profile>

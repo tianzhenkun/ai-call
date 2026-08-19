@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<include>
+  <context name="sip_provider_sandbox">
+    <extension name="linphone-test-only">
+      <condition field="destination_number" expression="^19900001001$">
+        <action application="ring_ready"/>
+        <action application="bridge" data="${sofia_contact(*/1000)}"/>
+      </condition>
+    </extension>
+    <extension name="reject-all-other-destinations">
+      <condition field="destination_number" expression="^.*$">
+        <action application="respond" data="484"/>
+        <action application="hangup" data="UNALLOCATED_NUMBER"/>
+      </condition>
+    </extension>
+  </context>
+</include>

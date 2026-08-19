@@ -1,0 +1,143 @@
+name: ai-call-118
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: ai-call-transfer/postgres:16.14-alpine-amd64
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *default-logging
+    networks: [ai-call]
+
+  redis:
+    image: ai-call-transfer/redis:7.4.9-alpine-amd64
+    restart: unless-stopped
+    env_file: .env
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *default-logging
+    networks: [ai-call]
+
+  init-db:
+    image: ai-call-transfer/api:20260807
+    env_file: .env
+    command: ["python", "/opt/ai-call/bootstrap_db.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+    networks: [ai-call]
+
+  api:
+    image: ai-call-transfer/api:20260807
+    restart: unless-stopped
+    env_file: .env
+    command: ["uvicorn", "main:create_app", "--factory", "--host", "0.0.0.0", "--port", "19011"]
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+      livekit:
+        condition: service_started
+      livekit-egress:
+        condition: service_started
+      livekit-sip:
+        condition: service_started
+    ports:
+      - "10.77.0.2:19011:19011/tcp"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19011/ai-call/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [ai-call]
+
+  livekit:
+    image: ai-call-transfer/livekit-server:v1.13.1-amd64
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./runtime/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "10.77.0.2:7880:7880/tcp"
+      - "7881:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+    logging: *default-logging
+    networks: [ai-call]
+
+  livekit-egress:
+    image: ai-call-transfer/livekit-egress:v1.13.0-amd64
+    restart: unless-stopped
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
+    volumes:
+      - ./runtime/egress.yaml:/etc/egress.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    logging: *default-logging
+    networks: [ai-call]
+
+  freeswitch:
+    image: ai-call-transfer/freeswitch:20260807-r1
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "10.77.0.2:5060:5060/udp"
+      - "10.77.0.2:16384-16484:16384-16484/udp"
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [ai-call]
+
+  livekit-sip:
+    image: ai-call-transfer/livekit-sip:v1.5.0-amd64
+    restart: unless-stopped
+    command: ["--config", "/etc/sip.yaml"]
+    volumes:
+      - ./runtime/sip.yaml:/etc/sip.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      freeswitch:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [ai-call]
+
+networks:
+  ai-call:
+    name: ai-call-118-network
+
+volumes:
+  postgres-data:
+    name: ai-call-118-postgres-data
+  redis-data:
+    name: ai-call-118-redis-data
