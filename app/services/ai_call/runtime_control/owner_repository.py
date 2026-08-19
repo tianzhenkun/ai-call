@@ -81,6 +81,14 @@ def _sip_connected_event_id(tenant_id: str, call_id: str) -> str:
     return f"media-connected-{digest}"
 
 
+def _requires_outbound_chain(record: AiCallRecordModel) -> bool:
+    entry_type = getattr(record, "entry_type", None)
+    return entry_type == "outbound" or (
+        entry_type == "web"
+        and getattr(record, "business_type", None) == "outbound_attempt"
+    )
+
+
 class WorkerRegistryRepository:
     def __init__(
         self,
@@ -206,8 +214,7 @@ class DispatcherOwnerRepository:
         record = await self._lock_record(tenant_id, call_id)
         if record is None or not self._initial_assignment_allowed(record):
             return None
-        is_outbound = getattr(record, "entry_type", None) in {"outbound", "web"}
-        if is_outbound:
+        if _requires_outbound_chain(record):
             if outbound_refs is None or outbound_chain is None:
                 return None
             if not _outbound_chain_matches(
@@ -805,7 +812,7 @@ class RecoveryOwnerRepository:
             )
         ):
             return None
-        if record.entry_type in {"outbound", "web"}:
+        if _requires_outbound_chain(record):
             if (
                 outbound_refs is None
                 or outbound_chain is None

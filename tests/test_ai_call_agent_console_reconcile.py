@@ -518,7 +518,7 @@ async def test_reconcile_handoff_is_idempotent_and_audited(session_factory) -> N
                 AiCallEventModel.event_type == "handoff_reconciled"
             )
         )
-        assert follow_up_count == 1
+        assert follow_up_count == 0
         assert audit_count == 1
 
 

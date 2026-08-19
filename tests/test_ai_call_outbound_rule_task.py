@@ -1558,12 +1558,12 @@ async def test_task_creation_freezes_current_ready_knowledge_versions(database) 
 
 
 @pytest.mark.anyio
-async def test_task_creation_rejects_more_than_one_hundred_frozen_chunks(database) -> None:
+async def test_task_creation_rejects_more_than_five_hundred_frozen_chunks(database) -> None:
     prompt_id, _ = await _seed_references(database)
     await _seed_ready_knowledge(
         database,
         prompt_id=prompt_id,
-        chunk_count=101,
+        chunk_count=501,
     )
     service = OutboundRuleTaskService(database)
     async with database() as session:
@@ -1582,7 +1582,7 @@ async def test_task_creation_rejects_more_than_one_hundred_frozen_chunks(databas
     )
 
     async with database() as session:
-        with pytest.raises(CustomException, match="100") as exc_info:
+        with pytest.raises(CustomException, match="500") as exc_info:
             await service.create_task(
                 session,
                 "tenant-a",

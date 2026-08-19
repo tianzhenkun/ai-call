@@ -50,7 +50,7 @@ from .sip_line_schema import SipLineSnapshot
 from .sip_line_service import SipLineService
 
 DEFAULT_TARGET_COPY_BATCH_SIZE = 500
-MAX_FROZEN_KNOWLEDGE_CHUNKS = 100
+MAX_FROZEN_KNOWLEDGE_CHUNKS = 500
 
 
 def _now() -> datetime:

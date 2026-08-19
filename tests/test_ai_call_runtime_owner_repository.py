@@ -146,6 +146,8 @@ async def test_initial_owner_assignment_publishes_one_transactional_wakeup(
     record = SimpleNamespace(
         tenant_id="tenant-a",
         call_id="call-1",
+        entry_type="web",
+        business_type=None,
         runtime_control_mode="owner_command_v1",
         runtime_owner_id=None,
         runtime_fencing_token=0,

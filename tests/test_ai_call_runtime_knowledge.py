@@ -16,6 +16,7 @@ from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.knowledge import (
     KnowledgeRealtimeSearchResult,
     KnowledgeRealtimeSearchService,
+    KnowledgeSearchHit,
     parse_knowledge_runtime_context,
 )
 from app.services.ai_call.providers.aliyun_qwen_realtime import (
@@ -43,6 +44,25 @@ def _snapshot() -> dict:
             "frozenAt": "2026-08-19T00:00:00+00:00",
         },
     }
+
+
+def test_realtime_knowledge_audit_evidence_keeps_retrieval_score() -> None:
+    hit = KnowledgeSearchHit(
+        chunk_id=91,
+        version_id=11,
+        chunk_index=0,
+        content="退款需五个工作日。",
+        content_checksum="b" * 64,
+        source_filename="policy.md",
+        page_no=2,
+        section_path="售后政策",
+        source_path="word/document.xml",
+        start_ms=None,
+        end_ms=None,
+        score=0.875,
+    )
+
+    assert KnowledgeRealtimeSearchService._audit_evidence(hit)["score"] == 0.875
 
 
 def test_parse_knowledge_runtime_context_fails_closed_for_damaged_snapshot() -> None:

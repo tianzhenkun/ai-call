@@ -2598,7 +2598,11 @@ async def test_browser_disconnect_accepts_sqlite_lock_during_recording_stop() ->
 
         async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
             _ = (tenant_id, call_id)
-            return type("Record", (), {"tenant_id": "000000"})()
+            return type(
+                "Record",
+                (),
+                {"tenant_id": "000000", "runtime_control_mode": None},
+            )()
 
         async def complete_session(self, call_id: str, **values) -> None:
             _ = (call_id, values)
@@ -2637,7 +2641,11 @@ async def test_browser_disconnect_is_idempotent_after_failed_session() -> None:
 
         async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
             _ = (tenant_id, call_id)
-            return type("Record", (), {"tenant_id": "000000"})()
+            return type(
+                "Record",
+                (),
+                {"tenant_id": "000000", "runtime_control_mode": None},
+            )()
 
     service = AiCallService(
         orchestrator,
@@ -17443,7 +17451,7 @@ def test_session_api_returns_unified_camel_case_response() -> None:
         class BrowserRecordService:
             async def get_record_for_tenant(self, *, tenant_id: str, call_id: str):
                 _ = (tenant_id, call_id)
-                return object()
+                return type("Record", (), {"runtime_control_mode": None})()
 
             async def mark_answered(self, call_id: str, answered_at: datetime) -> None:
                 _ = (call_id, answered_at)

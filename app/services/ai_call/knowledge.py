@@ -693,6 +693,7 @@ class KnowledgeRealtimeSearchService:
         return {
             "chunkId": str(hit.chunk_id),
             "versionId": str(hit.version_id),
+            "score": hit.score,
             "contentChecksum": hit.content_checksum,
             "sourceFilename": hit.source_filename,
             "pageNo": hit.page_no,

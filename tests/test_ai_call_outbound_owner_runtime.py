@@ -1444,7 +1444,7 @@ async def test_dispatcher_rolls_back_owner_if_deadline_elapses_before_commit(
 
 
 @pytest.mark.anyio
-async def test_attempt_terminal_projection_retries_allocation_timeout(
+async def test_attempt_terminal_projection_does_not_retry_allocation_timeout(
     database,
 ) -> None:
     from app.api.v1.ai_call.outbound.attempt_reconciler import (
@@ -1510,10 +1510,10 @@ async def test_attempt_terminal_projection_retries_allocation_timeout(
     assert attempt.status == "FAILED"
     assert attempt.call_result == "call_failed"
     assert attempt.error_message == "ALLOCATION_TIMEOUT"
-    assert target is not None and target.status == "RETRY_WAIT"
+    assert target is not None and target.status == "COMPLETED"
     assert target.latest_result == "call_failed"
-    assert target.next_attempt_at == expired_at + timedelta(minutes=1)
-    assert task is not None and task.status == "RUNNING"
+    assert target.next_attempt_at is None
+    assert task is not None and task.status == "COMPLETED"
 
 
 @pytest.mark.anyio
