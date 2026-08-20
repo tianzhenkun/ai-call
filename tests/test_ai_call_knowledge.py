@@ -171,16 +171,27 @@ def test_txt_and_markdown_parser_is_deterministic_and_bounded() -> None:
     assert first.chunks[-1].section_path == "售后政策 / 补充说明"
 
 
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "expected_media_type"),
+    (
+        ("faq.md", "text/markdown", "text/plain"),
+        ("guide.pdf", "application/pdf", "application/pdf"),
+    ),
+)
 @pytest.mark.anyio
-async def test_text_preview_is_inline_and_cannot_be_sniffed_as_active_content() -> None:
+async def test_safe_preview_is_inline_and_cannot_be_sniffed_as_active_content(
+    filename: str,
+    mime_type: str,
+    expected_media_type: str,
+) -> None:
     async def body():
         yield b"# safe text"
 
     class _PreviewService:
         async def open_download(self, *args, **kwargs):
             return KnowledgeDownload(
-                filename="faq.md",
-                mime_type="text/markdown",
+                filename=filename,
+                mime_type=mime_type,
                 status_code=200,
                 content_length=11,
                 content_range=None,
@@ -195,10 +206,40 @@ async def test_text_preview_is_inline_and_cannot_be_sniffed_as_active_content() 
         range_header=None,
     )
 
-    assert response.media_type == "text/plain"
+    assert response.media_type == expected_media_type
     assert response.headers["content-disposition"].startswith("inline;")
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["content-security-policy"] == "sandbox"
+
+
+@pytest.mark.anyio
+async def test_office_preview_is_rejected() -> None:
+    class _PreviewService:
+        async def open_download(self, *args, **kwargs):
+            return KnowledgeDownload(
+                filename="guide.docx",
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                status_code=200,
+                content_length=1,
+                content_range=None,
+                body=iter(()),
+            )
+
+    with pytest.raises(CustomException) as exc_info:
+        await preview_knowledge_version_controller(
+            version_id=1,
+            auth=SimpleNamespace(
+                user=SimpleNamespace(tenant_id="tenant-a", user_id=7)
+            ),
+            db=object(),
+            service=_PreviewService(),
+            range_header=None,
+        )
+
+    assert exc_info.value.status_code == 415
 
 
 def test_text_parser_rejects_unsupported_or_unsafe_input() -> None:

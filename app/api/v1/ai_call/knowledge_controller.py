@@ -370,12 +370,12 @@ async def preview_knowledge_version_controller(
         range_header=range_header,
     )
     extension = preview.filename.rsplit(".", 1)[-1].lower()
-    if extension not in {"txt", "md", "markdown"}:
+    if extension not in {"txt", "md", "markdown", "pdf"}:
         raise CustomException(msg="该文件类型不支持在线预览", status_code=415)
     return _knowledge_file_response(
         preview,
         disposition="inline",
-        media_type="text/plain",
+        media_type="application/pdf" if extension == "pdf" else "text/plain",
     )
 
 
