@@ -206,6 +206,10 @@ async def list_knowledge_items_controller(
     service: Annotated[Any, Depends(get_knowledge_service)],
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 20,
+    content_category: Annotated[
+        str | None,
+        Query(alias="contentCategory", max_length=20),
+    ] = None,
 ) -> TableResponse:
     tenant_id, _ = _identity(auth)
     rows, total = await service.list_items(
@@ -213,6 +217,7 @@ async def list_knowledge_items_controller(
         tenant_id=tenant_id,
         page_num=page_num,
         page_size=page_size,
+        content_category=content_category,
     )
     return TableResponse(rows=rows, total=total, msg="查询成功")
 

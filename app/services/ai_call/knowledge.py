@@ -1647,12 +1647,17 @@ class KnowledgeService:
         tenant_id: str,
         page_num: int,
         page_size: int,
+        content_category: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         tenant_id = tenant_id.strip()
         if not tenant_id:
             raise CustomException(msg="租户上下文缺失", status_code=401)
         if page_num < 1 or not 1 <= page_size <= 100:
             raise CustomException(msg="分页参数不合法", status_code=400)
+        if content_category is not None:
+            content_category = content_category.strip().upper()
+            if content_category not in _CONTENT_CATEGORIES:
+                raise CustomException(msg="内容分类不合法", status_code=400)
 
         visible_version = (
             select(AiCallKnowledgeVersionModel.id)
@@ -1663,11 +1668,15 @@ class KnowledgeService:
             )
             .exists()
         )
-        conditions = (
+        conditions = [
             AiCallKnowledgeItemModel.tenant_id == tenant_id,
             AiCallKnowledgeItemModel.deleted_at.is_(None),
             visible_version,
-        )
+        ]
+        if content_category is not None:
+            conditions.append(
+                AiCallKnowledgeItemModel.content_category == content_category
+            )
         total = int(
             await db.scalar(
                 select(func.count()).select_from(AiCallKnowledgeItemModel).where(*conditions)
@@ -1715,27 +1724,52 @@ class KnowledgeService:
                 version_counts.get(version.knowledge_item_id, 0) + 1
             )
             latest_versions.setdefault(version.knowledge_item_id, version)
-        binding_counts = dict(
-            (
-                await db.execute(
-                    select(
-                        AiCallPromptKnowledgeBindingModel.knowledge_item_id,
-                        func.count(),
-                    )
-                    .where(
-                        AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
-                        AiCallPromptKnowledgeBindingModel.knowledge_item_id.in_(item_ids),
-                    )
-                    .group_by(AiCallPromptKnowledgeBindingModel.knowledge_item_id)
+        binding_rows = (
+            await db.execute(
+                select(
+                    AiCallPromptKnowledgeBindingModel.knowledge_item_id,
+                    AiCallPromptKnowledgeBindingModel.prompt_profile_id,
+                    AiCallPromptProfileModel.scene_code,
+                    AiCallPromptProfileModel.name,
                 )
-            ).all()
-        )
+                .join(
+                    AiCallPromptProfileModel,
+                    (
+                        AiCallPromptProfileModel.id
+                        == AiCallPromptKnowledgeBindingModel.prompt_profile_id
+                    )
+                    & (
+                        AiCallPromptProfileModel.tenant_id
+                        == AiCallPromptKnowledgeBindingModel.tenant_id
+                    ),
+                )
+                .where(
+                    AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
+                    AiCallPromptKnowledgeBindingModel.knowledge_item_id.in_(item_ids),
+                )
+                .order_by(
+                    AiCallPromptKnowledgeBindingModel.knowledge_item_id,
+                    AiCallPromptProfileModel.scene_code,
+                    AiCallPromptProfileModel.id,
+                )
+            )
+        ).all()
+        bindings_by_item: dict[int, list[dict[str, str]]] = {}
+        for item_id, prompt_profile_id, scene_code, name in binding_rows:
+            bindings_by_item.setdefault(item_id, []).append(
+                {
+                    "promptProfileId": str(prompt_profile_id),
+                    "sceneCode": scene_code,
+                    "name": name,
+                }
+            )
         return [
             self._item_to_dict(
                 item,
                 latest_version=latest_versions.get(item.id),
                 version_count=version_counts.get(item.id, 0),
-                binding_count=int(binding_counts.get(item.id, 0)),
+                binding_count=len(bindings_by_item.get(item.id, [])),
+                scene_bindings=bindings_by_item.get(item.id, []),
             )
             for item in items
         ], total

@@ -905,11 +905,30 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
             tenant_id="tenant-a",
             page_num=1,
             page_size=20,
+            content_category="FAQ",
+        )
+        assert rows == [] and total == 0
+        with pytest.raises(CustomException, match="内容分类不合法"):
+            await service.list_items(
+                db,
+                tenant_id="tenant-a",
+                page_num=1,
+                page_size=20,
+                content_category="UNKNOWN",
+            )
+
+        rows, total = await service.list_items(
+            db,
+            tenant_id="tenant-a",
+            page_num=1,
+            page_size=20,
+            content_category="PRODUCT_SERVICE",
         )
         assert total == 1
         assert rows[0]["id"] == "1"
         assert rows[0]["latestVersion"]["id"] == "12"
         assert rows[0]["currentReadyVersionId"] == "11"
+        assert rows[0]["sceneBindings"] == []
 
         updated = await service.update_item(
             db,
@@ -934,6 +953,13 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
                 "name": "合同介绍",
             }
         ]
+        rows, _ = await service.list_items(
+            db,
+            tenant_id="tenant-a",
+            page_num=1,
+            page_size=20,
+        )
+        assert rows[0]["sceneBindings"] == bindings
         with pytest.raises(CustomException) as cross_tenant:
             await service.replace_scene_bindings(
                 db,
