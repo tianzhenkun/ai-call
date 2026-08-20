@@ -731,6 +731,18 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
     assert updated["versionNo"] == 2
     assert updated["versionCount"] == 2
     assert [row["versionNo"] for row in versions["rows"]] == [2, 1]
+    assert [row["versionName"] for row in versions["rows"]] == [
+        created["name"],
+        created["name"],
+    ]
+
+    renamed = await service.update_prompt_profile_version_name(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        version_id=int(versions["rows"][0]["id"]),
+        version_name="GEO 首次试讲",
+    )
+    assert renamed["versionName"] == "GEO 首次试讲"
 
     restored = await service.apply_prompt_profile_version(
         tenant_id=TEST_TENANT_ID,
@@ -742,6 +754,18 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
     assert restored["promptText"] == created["promptText"]
     assert restored["versionNo"] == 3
     assert restored["versionCount"] == 3
+
+
+def test_prompt_version_name_migration_backfills_existing_versions() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-prompt-workbench-postgres.sql"
+    )
+    migration_sql = migration_path.read_text(encoding="utf-8")
+
+    assert "add column if not exists version_name varchar(100)" in migration_sql.lower()
+    assert "snapshot_json::jsonb ->> 'name'" in migration_sql
+    assert "alter column version_name set not null" in migration_sql.lower()
 
 
 @pytest.mark.anyio

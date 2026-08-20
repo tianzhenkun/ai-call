@@ -738,6 +738,7 @@ class PromptProfileVersionOut(AiCallBaseSchema):
     id: str
     profile_id: str
     version_no: int
+    version_name: str
     creation_method: Literal["manual", "ai_generated", "ai_optimized", "restored"]
     restored_from_version_id: str | None = None
     created_by: str | None = None
@@ -747,6 +748,19 @@ class PromptProfileVersionOut(AiCallBaseSchema):
 
 class PromptProfileVersionDetailOut(PromptProfileVersionOut):
     snapshot: dict[str, Any]
+
+
+class PromptProfileVersionUpdateRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+    version_name: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def normalize_version_name(self):
+        self.version_name = self.version_name.strip()
+        if not self.version_name:
+            raise ValueError("版本名称不能为空")
+        return self
 
 
 class VoiceProfileCreateRequest(AiCallBaseSchema):

@@ -497,6 +497,24 @@ class AiCallService:
         )
         return self._prompt_profile_to_dict(profile, summaries.get(profile.id))
 
+    async def update_prompt_profile_version_name(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+        version_name: str,
+    ) -> dict:
+        version = await self._ensure_prompt_repository().update_prompt_profile_version_name(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+            version_name=version_name.strip(),
+        )
+        if version is None:
+            raise CustomException(msg="提示词版本不存在", status_code=404)
+        return self._prompt_version_to_dict(version)
+
     async def create_prompt_profile(
         self,
         *,
@@ -2466,6 +2484,7 @@ class AiCallService:
         return await repository.create_prompt_profile_version(
             tenant_id=profile.tenant_id,
             profile_id=profile.id,
+            version_name=profile.name,
             snapshot_json=json.dumps(
                 self._prompt_profile_snapshot(profile),
                 ensure_ascii=False,
@@ -2507,6 +2526,7 @@ class AiCallService:
             "id": str(version.id),
             "profileId": str(version.profile_id),
             "versionNo": version.version_no,
+            "versionName": version.version_name,
             "creationMethod": version.creation_method,
             "restoredFromVersionId": (
                 str(version.restored_from_version_id)

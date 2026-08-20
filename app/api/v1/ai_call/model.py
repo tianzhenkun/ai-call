@@ -1926,6 +1926,7 @@ class AiCallPromptProfileVersionModel(MappedBase):
     tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
     profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="场景配置ID")
     version_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="版本号")
+    version_name: Mapped[str] = mapped_column(String(100), nullable=False, comment="版本名称")
     snapshot_json: Mapped[str] = mapped_column(Text, nullable=False, comment="完整场景快照")
     creation_method: Mapped[str] = mapped_column(
         String(32),

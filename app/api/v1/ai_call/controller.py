@@ -96,6 +96,7 @@ from .schema import (
     PromptProfileUpdateRequest,
     PromptProfileVersionDetailOut,
     PromptProfileVersionOut,
+    PromptProfileVersionUpdateRequest,
     QualityDetailOut,
     QualityReviewOut,
     QualityReviewRequest,
@@ -716,6 +717,31 @@ async def apply_prompt_profile_version_controller(
         ),
     )
     return SuccessResponse(data=PromptProfileOut.model_validate(result), msg="应用成功")
+
+
+@AiCallRouter.patch(
+    "/prompt-profiles/{profileId}/versions/{versionId}",
+    summary="修改业务提示词版本名称",
+    response_model=ResponseSchema[PromptProfileVersionOut],
+)
+async def update_prompt_profile_version_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    version_id: Annotated[int, Path(alias="versionId")],
+    request: PromptProfileVersionUpdateRequest,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.update_prompt_profile_version_name(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        version_id=version_id,
+        version_name=request.version_name,
+    )
+    return SuccessResponse(
+        data=PromptProfileVersionOut.model_validate(result),
+        msg="修改成功",
+    )
 
 
 @AiCallRouter.delete(

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS ai_call_prompt_profile_version (
     tenant_id varchar(20) NOT NULL,
     profile_id bigint NOT NULL,
     version_no integer NOT NULL,
+    version_name varchar(100) NOT NULL,
     snapshot_json text NOT NULL,
     creation_method varchar(32) NOT NULL,
     restored_from_version_id bigint,
@@ -59,6 +60,19 @@ CREATE TABLE IF NOT EXISTS ai_call_prompt_profile_version (
 
 CREATE INDEX IF NOT EXISTS idx_ai_call_prompt_version_profile_created
     ON ai_call_prompt_profile_version (tenant_id, profile_id, created_at);
+
+ALTER TABLE ai_call_prompt_profile_version
+    ADD COLUMN IF NOT EXISTS version_name varchar(100);
+
+UPDATE ai_call_prompt_profile_version
+SET version_name = COALESCE(
+    NULLIF(snapshot_json::jsonb ->> 'name', ''),
+    '版本 v' || version_no
+)
+WHERE version_name IS NULL OR btrim(version_name) = '';
+
+ALTER TABLE ai_call_prompt_profile_version
+    ALTER COLUMN version_name SET NOT NULL;
 
 ALTER TABLE ai_call_outbound_validation_row
     ADD COLUMN IF NOT EXISTS business_params_json text NOT NULL DEFAULT '{}';

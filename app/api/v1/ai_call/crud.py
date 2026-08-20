@@ -2341,6 +2341,7 @@ class AiCallRecordRepository:
         *,
         tenant_id: str,
         profile_id: int,
+        version_name: str,
         snapshot_json: str,
         creation_method: str,
         created_by: int | None,
@@ -2361,6 +2362,7 @@ class AiCallRecordRepository:
             tenant_id=tenant_id,
             profile_id=profile_id,
             version_no=version_no,
+            version_name=version_name,
             snapshot_json=snapshot_json,
             creation_method=creation_method,
             restored_from_version_id=restored_from_version_id,
@@ -2370,6 +2372,26 @@ class AiCallRecordRepository:
             deleted_at=None,
         )
         self.db.add(version)
+        await self.db.flush()
+        await self.db.refresh(version)
+        return version
+
+    async def update_prompt_profile_version_name(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        version_id: int,
+        version_name: str,
+    ) -> AiCallPromptProfileVersionModel | None:
+        version = await self.get_prompt_profile_version(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            version_id=version_id,
+        )
+        if version is None:
+            return None
+        version.version_name = version_name
         await self.db.flush()
         await self.db.refresh(version)
         return version
