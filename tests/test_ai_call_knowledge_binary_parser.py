@@ -40,6 +40,65 @@ def _pptx(*slides: str, extra_files: dict[str, bytes] | None = None) -> BytesIO:
     return payload
 
 
+def _docx(*paragraphs: str, extra_files: dict[str, bytes] | None = None) -> BytesIO:
+    payload = BytesIO()
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
+    with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                f'wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>'
+            ),
+        )
+        for name, content in (extra_files or {}).items():
+            archive.writestr(name, content)
+    payload.seek(0)
+    return payload
+
+
+def _pdf(*pages: str) -> BytesIO:
+    page_ids = [4 + index * 2 for index in range(len(pages))]
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{' '.join(f'{page_id} 0 R' for page_id in page_ids)}] /Count {len(pages)} >>".encode(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for page_id, text in zip(page_ids, pages, strict=True):
+        content_id = page_id + 1
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode()
+        objects.extend([
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+            ).encode(),
+            f"<< /Length {len(stream)} >>\nstream\n".encode()
+            + stream
+            + b"\nendstream",
+        ])
+
+    payload = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(payload))
+        payload.extend(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_offset = len(payload)
+    payload.extend(f"xref\n0 {len(objects) + 1}\n".encode())
+    payload.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        payload.extend(f"{offset:010d} 00000 n \n".encode())
+    payload.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    return BytesIO(payload)
+
+
 def test_pptx_parser_returns_deterministic_page_citations() -> None:
     first = parse_document(_pptx("退款将在审核通过后原路退回", "交付周期为两周"), extension="pptx")
     second = parse_document(_pptx("退款将在审核通过后原路退回", "交付周期为两周"), extension=".PPTX")
@@ -87,6 +146,42 @@ def test_pptx_parser_ignores_embedded_objects_without_opening_them() -> None:
     result = parse_document(source, extension="pptx")
 
     assert result["chunks"][0]["content"] == "只提取幻灯片正文"
+
+
+def test_docx_parser_returns_paragraph_citations() -> None:
+    result = parse_document(
+        _docx("Refunds return to the original account.", "Delivery takes two weeks."),
+        extension="docx",
+    )
+
+    assert result["parserName"] == "docx"
+    assert result["parserVersion"] == "docx-ooxml-stdlib-v1"
+    assert result["chunkStrategyVersion"] == "docx-paragraph-900-1200-v1"
+    assert result["chunks"][0]["pageNo"] is None
+    assert result["chunks"][0]["sourcePath"] == "word/document.xml#paragraphs/1-2"
+    assert "Delivery takes two weeks." in result["chunks"][0]["content"]
+
+
+def test_docx_parser_rejects_active_content() -> None:
+    source = _docx("Safe text", extra_files={"word/vbaProject.bin": b"unsafe"})
+
+    with pytest.raises(KnowledgeBinaryParseError, match="活动内容"):
+        parse_document(source, extension="docx")
+
+
+def test_pdf_parser_returns_page_citations() -> None:
+    result = parse_document(_pdf("Refund policy", "Delivery timeline"), extension="pdf")
+
+    assert result["parserName"] == "pdf"
+    assert result["parserVersion"] == "pdf-pypdf-6.16.1-v1"
+    assert result["chunkStrategyVersion"] == "pdf-page-semantic-900-1200-v1"
+    assert [chunk["pageNo"] for chunk in result["chunks"]] == [1, 2]
+    assert [chunk["sourcePath"] for chunk in result["chunks"]] == ["pages/1", "pages/2"]
+
+
+def test_pdf_parser_rejects_document_without_text() -> None:
+    with pytest.raises(KnowledgeBinaryParseError, match="没有可用正文"):
+        parse_document(_pdf(""), extension="pdf")
 
 
 def test_pptx_parser_rejects_extreme_zip_expansion() -> None:

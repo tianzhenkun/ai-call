@@ -11,7 +11,7 @@ services:
         condition: service_healthy
 
   knowledge-parser:
-    image: ai-call-transfer/knowledge-parser:${AI_CALL_KNOWLEDGE_PARSER_TAG:-20260819}
+    image: ai-call-transfer/knowledge-parser:${AI_CALL_KNOWLEDGE_PARSER_TAG:-20260820-docx-pdf}
     platform: linux/amd64
     restart: unless-stopped
     read_only: true

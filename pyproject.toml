@@ -29,6 +29,7 @@ dependencies = [
     "psycopg-binary==3.3.2",
     "pydantic-settings==2.13.1",
     "pydantic-validation-decorator==0.1.4",
+    "pypdf==6.16.1",
     "pyjwt==2.12.1",
     "pymysql==1.1.2",
     "pytest==9.0.2",

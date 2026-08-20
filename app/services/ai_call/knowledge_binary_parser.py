@@ -20,14 +20,21 @@ from xml.etree import ElementTree
 
 PPTX_PARSER_VERSION = "pptx-ooxml-stdlib-v1"
 PPTX_CHUNK_STRATEGY_VERSION = "pptx-slide-semantic-900-1200-v1"
+DOCX_PARSER_VERSION = "docx-ooxml-stdlib-v1"
+DOCX_CHUNK_STRATEGY_VERSION = "docx-paragraph-900-1200-v1"
+PDF_PARSER_VERSION = "pdf-pypdf-6.16.1-v1"
+PDF_CHUNK_STRATEGY_VERSION = "pdf-page-semantic-900-1200-v1"
 
 _TEXT_TAG = "{http://schemas.openxmlformats.org/drawingml/2006/main}t"
 _PARAGRAPH_TAG = "{http://schemas.openxmlformats.org/drawingml/2006/main}p"
+_DOCX_TEXT_TAG = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+_DOCX_PARAGRAPH_TAG = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
 _SLIDE_RE = re.compile(r"ppt/slides/slide(\d+)\.xml$")
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[。！？!?；;])|\n+")
 _TARGET_CHARS = 900
 _MAX_CHARS = 1200
-_UNSAFE_PARTS = ("ppt/vbaproject.bin", "ppt/activex/")
+_PPTX_UNSAFE_PARTS = ("ppt/vbaproject.bin", "ppt/activex/")
+_DOCX_UNSAFE_PARTS = ("word/vbaproject.bin", "word/activex/")
 _MAX_ARCHIVE_ENTRIES = 10_000
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_COMPRESSION_RATIO = 200
@@ -218,40 +225,30 @@ def _recv_exact(connection: socket.socket, size: int) -> bytes:
 
 def parse_document(source: BinaryIO, *, extension: str) -> dict[str, Any]:
     normalized_extension = extension.strip().lower().lstrip(".")
-    if normalized_extension != "pptx":
-        raise KnowledgeBinaryParseError("当前二进制解析器只支持 PPTX")
+    if normalized_extension == "pptx":
+        return _parse_pptx(source)
+    if normalized_extension == "docx":
+        return _parse_docx(source)
+    if normalized_extension == "pdf":
+        return _parse_pdf(source)
+    raise KnowledgeBinaryParseError("当前二进制解析器只支持 PPTX、DOCX 和文本型 PDF")
 
+
+def _parse_pptx(source: BinaryIO) -> dict[str, Any]:
     chunks: list[dict[str, Any]] = []
     with zipfile.ZipFile(source) as archive:
-        entries = archive.infolist()
-        if (
-            len(entries) > _MAX_ARCHIVE_ENTRIES
-            or sum(entry.file_size for entry in entries) > _MAX_UNCOMPRESSED_BYTES
-            or any(
-                entry.file_size > 1024 * 1024
-                and entry.file_size / max(entry.compress_size, 1) > _MAX_COMPRESSION_RATIO
-                for entry in entries
-            )
-        ):
-            raise KnowledgeBinaryParseError("PPTX 超过安全解压限制")
-        names = archive.namelist()
-        if "[Content_Types].xml" not in names:
-            raise KnowledgeBinaryParseError("PPTX 缺少 OOXML 清单")
-        if any(entry.flag_bits & 0x1 for entry in entries):
-            raise KnowledgeBinaryParseError("PPTX 不支持加密成员")
-        if any(
-            normalized == _UNSAFE_PARTS[0]
-            or normalized.startswith(_UNSAFE_PARTS[1:])
-            for normalized in map(str.lower, names)
-        ):
-            raise KnowledgeBinaryParseError("PPTX 包含活动内容")
+        names = _validate_ooxml_archive(
+            archive,
+            format_name="PPTX",
+            unsafe_parts=_PPTX_UNSAFE_PARTS,
+        )
         slide_names = sorted(
             (name for name in names if _SLIDE_RE.fullmatch(name)),
             key=lambda name: int(_SLIDE_RE.fullmatch(name).group(1)),  # type: ignore[union-attr]
         )
         for name in slide_names:
             page_no = int(_SLIDE_RE.fullmatch(name).group(1))  # type: ignore[union-attr]
-            root = ElementTree.fromstring(archive.read(name))
+            root = _parse_ooxml_xml(archive.read(name))
             paragraphs = []
             for paragraph in root.iter(_PARAGRAPH_TAG):
                 text = _normalized_text(
@@ -260,19 +257,150 @@ def parse_document(source: BinaryIO, *, extension: str) -> dict[str, Any]:
                 if text:
                     paragraphs.append(text)
             for content in _split_long_text("\n".join(paragraphs)):
-                chunks.append(_chunk(len(chunks), content, page_no))
+                chunks.append(
+                    _chunk(
+                        len(chunks),
+                        content,
+                        source_type="PPTX",
+                        source_path=f"slides/{page_no}",
+                        page_no=page_no,
+                    )
+                )
     if not chunks:
         raise KnowledgeBinaryParseError("PPTX 没有可用正文")
+    return _result(
+        "pptx",
+        PPTX_PARSER_VERSION,
+        PPTX_CHUNK_STRATEGY_VERSION,
+        chunks,
+    )
 
+
+def _parse_docx(source: BinaryIO) -> dict[str, Any]:
+    with zipfile.ZipFile(source) as archive:
+        names = _validate_ooxml_archive(
+            archive,
+            format_name="DOCX",
+            unsafe_parts=_DOCX_UNSAFE_PARTS,
+        )
+        if "word/document.xml" not in names:
+            raise KnowledgeBinaryParseError("DOCX 缺少主文档")
+        root = _parse_ooxml_xml(archive.read("word/document.xml"))
+
+    paragraphs: list[tuple[int, str]] = []
+    for paragraph_no, paragraph in enumerate(root.iter(_DOCX_PARAGRAPH_TAG), start=1):
+        text = _normalized_text(
+            "".join(node.text or "" for node in paragraph.iter(_DOCX_TEXT_TAG))
+        )
+        if text:
+            paragraphs.append((paragraph_no, text))
+    chunks = [
+        _chunk(
+            index,
+            content,
+            source_type="DOCX",
+            source_path=f"word/document.xml#paragraphs/{start}-{end}",
+        )
+        for index, (content, start, end) in enumerate(_split_paragraphs(paragraphs))
+    ]
+    if not chunks:
+        raise KnowledgeBinaryParseError("DOCX 没有可用正文")
+    return _result(
+        "docx",
+        DOCX_PARSER_VERSION,
+        DOCX_CHUNK_STRATEGY_VERSION,
+        chunks,
+    )
+
+
+def _parse_pdf(source: BinaryIO) -> dict[str, Any]:
+    if source.read(5) != b"%PDF-":
+        raise KnowledgeBinaryParseError("PDF 文件头不合法")
+    source.seek(0)
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(source)
+        if reader.is_encrypted:
+            raise KnowledgeBinaryParseError("PDF 不支持加密文件")
+        chunks = []
+        for page_no, page in enumerate(reader.pages, start=1):
+            text = _normalized_text(page.extract_text() or "")
+            for content in _split_long_text(text):
+                chunks.append(
+                    _chunk(
+                        len(chunks),
+                        content,
+                        source_type="PDF",
+                        source_path=f"pages/{page_no}",
+                        page_no=page_no,
+                    )
+                )
+    except KnowledgeBinaryParseError:
+        raise
+    except Exception as exc:
+        raise KnowledgeBinaryParseError("PDF 解析失败") from exc
+    if not chunks:
+        raise KnowledgeBinaryParseError("PDF 没有可用正文（可能是扫描件）")
+    return _result(
+        "pdf",
+        PDF_PARSER_VERSION,
+        PDF_CHUNK_STRATEGY_VERSION,
+        chunks,
+    )
+
+
+def _validate_ooxml_archive(
+    archive: zipfile.ZipFile,
+    *,
+    format_name: str,
+    unsafe_parts: tuple[str, ...],
+) -> list[str]:
+    entries = archive.infolist()
+    if (
+        len(entries) > _MAX_ARCHIVE_ENTRIES
+        or sum(entry.file_size for entry in entries) > _MAX_UNCOMPRESSED_BYTES
+        or any(
+            entry.file_size > 1024 * 1024
+            and entry.file_size / max(entry.compress_size, 1) > _MAX_COMPRESSION_RATIO
+            for entry in entries
+        )
+    ):
+        raise KnowledgeBinaryParseError(f"{format_name} 超过安全解压限制")
+    names = archive.namelist()
+    if "[Content_Types].xml" not in names:
+        raise KnowledgeBinaryParseError(f"{format_name} 缺少 OOXML 清单")
+    if any(entry.flag_bits & 0x1 for entry in entries):
+        raise KnowledgeBinaryParseError(f"{format_name} 不支持加密成员")
+    if any(
+        normalized == unsafe_parts[0] or normalized.startswith(unsafe_parts[1:])
+        for normalized in map(str.lower, names)
+    ):
+        raise KnowledgeBinaryParseError(f"{format_name} 包含活动内容")
+    return names
+
+
+def _parse_ooxml_xml(payload: bytes) -> ElementTree.Element:
+    if b"<!doctype" in payload[:4096].lower():
+        raise KnowledgeBinaryParseError("OOXML 不支持文档类型声明")
+    return ElementTree.fromstring(payload)
+
+
+def _result(
+    parser_name: str,
+    parser_version: str,
+    chunk_strategy_version: str,
+    chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
     chunk_set_sha256 = hashlib.sha256(
         "".join(
             f"{chunk['chunkIndex']}:{chunk['contentChecksum']}\n" for chunk in chunks
         ).encode()
     ).hexdigest()
     return {
-        "parserName": "pptx",
-        "parserVersion": PPTX_PARSER_VERSION,
-        "chunkStrategyVersion": PPTX_CHUNK_STRATEGY_VERSION,
+        "parserName": parser_name,
+        "parserVersion": parser_version,
+        "chunkStrategyVersion": chunk_strategy_version,
         "chunkSetSha256": chunk_set_sha256,
         "chunks": chunks,
     }
@@ -309,16 +437,46 @@ def _split_long_text(value: str) -> list[str]:
     return chunks
 
 
-def _chunk(index: int, content: str, page_no: int) -> dict[str, Any]:
+def _split_paragraphs(paragraphs: list[tuple[int, str]]) -> list[tuple[str, int, int]]:
+    chunks: list[tuple[str, int, int]] = []
+    current: list[str] = []
+    start = 0
+    end = 0
+    for paragraph_no, paragraph in paragraphs:
+        for part in _split_long_text(paragraph):
+            candidate = "\n".join([*current, part])
+            if current and len(candidate) > _MAX_CHARS:
+                chunks.append(("\n".join(current), start, end))
+                current = []
+            if not current:
+                start = paragraph_no
+            current.append(part)
+            end = paragraph_no
+            if len("\n".join(current)) >= _TARGET_CHARS:
+                chunks.append(("\n".join(current), start, end))
+                current = []
+    if current:
+        chunks.append(("\n".join(current), start, end))
+    return chunks
+
+
+def _chunk(
+    index: int,
+    content: str,
+    *,
+    source_type: str,
+    source_path: str,
+    page_no: int | None = None,
+) -> dict[str, Any]:
     return {
         "chunkIndex": index,
         "content": content,
         "contentChecksum": hashlib.sha256(content.encode()).hexdigest(),
         "contentType": "TEXT",
-        "sourceType": "PPTX",
+        "sourceType": source_type,
         "pageNo": page_no,
         "sectionPath": None,
-        "sourcePath": f"slides/{page_no}",
+        "sourcePath": source_path,
         "startMs": None,
         "endMs": None,
     }

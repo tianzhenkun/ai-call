@@ -31,6 +31,12 @@ from app.api.v1.ai_call.model import (
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.knowledge_binary_parser import (
+    DOCX_CHUNK_STRATEGY_VERSION,
+    DOCX_PARSER_VERSION,
+    PDF_CHUNK_STRATEGY_VERSION,
+    PDF_PARSER_VERSION,
+    PPTX_CHUNK_STRATEGY_VERSION,
+    PPTX_PARSER_VERSION,
     KnowledgeBinaryParseError,
     KnowledgeBinaryParserClient,
 )
@@ -63,9 +69,23 @@ _SUPPORTED_MIME_TYPES = {
     "text/x-markdown",
     "application/octet-stream",
 }
-_PPTX_MIME_TYPE = (
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-)
+_BINARY_MIME_TYPES = {
+    "pptx": {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/octet-stream",
+    },
+    "docx": {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/octet-stream",
+    },
+    "pdf": {"application/pdf", "application/octet-stream"},
+}
+_BINARY_PARSER_CONTRACTS = {
+    "pptx": (PPTX_PARSER_VERSION, PPTX_CHUNK_STRATEGY_VERSION, "PPTX"),
+    "docx": (DOCX_PARSER_VERSION, DOCX_CHUNK_STRATEGY_VERSION, "DOCX"),
+    "pdf": (PDF_PARSER_VERSION, PDF_CHUNK_STRATEGY_VERSION, "PDF"),
+}
+_DOCX_SOURCE_PATH_RE = re.compile(r"word/document\.xml#paragraphs/(\d+)-(\d+)$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -159,10 +179,18 @@ def parse_text_knowledge(payload: bytes, *, extension: str) -> ParsedKnowledge:
 
 
 def _parse_binary_result(payload: dict[str, Any]) -> ParsedKnowledge:
+    parser_name = payload.get("parserName")
+    contract = (
+        _BINARY_PARSER_CONTRACTS.get(parser_name)
+        if isinstance(parser_name, str)
+        else None
+    )
+    if contract is None:
+        raise KnowledgeBinaryParseError("解析器版本不受信任")
+    parser_version, chunk_strategy_version, source_type = contract
     if (
-        payload.get("parserName") != "pptx"
-        or payload.get("parserVersion") != "pptx-ooxml-stdlib-v1"
-        or payload.get("chunkStrategyVersion") != "pptx-slide-semantic-900-1200-v1"
+        payload.get("parserVersion") != parser_version
+        or payload.get("chunkStrategyVersion") != chunk_strategy_version
     ):
         raise KnowledgeBinaryParseError("解析器版本不受信任")
     raw_chunks = payload.get("chunks")
@@ -176,15 +204,31 @@ def _parse_binary_result(payload: dict[str, Any]) -> ParsedKnowledge:
         content = raw.get("content")
         page_no = raw.get("pageNo")
         source_path = raw.get("sourcePath")
+        if parser_name == "docx":
+            source_match = (
+                _DOCX_SOURCE_PATH_RE.fullmatch(source_path)
+                if isinstance(source_path, str)
+                else None
+            )
+            source_location_valid = (
+                page_no is None
+                and source_match is not None
+                and int(source_match.group(1)) <= int(source_match.group(2))
+            )
+        else:
+            source_prefix = "slides" if parser_name == "pptx" else "pages"
+            source_location_valid = (
+                isinstance(page_no, int)
+                and page_no > 0
+                and source_path == f"{source_prefix}/{page_no}"
+            )
         if (
             not isinstance(content, str)
             or not 0 < len(content) <= _MAX_CHARS
             or hashlib.sha256(content.encode()).hexdigest() != raw.get("contentChecksum")
             or raw.get("contentType") != "TEXT"
-            or raw.get("sourceType") != "PPTX"
-            or not isinstance(page_no, int)
-            or page_no <= 0
-            or source_path != f"slides/{page_no}"
+            or raw.get("sourceType") != source_type
+            or not source_location_valid
             or raw.get("sectionPath") is not None
             or raw.get("startMs") is not None
             or raw.get("endMs") is not None
@@ -196,7 +240,7 @@ def _parse_binary_result(payload: dict[str, Any]) -> ParsedKnowledge:
                 content=content,
                 content_checksum=raw["contentChecksum"],
                 content_type="TEXT",
-                source_type="PPTX",
+                source_type=source_type,
                 section_path=None,
                 source_path=source_path,
                 page_no=page_no,
@@ -209,9 +253,9 @@ def _parse_binary_result(payload: dict[str, Any]) -> ParsedKnowledge:
     if chunk_set_sha256 != payload.get("chunkSetSha256"):
         raise KnowledgeBinaryParseError("解析器切片校验值不合法")
     return ParsedKnowledge(
-        parser_name="pptx",
-        parser_version="pptx-ooxml-stdlib-v1",
-        chunk_strategy_version="pptx-slide-semantic-900-1200-v1",
+        parser_name=parser_name,
+        parser_version=parser_version,
+        chunk_strategy_version=chunk_strategy_version,
         chunk_set_sha256=chunk_set_sha256,
         chunks=tuple(chunks),
     )
@@ -2116,13 +2160,17 @@ def _validate_upload(
         raise CustomException(msg="文件名不合法", status_code=400)
     extension = filename.rsplit(".", 1)[1].lower()
     text_extension = extension in {"txt", "md", "markdown"}
-    if not text_extension and not (extension == "pptx" and binary_parser_enabled):
-        raise CustomException(msg="当前只支持 TXT、Markdown 和已启用的 PPTX", status_code=400)
+    binary_extension = extension in _BINARY_MIME_TYPES
+    if not text_extension and not (binary_extension and binary_parser_enabled):
+        raise CustomException(
+            msg="当前只支持 TXT、Markdown 和已启用的 PPTX、DOCX、文本型 PDF",
+            status_code=400,
+        )
     mime_type = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
     supported_mime_types = (
         _SUPPORTED_MIME_TYPES
         if text_extension
-        else {_PPTX_MIME_TYPE, "application/octet-stream"}
+        else _BINARY_MIME_TYPES[extension]
     )
     if mime_type not in supported_mime_types:
         raise CustomException(msg="文件 MIME 类型不支持", status_code=400)
@@ -2153,8 +2201,10 @@ def _validate_upload(
             codecs.getincrementaldecoder("utf-8-sig")().decode(prefix, final=False)
         except UnicodeDecodeError as exc:
             raise CustomException(msg="文本文件必须是 UTF-8 编码", status_code=400) from exc
-    elif not prefix.startswith(b"PK\x03\x04"):
-        raise CustomException(msg="PPTX 文件头不合法", status_code=400)
+    elif extension in {"pptx", "docx"} and not prefix.startswith(b"PK\x03\x04"):
+        raise CustomException(msg=f"{extension.upper()} 文件头不合法", status_code=400)
+    elif extension == "pdf" and not prefix.startswith(b"%PDF-"):
+        raise CustomException(msg="PDF 文件头不合法", status_code=400)
     return _ValidatedUpload(
         filename,
         extension,
@@ -2278,7 +2328,7 @@ class KnowledgeWorker:
             await self._fail(
                 claimed,
                 code="BINARY_PARSE_FAILED",
-                message="PPTX 文件不满足安全解析合同或没有可用正文",
+                message="二进制文档不满足安全解析合同或没有可用正文",
                 retryable=False,
             )
         except _SourceChecksumMismatch:
@@ -2439,7 +2489,7 @@ class KnowledgeWorker:
                 raise _SourceChecksumMismatch
             if claimed.extension in {"txt", "md", "markdown"}:
                 return parse_text_knowledge(path.read_bytes(), extension=claimed.extension)
-            if claimed.extension == "pptx" and self.binary_parser is not None:
+            if claimed.extension in _BINARY_MIME_TYPES and self.binary_parser is not None:
                 payload = await asyncio.to_thread(
                     self.binary_parser.parse,
                     path,

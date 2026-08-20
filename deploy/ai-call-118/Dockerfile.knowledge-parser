@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY app/services/ai_call/knowledge_binary_parser.py /opt/ai-call/knowledge_binary_parser.py
 
-RUN useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin ai-call-parser \
+RUN pip install --no-cache-dir pypdf==6.16.1 \
+ && useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin ai-call-parser \
  && mkdir -p /run/ai-call-parser \
  && chown ai-call-parser:ai-call-parser /run/ai-call-parser
 

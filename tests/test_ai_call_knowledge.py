@@ -299,9 +299,84 @@ def _pptx_payload(*slides: str) -> bytes:
     return payload.getvalue()
 
 
+def _docx_payload(*paragraphs: str) -> bytes:
+    payload = BytesIO()
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
+    with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                f'wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>'
+            ),
+        )
+    return payload.getvalue()
+
+
+def _pdf_payload(*pages: str) -> bytes:
+    page_ids = [4 + index * 2 for index in range(len(pages))]
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{' '.join(f'{page_id} 0 R' for page_id in page_ids)}] /Count {len(pages)} >>".encode(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for page_id, text in zip(page_ids, pages, strict=True):
+        content_id = page_id + 1
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode()
+        objects.extend([
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+            ).encode(),
+            f"<< /Length {len(stream)} >>\nstream\n".encode()
+            + stream
+            + b"\nendstream",
+        ])
+
+    payload = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(payload))
+        payload.extend(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_offset = len(payload)
+    payload.extend(f"xref\n0 {len(objects) + 1}\n".encode())
+    payload.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        payload.extend(f"{offset:010d} 00000 n \n".encode())
+    payload.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    return bytes(payload)
+
+
+@pytest.mark.parametrize(
+    ("payload", "filename", "content_type"),
+    [
+        (
+            _pptx_payload("产品能力"),
+            "产品资料.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            _docx_payload("产品能力"),
+            "产品资料.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (_pdf_payload("Product capability"), "产品资料.pdf", "application/pdf"),
+    ],
+)
 @pytest.mark.anyio
-async def test_pptx_upload_stays_closed_without_isolated_parser() -> None:
-    payload = _pptx_payload("产品能力")
+async def test_binary_upload_stays_closed_without_isolated_parser(
+    payload: bytes,
+    filename: str,
+    content_type: str,
+) -> None:
     service = KnowledgeService(
         CosKnowledgeStore(client=_FakeCosClient(), bucket="bucket-1", prefix="ai-call")
     )
@@ -311,14 +386,11 @@ async def test_pptx_upload_stays_closed_without_isolated_parser() -> None:
             object(),
             tenant_id="tenant-a",
             user_id=7,
-            idempotency_key="upload-pptx-disabled",
+            idempotency_key="upload-binary-disabled",
             file=_upload(
                 payload,
-                filename="产品资料.pptx",
-                content_type=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "presentationml.presentation"
-                ),
+                filename=filename,
+                content_type=content_type,
             ),
             file_sha256=hashlib.sha256(payload).hexdigest(),
             content_category="PRODUCT_SERVICE",
@@ -447,9 +519,51 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
     assert parse_byte_range("bytes=-4", len(payload)) == (len(payload) - 4, len(payload) - 1)
 
 
+@pytest.mark.parametrize(
+    (
+        "payload",
+        "filename",
+        "content_type",
+        "parser_version",
+        "page_numbers",
+        "source_paths",
+    ),
+    [
+        (
+            _pptx_payload("第一页产品能力", "第二页交付周期"),
+            "产品资料.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "pptx-ooxml-stdlib-v1",
+            [1, 2],
+            ["slides/1", "slides/2"],
+        ),
+        (
+            _docx_payload("产品能力", "交付周期"),
+            "产品资料.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx-ooxml-stdlib-v1",
+            [None],
+            ["word/document.xml#paragraphs/1-2"],
+        ),
+        (
+            _pdf_payload("Product capability", "Delivery timeline"),
+            "产品资料.pdf",
+            "application/pdf",
+            "pdf-pypdf-6.16.1-v1",
+            [1, 2],
+            ["pages/1", "pages/2"],
+        ),
+    ],
+)
 @pytest.mark.anyio
-async def test_pptx_upload_worker_persists_parser_and_page_citations() -> None:
-    payload = _pptx_payload("第一页产品能力", "第二页交付周期")
+async def test_binary_upload_worker_persists_parser_and_source_citations(
+    payload: bytes,
+    filename: str,
+    content_type: str,
+    parser_version: str,
+    page_numbers: list[int | None],
+    source_paths: list[str],
+) -> None:
     client = _FakeCosClient()
     store = CosKnowledgeStore(client=client, bucket="bucket-1", prefix="ai-call")
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -477,14 +591,11 @@ async def test_pptx_upload_worker_persists_parser_and_page_citations() -> None:
                 db,
                 tenant_id="tenant-a",
                 user_id=7,
-                idempotency_key="upload-pptx-1",
+                idempotency_key=f"upload-{filename}",
                 file=_upload(
                     payload,
-                    filename="产品资料.pptx",
-                    content_type=(
-                        "application/vnd.openxmlformats-officedocument."
-                        "presentationml.presentation"
-                    ),
+                    filename=filename,
+                    content_type=content_type,
                 ),
                 file_sha256=hashlib.sha256(payload).hexdigest(),
                 content_category="PRODUCT_SERVICE",
@@ -494,7 +605,7 @@ async def test_pptx_upload_worker_persists_parser_and_page_citations() -> None:
         worker = KnowledgeWorker(
             sessions,
             store,
-            worker_id="knowledge-pptx-worker",
+            worker_id="knowledge-binary-worker",
             binary_parser=KnowledgeBinaryParserClient(socket_path, timeout_seconds=2),
         )
         assert await worker.run_once() is True
@@ -513,9 +624,9 @@ async def test_pptx_upload_worker_persists_parser_and_page_citations() -> None:
 
     assert not parser.is_alive()
     assert version is not None and version.status == "READY"
-    assert version.parser_version == "pptx-ooxml-stdlib-v1"
-    assert [chunk.page_no for chunk in chunks] == [1, 2]
-    assert [chunk.source_path for chunk in chunks] == ["slides/1", "slides/2"]
+    assert version.parser_version == parser_version
+    assert [chunk.page_no for chunk in chunks] == page_numbers
+    assert [chunk.source_path for chunk in chunks] == source_paths
     await engine.dispose()
 
 
