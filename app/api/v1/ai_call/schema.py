@@ -858,8 +858,15 @@ class ProductInfoConflictOut(AiCallBaseSchema):
     source_chunk_ids: list[str]
 
 
+class ProductInfoSourceDocumentOut(AiCallBaseSchema):
+    version_id: str
+    version_no: int
+    source_filename: str
+
+
 class ProductInfoExtractOut(AiCallBaseSchema):
     draft_text: str
+    source_documents: list[ProductInfoSourceDocumentOut]
     sources: list[ProductInfoSourceOut]
     conflicts: list[ProductInfoConflictOut]
     source_version_ids: list[str]

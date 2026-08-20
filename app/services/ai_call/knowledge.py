@@ -950,6 +950,14 @@ class KnowledgeProductInfoService:
         source_version_ids = [str(version_id) for version_id in version_ids]
         response = {
             **result,
+            "sourceDocuments": [
+                {
+                    "versionId": str(version.id),
+                    "versionNo": version.version_no,
+                    "sourceFilename": version.source_filename,
+                }
+                for version in versions
+            ],
             "sourceVersionIds": source_version_ids,
             "versionSnapshotHash": snapshot_hash,
         }

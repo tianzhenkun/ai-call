@@ -1170,6 +1170,13 @@ async def test_product_info_extraction_uses_all_current_chunks_and_keeps_audit()
         "合同审查覆盖风险识别。\n具体效果取决于客户材料完整度。"
     )
     assert result["sourceVersionIds"] == ["11"]
+    assert result["sourceDocuments"] == [
+        {
+            "versionId": "11",
+            "versionNo": 1,
+            "sourceFilename": "合同产品.md",
+        }
+    ]
     assert [source["chunkId"] for source in result["sources"]] == ["101", "102"]
     assert result["sources"][0]["sourceFilename"] == "合同产品.md"
     assert result["sources"][0]["excerpt"] == "合同审查覆盖风险识别。"
