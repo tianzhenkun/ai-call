@@ -759,7 +759,7 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
 def test_prompt_version_name_migration_backfills_existing_versions() -> None:
     migration_path = (
         Path(__file__).resolve().parents[1]
-        / "docs/livekit-ai-outbound/sql/phase-b4-prompt-workbench-postgres.sql"
+        / "docs/livekit-ai-outbound/sql/phase-b4-prompt-version-name-postgres.sql"
     )
     migration_sql = migration_path.read_text(encoding="utf-8")
 
