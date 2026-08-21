@@ -9,8 +9,11 @@ import httpx
 PROMPT_VARIABLE_RE = re.compile(r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}")
 UNSUPPORTED_PROMISE_RE = re.compile(
     r"(已(?:经)?(?:添加|加了).*微信|已(?:经)?为您预约|"
-    r"(?:稍后|之后).{0,8}(?:发|联系)|"
-    r"(?:安排|会有).{0,8}(?:顾问|工作人员).{0,8}联系)"
+    r"已(?:经)?.{0,8}(?:发送|发给|发出|发了|发).{0,8}(?:资料|文件)|"
+    r"(?:资料|文件).{0,8}已(?:经)?.{0,4}(?:发送|发给|发出|发了|发)|"
+    r"(?:稍后|之后).{0,8}(?:会|将|一定).{0,8}(?:发|联系)|"
+    r"(?:已(?:经)?安排|会有|将有).{0,8}(?:顾问|工作人员).{0,8}联系|"
+    r"(?:我|我们|这边).{0,4}(?:会|将).{0,4}安排.{0,8}(?:顾问|工作人员).{0,8}联系)"
 )
 
 
@@ -41,24 +44,27 @@ class OpenAICompatiblePromptOptimizer:
         self.transport = transport
 
     async def optimize(self, payload: dict[str, Any]) -> dict[str, Any]:
-        result = await self._complete_json(
+        return await self._complete_json(
             system_content=(
                 "你是 AI 外呼提示词编辑器。只输出 JSON 对象："
                 '{"candidateContent":"候选内容","warnings":[]}。'
                 "只能使用 allowedVariables 中的变量，保留原内容已有变量；"
                 "currentContent 非空时必须产生实质改进，不得原样返回；"
-                "不得虚构微信、预约、发送资料或安排顾问等系统未提供动作；"
+                "允许询问并记录微信等联系方式，也可以表达后续沟通意向；"
+                "不得声称已经添加微信、发送资料、完成预约，"
+                "也不得承诺尚未确认的后续联系；"
                 "开场白不要生成停顿标记。"
             ),
             payload=payload,
+            validate_candidate=True,
         )
-        return self._validate_result(payload, result)
 
     async def _complete_json(
         self,
         *,
         system_content: str,
         payload: dict[str, Any],
+        validate_candidate: bool = False,
     ) -> dict[str, Any]:
         if not self.base_url or not self.api_key or not self.model:
             raise ValueError("提示词 AI 优化服务未配置")
@@ -82,16 +88,49 @@ class OpenAICompatiblePromptOptimizer:
             timeout=self.timeout_seconds,
             transport=self.transport,
         ) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=request,
-            )
-        response.raise_for_status()
-        return self._parse_response(response.json())
+            for attempt in range(2 if validate_candidate else 1):
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request,
+                )
+                response.raise_for_status()
+                result = self._parse_response(response.json())
+                if not validate_candidate:
+                    return result
+                try:
+                    return self._validate_result(payload, result)
+                except ValueError as exc:
+                    if attempt == 1:
+                        raise
+                    request["messages"].extend([
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                result,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "validationError": str(exc),
+                                    "instruction": (
+                                        "上一次候选未通过系统校验。请根据原因修正并重新输出"
+                                        "完整 JSON，不得绕过校验。"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ])
+        raise RuntimeError("AI 优化重试流程异常")
 
     @staticmethod
     def _parse_response(data: Any) -> dict[str, Any]:

@@ -875,6 +875,9 @@ async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert payload["model"] == "qwen3.7-plus"
+        system_prompt = payload["messages"][0]["content"]
+        assert "允许询问并记录微信等联系方式" in system_prompt
+        assert "不得声称已经添加微信、发送资料、完成预约" in system_prompt
         return httpx.Response(
             200,
             json={
@@ -914,12 +917,93 @@ async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
     }
 
 
-def test_prompt_optimizer_rejects_unavailable_follow_up_promises() -> None:
+@pytest.mark.anyio
+async def test_prompt_optimizer_retries_once_with_validation_feedback() -> None:
+    requests: list[dict] = []
+    candidates = iter([
+        "我先记录，稍后会有顾问联系您。",
+        "您好，请问现在方便简单沟通吗？",
+    ])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "candidateContent": next(candidates),
+                                    "warnings": [],
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    optimizer = OpenAICompatiblePromptOptimizer(
+        base_url="https://dashscope.test/v1",
+        api_key="test-key",
+        model="qwen3.7-plus",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await optimizer.optimize({
+        "targetType": "opening",
+        "currentContent": "您好",
+        "allowedVariables": [],
+    })
+
+    assert result["candidateContent"] == "您好，请问现在方便简单沟通吗？"
+    assert len(requests) == 2
+    retry_messages = requests[1]["messages"]
+    assert json.loads(retry_messages[-2]["content"])["candidateContent"] == (
+        "我先记录，稍后会有顾问联系您。"
+    )
+    assert json.loads(retry_messages[-1]["content"])["validationError"] == (
+        "AI 优化生成了系统未支持的动作承诺"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "我已经添加您微信了。",
+        "资料已经发给您了。",
+        "已经为您预约成功。",
+        "我先记录，稍后会有顾问联系您。",
+    ],
+)
+def test_prompt_optimizer_rejects_unavailable_follow_up_promises(candidate: str) -> None:
     with pytest.raises(ValueError, match="系统未支持的动作承诺"):
         OpenAICompatiblePromptOptimizer._validate_result(
             {"currentContent": "", "allowedVariables": []},
-            {"candidateContent": "我先记录，稍后会有顾问联系您。"},
+            {"candidateContent": candidate},
         )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "方便留个微信吗？后续我们可以通过微信继续详聊。",
+        "您是否愿意留下微信号，之后方便联系吗？",
+        "如果您愿意，我可以先记录微信号，方便后续沟通。",
+    ],
+)
+def test_prompt_optimizer_allows_contact_collection_and_conditional_follow_up(
+    candidate: str,
+) -> None:
+    result = OpenAICompatiblePromptOptimizer._validate_result(
+        {"currentContent": "", "allowedVariables": []},
+        {"candidateContent": candidate},
+    )
+
+    assert result["candidateContent"] == candidate
 
 
 def test_prompt_optimizer_rejects_unchanged_candidate() -> None:
