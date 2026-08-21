@@ -470,6 +470,7 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
     payload = FollowUpDataClassificationIn(
         classification=classification,
         reason="坐席确认本次分类结果。",
+        conclusion="客户关注效果指标，但尚未接受产品演示。",
         low_value_reason=low_value_reason,
         expected_version=1,
     )
@@ -496,6 +497,9 @@ async def test_manual_classification_is_atomic_idempotent_and_versioned(
         assert repeated == first
         assert first["classification"] == classification
         assert first["version"] == 2
+        data = await db.get(AiCallFollowUpDataModel, 100)
+        assert data is not None
+        assert data.latest_conclusion == "客户关注效果指标，但尚未接受产品演示。"
         task = await db.scalar(select(AiCallFollowUpTaskModel))
         assert task is not None
         assert task.status == expected_task_status

@@ -24,6 +24,7 @@ LowValueReason = Literal[
 class FollowUpDataClassificationIn(BaseModel):
     classification: FollowUpClassification
     reason: str = Field(min_length=1, max_length=500)
+    conclusion: str | None = Field(default=None, max_length=4000)
     low_value_reason: LowValueReason | None = None
     expected_version: int = Field(ge=1)
 
@@ -33,6 +34,16 @@ class FollowUpDataClassificationIn(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("调整原因不能为空")
+        return normalized
+
+    @field_validator("conclusion")
+    @classmethod
+    def normalize_conclusion(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("沟通结论不能为空")
         return normalized
 
     @model_validator(mode="after")

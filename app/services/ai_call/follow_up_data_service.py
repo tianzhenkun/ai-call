@@ -331,6 +331,8 @@ class AiCallFollowUpDataService:
                 from_classification = data.classification
                 data.classification = payload.classification
                 data.classification_reason = payload.reason
+                if payload.conclusion is not None:
+                    data.latest_conclusion = payload.conclusion
                 data.classification_source = "human"
                 data.classification_confidence = None
                 data.suggest_review = False
