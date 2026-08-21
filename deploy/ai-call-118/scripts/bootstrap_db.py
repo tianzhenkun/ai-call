@@ -31,6 +31,7 @@ async def seed_oss_config() -> None:
         "access_key": required("AI_CALL_OSS_ACCESS_KEY"),
         "secret_key": required("AI_CALL_OSS_SECRET_KEY"),
         "bucket_name": required("AI_CALL_OSS_BUCKET"),
+        "domain": os.getenv("AI_CALL_OSS_DOMAIN", "").strip(),
         "region": os.getenv("AI_CALL_OSS_REGION", "ap-shanghai").strip(),
         "prefix": os.getenv("AI_CALL_OSS_PREFIX", "ai-call").strip(),
         "is_https": "Y" if os.getenv("AI_CALL_OSS_HTTPS", "true").lower() == "true" else "N",

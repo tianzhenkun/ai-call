@@ -96,6 +96,30 @@ def test_presigned_get_url_allows_private_object_download_without_exposing_secre
     assert "private-secret" not in url
 
 
+def test_presigned_get_url_prefers_public_proxy_domain():
+    config = {
+        "is_https": "N",
+        "domain": "https://reach.lingchen-ai.com/ai-call-oss",
+        "endpoint": "10.77.0.1:9000",
+        "bucket_name": "recov",
+        "access_key": "public-key",
+        "secret_key": "private-secret",
+        "region": "us-east-1",
+    }
+
+    url = MinioUtil.presigned_get_url(
+        config,
+        "ai-call/recordings/call-1.mp3",
+        expires_seconds=900,
+        now=datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc),
+    )
+
+    parsed = urlparse(url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "reach.lingchen-ai.com"
+    assert parsed.path == "/ai-call-oss/recov/ai-call/recordings/call-1.mp3"
+
+
 def _private_object_config() -> dict:
     return {
         "is_https": "Y",

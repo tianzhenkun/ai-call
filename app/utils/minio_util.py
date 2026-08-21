@@ -53,7 +53,7 @@ class MinioUtil:
     @staticmethod
     def _endpoint_base_and_host(config: dict) -> tuple[str, str]:
         protocol = "https" if config.get("is_https", "N") == "Y" else "http"
-        endpoint = str(config["endpoint"]).strip().rstrip("/")
+        endpoint = str(config.get("domain") or config["endpoint"]).strip().rstrip("/")
         if endpoint.startswith(("http://", "https://")):
             parsed = urlparse(endpoint)
             return endpoint, parsed.netloc
