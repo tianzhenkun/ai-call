@@ -132,6 +132,18 @@ FOLLOW_UP_DELIVERY_OFFER_PATTERN = re.compile(
     r"(?:发|发送|提供).{0,10}(?:试用|链接|资料|方案|报价)|"
     r"(?:试用|链接|资料|方案|报价).{0,10}(?:发|发送|提供)"
 )
+FOLLOW_UP_MEETING_PATTERN = re.compile(
+    r"(?:安排|预约|参加|看).{0,12}(?:演示|demo|会议)|"
+    r"(?:演示|demo|会议).{0,12}(?:安排|预约|方便|愿意|想|需要)",
+    re.IGNORECASE,
+)
+FOLLOW_UP_ACCEPTANCE_CLAIM_PATTERN = re.compile(
+    r"(?:同意|接受|确认|应答|愿意|开放态度).{0,24}"
+    r"(?:演示|demo|邀约|后续安排|跟进|回访|回拨|联系)|"
+    r"(?:演示|demo|邀约|后续安排|跟进|回访|回拨|联系).{0,24}"
+    r"(?:同意|接受|确认|应答|愿意|开放态度)",
+    re.IGNORECASE,
+)
 FOLLOW_UP_REFUSAL_PATTERN = re.compile(
     r"(?:不用|不要|别|无需|不需要|拒绝).{0,6}(?:联系|回访|回拨|打电话)|"
     r"(?:联系|回访|回拨).{0,6}(?:不用|不要|别)"
@@ -181,6 +193,8 @@ speaker_type=human_agent 且 transcript_quality.low_confidence_source=true 的�
 - time_hint: 对象，包含 time_text、time_value、original_texts。
 - tags: 字符串数组，开放中文标签。
 - follow_up: 对象，包含 required、consent、reason、preferred_time、confidence。required 表示客户侧存在后续联系或业务履约需求（如回访、发送资料或试用链接）；consent 只能是 explicit、missing、refused；confidence 只能是 high、medium、low；assistant 自己提出或承诺跟进不能作为客户同意证据。
+客户轮次只能回应它之前最近一轮 assistant，绝不能把较早的客户回答解释成对之后 assistant 话术的同意。
+如果通话在 assistant 提出演示、回访或发送资料后结束且没有后续 role=user 回应，必须视为客户未确认，不得写成“客户接受演示”“客户同意后续安排”。
 
 客户价值分类字段：
 - classification: 有效业务对话时只能是 interested、nurturing、low_value；无有效业务对话时为 null；不得输出 converted。
@@ -1546,6 +1560,7 @@ class SemanticTranscriptBuilder:
         if (
             FOLLOW_UP_CONTACT_PATTERN.search(text)
             or FOLLOW_UP_DELIVERY_PATTERN.search(text)
+            or FOLLOW_UP_MEETING_PATTERN.search(text)
         ):
             return True
         return bool(
@@ -1553,6 +1568,7 @@ class SemanticTranscriptBuilder:
             and (
                 FOLLOW_UP_CONTACT_OFFER_PATTERN.search(previous_ai_text)
                 or FOLLOW_UP_DELIVERY_OFFER_PATTERN.search(previous_ai_text)
+                or FOLLOW_UP_MEETING_PATTERN.search(previous_ai_text)
             )
         )
 
@@ -1916,6 +1932,7 @@ def enforce_semantic_evidence_on_result(
         _snapshot_rejected_candidate_source_texts(snapshot),
     )
     normalized = _remove_assistant_only_claims(normalized, snapshot)
+    normalized = _remove_unanswered_follow_up_acceptance_claims(normalized, snapshot)
     normalized = _remove_metadata_time_hints(normalized)
     normalized = _remove_unsupported_time_hints(normalized, snapshot)
     normalized = _remove_transcript_listing_summary(normalized)
@@ -2074,6 +2091,72 @@ def _remove_assistant_only_claims(
         "key_points": cleaned_key_points,
         "tags": cleaned_tags,
     }
+
+
+def _remove_unanswered_follow_up_acceptance_claims(
+    result: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        _snapshot_supports_follow_up_consent(snapshot)
+        or not _snapshot_has_unanswered_follow_up_offer(snapshot)
+    ):
+        return result
+    cleaned_summary = _remove_follow_up_acceptance_claims(result["summary"])
+    cleaned_reason = _remove_follow_up_acceptance_claims(result["reason"])
+    follow_up = result["follow_up"]
+    return {
+        **result,
+        "summary": cleaned_summary or "客户未明确确认后续安排。",
+        "key_points": [
+            point
+            for point in result["key_points"]
+            if not FOLLOW_UP_ACCEPTANCE_CLAIM_PATTERN.search(point)
+        ],
+        "tags": [
+            tag
+            for tag in result["tags"]
+            if not FOLLOW_UP_ACCEPTANCE_CLAIM_PATTERN.search(tag)
+        ],
+        "reason": cleaned_reason,
+        "follow_up": {
+            **follow_up,
+            "reason": _remove_follow_up_acceptance_claims(follow_up["reason"]),
+        },
+    }
+
+
+def _remove_follow_up_acceptance_claims(text: str) -> str:
+    parts = [
+        part.strip()
+        for part in re.split(r"(?<=[。！？!?；;])\s*", text)
+        if part.strip()
+    ]
+    cleaned = "".join(
+        part for part in parts if not FOLLOW_UP_ACCEPTANCE_CLAIM_PATTERN.search(part)
+    ).strip()
+    return re.sub(r"[；;]+$", "。", cleaned)
+
+
+def _snapshot_has_unanswered_follow_up_offer(snapshot: dict[str, Any]) -> bool:
+    turns = snapshot.get("turns")
+    if not isinstance(turns, list):
+        return False
+    for turn in reversed(turns):
+        if not isinstance(turn, dict):
+            continue
+        if turn.get("role") == ROLE_USER:
+            return False
+        if turn.get("role") != ROLE_ASSISTANT:
+            continue
+        text = _string_value(turn.get("text"))
+        if (
+            FOLLOW_UP_CONTACT_OFFER_PATTERN.search(text)
+            or FOLLOW_UP_DELIVERY_OFFER_PATTERN.search(text)
+            or FOLLOW_UP_MEETING_PATTERN.search(text)
+        ):
+            return True
+    return False
 
 
 def _remove_metadata_time_hints(result: dict[str, Any]) -> dict[str, Any]:

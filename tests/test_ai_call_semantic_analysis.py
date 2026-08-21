@@ -1105,6 +1105,94 @@ def test_semantic_evidence_marks_trial_link_acceptance_as_follow_up_consent() ->
     assert "follow_up_consent" in evidence["supported_strong_fact_types"]
 
 
+def test_semantic_analysis_does_not_treat_answer_before_demo_offer_as_acceptance() -> None:
+    module = _semantic_module()
+    rows = [
+        _segment(
+            segment_no=1,
+            speaker_type="ai",
+            text="我们先看整体品牌表现，再深入具体平台。您觉得这样安排可以吗？",
+            started_offset_seconds=0,
+            ended_offset_seconds=3,
+        ),
+        _segment(
+            segment_no=2,
+            speaker_type="customer",
+            text="行。",
+            source="qwen_realtime",
+            started_offset_seconds=4,
+            ended_offset_seconds=5,
+        ),
+        _segment(
+            segment_no=3,
+            speaker_type="ai",
+            text="我可以帮您安排一次产品演示。您看是这周还是下周方便呢？",
+            started_offset_seconds=6,
+            ended_offset_seconds=9,
+        ),
+    ]
+    snapshot = _build_snapshot(rows)
+
+    raw_result = {
+        "summary": (
+            "客户持续关注上传、试用和效果指标；"
+            "当AI提出演示邀约时，客户明确应答‘行’，表示接受后续安排。"
+        ),
+        "feedback_type": "中性",
+        "key_points": [
+            "客户关注上传、试用和效果指标",
+            "客户应答AI提出的演示邀约‘行’",
+        ],
+        "time_hint": {},
+        "tags": ["指标关注", "演示接受"],
+        "follow_up": {
+            "required": True,
+            "consent": "explicit",
+            "reason": "客户同意产品演示",
+            "confidence": "high",
+        },
+        "classification": "nurturing",
+        "confidence": "medium",
+        "valid_dialogue": True,
+        "reason": (
+            "客户持续追问产品落地问题，表现出实质性兴趣；"
+            "对指标和演示表现出开放态度，仍需进一步培育。"
+        ),
+        "evidence": ["有没有具体指标？", "都感兴趣。", "行。"],
+        "evidence_conflict": False,
+        "low_value_reason": None,
+    }
+    result = module.enforce_semantic_evidence_on_result(raw_result, snapshot)
+
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert result["summary"] == "客户持续关注上传、试用和效果指标。"
+    assert result["key_points"] == ["客户关注上传、试用和效果指标"]
+    assert result["tags"] == ["指标关注"]
+    assert result["reason"] == "客户持续追问产品落地问题，表现出实质性兴趣。"
+    assert result["follow_up"]["consent"] == "missing"
+    assert result["follow_up"]["confidence"] == "low"
+    assert result["classification"] == "nurturing"
+    assert "演示接受" not in rendered
+    assert "同意产品演示" not in rendered
+
+    confirmed = module.enforce_semantic_evidence_on_result(
+        raw_result,
+        _build_snapshot([
+            *rows,
+            _segment(
+                segment_no=4,
+                speaker_type="customer",
+                text="行。",
+                source="qwen_realtime",
+                started_offset_seconds=10,
+                ended_offset_seconds=11,
+            ),
+        ]),
+    )
+    assert confirmed["follow_up"]["consent"] == "explicit"
+    assert "演示接受" in confirmed["tags"]
+
+
 def test_semantic_evidence_marks_weak_feedback_without_business_fact() -> None:
     snapshot = _build_snapshot([
         _segment(
