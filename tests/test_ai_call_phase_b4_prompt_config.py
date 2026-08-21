@@ -269,6 +269,9 @@ def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries()
     assert "PR 稿、摘要、短视频脚本或关键词策略" in seed_sql
     assert "普通产品问题先直接回答" in seed_sql
     assert "不要每个回答都用预约顾问收尾" in seed_sql
+    assert "您问的是能不能给出一个统一的具体提升数字" in seed_sql
+    assert "不得编造免费基线扫描或免费试用" in seed_sql
+    assert "不得举任何客户数字、百分比或假设数字" in seed_sql
     assert "不说“不少客户反馈”等无依据优势" in seed_sql
     assert "持续监控的闭环能力" in seed_sql
     assert "默认每次回复控制在 1 到 2 句" in seed_sql
@@ -293,8 +296,8 @@ def test_geo_product_intro_seed_uses_professional_customer_friendly_boundaries()
     assert "工具未成功前，不得声称已经记录、预约成功或稍后一定联系" in seed_sql
     assert "稍后会安排顾问联系您" not in seed_sql
     assert "不能承诺一定排名、一定被模型推荐或一定周期见效" in seed_sql
-    assert "用户问“效果怎么看”“有什么指标”这类普通指标问题时" in seed_sql
-    assert "包含“错误回答占比”" in seed_sql
+    assert "用户问“效果怎么看”“有什么指标”时" in seed_sql
+    assert "错误回答占比" in seed_sql
     assert "不要主动提顾问、基线评估、试点或优化节奏" in seed_sql
     assert "不给任何固定周期或区间" in seed_sql
     assert "GEO 可能被语音识别成“机油”“CEO”“Z O”" in seed_sql

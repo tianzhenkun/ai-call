@@ -10,6 +10,7 @@ import pytest
 from app.api.v1.ai_call.service import AiCallService
 from app.services.ai_call.agent_runner import (
     KNOWLEDGE_TOOL_INSTRUCTIONS,
+    PHONE_RESPONSE_BREVITY_INSTRUCTIONS,
     RealtimeCallAgentRunner,
 )
 from app.services.ai_call.event_store import InMemoryEventStore
@@ -19,6 +20,7 @@ from app.services.ai_call.knowledge import (
     KnowledgeSearchHit,
     parse_knowledge_runtime_context,
 )
+from app.services.ai_call.prompt_config import DEFAULT_COMMON_BUSINESS_PROMPT
 from app.services.ai_call.providers.aliyun_qwen_realtime import (
     SEARCH_SCENE_KNOWLEDGE_TOOL,
 )
@@ -63,6 +65,21 @@ def test_realtime_knowledge_audit_evidence_keeps_retrieval_score() -> None:
     )
 
     assert KnowledgeRealtimeSearchService._audit_evidence(hit)["score"] == 0.875
+
+
+def test_runtime_dialogue_instructions_answer_repeated_questions_naturally() -> None:
+    assert "第一句先正面回答" in DEFAULT_COMMON_BUSINESS_PROMPT
+    assert "客户重复追问时" in DEFAULT_COMMON_BUSINESS_PROMPT
+    assert "第一句先正面回答" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
+    assert "相邻两轮连续用问题收尾" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
+    assert "客户重复追问时" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
+    assert "先回答可确认部分" in KNOWLEDGE_TOOL_INSTRUCTIONS
+    assert "资料、知识库、检索、证据" in KNOWLEDGE_TOOL_INSTRUCTIONS
+
+    output = KnowledgeRealtimeSearchService._tool_output("OK", [])
+
+    assert "自然业务语言" in output["message"]
+    assert "转业务顾问" not in output["message"]
 
 
 def test_parse_knowledge_runtime_context_fails_closed_for_damaged_snapshot() -> None:
