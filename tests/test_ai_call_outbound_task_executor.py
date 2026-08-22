@@ -2805,3 +2805,60 @@ async def test_exception_retry_stops_at_batch_limit_and_is_tenant_isolated(
         )
         assert other_rows == []
         assert other_total == 0
+
+
+@pytest.mark.anyio
+async def test_exception_retry_invalid_number_is_unavailable(database) -> None:
+    now = datetime(2026, 8, 13, 4, 0, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(database, now=now)
+    original = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="busy")]),
+        now_provider=lambda: now,
+    )
+    assert await original.run_once() == 1
+
+    service = OutboundExceptionService()
+    async with database() as session:
+        batch_out = await service.start_batch(
+            session,
+            "tenant-a",
+            1,
+            "no_answer",
+            "invalid-number-batch",
+        )
+        await session.commit()
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target is not None and target.next_attempt_at is not None
+        retry_at = target.next_attempt_at
+
+    retry = OutboundTaskExecutor(
+        database,
+        SequenceDialer([DialResult(call_result="invalid_number")]),
+        now_provider=lambda: retry_at,
+    )
+    assert await retry.run_once() == 1
+
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_ids[0])
+        batch = await session.get(
+            AiCallOutboundExceptionBatchModel,
+            int(batch_out.batch_id),
+        )
+        rows, total = await service.list_targets(
+            session,
+            "tenant-a",
+            1,
+            category="no_answer",
+            target_status="UNAVAILABLE",
+            keyword=None,
+            page_num=1,
+            page_size=20,
+        )
+
+        assert target is not None and target.status == "COMPLETED"
+        assert target.next_attempt_at is None
+        assert batch is not None and batch.status == "COMPLETED"
+        assert total == 1
+        assert rows[0].status == "UNAVAILABLE"
+        assert rows[0].last_result == "invalid_number"

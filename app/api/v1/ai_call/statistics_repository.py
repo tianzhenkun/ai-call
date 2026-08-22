@@ -6,9 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Selectable
 
 from .model import (
+    AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallRecordModel,
-    AiCallSemanticAnalysisModel,
 )
 from .outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
@@ -113,14 +113,16 @@ class OutboundStatisticsRepository:
             if include_pending_follow_ups
             else literal(0)
         )
-        positive_intent_exists = (
-            select(AiCallSemanticAnalysisModel.id)
+        interested_lead_id = (
+            select(AiCallFollowUpDataModel.id)
             .where(
-                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
-                AiCallSemanticAnalysisModel.analysis_status == "2",
-                AiCallSemanticAnalysisModel.customer_intent == "positive",
+                AiCallFollowUpDataModel.tenant_id == tenant_id,
+                AiCallFollowUpDataModel.task_id == AiCallOutboundAttemptModel.task_id,
+                AiCallFollowUpDataModel.target_id == AiCallOutboundAttemptModel.target_id,
+                AiCallFollowUpDataModel.source_call_id == AiCallRecordModel.call_id,
+                AiCallFollowUpDataModel.classification == "interested",
             )
-            .exists()
+            .scalar_subquery()
         )
         connected = AiCallOutboundAttemptModel.call_result == "connected"
         statement = select(
@@ -138,7 +140,7 @@ class OutboundStatisticsRepository:
                 ),
                 0,
             ),
-            func.coalesce(func.sum(case((positive_intent_exists, 1), else_=0)), 0),
+            func.coalesce(func.count(func.distinct(interested_lead_id)), 0),
             func.coalesce(pending_expression, 0),
         ).select_from(self._formal_outbound_from())
         statement = self._apply_period(

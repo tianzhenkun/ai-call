@@ -534,6 +534,11 @@ class OutboundExceptionService:
             (AiCallOutboundTargetModel.status == "CANCELLED", "STOPPED"),
             (
                 (AiCallOutboundTargetModel.status == "COMPLETED")
+                & (AiCallOutboundTargetModel.latest_result == "invalid_number"),
+                "UNAVAILABLE",
+            ),
+            (
+                (AiCallOutboundTargetModel.status == "COMPLETED")
                 & (AiCallOutboundTargetModel.latest_result == "connected"),
                 "CONNECTED",
             ),

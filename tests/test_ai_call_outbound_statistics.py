@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
-from app.api.v1.ai_call.model import AiCallFollowUpTaskModel, AiCallRecordModel
+from app.api.v1.ai_call.model import (
+    AiCallFollowUpDataModel,
+    AiCallFollowUpTaskModel,
+    AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
+)
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -276,6 +281,31 @@ def _follow_up(
     )
 
 
+def _follow_up_data(
+    *,
+    data_id: int,
+    target_id: int,
+    classification: str,
+    now: datetime,
+) -> AiCallFollowUpDataModel:
+    return AiCallFollowUpDataModel(
+        id=data_id,
+        tenant_id="tenant-a",
+        task_id=100,
+        target_id=target_id,
+        source_call_id=f"call-{target_id}",
+        classification=classification,
+        classification_reason="人工确认客户当前分类",
+        classification_source="human",
+        suggest_review=False,
+        version=1,
+        classification_updated_at=now,
+        classification_updated_by="tester",
+        created_at=now,
+        updated_at=now,
+    )
+
+
 @pytest.mark.anyio
 async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -401,6 +431,37 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
                 status="pending",
                 now=begin,
             ),
+            _follow_up_data(
+                data_id=9101,
+                target_id=1,
+                classification="interested",
+                now=begin,
+            ),
+            _follow_up_data(
+                data_id=9102,
+                target_id=2,
+                classification="interested",
+                now=begin,
+            ),
+            _follow_up_data(
+                data_id=9103,
+                target_id=3,
+                classification="nurturing",
+                now=begin,
+            ),
+            AiCallSemanticAnalysisModel(
+                id=9201,
+                call_id="call-3",
+                scene_code="product_intro",
+                analysis_scene_code="ai_call_semantic_analysis",
+                analysis_status="2",
+                analysis_result="{}",
+                customer_intent="positive",
+                follow_up_suggested=False,
+                analysis_retry_count=0,
+                created_at=begin,
+                updated_at=begin,
+            ),
         ])
         await session.commit()
 
@@ -429,7 +490,7 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
     assert overview.dial_attempts == 12
     assert overview.connected_calls == 3
     assert overview.total_duration_ms == 14_000
-    assert overview.intent_leads == 0
+    assert overview.intent_leads == 2
     assert overview.pending_follow_ups == 2
     assert result_counts == {
         "connected": 2,
@@ -443,6 +504,125 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
         (8, 3),
         (4, 0),
     ]
+
+
+@pytest.mark.anyio
+async def test_repository_counts_each_interested_target_once_across_attempts() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    begin = datetime(2026, 7, 25, tzinfo=ZoneInfo("UTC"))
+
+    async with session_maker() as session:
+        second_attempt_at = begin + timedelta(hours=1)
+        session.add_all([
+            _task(task_id=100, tenant_id="tenant-a", now=begin),
+            _target(target_id=1, tenant_id="tenant-a", task_id=100, now=begin),
+            _record(row_id=1, started_at=begin),
+            _attempt(
+                row_id=1,
+                tenant_id="tenant-a",
+                task_id=100,
+                call_result="connected",
+                started_at=begin,
+            ),
+            _record(row_id=2, started_at=second_attempt_at),
+            AiCallOutboundAttemptModel(
+                id=10_002,
+                tenant_id="tenant-a",
+                task_id=100,
+                target_id=1,
+                attempt_no=2,
+                call_id="call-2",
+                status="COMPLETED",
+                call_result="connected",
+                started_at=second_attempt_at,
+                created_at=second_attempt_at,
+                updated_at=second_attempt_at,
+            ),
+            _follow_up_data(
+                data_id=9101,
+                target_id=1,
+                classification="interested",
+                now=begin,
+            ),
+        ])
+        await session.commit()
+
+        overview = await OutboundStatisticsRepository(session).aggregate_overview(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+            include_pending_follow_ups=True,
+        )
+
+    await engine.dispose()
+
+    assert overview.dial_attempts == 2
+    assert overview.intent_leads == 1
+
+
+@pytest.mark.anyio
+async def test_repository_attributes_interested_target_to_source_call_period() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    begin = datetime(2026, 7, 25, tzinfo=ZoneInfo("UTC"))
+    source_call_at = begin - timedelta(hours=1)
+
+    async with session_maker() as session:
+        session.add_all([
+            _task(task_id=100, tenant_id="tenant-a", now=source_call_at),
+            _target(
+                target_id=1,
+                tenant_id="tenant-a",
+                task_id=100,
+                now=source_call_at,
+            ),
+            _record(row_id=1, started_at=source_call_at),
+            _attempt(
+                row_id=1,
+                tenant_id="tenant-a",
+                task_id=100,
+                call_result="connected",
+                started_at=source_call_at,
+            ),
+            _record(row_id=2, started_at=begin),
+            AiCallOutboundAttemptModel(
+                id=10_002,
+                tenant_id="tenant-a",
+                task_id=100,
+                target_id=1,
+                attempt_no=2,
+                call_id="call-2",
+                status="COMPLETED",
+                call_result="connected",
+                started_at=begin,
+                created_at=begin,
+                updated_at=begin,
+            ),
+            _follow_up_data(
+                data_id=9101,
+                target_id=1,
+                classification="interested",
+                now=source_call_at,
+            ),
+        ])
+        await session.commit()
+
+        overview = await OutboundStatisticsRepository(session).aggregate_overview(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+            include_pending_follow_ups=True,
+        )
+
+    await engine.dispose()
+
+    assert overview.dial_attempts == 1
+    assert overview.intent_leads == 0
 
 
 class _StatisticsRepositoryStub:
