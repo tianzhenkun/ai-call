@@ -30,7 +30,7 @@ from app.api.v1.ai_call.schema import (
 )
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_prompt_manager
 from app.core.exceptions import CustomException
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.knowledge import knowledge_version_snapshot_hash
@@ -55,6 +55,38 @@ from app.services.ai_call.session_registry import (
 from app.services.ai_call.voice_profile import BUILTIN_QWEN_OMNI_REALTIME_VOICES
 
 TEST_TENANT_ID = "tenant_001"
+
+
+def test_prompt_config_routes_require_prompt_manager_permission() -> None:
+    expected_routes = {
+        ("/ai-call/prompt-profiles", "GET"),
+        ("/ai-call/prompt-profiles", "POST"),
+        ("/ai-call/prompt-profiles/{profileId}", "GET"),
+        ("/ai-call/prompt-profiles/{profileId}", "PUT"),
+        ("/ai-call/prompt-components", "GET"),
+        ("/ai-call/prompt-common-config", "GET"),
+        ("/ai-call/prompt-common-config", "PUT"),
+        ("/ai-call/prompt-profiles/ai-optimize", "POST"),
+        ("/ai-call/prompt-profiles/preview", "POST"),
+        ("/ai-call/prompt-profiles/{profileId}/versions", "GET"),
+        ("/ai-call/prompt-profiles/{profileId}/version-applications", "GET"),
+        ("/ai-call/prompt-profiles/{profileId}/versions/{versionId}", "GET"),
+        ("/ai-call/prompt-profiles/{profileId}/versions/{versionId}", "PATCH"),
+        ("/ai-call/prompt-profiles/{profileId}/versions/{versionId}", "DELETE"),
+        ("/ai-call/prompt-profiles/{profileId}/versions/{versionId}/apply", "POST"),
+    }
+    routes = {
+        (route.path, method): route
+        for route in AiCallRouter.routes
+        for method in getattr(route, "methods", set())
+        if (route.path, method) in expected_routes
+    }
+
+    assert routes.keys() == expected_routes
+    for route in routes.values():
+        assert get_prompt_manager in {
+            dependency.call for dependency in route.dependant.dependencies
+        }
 
 
 class FakeLiveKitRoomManager:
@@ -703,7 +735,7 @@ async def test_common_business_prompt_is_persisted_without_implicit_binding(b4_s
 
 @pytest.mark.anyio
 async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> None:
-    service, _repository, _room_manager, _agent_runner = b4_service
+    service, repository, _room_manager, _agent_runner = b4_service
     created = await create_static_profile(service)
 
     assert created["versionNo"] == 1
@@ -751,12 +783,64 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
         tenant_id=TEST_TENANT_ID,
         profile_id=int(created["id"]),
         version_id=int(versions["rows"][1]["id"]),
-        created_by=1,
-        created_by_name="测试用户",
+        applied_by=7,
+        applied_by_name="测试用户",
     )
     assert restored["promptText"] == created["promptText"]
-    assert restored["versionNo"] == 3
-    assert restored["versionCount"] == 3
+    assert restored["versionNo"] == 1
+    assert restored["versionCount"] == 2
+    assert (
+        await repository.get_prompt_profile(
+            int(created["id"]),
+            tenant_id=TEST_TENANT_ID,
+        )
+    ).current_version_id == int(versions["rows"][1]["id"])
+    assert (await service.list_prompt_profile_versions(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    ))["total"] == 2
+    applications = await service.list_prompt_profile_version_applications(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    )
+    assert applications["total"] == 1
+    assert applications["rows"][0] == {
+        "id": applications["rows"][0]["id"],
+        "profileId": created["id"],
+        "fromVersionId": versions["rows"][0]["id"],
+        "fromVersionNo": 2,
+        "fromVersionName": "GEO 首次试讲",
+        "toVersionId": versions["rows"][1]["id"],
+        "toVersionNo": 1,
+        "toVersionName": created["name"],
+        "appliedBy": "7",
+        "appliedByName": "测试用户",
+        "appliedAt": applications["rows"][0]["appliedAt"],
+    }
+
+    await service.apply_prompt_profile_version(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+        version_id=int(versions["rows"][1]["id"]),
+        applied_by=7,
+        applied_by_name="测试用户",
+    )
+    assert (await service.list_prompt_profile_version_applications(
+        tenant_id=TEST_TENANT_ID,
+        profile_id=int(created["id"]),
+    ))["total"] == 1
+
+
+def test_prompt_current_version_migration_backfills_latest_version() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs/livekit-ai-outbound/sql/phase-b4-prompt-current-version-postgres.sql"
+    )
+    migration_sql = migration_path.read_text(encoding="utf-8").lower()
+
+    assert "add column if not exists current_version_id bigint" in migration_sql
+    assert "order by version.version_no desc" in migration_sql
+    assert "create table if not exists ai_call_prompt_profile_version_application" in migration_sql
 
 
 def test_prompt_version_name_migration_backfills_existing_versions() -> None:
@@ -1589,6 +1673,8 @@ def test_prompt_requests_reject_removed_fields() -> None:
 
 def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     class FakePromptConfigService:
+        applied_version: dict | None = None
+
         async def list_prompt_profiles(self, **kwargs):
             _ = kwargs
             return {
@@ -1636,10 +1722,46 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "promptSourceKey": "debt_promise_repay_reminder",
             }
 
+        async def apply_prompt_profile_version(self, **kwargs):
+            self.applied_version = kwargs
+            return {
+                "id": "1",
+                "sceneCode": "debt_promise_repay_reminder",
+                "name": "承诺还款提醒",
+                "providerKey": "static_profile",
+                "promptText": "业务话术",
+                "openingMessage": "您好",
+                "createdAt": "2026-06-17T00:00:00Z",
+                "updatedAt": "2026-06-17T00:00:00Z",
+            }
+
+        async def list_prompt_profile_version_applications(self, **kwargs):
+            _ = kwargs
+            return {
+                "rows": [
+                    {
+                        "id": "10",
+                        "profileId": "1",
+                        "fromVersionId": "2",
+                        "fromVersionNo": 2,
+                        "fromVersionName": "第二版",
+                        "toVersionId": "1",
+                        "toVersionNo": 1,
+                        "toVersionName": "初稿",
+                        "appliedBy": "1",
+                        "appliedByName": "测试用户",
+                        "appliedAt": "2026-06-17T01:00:00Z",
+                    }
+                ],
+                "total": 1,
+            }
+
     app = FastAPI()
     app.include_router(AiCallRouter)
-    app.dependency_overrides[get_ai_call_service] = lambda: FakePromptConfigService()
+    fake_service = FakePromptConfigService()
+    app.dependency_overrides[get_ai_call_service] = lambda: fake_service
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        permissions=frozenset({"ai_call:prompt:manage"}),
         user=SimpleNamespace(
             tenant_id=TEST_TENANT_ID,
             user_id=1,
@@ -1662,6 +1784,10 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "businessParams": {},
             },
         ).json()
+        applied = client.post("/ai-call/prompt-profiles/1/versions/1/apply").json()
+        applications = client.get(
+            "/ai-call/prompt-profiles/1/version-applications"
+        ).json()
 
     assert profiles["code"] == 200
     assert profiles["rows"][0]["sceneCode"] == "debt_promise_repay_reminder"
@@ -1669,3 +1795,14 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert common_config["data"]["content"] == "统一品牌语气"
     assert saved_common_config["data"]["content"] == "新的统一品牌语气"
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"
+    assert applied["data"]["id"] == "1"
+    assert fake_service.applied_version == {
+        "tenant_id": TEST_TENANT_ID,
+        "profile_id": 1,
+        "version_id": 1,
+        "applied_by": 1,
+        "applied_by_name": "测试用户",
+    }
+    assert applications["rows"][0]["fromVersionNo"] == 2
+    assert applications["rows"][0]["toVersionNo"] == 1
+    assert applications["rows"][0]["appliedByName"] == "测试用户"

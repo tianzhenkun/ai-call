@@ -1255,7 +1255,13 @@ def _outbound_chain_matches(
     return (
         task.tenant_id == tenant_id
         and task.id == refs.task_id
-        and task.status == "RUNNING"
+        and (
+            task.status == "RUNNING"
+            or (
+                task.status == "COMPLETED"
+                and target.exception_batch_id is not None
+            )
+        )
         and task.line_id == refs.line_id
         and task.answer_mode == ("web" if refs.line_id is None else "linphone")
         and target.tenant_id == tenant_id

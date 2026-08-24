@@ -36,6 +36,7 @@ from app.core.base_model import MappedBase
 from app.core.dependencies import get_ai_call_manager
 from app.core.exceptions import CustomException
 from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
+from app.services.ai_call.semantic_analysis import AiCallSemanticAnalysisService
 
 
 @pytest.fixture
@@ -258,6 +259,119 @@ async def test_transfer_failure_creates_nurturing_data_without_task(
         )
         assert len(history) == 1
         assert history[0].source == "transfer_failed"
+
+
+@pytest.mark.anyio
+async def test_transfer_failure_ai_mismatch_requires_review(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(
+        session_factory,
+        with_data=False,
+        with_active_task=False,
+    )
+    now = datetime(2026, 8, 15, 10, 5, tzinfo=timezone.utc)
+
+    async with session_factory() as db, db.begin():
+        handoff = AiCallHandoffModel(
+            id=105,
+            tenant_id="tenant-a",
+            handoff_id="handoff-failed-ai-mismatch",
+            call_id="call-source-1",
+            room_name="room-call-source-1",
+            scene_code="intro_product",
+            status="failed",
+            request_source="customer",
+            request_reason="customer_requested_human",
+            request_message="请转人工",
+            requested_at=now,
+            ended_at=now,
+            end_reason="no_online_agent",
+            failure_stage="availability_check",
+        )
+        db.add(handoff)
+        await db.flush()
+
+        service = AiCallFollowUpDataService.from_session(db)
+        data = await service.apply_transfer_failure(
+            handoff,
+            reason="转人工时当前场景没有在线坐席",
+        )
+        assert data is not None
+
+        analysis = AiCallSemanticAnalysisModel(
+            id=503,
+            call_id="call-source-1",
+            scene_code="intro_product",
+            analysis_scene_code="ai_call_semantic_analysis",
+            analysis_status="2",
+            analysis_version=1,
+            analysis_result=json.dumps(
+                {
+                    "classification": "low_value",
+                    "low_value_reason": "non_target_customer",
+                    "confidence": "high",
+                    "valid_dialogue": False,
+                    "reason": "客户并非目标客户。",
+                    "evidence": [],
+                    "evidence_conflict": False,
+                },
+                ensure_ascii=False,
+            ),
+            customer_intent="negative",
+            follow_up_suggested=False,
+            follow_up_consent=None,
+            follow_up_reason=None,
+            follow_up_preferred_at=None,
+            follow_up_confidence=None,
+            follow_up_review_status=None,
+            follow_up_reviewed_by=None,
+            follow_up_reviewed_by_name=None,
+            follow_up_reviewed_at=None,
+            analysis_error=None,
+            analysis_retry_count=0,
+            analysis_started_at=now,
+            analysis_finished_at=now,
+            transcript_hash=None,
+            transcript_snapshot_json=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(analysis)
+        await db.flush()
+
+        response = AiCallSemanticAnalysisService.analysis_to_dict(
+            analysis,
+            current_classification=data.classification,
+        )
+        assert response["classificationRequiresReview"] is True
+
+        await service.review_classification(
+            tenant_id="tenant-a",
+            follow_up_data_id=data.id,
+            analysis=analysis,
+            payload=FollowUpDataClassificationIn(
+                classification="nurturing",
+                reason="人工复核后保留当前业务分类。",
+                expected_version=1,
+            ),
+            idempotency_key="transfer-failure-review-keep-current",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert data.classification == "nurturing"
+        assert data.classification_source == "human"
+        assert analysis.follow_up_review_status == "adjusted"
+        history = list(
+            (await db.execute(select(AiCallFollowUpClassificationHistoryModel))).scalars().all()
+        )
+        assert [item.source for item in history] == [
+            "transfer_failed",
+            "manual_adjustment",
+        ]
+        assert history[-1].ai_adopted is False
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
 
 
 def test_follow_up_data_routes_require_manager_permission() -> None:
@@ -619,7 +733,7 @@ async def test_follow_up_data_http_flow_keeps_classification_and_task_separate(
 
 
 @pytest.mark.anyio
-async def test_classification_review_updates_classification_without_creating_task(
+async def test_classification_review_after_follow_up_dismissal_creates_no_task(
     session_factory,
 ) -> None:
     await _seed_follow_up_data(session_factory, with_active_task=False)
@@ -657,7 +771,7 @@ async def test_classification_review_updates_classification_without_creating_tas
             follow_up_reason=None,
             follow_up_preferred_at=None,
             follow_up_confidence=None,
-            follow_up_review_status=None,
+            follow_up_review_status="dismissed",
             follow_up_reviewed_by=None,
             follow_up_reviewed_by_name=None,
             follow_up_reviewed_at=None,
@@ -731,6 +845,128 @@ async def test_classification_review_updates_classification_without_creating_tas
             )
             == 2
         )
+
+
+@pytest.mark.anyio
+async def test_high_confidence_ai_mismatch_requires_review_and_can_keep_current(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(
+        session_factory,
+        classification="nurturing",
+        with_active_task=False,
+    )
+    now = datetime.now(timezone.utc)
+    analysis_result = {
+        "classification": "low_value",
+        "low_value_reason": "non_target_customer",
+        "confidence": "high",
+        "valid_dialogue": True,
+        "reason": "客户并非目标客户。",
+        "evidence": ["客户：我不是负责人"],
+        "evidence_conflict": False,
+    }
+
+    async with session_factory() as db, db.begin():
+        data = await db.get(AiCallFollowUpDataModel, 100)
+        assert data is not None
+        data.classification_source = "system"
+        data.classification_reason = "转人工未接通，保持持续跟进。"
+        analysis = AiCallSemanticAnalysisModel(
+            id=502,
+            call_id="call-source-1",
+            scene_code="intro_product",
+            analysis_scene_code="ai_call_semantic_analysis",
+            analysis_status="2",
+            analysis_version=1,
+            analysis_result=json.dumps(analysis_result, ensure_ascii=False),
+            customer_intent="negative",
+            follow_up_suggested=False,
+            follow_up_consent=None,
+            follow_up_reason=None,
+            follow_up_preferred_at=None,
+            follow_up_confidence=None,
+            follow_up_review_status=None,
+            follow_up_reviewed_by=None,
+            follow_up_reviewed_by_name=None,
+            follow_up_reviewed_at=None,
+            analysis_error=None,
+            analysis_retry_count=0,
+            analysis_started_at=now,
+            analysis_finished_at=now,
+            transcript_hash=None,
+            transcript_snapshot_json=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(analysis)
+        await db.flush()
+
+        service = AiCallFollowUpDataService.from_session(db)
+        applied = await service.apply_ai_analysis(analysis)
+
+        assert applied == data
+        assert data.classification == "nurturing"
+        assert data.classification_source == "system"
+        assert data.suggest_review is True
+        assert data.version == 2
+        response = AiCallSemanticAnalysisService.analysis_to_dict(
+            analysis,
+            current_classification=data.classification,
+        )
+        assert response["classificationRequiresReview"] is True
+        assert response["classificationReviewStatus"] == "suggested"
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
+
+        with pytest.raises(CustomException) as review_required:
+            await service.schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=FollowUpDataScheduleIn(
+                    follow_up_reason="客户要求下周回访",
+                    next_follow_up_at=now + timedelta(days=7),
+                    expected_version=2,
+                ),
+                idempotency_key="schedule-before-classification-review",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert review_required.value.status_code == 409
+        assert (
+            review_required.value.data["errorCode"]
+            == "CLASSIFICATION_REVIEW_REQUIRED"
+        )
+
+        await service.review_classification(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            analysis=analysis,
+            payload=FollowUpDataClassificationIn(
+                classification="nurturing",
+                reason="人工复核后保留当前业务分类。",
+                expected_version=2,
+            ),
+            idempotency_key="classification-review-keep-current",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert data.classification == "nurturing"
+        assert data.classification_source == "human"
+        assert data.suggest_review is False
+        assert analysis.follow_up_review_status == "adjusted"
+        assert analysis.follow_up_reviewed_by == "20"
+        assert analysis.follow_up_reviewed_by_name == "管理员"
+        assert analysis.follow_up_reviewed_at is not None
+        history = await db.scalar(
+            select(AiCallFollowUpClassificationHistoryModel)
+            .where(AiCallFollowUpClassificationHistoryModel.source == "manual_adjustment")
+            .order_by(AiCallFollowUpClassificationHistoryModel.id.desc())
+        )
+        assert history is not None
+        assert history.changed_by_name == "管理员"
+        assert history.ai_adopted is False
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
 
 
 @pytest.mark.anyio

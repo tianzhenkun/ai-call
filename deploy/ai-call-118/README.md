@@ -23,6 +23,18 @@ docker compose --env-file .env -f compose.yml ps
 
 `init-db` 只会在独立数据库中创建当前代码的表，并写入一个名为 `ai-call-oss` 的 OSS 配置；它不会连接或修改任何 UAT 数据库。
 
+升级已有数据库时，必须在更新 API 前备份数据库并执行提示词当前版本迁移：
+
+```bash
+docker compose -f compose.yml exec -T postgres sh -lc \
+  'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > pre-prompt-current-version.sql
+docker compose -f compose.yml exec -T postgres sh -lc \
+  'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < phase-b4-prompt-current-version-postgres.sql
+```
+
+迁移文件来自 `docs/livekit-ai-outbound/sql/phase-b4-prompt-current-version-postgres.sql`，需随发布包上传到运行目录；迁移可重复执行。
+
 ## 网络与安全组
 
 - 118：仅向受控 Mac 的公网 IP 开放 `51820/udp`、`7881/tcp`、`50000-50100/udp`；不要开放 `19011`、`7880`、`5432`、`6379`、`5089`、`8021`。

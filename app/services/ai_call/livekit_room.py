@@ -27,6 +27,7 @@ class LiveKitParticipantMediaFact:
     participant_sid: str | None
     track_sid: str | None
     microphone_ready: bool
+    sip_call_status: str | None
 
 
 class LiveKitRoomManager:
@@ -181,6 +182,10 @@ class LiveKitRoomManager:
                 else None
             ),
             microphone_ready=microphone_track is not None,
+            sip_call_status=(
+                str((participant.get("attributes") or {}).get("sip.callStatus") or "")
+                or None
+            ),
         )
 
     async def participant_exists(self, room_name: str, participant_identity: str) -> bool:

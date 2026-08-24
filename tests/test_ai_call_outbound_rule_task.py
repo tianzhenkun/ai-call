@@ -19,6 +19,7 @@ from app.api.v1.ai_call.model import (
     AiCallKnowledgeVersionModel,
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
+    AiCallPromptProfileVersionModel,
     AiCallVoiceProfileModel,
 )
 from app.api.v1.ai_call.outbound.model import (
@@ -53,6 +54,21 @@ QWEN_OMNI_REALTIME_TARGET_MODEL = settings.QWEN_REALTIME_MODEL
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def test_task_datetime_round_trip_uses_business_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "AI_CALL_OUTBOUND_TIMEZONE", "Asia/Shanghai")
+
+    stored = OutboundRuleTaskService._parse_datetime("2026-07-29 10:00:00")
+
+    assert stored == datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    assert OutboundRuleTaskService._format_datetime(stored) == "2026-07-29 10:00:00"
+    assert (
+        OutboundRuleTaskService._format_datetime(datetime(2026, 7, 29, 2, 0))
+        == "2026-07-29 10:00:00"
+    )
 
 
 def _rule_payload(name: str = "工作日规则") -> CallRuleIn:
@@ -198,11 +214,18 @@ async def test_web_single_validation_and_task_creation_skip_sip_line(database) -
             customer_name=None,
             target_status=None,
         )
+        current_version_id = await session.scalar(
+            select(AiCallPromptProfileModel.current_version_id).where(
+                AiCallPromptProfileModel.id == prompt_id
+            )
+        )
 
     assert created is True
     assert task.answer_mode == "web"
     assert task.line_id is None
-    assert "sipLine" not in json.loads(task.config_snapshot_json)
+    task_snapshot = json.loads(task.config_snapshot_json)
+    assert "sipLine" not in task_snapshot
+    assert task_snapshot["prompt"]["versionId"] == str(current_version_id)
     assert total == 1
     assert targets[0].phone_number is None
 
@@ -275,10 +298,12 @@ async def database(tmp_path):
 
 async def _seed_references(database) -> tuple[int, int]:
     prompt_id = generate_snowflake_id()
+    current_prompt_version_id = generate_snowflake_id()
+    newer_prompt_version_id = generate_snowflake_id()
     voice_id = generate_snowflake_id()
     async with database() as session:
         now = _now()
-        session.add(
+        session.add_all([
             AiCallPromptProfileModel(
                 id=prompt_id,
                 tenant_id="tenant-a",
@@ -287,11 +312,30 @@ async def _seed_references(database) -> tuple[int, int]:
                 provider_key="static_profile",
                 prompt_text="测试提示词",
                 opening_message="您好",
+                current_version_id=current_prompt_version_id,
                 created_at=now,
                 updated_at=now,
-            )
-        )
-        session.add(
+            ),
+            AiCallPromptProfileVersionModel(
+                id=current_prompt_version_id,
+                tenant_id="tenant-a",
+                profile_id=prompt_id,
+                version_no=1,
+                version_name="合同审查产品介绍",
+                snapshot_json='{"promptText":"测试提示词"}',
+                creation_method="manual",
+                created_at=now,
+            ),
+            AiCallPromptProfileVersionModel(
+                id=newer_prompt_version_id,
+                tenant_id="tenant-a",
+                profile_id=prompt_id,
+                version_no=2,
+                version_name="未应用的新版本",
+                snapshot_json='{"promptText":"未应用提示词"}',
+                creation_method="manual",
+                created_at=now,
+            ),
             AiCallVoiceProfileModel(
                 id=voice_id,
                 voice="Tina",
@@ -304,8 +348,8 @@ async def _seed_references(database) -> tuple[int, int]:
                 remark=None,
                 created_at=now,
                 updated_at=now,
-            )
-        )
+            ),
+        ])
         await session.commit()
     return prompt_id, voice_id
 

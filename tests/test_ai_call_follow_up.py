@@ -1669,6 +1669,7 @@ class _FakeCallbackFactory:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.ended_calls: list[str] = []
+        self.sip_call_status = "active"
 
     async def create(self, **kwargs) -> HumanCallbackSessionResult:
         self.calls.append(kwargs)
@@ -1685,6 +1686,23 @@ class _FakeCallbackFactory:
 
     async def end(self, *, call_id: str) -> None:
         self.ended_calls.append(call_id)
+
+    async def get_call_status(self, *, call_id: str) -> str:
+        return self.sip_call_status
+
+
+class _ConcurrentStatusCallbackFactory(_FakeCallbackFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = 0
+        self.ready = asyncio.Event()
+
+    async def get_call_status(self, *, call_id: str) -> str:
+        self.waiting += 1
+        if self.waiting == 2:
+            self.ready.set()
+        await self.ready.wait()
+        return await super().get_call_status(call_id=call_id)
 
 
 class _FailingCallbackFactory:
@@ -1770,6 +1788,7 @@ async def test_follow_up_data_direct_call_does_not_create_task_and_submits_resul
             event_type="participant_joined",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
+            payload={"participant": {"attributes": {"sip.callStatus": "active"}}},
         )
         assert joined["attemptResult"] == "connected"
         await service.end_follow_up_data_callback(
@@ -1804,6 +1823,59 @@ async def test_follow_up_data_direct_call_does_not_create_task_and_submits_resul
         assert await db.scalar(
             select(func.count()).select_from(AiCallFollowUpTaskModel)
         ) == 0
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_callback_connection_requires_active_sip_status(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+
+    async with session_factory() as db:
+        factory = _FakeCallbackFactory()
+        factory.sip_call_status = "ringing"
+        recording_service = SimpleNamespace(
+            start_for_session=AsyncMock(),
+            start_session_participant_recordings=AsyncMock(),
+            start_human_agent_recording=AsyncMock(),
+        )
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            recording_service=recording_service,
+        )
+        auth = _auth(db, user_id=20)
+        callback, _ = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-connected-status",
+        )
+
+        with pytest.raises(CustomException) as ringing:
+            await service.confirm_follow_up_data_callback_connected(
+                auth,
+                follow_up_data_id=data_id,
+                call_id=callback.call_id,
+                payload=AgentPresenceSessionIn(
+                    console_session_id=console_session_id,
+                ),
+            )
+        assert _error_code(ringing.value) == "CALLBACK_NOT_CONNECTED"
+
+        factory.sip_call_status = "active"
+        record = await service.confirm_follow_up_data_callback_connected(
+            auth,
+            follow_up_data_id=data_id,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+
+        assert record.status == "running"
+        assert record.answered_at is not None
+        recording_service.start_for_session.assert_awaited_once()
 
 
 @pytest.mark.anyio
@@ -1871,6 +1943,7 @@ async def test_follow_up_data_direct_call_can_schedule_owned_task(
             event_type="participant_joined",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
+            payload={"participant": {"attributes": {"sip.callStatus": "active"}}},
         )
         await service.end_follow_up_data_callback(
             auth,
@@ -2254,6 +2327,106 @@ async def test_no_answer_callback_waits_for_atomic_handling_result(
 
 
 @pytest.mark.anyio
+async def test_callback_connection_requires_active_livekit_sip_status(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        factory = _FakeCallbackFactory()
+        factory.sip_call_status = "ringing"
+        recording_service = SimpleNamespace(
+            start_for_session=AsyncMock(),
+            start_session_participant_recordings=AsyncMock(),
+            start_human_agent_recording=AsyncMock(),
+        )
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            recording_service=recording_service,
+        )
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+
+        with pytest.raises(CustomException) as ringing:
+            await service.confirm_callback_connected(
+                auth,
+                follow_up_id=100,
+                call_id=callback.call_id,
+                payload=AgentPresenceSessionIn(
+                    console_session_id=console_session_id,
+                ),
+            )
+        assert _error_code(ringing.value) == "CALLBACK_NOT_CONNECTED"
+
+        factory.sip_call_status = "active"
+        attempt = await service.confirm_callback_connected(
+            auth,
+            follow_up_id=100,
+            call_id=callback.call_id,
+            payload=AgentPresenceSessionIn(console_session_id=console_session_id),
+        )
+
+        assert attempt.attempt_result == "connected"
+        detail = service.follow_up_payload(
+            await service.get_follow_up(auth, follow_up_id=100)
+        )
+        assert [item["attempt_result"] for item in detail["attempts"]] == [
+            "connected"
+        ]
+        recording_service.start_for_session.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_callback_joined_while_sip_is_ringing_is_not_connected(
+    session_factory,
+) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+
+        result = await service.handle_livekit_webhook_event(
+            event_type="participant_joined",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+            payload={
+                "participant": {
+                    "attributes": {"sip.callStatus": "ringing"},
+                }
+            },
+        )
+
+        assert result == {"handled": False, "reason": "sip_not_connected"}
+        detail = service.follow_up_payload(
+            await service.get_follow_up(auth, follow_up_id=100)
+        )
+        assert detail["attempts"] == []
+
+
+@pytest.mark.anyio
 async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
     session_factory,
 ) -> None:
@@ -2435,11 +2608,13 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
             event_type="participant_joined",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
+            payload={"participant": {"attributes": {"sip.callStatus": "active"}}},
         )
         await service.handle_livekit_webhook_event(
             event_type="participant_joined",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
+            payload={"participant": {"attributes": {"sip.callStatus": "active"}}},
         )
         recording_service.start_for_session.assert_awaited_once_with(
             tenant_id="tenant-a",
@@ -2505,6 +2680,62 @@ async def test_connected_callback_hangup_finishes_call_and_releases_agent(
         )
         assert ended.status == "completed"
         assert factory.ended_calls == []
+
+
+@pytest.mark.anyio
+async def test_concurrent_connected_confirmations_record_once(session_factory) -> None:
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+    factory = _ConcurrentStatusCallbackFactory()
+    recording_service = SimpleNamespace(
+        start_for_session=AsyncMock(),
+        start_session_participant_recordings=AsyncMock(),
+        start_human_agent_recording=AsyncMock(),
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=factory)
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+        await db.commit()
+
+    async def confirm_connected():
+        async with session_factory() as db:
+            service = AiCallFollowUpService(
+                db,
+                callback_factory=factory,
+                recording_service=recording_service,
+            )
+            attempt = await service.confirm_callback_connected(
+                _auth(db, user_id=20),
+                follow_up_id=100,
+                call_id=callback.call_id,
+                payload=AgentPresenceSessionIn(
+                    console_session_id=console_session_id,
+                ),
+            )
+            await db.commit()
+            return attempt
+
+    attempts = await asyncio.gather(confirm_connected(), confirm_connected())
+
+    assert attempts[0].id == attempts[1].id
+    recording_service.start_for_session.assert_awaited_once()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(AiCallFollowUpAttemptModel.id)).where(
+                AiCallFollowUpAttemptModel.related_call_id == callback.call_id
+            )
+        ) == 1
 
 
 @pytest.mark.anyio

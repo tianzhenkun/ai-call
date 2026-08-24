@@ -535,6 +535,8 @@ class AiCallService:
             created_by=created_by,
             created_by_name=created_by_name,
         )
+        profile.current_version_id = version.id
+        await repository.db.flush()
         return self._prompt_profile_to_dict(profile, (version.version_no, 1))
 
     async def update_prompt_profile(
@@ -591,13 +593,15 @@ class AiCallService:
         )
         if profile is None:
             raise CustomException(msg="提示词配置不存在", code=RET.ERROR.code, status_code=404)
-        await self._append_prompt_profile_version(
+        version = await self._append_prompt_profile_version(
             repository,
             profile,
             creation_method="manual",
             created_by=created_by,
             created_by_name=created_by_name,
         )
+        profile.current_version_id = version.id
+        await repository.db.flush()
         summaries = await repository.get_prompt_profile_version_summaries(
             tenant_id=tenant_id,
             profile_ids=[profile.id],
@@ -740,16 +744,40 @@ class AiCallService:
             raise CustomException(msg="提示词版本不存在", status_code=404)
         return self._prompt_version_to_dict(version, include_snapshot=True)
 
+    async def list_prompt_profile_version_applications(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> dict:
+        repository = self._ensure_prompt_repository()
+        await self.get_prompt_profile(tenant_id=tenant_id, profile_id=profile_id)
+        rows = await repository.list_prompt_profile_version_applications(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+        )
+        return {
+            "rows": [self._prompt_version_application_to_dict(*row) for row in rows],
+            "total": len(rows),
+        }
+
     async def apply_prompt_profile_version(
         self,
         *,
         tenant_id: str,
         profile_id: int,
         version_id: int,
-        created_by: int | None,
-        created_by_name: str | None,
+        applied_by: int | None = None,
+        applied_by_name: str | None = None,
     ) -> dict:
         repository = self._ensure_prompt_repository()
+        current_profile = await repository.get_prompt_profile(
+            profile_id,
+            tenant_id=tenant_id,
+            for_update=True,
+        )
+        if current_profile is None:
+            raise CustomException(msg="提示词配置不存在", status_code=404)
         version = await repository.get_prompt_profile_version(
             tenant_id=tenant_id,
             profile_id=profile_id,
@@ -757,21 +785,32 @@ class AiCallService:
         )
         if version is None:
             raise CustomException(msg="提示词版本不存在", status_code=404)
+        if current_profile.current_version_id == version.id:
+            summaries = await repository.get_prompt_profile_version_summaries(
+                tenant_id=tenant_id,
+                profile_ids=[current_profile.id],
+            )
+            return self._prompt_profile_to_dict(
+                current_profile,
+                summaries.get(current_profile.id),
+            )
+        from_version_id = current_profile.current_version_id
         snapshot = json.loads(version.snapshot_json)
         profile = await repository.update_prompt_profile(
             profile_id,
             tenant_id=tenant_id,
+            current_version_id=version.id,
             **self._profile_values_from_snapshot(snapshot),
         )
         if profile is None:
             raise CustomException(msg="提示词配置不存在", status_code=404)
-        await self._append_prompt_profile_version(
-            repository,
-            profile,
-            creation_method="restored",
-            created_by=created_by,
-            created_by_name=created_by_name,
-            restored_from_version_id=version.id,
+        await repository.create_prompt_profile_version_application(
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            from_version_id=from_version_id,
+            to_version_id=version.id,
+            applied_by=applied_by,
+            applied_by_name=applied_by_name,
         )
         summaries = await repository.get_prompt_profile_version_summaries(
             tenant_id=tenant_id,
@@ -787,11 +826,20 @@ class AiCallService:
         version_id: int,
     ) -> None:
         repository = self._ensure_prompt_repository()
-        latest = await repository.get_latest_prompt_profile_version(
+        profile = await repository.get_prompt_profile(
+            profile_id,
             tenant_id=tenant_id,
-            profile_id=profile_id,
         )
-        if latest is None or latest.id == version_id:
+        if profile is None:
+            raise CustomException(msg="提示词配置不存在", status_code=404)
+        current_version_id = profile.current_version_id
+        if current_version_id is None:
+            latest = await repository.get_latest_prompt_profile_version(
+                tenant_id=tenant_id,
+                profile_id=profile_id,
+            )
+            current_version_id = latest.id if latest is not None else None
+        if current_version_id == version_id:
             raise CustomException(msg="当前版本不能删除", status_code=409)
         deleted = await repository.soft_delete_prompt_profile_version(
             tenant_id=tenant_id,
@@ -1494,7 +1542,18 @@ class AiCallService:
         analysis = await repository.get_semantic_analysis(call_id=call_id)
         if analysis is None:
             return None
-        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+        current_classification = None
+        record = await repository.get_record(call_id)
+        if record is not None and record.follow_up_data_id is not None:
+            data = await repository.get_follow_up_data(
+                tenant_id=record.tenant_id,
+                follow_up_data_id=record.follow_up_data_id,
+            )
+            current_classification = data.classification if data is not None else None
+        return AiCallSemanticAnalysisService.analysis_to_dict(
+            analysis,
+            current_classification=current_classification,
+        )
 
     async def reanalyze_record_semantic_analysis(self, call_id: str) -> dict:
         repository = self._ensure_prompt_repository()
@@ -1511,7 +1570,17 @@ class AiCallService:
             reference_date=date.today().isoformat(),
             now=datetime.now(timezone.utc),
         )
-        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+        current_classification = None
+        if record.follow_up_data_id is not None:
+            data = await repository.get_follow_up_data(
+                tenant_id=record.tenant_id,
+                follow_up_data_id=record.follow_up_data_id,
+            )
+            current_classification = data.classification if data is not None else None
+        return AiCallSemanticAnalysisService.analysis_to_dict(
+            analysis,
+            current_classification=current_classification,
+        )
 
     async def review_record_follow_up(
         self,
@@ -1597,7 +1666,10 @@ class AiCallService:
             changed_by=reviewed_by,
             changed_by_name=reviewed_by_name,
         )
-        return AiCallSemanticAnalysisService.analysis_to_dict(analysis)
+        return AiCallSemanticAnalysisService.analysis_to_dict(
+            analysis,
+            current_classification=request.classification,
+        )
 
     async def get_record_quality(self, *, tenant_id: str, call_id: str) -> dict:
         self._ensure_record_service()
@@ -2540,6 +2612,36 @@ class AiCallService:
         if include_snapshot:
             data["snapshot"] = json.loads(version.snapshot_json)
         return data
+
+    @staticmethod
+    def _prompt_version_application_to_dict(
+        application,
+        from_version_no,
+        from_version_name,
+        to_version_no,
+        to_version_name,
+    ) -> dict:
+        return {
+            "id": str(application.id),
+            "profileId": str(application.profile_id),
+            "fromVersionId": (
+                str(application.from_version_id)
+                if application.from_version_id is not None
+                else None
+            ),
+            "fromVersionNo": from_version_no,
+            "fromVersionName": from_version_name,
+            "toVersionId": str(application.to_version_id),
+            "toVersionNo": to_version_no,
+            "toVersionName": to_version_name,
+            "appliedBy": (
+                str(application.applied_by)
+                if application.applied_by is not None
+                else None
+            ),
+            "appliedByName": application.applied_by_name,
+            "appliedAt": application.applied_at,
+        }
 
     @staticmethod
     def _voice_profile_to_dict(profile) -> dict:

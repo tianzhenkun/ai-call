@@ -28,7 +28,7 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_prompt_manager
 from app.core.exceptions import CustomException
 from app.core.security import OAuth2Schema
 from app.services.ai_call.runtime_control.command_repository import (
@@ -94,6 +94,7 @@ from .schema import (
     PromptProfilePreviewOut,
     PromptProfilePreviewRequest,
     PromptProfileUpdateRequest,
+    PromptProfileVersionApplicationOut,
     PromptProfileVersionDetailOut,
     PromptProfileVersionOut,
     PromptProfileVersionUpdateRequest,
@@ -485,7 +486,7 @@ async def _after_call_record_operator_scope(auth: AuthSchema) -> str | None:
     summary="查询业务提示词配置列表",
 )
 async def list_prompt_profiles_controller(
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
@@ -508,7 +509,7 @@ async def list_prompt_profiles_controller(
 )
 async def get_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -523,7 +524,7 @@ async def get_prompt_profile_controller(
 )
 async def create_prompt_profile_controller(
     request: PromptProfileCreateRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
@@ -547,7 +548,7 @@ async def create_prompt_profile_controller(
 async def update_prompt_profile_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     request: PromptProfileUpdateRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
@@ -572,8 +573,10 @@ async def update_prompt_profile_controller(
     summary="查询平台公共提示词组件",
 )
 async def list_prompt_components_controller(
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
+    _ = auth
     result = await service.list_prompt_components()
     rows = [PromptComponentOut.model_validate(row) for row in result["rows"]]
     return TableResponse(rows=rows, total=result["total"], msg="查询成功")
@@ -585,7 +588,7 @@ async def list_prompt_components_controller(
     response_model=ResponseSchema[PromptCommonConfigOut],
 )
 async def get_prompt_common_config_controller(
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -600,7 +603,7 @@ async def get_prompt_common_config_controller(
 )
 async def update_prompt_common_config_controller(
     request: PromptCommonConfigUpdateRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -618,7 +621,7 @@ async def update_prompt_common_config_controller(
 )
 async def optimize_prompt_profile_controller(
     request: PromptOptimizeRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -636,7 +639,7 @@ async def optimize_prompt_profile_controller(
 )
 async def preview_prompt_profile_controller(
     request: PromptProfilePreviewRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -659,7 +662,7 @@ async def preview_prompt_profile_controller(
 )
 async def list_prompt_profile_versions_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -672,6 +675,27 @@ async def list_prompt_profile_versions_controller(
 
 
 @AiCallRouter.get(
+    "/prompt-profiles/{profileId}/version-applications",
+    summary="查询业务提示词版本切换记录",
+)
+async def list_prompt_profile_version_applications_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    result = await service.list_prompt_profile_version_applications(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+    )
+    rows = [
+        PromptProfileVersionApplicationOut.model_validate(row)
+        for row in result["rows"]
+    ]
+    return TableResponse(rows=rows, total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get(
     "/prompt-profiles/{profileId}/versions/{versionId}",
     summary="查询业务提示词版本详情",
     response_model=ResponseSchema[PromptProfileVersionDetailOut],
@@ -679,7 +703,7 @@ async def list_prompt_profile_versions_controller(
 async def get_prompt_profile_version_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     version_id: Annotated[int, Path(alias="versionId")],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -702,7 +726,7 @@ async def get_prompt_profile_version_controller(
 async def apply_prompt_profile_version_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     version_id: Annotated[int, Path(alias="versionId")],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
@@ -711,8 +735,8 @@ async def apply_prompt_profile_version_controller(
         tenant_id=tenant_id,
         profile_id=profile_id,
         version_id=version_id,
-        created_by=user_id,
-        created_by_name=(
+        applied_by=user_id,
+        applied_by_name=(
             getattr(user, "nick_name", None) or getattr(user, "user_name", None)
         ),
     )
@@ -728,7 +752,7 @@ async def update_prompt_profile_version_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     version_id: Annotated[int, Path(alias="versionId")],
     request: PromptProfileVersionUpdateRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
@@ -751,7 +775,7 @@ async def update_prompt_profile_version_controller(
 async def delete_prompt_profile_version_controller(
     profile_id: Annotated[int, Path(alias="profileId")],
     version_id: Annotated[int, Path(alias="versionId")],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)

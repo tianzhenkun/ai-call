@@ -788,38 +788,12 @@ class AiCallAgentConsoleReconciler:
         task = await self._follow_up_by_id(tenant_id, follow_up_id)
         if task is None:
             raise CustomException(msg="跟进任务不存在", status_code=404)
-        attempts = list(
-            (
-                await self.db.execute(
-                    select(AiCallFollowUpAttemptModel)
-                    .where(
-                        AiCallFollowUpAttemptModel.tenant_id == tenant_id,
-                        AiCallFollowUpAttemptModel.follow_up_id == follow_up_id,
-                    )
-                    .order_by(AiCallFollowUpAttemptModel.contacted_at)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        callback_records = list(
-            (
-                await self.db.execute(
-                    select(AiCallRecordModel)
-                    .where(AiCallRecordModel.follow_up_id == follow_up_id)
-                    .order_by(AiCallRecordModel.started_at)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        await self.follow_up_service._attach_follow_up_detail(task)
+        task_payload = self.follow_up_service.follow_up_payload(task)
         return {
-            "task": self.follow_up_service.follow_up_payload(task),
-            "attempts": [self.follow_up_service.attempt_payload(attempt) for attempt in attempts],
-            "callback_records": [
-                self.follow_up_service.follow_up_record_payload(record)
-                for record in callback_records
-            ],
+            "task": task_payload,
+            "attempts": task_payload["attempts"],
+            "callback_records": task_payload["callback_records"],
         }
 
     async def _append_audit_event(

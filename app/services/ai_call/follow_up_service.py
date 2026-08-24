@@ -56,6 +56,7 @@ CLAIMABLE_UNASSIGNED_SOURCE_TYPES = {
     "ai_post_call",
     "manual_schedule",
 }
+CONNECTED_SIP_STATUSES = {"active", "answered", "connected"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1352,6 +1353,117 @@ class AiCallFollowUpService:
             follow_up_task=task,
         )
 
+    async def confirm_callback_connected(
+        self,
+        auth: AuthSchema,
+        *,
+        follow_up_id: int,
+        call_id: str,
+        payload: AgentPresenceSessionIn,
+    ) -> AiCallFollowUpAttemptModel:
+        profile, task = await self._required_owned_task(auth, follow_up_id)
+        if self.callback_factory is None:
+            raise CustomException(msg="人工回拨服务未配置", status_code=503)
+        record = await self._callback_record(
+            tenant_id=profile.tenant_id,
+            follow_up_id=task.id,
+            call_id=call_id,
+        )
+        await self._confirm_callback_connected_record(
+            profile=profile,
+            record=record,
+            console_session_id=str(payload.console_session_id),
+        )
+        attempt = await self._attempt_by_call_id(call_id)
+        assert attempt is not None
+        return attempt
+
+    async def confirm_follow_up_data_callback_connected(
+        self,
+        auth: AuthSchema,
+        *,
+        follow_up_data_id: int,
+        call_id: str,
+        payload: AgentPresenceSessionIn,
+    ) -> AiCallRecordModel:
+        profile = await self.agent_service.require_current_agent(auth)
+        record = await self.db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.tenant_id == profile.tenant_id,
+                AiCallRecordModel.follow_up_data_id == follow_up_data_id,
+                AiCallRecordModel.call_id == call_id,
+                AiCallRecordModel.operator_agent_identity == profile.agent_identity,
+                AiCallRecordModel.entry_type == "sip_callback",
+            )
+        )
+        if record is None:
+            raise CustomException(msg="人工外呼记录不存在", status_code=404)
+        return await self._confirm_callback_connected_record(
+            profile=profile,
+            record=record,
+            console_session_id=str(payload.console_session_id),
+        )
+
+    async def _confirm_callback_connected_record(
+        self,
+        *,
+        profile,
+        record: AiCallRecordModel,
+        console_session_id: str,
+    ) -> AiCallRecordModel:
+        if self.callback_factory is None:
+            raise CustomException(msg="人工回拨服务未配置", status_code=503)
+        if record.answered_at is not None:
+            return record
+        if record.status in {"completed", "failed"}:
+            self._raise_conflict("当前回拨通话已经结束", "FOLLOW_UP_STATE_CONFLICT")
+        await self._callback_presence(
+            tenant_id=profile.tenant_id,
+            agent_identity=profile.agent_identity,
+            console_session_id=console_session_id,
+            call_id=record.call_id,
+        )
+        sip_status = await self.callback_factory.get_call_status(
+            call_id=record.call_id
+        )
+        if str(sip_status or "").strip().lower() not in CONNECTED_SIP_STATUSES:
+            self._raise_conflict("客户尚未接通", "CALLBACK_NOT_CONNECTED")
+        if not await self._ensure_callback_connected(record):
+            self._raise_conflict("当前回拨通话已经结束", "FOLLOW_UP_STATE_CONFLICT")
+        return record
+
+    async def _ensure_callback_connected(self, record: AiCallRecordModel) -> bool:
+        if record.answered_at is not None:
+            return True
+        now = datetime.now(timezone.utc)
+        claimed = await self.db.scalar(
+            update(AiCallRecordModel)
+            .where(
+                AiCallRecordModel.id == record.id,
+                AiCallRecordModel.answered_at.is_(None),
+                AiCallRecordModel.status.not_in({"completed", "failed"}),
+            )
+            .values(status="running", answered_at=now)
+            .returning(AiCallRecordModel.id)
+        )
+        if claimed is None:
+            await self.db.refresh(record)
+            return record.answered_at is not None
+        record.status = "running"
+        record.answered_at = now
+        if record.follow_up_id is not None:
+            await self.record_callback_outcome(
+                call_id=record.call_id,
+                attempt_result="connected",
+            )
+        else:
+            await self._record_follow_up_data_callback_outcome(
+                call_id=record.call_id,
+                attempt_result="connected",
+            )
+        await self._start_callback_recording(record)
+        return True
+
     async def end_follow_up_data_callback(
         self,
         auth: AuthSchema,
@@ -1714,6 +1826,8 @@ class AiCallFollowUpService:
             return {"handled": False, "reason": "not_human_callback"}
 
         if event_type == "participant_joined":
+            if self._callback_sip_status(payload or {}) not in CONNECTED_SIP_STATUSES:
+                return {"handled": False, "reason": "sip_not_connected"}
             attempt_result = "connected"
         elif event_type == "participant_left":
             existing_attempt = await self._attempt_by_call_id(call_id)
@@ -1761,26 +1875,33 @@ class AiCallFollowUpService:
             if attempt_result == "technical_failure"
             else None
         )
-        if record.follow_up_id is not None:
-            existing_attempt = await self._attempt_by_call_id(call_id)
+        if attempt_result == "connected":
+            connected = await self._ensure_callback_connected(record)
+            if connected:
+                result = "connected"
+            elif record.follow_up_id is not None:
+                existing_attempt = await self._attempt_by_call_id(call_id)
+                result = (
+                    existing_attempt.attempt_result
+                    if existing_attempt is not None
+                    else self._callback_result_for_record(record)
+                )
+            else:
+                result = self._callback_result_for_record(record)
+        elif record.follow_up_id is not None:
             attempt = await self.record_callback_outcome(
                 call_id=call_id,
                 attempt_result=attempt_result,
                 ring_duration_seconds=self._callback_ring_duration(payload or {}),
                 error_message=error_message,
             )
-            if attempt_result == "connected" and existing_attempt is None:
-                await self._start_callback_recording(record)
             result = attempt.attempt_result
         else:
-            was_connected = record.answered_at is not None
             await self._record_follow_up_data_callback_outcome(
                 call_id=call_id,
                 attempt_result=attempt_result,
                 error_message=error_message,
             )
-            if attempt_result == "connected" and not was_connected:
-                await self._start_callback_recording(record)
             result = attempt_result
         return {
             "handled": True,
@@ -2916,7 +3037,7 @@ class AiCallFollowUpService:
         return f"sha256:{digest}"
 
     @staticmethod
-    def _callback_attempt_result(payload: dict) -> str | None:
+    def _callback_sip_status(payload: dict) -> str:
         participant = payload.get("participant")
         participant = participant if isinstance(participant, dict) else {}
         attributes = participant.get("attributes") or payload.get("attributes") or {}
@@ -2926,7 +3047,11 @@ class AiCallFollowUpService:
             or payload.get("sipCallStatus")
             or payload.get("sip_call_status")
         )
-        normalized = str(raw_status or "").strip().lower().replace("-", "_")
+        return str(raw_status or "").strip().lower().replace("-", "_")
+
+    @classmethod
+    def _callback_attempt_result(cls, payload: dict) -> str | None:
+        normalized = cls._callback_sip_status(payload)
         mapping = {
             "no_answer": "no_answer",
             "timeout": "no_answer",
@@ -2943,6 +3068,8 @@ class AiCallFollowUpService:
         mapped = mapping.get(normalized)
         if mapped is not None:
             return mapped
+        participant = payload.get("participant")
+        participant = participant if isinstance(participant, dict) else {}
         disconnect_reason = (
             payload.get("disconnectReason")
             or payload.get("disconnect_reason")

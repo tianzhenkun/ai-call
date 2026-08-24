@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -506,6 +507,89 @@ async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
             or 0
         )
     assert reservation_count == 0
+
+
+@pytest.mark.anyio
+async def test_owner_runtime_assigns_exception_retry_without_reopening_source_task(
+    database,
+) -> None:
+    from app.api.v1.ai_call.outbound.owner_runtime_start import (
+        OwnerRuntimeOutboundStart,
+    )
+
+    now = datetime(2026, 8, 23, 1, 0, tzinfo=timezone.utc)
+    task_id, target_id, _phone_number = await _seed_due_task(
+        database,
+        now,
+        answer_mode="web",
+    )
+    batch_id = generate_snowflake_id()
+    async with database.begin() as session:
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+        assert task is not None and target is not None
+        task.status = "COMPLETED"
+        task.completed_targets = 1
+        task.failed_targets = 1
+        task.ended_at = now
+        target.status = "RETRY_WAIT"
+        target.attempt_count = 1
+        target.latest_result = "no_answer"
+        target.next_attempt_at = now
+        target.exception_category = "no_answer"
+        target.exception_source_result = "no_answer"
+        target.exception_original_attempt_count = 1
+        target.exception_batch_id = batch_id
+        target.exception_entered_at = now
+        session.add(
+            AiCallOutboundExceptionBatchModel(
+                id=batch_id,
+                tenant_id="tenant-a",
+                category="no_answer",
+                status="RUNNING",
+                interval_days=30,
+                max_retry_count=3,
+                cutoff_at=now,
+                target_count=1,
+                idempotency_key=f"exception-{batch_id}",
+                request_fingerprint=f"{batch_id:064d}"[-64:],
+                active_slot="no_answer",
+                created_by=1,
+                started_at=now,
+                ended_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    worker_id = await _seed_ready_worker(database, now)
+    executor = OutboundTaskExecutor(
+        database,
+        RejectingDialer(),
+        now_provider=lambda: now,
+        business_timezone="UTC",
+        owner_runtime_start=OwnerRuntimeOutboundStart(
+            database_clock=lambda _session: _constant_time(now)
+        ),
+    )
+    assert await executor.run_once() == 1
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.target_id == target_id,
+            )
+        )
+        assert attempt is not None
+        lease = await DispatcherOwnerRepository(
+            session,
+            database_clock=lambda _session: _constant_time(now.replace(tzinfo=None)),
+        ).assign_initial_owner("tenant-a", attempt.call_id)
+        await session.commit()
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+
+    assert lease is not None and lease.owner_id == worker_id
+    assert task is not None and task.status == "COMPLETED"
 
 
 @pytest.mark.anyio

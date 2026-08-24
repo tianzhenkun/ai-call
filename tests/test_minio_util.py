@@ -120,6 +120,46 @@ def test_presigned_get_url_prefers_public_proxy_domain():
     assert parsed.path == "/ai-call-oss/recov/ai-call/recordings/call-1.mp3"
 
 
+@pytest.mark.anyio
+async def test_head_object_size_uses_internal_endpoint_when_public_domain_configured(
+    monkeypatch,
+) -> None:
+    requested_urls: list[str] = []
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            pass
+
+        async def head(self, url: str, **_kwargs) -> httpx.Response:
+            requested_urls.append(url)
+            return httpx.Response(
+                200,
+                headers={"content-length": "42"},
+                request=httpx.Request("HEAD", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    config = {
+        **_private_object_config(),
+        "is_https": "N",
+        "domain": "https://reach.lingchen-ai.com/ai-call-oss",
+        "endpoint": "10.77.0.1:9000",
+    }
+
+    size = await MinioUtil.head_object_size(config, "ai-call/recordings/call-1.mp3")
+
+    assert size == 42
+    assert requested_urls == [
+        "http://10.77.0.1:9000/recov/ai-call/recordings/call-1.mp3"
+    ]
+
+
 def _private_object_config() -> dict:
     return {
         "is_https": "Y",

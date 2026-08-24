@@ -63,9 +63,11 @@ def _record(
     *,
     row_id: int,
     started_at: datetime,
+    tenant_id: str = "tenant-a",
 ) -> AiCallRecordModel:
     return AiCallRecordModel(
         id=10_000 + row_id,
+        tenant_id=tenant_id,
         call_id=f"call-{row_id}",
         follow_up_id=row_id,
         entry_type="sip_outbound",
@@ -199,7 +201,7 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
                 status="pending",
                 created_at=begin,
             ),
-            _record(row_id=13, started_at=begin),
+            _record(row_id=13, started_at=begin, tenant_id="tenant-b"),
         ])
         await session.commit()
 

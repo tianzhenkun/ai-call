@@ -51,9 +51,15 @@ class MinioUtil:
         return f"{protocol}://{endpoint}/{bucket}/{object_path}"
 
     @staticmethod
-    def _endpoint_base_and_host(config: dict) -> tuple[str, str]:
+    def _endpoint_base_and_host(
+        config: dict, *, use_public_domain: bool = True
+    ) -> tuple[str, str]:
         protocol = "https" if config.get("is_https", "N") == "Y" else "http"
-        endpoint = str(config.get("domain") or config["endpoint"]).strip().rstrip("/")
+        endpoint = str(
+            (config.get("domain") or config["endpoint"])
+            if use_public_domain
+            else config["endpoint"]
+        ).strip().rstrip("/")
         if endpoint.startswith(("http://", "https://")):
             parsed = urlparse(endpoint)
             return endpoint, parsed.netloc
@@ -218,7 +224,9 @@ class MinioUtil:
         cls, config: dict, object_name: str, timeout: float = 5.0
     ) -> int | None:
         """通过 S3 HEAD 查询对象大小，用于登记外部组件已写入的文件。"""
-        endpoint_base, host = cls._endpoint_base_and_host(config)
+        endpoint_base, host = cls._endpoint_base_and_host(
+            config, use_public_domain=False
+        )
         bucket = str(config["bucket_name"]).strip("/")
         access_key = config["access_key"]
         secret_key = config["secret_key"]
@@ -399,7 +407,9 @@ class MinioUtil:
         transport: httpx.AsyncBaseTransport | None,
         now: datetime | None,
     ) -> httpx.Response:
-        endpoint_base, _ = cls._endpoint_base_and_host(config)
+        endpoint_base, _ = cls._endpoint_base_and_host(
+            config, use_public_domain=False
+        )
         bucket = str(config["bucket_name"]).strip("/")
         object_path = object_name.lstrip("/")
         access_key = config["access_key"]

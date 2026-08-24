@@ -422,20 +422,21 @@ class AiCallFollowUpDataService:
                 )
             return self._replay_adjustment(existing, fingerprint)
 
-        result = analysis.analysis_result_dict or {}
-        if not requires_classification_review(
-            analysis_status=analysis.analysis_status,
-            analysis_result=result,
-            review_status=analysis.follow_up_review_status,
-        ):
-            raise CustomException(msg="该通话无需复核或已经复核", status_code=409)
-
         data = await self.db.scalar(
             select(AiCallFollowUpDataModel).where(
                 AiCallFollowUpDataModel.tenant_id == tenant_id,
                 AiCallFollowUpDataModel.id == follow_up_data_id,
             )
         )
+        result = analysis.analysis_result_dict or {}
+        if not requires_classification_review(
+            analysis_status=analysis.analysis_status,
+            analysis_result=result,
+            review_status=analysis.follow_up_review_status,
+            current_classification=data.classification if data else None,
+        ):
+            raise CustomException(msg="该通话无需复核或已经复核", status_code=409)
+
         latest_history = await self.db.scalar(
             select(AiCallFollowUpClassificationHistoryModel)
             .where(
@@ -451,11 +452,15 @@ class AiCallFollowUpDataService:
         )
         if (
             data is None
-            or not data.suggest_review
-            or data.classification_source != "ai"
             or latest_history is None
-            or latest_history.source != "ai_auto"
             or latest_history.call_id != analysis.call_id
+            or (
+                latest_history.source != "ai_auto"
+                and not (
+                    latest_history.source == "transfer_failed"
+                    and data.classification_source == "system"
+                )
+            )
         ):
             raise CustomException(
                 msg="分类已被后续通话或人工更新，请刷新后查看",
@@ -533,6 +538,30 @@ class AiCallFollowUpDataService:
                     "errorCode": "VERSION_CONFLICT",
                     "currentVersion": data.version,
                 },
+            )
+        latest_history = await self.db.scalar(
+            select(AiCallFollowUpClassificationHistoryModel)
+            .where(
+                AiCallFollowUpClassificationHistoryModel.tenant_id == tenant_id,
+                AiCallFollowUpClassificationHistoryModel.follow_up_data_id
+                == follow_up_data_id,
+            )
+            .order_by(
+                AiCallFollowUpClassificationHistoryModel.created_at.desc(),
+                AiCallFollowUpClassificationHistoryModel.id.desc(),
+            )
+            .limit(1)
+        )
+        if (
+            data.suggest_review
+            and latest_history is not None
+            and latest_history.ai_suggested_classification
+            and latest_history.ai_suggested_classification != data.classification
+        ):
+            raise CustomException(
+                msg="AI 建议分类与当前业务分类不一致，请先完成分类复核",
+                status_code=409,
+                data={"errorCode": "CLASSIFICATION_REVIEW_REQUIRED"},
             )
         if data.classification not in {"interested", "nurturing"}:
             raise CustomException(
@@ -1001,16 +1030,24 @@ class AiCallFollowUpDataService:
             return data
 
         from_classification = None if created_here else data.classification
-        protected = data.classification_source in PROTECTED_CLASSIFICATION_SOURCES
+        classification_conflict = bool(
+            not created_here
+            and data.classification
+            and data.classification != classification
+        )
+        protected = (
+            data.classification_source in PROTECTED_CLASSIFICATION_SOURCES
+            or classification_conflict
+        )
         if not protected:
             data.classification = classification
             data.classification_reason = result["reason"]
             data.classification_source = "ai"
             data.classification_confidence = result.get("confidence") or "low"
-            data.suggest_review = self._suggest_review(result)
             data.low_value_reason = result.get("low_value_reason")
             data.classification_updated_at = now
             data.classification_updated_by = "ai"
+        data.suggest_review = self._suggest_review(result) or classification_conflict
         data.latest_conclusion = result.get("summary") or None
         data.last_contact_at = record.ended_at or record.started_at
         data.updated_at = now

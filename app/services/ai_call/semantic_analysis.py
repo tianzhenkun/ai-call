@@ -1839,11 +1839,16 @@ class AiCallSemanticAnalysisService:
         )
 
     @staticmethod
-    def analysis_to_dict(analysis: AiCallSemanticAnalysisModel) -> dict[str, Any]:
+    def analysis_to_dict(
+        analysis: AiCallSemanticAnalysisModel,
+        *,
+        current_classification: str | None = None,
+    ) -> dict[str, Any]:
         classification_requires_review = requires_classification_review(
             analysis_status=analysis.analysis_status,
             analysis_result=analysis.analysis_result_dict,
             review_status=analysis.follow_up_review_status,
+            current_classification=current_classification,
         )
         return {
             "id": str(analysis.id),

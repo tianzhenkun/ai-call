@@ -402,16 +402,27 @@ class OutboundRuleTaskService:
             if request.execution_mode == "scheduled"
             else None
         )
-        prompt_version = await db.scalar(
-            select(AiCallPromptProfileVersionModel)
-            .where(
-                AiCallPromptProfileVersionModel.tenant_id == tenant_id,
-                AiCallPromptProfileVersionModel.profile_id == prompt.id,
-                AiCallPromptProfileVersionModel.deleted_at.is_(None),
+        prompt_version = None
+        if prompt.current_version_id is not None:
+            prompt_version = await db.scalar(
+                select(AiCallPromptProfileVersionModel).where(
+                    AiCallPromptProfileVersionModel.id == prompt.current_version_id,
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id == prompt.id,
+                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
+                )
             )
-            .order_by(AiCallPromptProfileVersionModel.version_no.desc())
-            .limit(1)
-        )
+        if prompt_version is None:
+            prompt_version = await db.scalar(
+                select(AiCallPromptProfileVersionModel)
+                .where(
+                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
+                    AiCallPromptProfileVersionModel.profile_id == prompt.id,
+                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
+                )
+                .order_by(AiCallPromptProfileVersionModel.version_no.desc())
+                .limit(1)
+            )
         knowledge_snapshot = await self._freeze_knowledge(
             db,
             tenant_id=tenant_id,
@@ -1324,7 +1335,11 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return (
+                datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+                .replace(tzinfo=ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE))
+                .astimezone(timezone.utc)
+            )
         except ValueError as exc:
             raise CustomException(
                 msg="时间格式必须为 YYYY-MM-DD HH:mm:ss",
@@ -1333,16 +1348,16 @@ class OutboundRuleTaskService:
 
     @staticmethod
     def _format_datetime(value: datetime | None) -> str | None:
-        return value.strftime("%Y-%m-%d %H:%M:%S") if value else None
-
-    @staticmethod
-    def _format_business_datetime(value: datetime | None) -> str | None:
         if value is None:
             return None
         aware_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
         return aware_value.astimezone(
             ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)
         ).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _format_business_datetime(value: datetime | None) -> str | None:
+        return OutboundRuleTaskService._format_datetime(value)
 
     @staticmethod
     def _load_list(value: str) -> list:

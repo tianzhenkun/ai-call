@@ -750,6 +750,20 @@ class PromptProfileVersionDetailOut(PromptProfileVersionOut):
     snapshot: dict[str, Any]
 
 
+class PromptProfileVersionApplicationOut(AiCallBaseSchema):
+    id: str
+    profile_id: str
+    from_version_id: str | None = None
+    from_version_no: int | None = None
+    from_version_name: str | None = None
+    to_version_id: str
+    to_version_no: int
+    to_version_name: str
+    applied_by: str | None = None
+    applied_by_name: str | None = None
+    applied_at: datetime
+
+
 class PromptProfileVersionUpdateRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 

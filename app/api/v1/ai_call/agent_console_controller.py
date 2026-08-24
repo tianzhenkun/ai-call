@@ -773,6 +773,33 @@ async def start_follow_up_data_call_controller(
 
 
 @AgentConsoleRouter.post(
+    "/follow-ups/{follow_up_id}/call/{call_id}/connected",
+    summary="确认浏览器人工回拨已接通",
+)
+async def confirm_follow_up_call_connected_controller(
+    follow_up_id: int,
+    call_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    attempt = await service.confirm_callback_connected(
+        auth,
+        follow_up_id=follow_up_id,
+        call_id=call_id,
+        payload=payload,
+    )
+    await _publish(
+        auth,
+        "follow_up.callback_connected",
+        {"follow_up_id": str(follow_up_id), "call_id": call_id},
+    )
+    return SuccessResponse(
+        data={"call_id": call_id, "attempt_result": attempt.attempt_result}
+    )
+
+
+@AgentConsoleRouter.post(
     "/follow-ups/{follow_up_id}/call/{call_id}/end",
     summary="结束浏览器人工回拨",
 )
@@ -796,6 +823,34 @@ async def end_follow_up_call_controller(
     )
     return SuccessResponse(
         data={"call_id": call_id, "status": record.status, "end_reason": record.end_reason}
+    )
+
+
+@AgentConsoleRouter.post(
+    "/follow-up-data/{follow_up_data_id}/call/{call_id}/connected",
+    summary="确认跟进数据人工外呼已接通",
+    dependencies=[Depends(get_ai_call_manager)],
+)
+async def confirm_follow_up_data_call_connected_controller(
+    follow_up_data_id: int,
+    call_id: str,
+    payload: AgentPresenceSessionIn,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
+):
+    record = await service.confirm_follow_up_data_callback_connected(
+        auth,
+        follow_up_data_id=follow_up_data_id,
+        call_id=call_id,
+        payload=payload,
+    )
+    await _publish(
+        auth,
+        "follow_up.callback_connected",
+        {"follow_up_data_id": str(follow_up_data_id), "call_id": call_id},
+    )
+    return SuccessResponse(
+        data={"call_id": call_id, "status": record.status}
     )
 
 

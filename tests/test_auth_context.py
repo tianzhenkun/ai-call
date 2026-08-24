@@ -18,6 +18,7 @@ from app.core.dependencies import (
     get_current_user,
     get_knowledge_manager,
     get_knowledge_viewer,
+    get_prompt_manager,
     get_voice_manager,
 )
 from app.core.exceptions import CustomException
@@ -222,6 +223,7 @@ def test_voice_manager_preserves_development_fallback(monkeypatch) -> None:
     (
         (get_ai_call_manager, "ai_call:agent:manage"),
         (get_ai_call_console, "ai_call:agent:console"),
+        (get_prompt_manager, "ai_call:prompt:manage"),
     ),
 )
 def test_ai_call_agent_permissions_default_to_deny(
@@ -241,7 +243,9 @@ def test_ai_call_agent_permissions_default_to_deny(
     assert asyncio.run(dependency(allowed)) is allowed
 
 
-@pytest.mark.parametrize("dependency", (get_ai_call_manager, get_ai_call_console))
+@pytest.mark.parametrize(
+    "dependency", (get_ai_call_manager, get_ai_call_console, get_prompt_manager)
+)
 def test_ai_call_agent_permissions_allow_superuser(monkeypatch, dependency) -> None:
     monkeypatch.setattr(settings, "JWT_ENABLE", True)
     superuser = UserModel(

@@ -142,6 +142,13 @@ class HumanOnlySipSessionFactory:
             f"sip-{call_id}",
         )
 
+    async def get_call_status(self, *, call_id: str) -> str | None:
+        fact = await self.room_manager.get_participant_media(
+            f"ai-call-{call_id}",
+            f"sip-{call_id}",
+        )
+        return fact.sip_call_status if fact else None
+
 
 class LiveKitSipClient:
     def __init__(

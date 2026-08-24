@@ -9,6 +9,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
@@ -23,6 +24,7 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffModel,
     AiCallPromptCommonConfigModel,
     AiCallPromptProfileModel,
+    AiCallPromptProfileVersionApplicationModel,
     AiCallPromptProfileVersionModel,
     AiCallQualityReviewModel,
     AiCallQualityScoreModel,
@@ -794,6 +796,28 @@ class AiCallRecordRepository:
         call_ids = [record.call_id for record in records]
         if not call_ids:
             return
+        follow_up_data_ids = [
+            record.follow_up_data_id
+            for record in records
+            if record.follow_up_data_id is not None
+        ]
+        classifications_by_data_id = {}
+        if follow_up_data_ids:
+            classification_rows = (
+                await self.db.execute(
+                    select(
+                        AiCallFollowUpDataModel.id,
+                        AiCallFollowUpDataModel.classification,
+                    ).where(AiCallFollowUpDataModel.id.in_(follow_up_data_ids))
+                )
+            ).all()
+            classifications_by_data_id = {
+                row.id: row.classification for row in classification_rows
+            }
+        current_classification_by_call_id = {
+            record.call_id: classifications_by_data_id.get(record.follow_up_data_id)
+            for record in records
+        }
         analysis_rows = (
             await self.db.execute(
                 select(
@@ -826,6 +850,9 @@ class AiCallRecordRepository:
                 analysis_status=row.analysis_status,
                 analysis_result=analysis_result,
                 review_status=row.follow_up_review_status,
+                current_classification=current_classification_by_call_id.get(
+                    row.call_id
+                ),
             )
             analysis_by_call_id[row.call_id] = {
                 "analysisStatus": row.analysis_status,
@@ -2396,6 +2423,79 @@ class AiCallRecordRepository:
         await self.db.refresh(version)
         return version
 
+    async def create_prompt_profile_version_application(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        from_version_id: int | None,
+        to_version_id: int,
+        applied_by: int | None,
+        applied_by_name: str | None,
+    ) -> AiCallPromptProfileVersionApplicationModel:
+        application = AiCallPromptProfileVersionApplicationModel(
+            id=generate_snowflake_id(),
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            from_version_id=from_version_id,
+            to_version_id=to_version_id,
+            applied_by=applied_by,
+            applied_by_name=applied_by_name,
+            applied_at=datetime.now(timezone.utc),
+        )
+        self.db.add(application)
+        await self.db.flush()
+        return application
+
+    async def list_prompt_profile_version_applications(
+        self,
+        *,
+        tenant_id: str,
+        profile_id: int,
+    ) -> list[tuple]:
+        from_version = aliased(AiCallPromptProfileVersionModel)
+        to_version = aliased(AiCallPromptProfileVersionModel)
+        result = await self.db.execute(
+            select(
+                AiCallPromptProfileVersionApplicationModel,
+                from_version.version_no,
+                from_version.version_name,
+                to_version.version_no,
+                to_version.version_name,
+            )
+            .outerjoin(
+                from_version,
+                and_(
+                    from_version.id
+                    == AiCallPromptProfileVersionApplicationModel.from_version_id,
+                    from_version.tenant_id
+                    == AiCallPromptProfileVersionApplicationModel.tenant_id,
+                    from_version.profile_id
+                    == AiCallPromptProfileVersionApplicationModel.profile_id,
+                ),
+            )
+            .join(
+                to_version,
+                and_(
+                    to_version.id
+                    == AiCallPromptProfileVersionApplicationModel.to_version_id,
+                    to_version.tenant_id
+                    == AiCallPromptProfileVersionApplicationModel.tenant_id,
+                    to_version.profile_id
+                    == AiCallPromptProfileVersionApplicationModel.profile_id,
+                ),
+            )
+            .where(
+                AiCallPromptProfileVersionApplicationModel.tenant_id == tenant_id,
+                AiCallPromptProfileVersionApplicationModel.profile_id == profile_id,
+            )
+            .order_by(
+                AiCallPromptProfileVersionApplicationModel.applied_at.desc(),
+                AiCallPromptProfileVersionApplicationModel.id.desc(),
+            )
+        )
+        return list(result.tuples().all())
+
     async def list_prompt_profile_versions(
         self,
         *,
@@ -2421,19 +2521,40 @@ class AiCallRecordRepository:
     ) -> dict[int, tuple[int, int]]:
         if not profile_ids:
             return {}
+        version = aliased(AiCallPromptProfileVersionModel)
+        current_version = aliased(AiCallPromptProfileVersionModel)
         rows = (
             await self.db.execute(
                 select(
-                    AiCallPromptProfileVersionModel.profile_id,
-                    func.max(AiCallPromptProfileVersionModel.version_no),
-                    func.count(AiCallPromptProfileVersionModel.id),
+                    AiCallPromptProfileModel.id,
+                    func.coalesce(
+                        current_version.version_no,
+                        func.max(version.version_no),
+                    ),
+                    func.count(version.id),
+                )
+                .join(
+                    version,
+                    and_(
+                        version.tenant_id == AiCallPromptProfileModel.tenant_id,
+                        version.profile_id == AiCallPromptProfileModel.id,
+                        version.deleted_at.is_(None),
+                    ),
+                )
+                .outerjoin(
+                    current_version,
+                    and_(
+                        current_version.id == AiCallPromptProfileModel.current_version_id,
+                        current_version.tenant_id == AiCallPromptProfileModel.tenant_id,
+                        current_version.profile_id == AiCallPromptProfileModel.id,
+                        current_version.deleted_at.is_(None),
+                    ),
                 )
                 .where(
-                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
-                    AiCallPromptProfileVersionModel.profile_id.in_(profile_ids),
-                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
+                    AiCallPromptProfileModel.tenant_id == tenant_id,
+                    AiCallPromptProfileModel.id.in_(profile_ids),
                 )
-                .group_by(AiCallPromptProfileVersionModel.profile_id)
+                .group_by(AiCallPromptProfileModel.id, current_version.version_no)
             )
         ).all()
         return {

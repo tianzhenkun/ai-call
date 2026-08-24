@@ -1869,6 +1869,11 @@ class AiCallPromptProfileModel(MappedBase):
         nullable=True,
         comment="固定开场白",
     )
+    current_version_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="当前使用版本ID",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -1939,6 +1944,39 @@ class AiCallPromptProfileVersionModel(MappedBase):
     created_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AiCallPromptProfileVersionApplicationModel(MappedBase):
+    """AI Call 场景提示词版本切换审计。"""
+
+    __tablename__ = "ai_call_prompt_profile_version_application"
+    __table_args__ = (
+        Index(
+            "idx_ai_call_prompt_version_apply_profile_time",
+            "tenant_id",
+            "profile_id",
+            "applied_at",
+        ),
+        {"comment": "AI Call 场景提示词版本切换审计表"},
+    )
+    __permission_strategy__ = None
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    tenant_id: Mapped[str] = mapped_column(String(20), nullable=False, comment="租户ID")
+    profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="场景配置ID")
+    from_version_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="切换前版本ID",
+    )
+    to_version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        comment="切换后版本ID",
+    )
+    applied_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    applied_by_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AiCallVoiceProfileModel(MappedBase):

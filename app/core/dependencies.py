@@ -303,6 +303,18 @@ async def get_knowledge_manager(
     return auth
 
 
+async def get_prompt_manager(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if auth.user and getattr(auth.user, "is_superuser", False):
+        return auth
+
+    allowed_permissions = {"ai_call:prompt:manage", "*:*:*"}
+    if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
+        raise CustomException(msg="无权限操作", code=10403, status_code=403)
+    return auth
+
+
 class AuthPermission:
     """权限验证类"""
 

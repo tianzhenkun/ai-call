@@ -22,6 +22,7 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
@@ -109,6 +110,7 @@ async def _seed_management_rows(session_factory) -> datetime:
             ),
             AiCallRecordModel(
                 id=100,
+                tenant_id="tenant-a",
                 call_id="call-1",
                 business_type="lead",
                 business_id="lead-1",
@@ -138,6 +140,31 @@ async def _seed_management_rows(session_factory) -> datetime:
                 accepted_at=now - timedelta(seconds=15),
                 connected_at=now - timedelta(seconds=10),
                 expires_at=now + timedelta(seconds=40),
+            ),
+            AiCallOutboundTaskModel(
+                id=300,
+                tenant_id="tenant-a",
+                validation_id=301,
+                idempotency_key="management-task",
+                request_fingerprint="management-task-fingerprint",
+                task_name="管理端回归任务",
+                task_mode="single",
+                status="COMPLETED",
+                total_targets=1,
+                completed_targets=1,
+                connected_targets=1,
+                failed_targets=0,
+                execution_mode="immediate",
+                prompt_name="智能外呼介绍",
+                scene_code="intro_contract",
+                voice="Tina",
+                rule_id=1,
+                rule_name="工作日规则",
+                rule_summary="全天",
+                config_snapshot_json="{}",
+                created_by=1,
+                created_at=now,
+                updated_at=now,
             ),
             AiCallOutboundTargetModel(
                 id=400,
@@ -305,6 +332,9 @@ async def test_admin_queries_return_metrics_details_and_string_ids(
         assert follow_ups["rows"][0]["latest_attempt"]["id"] == "301"
         follow_up_detail = await service.get_follow_up_detail(auth, 300)
         assert follow_up_detail["task"]["id"] == "300"
+        assert follow_up_detail["task"]["customer_name"] == "刘先生"
+        assert follow_up_detail["task"]["task_name"] == "管理端回归任务"
+        assert follow_up_detail["task"]["source_record"]["call_id"] == "call-1"
         assert follow_up_detail["attempts"][0]["attempt_result"] == "no_answer"
 
 
