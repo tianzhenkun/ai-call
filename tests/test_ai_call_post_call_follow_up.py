@@ -1142,7 +1142,7 @@ async def test_ai_classification_updates_follow_up_data_without_creating_task(
         assert protected is not None
         assert protected.classification == "interested"
         assert protected.classification_source == "human"
-        assert protected.suggest_review is False
+        assert protected.suggest_review is True
         assert protected.latest_conclusion == "客户本次表示暂时不考虑。"
         histories = list(
             (

@@ -422,7 +422,9 @@ def _safe_exception_details(exc: Exception) -> dict[str, str]:
             safe_message,
             maxsplit=1,
         )[0].strip()
-        if status_match and provider_reason:
+        if "sip request timed out" in safe_message.casefold():
+            details["providerReason"] = "线路无响应（SIP 请求超时）"
+        elif status_match and provider_reason:
             details["providerReason"] = provider_reason
     return details
 

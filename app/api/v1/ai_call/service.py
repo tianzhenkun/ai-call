@@ -171,7 +171,7 @@ class AiCallService:
                     status_code=400,
                 )
 
-        resolved_voice = await self._resolve_voice(voice)
+        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id)
         call_id = f"call_{generate_snowflake_id()}"
         room_name = f"ai-call-{call_id}"
         participant_identity = f"browser-{call_id}"
@@ -258,7 +258,7 @@ class AiCallService:
             callee_phone_number_masked=callee_phone_number_masked,
         )
 
-        resolved_voice = await self._resolve_voice(voice)
+        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id)
         resolved_call_id = call_id or f"call_{generate_snowflake_id()}"
         room_name = f"ai-call-{resolved_call_id}"
         participant_identity = f"sip-{resolved_call_id}"
@@ -372,7 +372,7 @@ class AiCallService:
                     resolved_call_id,
                     end_reason=exc.error_id,
                     failure_stage=self._failure_stage_for_end_reason(exc.error_id),
-                    failure_message=exc.msg,
+                    failure_message=str(exc.details.get("providerReason") or exc.msg),
                 )
             raise self._to_custom_exception(exc) from exc
 
@@ -2357,7 +2357,12 @@ class AiCallService:
             raise CustomException(msg="提示词组装服务未启用", code=RET.ERROR.code, status_code=500)
         return self.prompt_composer
 
-    async def _resolve_voice(self, voice: str | None) -> str | None:
+    async def _resolve_voice(
+        self,
+        voice: str | None,
+        *,
+        tenant_id: str | None = None,
+    ) -> str | None:
         normalized_voice = _strip_or_none(voice)
         if not normalized_voice:
             return None
@@ -2368,6 +2373,12 @@ class AiCallService:
             voice=normalized_voice,
             target_model=target_model,
         )
+        if profile is None and tenant_id:
+            profile = await repository.get_enabled_tenant_voice_profile_by_voice(
+                tenant_id=tenant_id,
+                voice=normalized_voice,
+                target_model=target_model,
+            )
         if profile is None:
             raise CustomException(
                 msg="音色不存在或不适用于当前模型",

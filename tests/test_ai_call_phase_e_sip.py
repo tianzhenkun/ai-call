@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.schema import CreateSipSessionRequest
 from app.api.v1.ai_call.service import AiCallService
+from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import Settings, settings
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
@@ -396,10 +398,12 @@ def build_service_with_failing_sip_client() -> tuple[
             error_id="sip_create_participant_failed",
             msg="LiveKit SIP Participant 创建失败",
             status_code=502,
-            details={
-                "rawErrorType": "TwirpError",
-                "rawErrorMessage": "callee already has an active SIP call",
-            },
+            details=livekit_sip_module._safe_exception_details(
+                RuntimeError(
+                    "TwirpError(code=canceled, message=twirp error unknown: "
+                    "sip request timed out, status=408)"
+                )
+            ),
         )
     )
     service = AiCallService(
@@ -739,6 +743,18 @@ def test_sip_sdk_error_details_extract_provider_diagnostics() -> None:
     assert details["hangupCause"] == "USER_BUSY"
 
 
+def test_sip_sdk_request_timeout_remains_a_technical_line_failure() -> None:
+    details = livekit_sip_module._safe_exception_details(
+        RuntimeError(
+            "TwirpError(code=canceled, message=twirp error unknown: "
+            "sip request timed out, status=408)"
+        )
+    )
+
+    assert details["providerReason"] == "线路无响应（SIP 请求超时）"
+    assert "providerStatusCode" not in details
+
+
 @pytest.mark.anyio
 async def test_livekit_sip_client_raises_aicall_error_when_preflight_fails() -> None:
     client = LiveKitSipClient(
@@ -840,6 +856,69 @@ async def test_create_sip_session_reuses_room_agent_prompt_and_records_sip_event
         "ringingTimeoutSeconds": 30,
     }
     assert sip_answered.source == "sip"
+
+
+@pytest.mark.anyio
+async def test_create_sip_session_accepts_enabled_tenant_voice() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    try:
+        async with session_maker() as db:
+            db.add(
+                AiCallTenantVoiceProfileModel(
+                    id=1,
+                    tenant_id="tenant-a",
+                    display_name="租户音色",
+                    voice="tenant-voice",
+                    voice_type="自定义复刻",
+                    gender="女声",
+                    language="zh-CN",
+                    target_model="qwen3.5-omni-plus-realtime",
+                    provider="dashscope",
+                    status="ENABLED",
+                    created_by=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await db.commit()
+
+        async with session_maker() as db:
+            room_manager = FakeLiveKitRoomManager()
+            agent_runner = CapturingAgentRunner()
+            repository = AiCallRecordRepository(db)
+            service = AiCallService(
+                AiCallOrchestrator(
+                    config=build_runtime_config(),
+                    livekit_room_manager=room_manager,
+                    agent_runner=agent_runner,
+                    registry=InMemorySessionRegistry(),
+                    event_store=InMemoryEventStore(),
+                ),
+                record_service=AiCallRecordService(repository),
+                prompt_repository=repository,
+                sip_client=FakeSipClient(),
+                prompt_resolver=FakePromptResolver(),
+                prompt_composer=PromptComposer(handoff_component_enabled=True),
+            )
+
+            result = await service.create_sip_session(
+                tenant_id="tenant-a",
+                callee_phone_number="13800000000",
+                voice="tenant-voice",
+                scene_code="intro_geo",
+            )
+
+            assert result.effective_config.voice == "tenant-voice"
+            assert agent_runner.started_sessions[0].effective_config.voice == "tenant-voice"
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(MappedBase.metadata.drop_all)
+        await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -1395,6 +1474,7 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
     failed = record_service.failed_sessions[0]
     assert failed["end_reason"] == "sip_create_participant_failed"
     assert failed["failure_stage"] == "sip"
+    assert failed["failure_message"] == "线路无响应（SIP 请求超时）"
     assert service.orchestrator.livekit_room_manager.deleted_rooms == [
         f"ai-call-{failed['call_id']}"
     ]
@@ -1412,8 +1492,12 @@ async def test_create_sip_session_marks_failed_when_sip_participant_creation_fai
         "message": "LiveKit SIP Participant 创建失败",
         "calleePhoneNumberMasked": "138****0000",
         "calleePhoneNumberHash": _callee_hash("13800000000"),
-        "rawErrorType": "TwirpError",
-        "rawErrorMessage": "callee already has an active SIP call",
+        "rawErrorType": "RuntimeError",
+        "rawErrorMessage": (
+            "TwirpError(code=canceled, message=twirp error unknown: "
+            "sip request timed out, status=408)"
+        ),
+        "providerReason": "线路无响应（SIP 请求超时）",
     }
 
 

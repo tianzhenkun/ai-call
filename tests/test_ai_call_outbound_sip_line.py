@@ -45,6 +45,10 @@ def _line_request(
     payload = {
         "lineCode": line_code,
         "lineName": f"线路 {line_code}",
+        "description": "用于正式营销外呼",
+        "unitPrice": "0.1250",
+        "purpose": "新客户邀约",
+        "expiresAt": "2027-12-31",
         "enabled": True,
         "adapterType": "livekit_sip",
         "routeMode": route_mode,
@@ -116,6 +120,10 @@ def test_sip_line_model_is_tenant_scoped_without_secrets_or_foreign_keys() -> No
         "tenant_id",
         "line_code",
         "line_name",
+        "description",
+        "unit_price",
+        "purpose",
+        "expires_at",
         "enabled",
         "default_marker",
         "adapter_type",
@@ -183,6 +191,10 @@ def test_sip_line_migration_adds_line_and_attempt_diagnostics() -> None:
     assert "create table if not exists ai_call_sip_line" in migration
     assert "add column if not exists line_id" in migration
     assert "add column if not exists provider_status_code" in migration
+    assert "add column if not exists description varchar(500)" in migration
+    assert "add column if not exists unit_price numeric(12,4)" in migration
+    assert "add column if not exists purpose varchar(200)" in migration
+    assert "add column if not exists expires_at date" in migration
     assert "uk_ai_call_sip_line_tenant_default" in migration
     assert "jsonb" not in migration
 
@@ -191,6 +203,10 @@ def test_sip_line_schema_validates_route_and_exposes_no_credentials() -> None:
     inline = _line_request("inline-a")
     assert inline.trunk_id is None
     assert inline.proxy_host == "127.0.0.1"
+    assert inline.description == "用于正式营销外呼"
+    assert str(inline.unit_price) == "0.1250"
+    assert inline.purpose == "新客户邀约"
+    assert inline.expires_at.isoformat() == "2027-12-31"
 
     managed = _line_request("managed-a", route_mode="managed_trunk_id")
     assert managed.trunk_id == "ST_test"
@@ -200,6 +216,11 @@ def test_sip_line_schema_validates_route_and_exposes_no_credentials() -> None:
     invalid_payload["trunkId"] = "ST_conflict"
     with pytest.raises(ValidationError, match="内联线路"):
         SipLineIn.model_validate(invalid_payload)
+
+    with pytest.raises(ValidationError):
+        SipLineIn.model_validate({**invalid_payload, "description": "x" * 501})
+    with pytest.raises(ValidationError):
+        SipLineIn.model_validate({**invalid_payload, "unitPrice": "0.12345"})
 
     assert "password" not in SipLineIn.model_fields
     assert "secret" not in SipLineIn.model_fields
@@ -414,6 +435,10 @@ async def test_sip_line_api_crud_is_tenant_isolated_and_hides_credentials(databa
         line = created.json()["data"]
         line_id = line["lineId"]
         assert line["healthStatus"] == "UNKNOWN"
+        assert line["description"] == "用于正式营销外呼"
+        assert line["unitPrice"] == "0.1250"
+        assert line["purpose"] == "新客户邀约"
+        assert line["expiresAt"] == "2027-12-31"
         assert "password" not in str(line).lower()
         assert "secret" not in str(line).lower()
 
@@ -425,13 +450,24 @@ async def test_sip_line_api_crud_is_tenant_isolated_and_hides_credentials(databa
         assert listed.json()["total"] == 1
         assert listed.json()["rows"][0]["lineId"] == line_id
 
-        renamed_payload = {**payload, "lineName": "正式线路"}
+        renamed_payload = {
+            **payload,
+            "lineName": "正式线路",
+            "description": "用于售后回访",
+            "unitPrice": "0.3000",
+            "purpose": "售后回访",
+            "expiresAt": "2028-06-30",
+        }
         updated = client.put(
             f"/ai-call/outbound-lines/{line_id}",
             json=renamed_payload,
         )
         assert updated.status_code == 200
         assert updated.json()["data"]["lineName"] == "正式线路"
+        assert updated.json()["data"]["description"] == "用于售后回访"
+        assert updated.json()["data"]["unitPrice"] == "0.3000"
+        assert updated.json()["data"]["purpose"] == "售后回访"
+        assert updated.json()["data"]["expiresAt"] == "2028-06-30"
 
         defaulted = client.post(
             f"/ai-call/outbound-lines/{line_id}/set-default"

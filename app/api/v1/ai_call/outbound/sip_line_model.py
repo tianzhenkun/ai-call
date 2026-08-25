@@ -1,8 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import MappedBase
@@ -55,6 +66,26 @@ class AiCallSipLineModel(MappedBase):
         String(100),
         nullable=False,
         comment="线路名称",
+    )
+    description: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="线路描述",
+    )
+    unit_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4),
+        nullable=True,
+        comment="线路单价，单位元/分钟",
+    )
+    purpose: Mapped[str | None] = mapped_column(
+        String(200),
+        nullable=True,
+        comment="线路用途",
+    )
+    expires_at: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+        comment="线路到期日期",
     )
     enabled: Mapped[bool] = mapped_column(
         Boolean,

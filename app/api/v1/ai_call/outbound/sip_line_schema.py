@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -20,6 +21,15 @@ LineAuthMode = Literal["managed_trunk", "ip_allowlist"]
 class SipLineIn(OutboundSchema):
     line_code: str = Field(min_length=1, max_length=64)
     line_name: str = Field(min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    unit_price: Decimal | None = Field(
+        default=None,
+        ge=0,
+        max_digits=12,
+        decimal_places=4,
+    )
+    purpose: str | None = Field(default=None, max_length=200)
+    expires_at: date | None = None
     enabled: bool = True
     adapter_type: Literal["livekit_sip"] = "livekit_sip"
     route_mode: LineRouteMode
@@ -46,6 +56,14 @@ class SipLineIn(OutboundSchema):
         if value is None:
             return None
         return str(value).strip()
+
+    @field_validator("description", "purpose", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     @model_validator(mode="after")
     def validate_route(self) -> SipLineIn:
@@ -79,6 +97,10 @@ class SipLineSnapshot(OutboundSchema):
 
 
 class SipLineOut(SipLineSnapshot):
+    description: str | None = None
+    unit_price: Decimal | None = None
+    purpose: str | None = None
+    expires_at: date | None = None
     enabled: bool
     is_default: bool
     health_status: LineHealthStatus

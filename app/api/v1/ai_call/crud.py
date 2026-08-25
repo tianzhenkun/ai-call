@@ -41,6 +41,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.services.ai_call.classification_review import requires_classification_review
 from app.utils.id_util import generate_snowflake_id
 
@@ -2676,6 +2677,23 @@ class AiCallRecordRepository:
             select(AiCallVoiceProfileModel).where(
                 AiCallVoiceProfileModel.voice == voice,
                 AiCallVoiceProfileModel.target_model == target_model,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_enabled_tenant_voice_profile_by_voice(
+        self,
+        *,
+        tenant_id: str,
+        voice: str,
+        target_model: str,
+    ) -> AiCallTenantVoiceProfileModel | None:
+        result = await self.db.execute(
+            select(AiCallTenantVoiceProfileModel).where(
+                AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                AiCallTenantVoiceProfileModel.voice == voice,
+                AiCallTenantVoiceProfileModel.target_model == target_model,
+                AiCallTenantVoiceProfileModel.status == "ENABLED",
             )
         )
         return result.scalar_one_or_none()

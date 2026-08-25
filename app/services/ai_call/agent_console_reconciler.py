@@ -579,6 +579,7 @@ class AiCallAgentConsoleReconciler:
         status: str | None = None,
         source_type: str | None = None,
         scene_code: str | None = None,
+        task_id: int | None = None,
         formal_outbound_only: bool = False,
         source_started_at_begin: datetime | None = None,
         source_started_at_end: datetime | None = None,
@@ -620,6 +621,7 @@ class AiCallAgentConsoleReconciler:
             )
         if (
             formal_outbound_only
+            or task_id is not None
             or source_started_at_begin is not None
             or source_started_at_end is not None
         ):
@@ -634,7 +636,7 @@ class AiCallAgentConsoleReconciler:
             if source_started_at_end is not None:
                 record_conditions.append(AiCallRecordModel.started_at < source_started_at_end)
             record_stmt = select(AiCallRecordModel.id)
-            if formal_outbound_only:
+            if formal_outbound_only or task_id is not None:
                 record_stmt = (
                     record_stmt
                     .join(
@@ -666,6 +668,8 @@ class AiCallAgentConsoleReconciler:
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
                     AiCallRecordModel.entry_type == "sip_outbound",
                 ])
+                if task_id is not None:
+                    record_conditions.append(AiCallOutboundAttemptModel.task_id == task_id)
             source_scope = record_stmt.where(*record_conditions).exists()
             filtered_stmt = filtered_stmt.where(source_scope)
             if formal_outbound_only:

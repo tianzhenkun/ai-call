@@ -361,6 +361,10 @@ class SipLineService:
     def line_out(self, line: AiCallSipLineModel) -> SipLineOut:
         return SipLineOut(
             **self.snapshot(line).model_dump(),
+            description=line.description,
+            unit_price=line.unit_price,
+            purpose=line.purpose,
+            expires_at=line.expires_at,
             enabled=line.enabled,
             is_default=line.default_marker == DEFAULT_MARKER,
             health_status=line.health_status,

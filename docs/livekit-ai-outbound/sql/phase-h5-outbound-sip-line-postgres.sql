@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS ai_call_sip_line (
     tenant_id varchar(64) NOT NULL,
     line_code varchar(64) NOT NULL,
     line_name varchar(100) NOT NULL,
+    description varchar(500),
+    unit_price numeric(12,4),
+    purpose varchar(200),
+    expires_at date,
     enabled boolean NOT NULL DEFAULT true,
     default_marker varchar(32),
     adapter_type varchar(32) NOT NULL,
@@ -43,6 +47,15 @@ CREATE INDEX IF NOT EXISTS idx_ai_call_sip_line_tenant_enabled
     ON ai_call_sip_line (tenant_id, deleted, enabled, updated_at);
 CREATE INDEX IF NOT EXISTS idx_ai_call_sip_line_tenant_id
     ON ai_call_sip_line (tenant_id, id);
+
+ALTER TABLE ai_call_sip_line
+    ADD COLUMN IF NOT EXISTS description varchar(500);
+ALTER TABLE ai_call_sip_line
+    ADD COLUMN IF NOT EXISTS unit_price numeric(12,4);
+ALTER TABLE ai_call_sip_line
+    ADD COLUMN IF NOT EXISTS purpose varchar(200);
+ALTER TABLE ai_call_sip_line
+    ADD COLUMN IF NOT EXISTS expires_at date;
 
 ALTER TABLE ai_call_outbound_validation
     ADD COLUMN IF NOT EXISTS line_id bigint;
