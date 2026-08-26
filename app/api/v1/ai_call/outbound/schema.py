@@ -24,6 +24,7 @@ class OutboundSchema(BaseModel):
 class BatchValidationRequest(OutboundSchema):
     task_name: str = Field(min_length=1, max_length=50)
     task_mode: Literal["batch"]
+    answer_mode: Literal["linphone"] = "linphone"
     prompt_profile_id: str | None = None
     scene_code: str = Field(min_length=1, max_length=64)
     voice: str = Field(min_length=1, max_length=128)

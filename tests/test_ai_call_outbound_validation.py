@@ -228,6 +228,17 @@ def test_outbound_validation_routes_are_registered() -> None:
     } <= paths
 
 
+def test_batch_validation_accepts_only_sip_answer_mode() -> None:
+    payload = _request().model_dump(mode="json", by_alias=True)
+
+    assert BatchValidationRequest.model_validate({
+        **payload,
+        "answerMode": "linphone",
+    }).answer_mode == "linphone"
+    with pytest.raises(ValueError):
+        BatchValidationRequest.model_validate({**payload, "answerMode": "web"})
+
+
 @pytest.mark.anyio
 async def test_valid_xlsx_is_streamed_to_rows_and_finishes_passed(database) -> None:
     service = OutboundValidationService(database, parse_batch_size=2)
