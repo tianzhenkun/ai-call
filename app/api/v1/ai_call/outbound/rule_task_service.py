@@ -18,6 +18,10 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.services.ai_call.livekit_sip import (
+    SipOutboundConfig,
+    validate_sip_outbound_preflight,
+)
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.utils.id_util import generate_snowflake_id
 
@@ -277,6 +281,11 @@ class OutboundRuleTaskService:
             if request.answer_mode == "linphone"
             else None
         )
+        if line is not None:
+            self._ensure_sip_target_allowed(
+                self.line_service.to_sip_config(line),
+                request.phone_number or "",
+            )
         now = _now()
         validation = AiCallOutboundValidationModel(
             id=generate_snowflake_id(),
@@ -377,12 +386,14 @@ class OutboundRuleTaskService:
             )
         line = None
         line_snapshot = None
+        sip_config = None
         if request.answer_mode == "linphone":
             line, line_snapshot = await self._resolve_validation_line(
                 db,
                 tenant_id,
                 validation,
             )
+            sip_config = self.line_service.to_sip_config(line_snapshot)
         validation_config = self._load_object(validation.task_config_json)
         request_config = request.config_dict()
         if validation_config != request_config:
@@ -502,6 +513,7 @@ class OutboundRuleTaskService:
             tenant_id=tenant_id,
             validation_id=validation_id,
             task_id=task.id,
+            sip_config=sip_config,
         )
         if task.total_targets != validation.valid_target_count:
             raise CustomException(
@@ -597,6 +609,7 @@ class OutboundRuleTaskService:
         tenant_id: str,
         validation_id: int,
         task_id: int,
+        sip_config: SipOutboundConfig | None,
     ) -> int:
         last_id = 0
         copied = 0
@@ -616,6 +629,12 @@ class OutboundRuleTaskService:
             ).all()
             if not rows:
                 return copied
+            if sip_config is not None:
+                for row in rows:
+                    self._ensure_sip_target_allowed(
+                        sip_config,
+                        row.normalized_phone or row.phone_number or "",
+                    )
             now = _now()
             db.add_all([
                 AiCallOutboundTargetModel(
@@ -639,6 +658,21 @@ class OutboundRuleTaskService:
             await db.flush()
             copied += len(rows)
             last_id = rows[-1].id
+
+    @staticmethod
+    def _ensure_sip_target_allowed(
+        config: SipOutboundConfig,
+        phone_number: str,
+    ) -> None:
+        preflight = validate_sip_outbound_preflight(
+            config,
+            callee_phone_number=phone_number,
+        )
+        if not preflight.ok:
+            raise CustomException(
+                msg=preflight.message or "SIP 外呼配置不合法",
+                status_code=status.HTTP_409_CONFLICT,
+            )
 
     async def list_tasks(
         self,

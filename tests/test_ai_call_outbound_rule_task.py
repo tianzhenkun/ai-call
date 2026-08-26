@@ -254,7 +254,9 @@ async def test_task_write_query_uses_row_lock() -> None:
 
 
 @pytest.fixture
-async def database(tmp_path):
+async def database(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_CALL_SIP_OUTBOUND_ENABLED", "true")
+    monkeypatch.setenv("SIP_PUBLIC_IP", "127.0.0.1")
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'outbound-task.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
@@ -1452,6 +1454,66 @@ async def test_single_validation_checks_phone_and_all_references(database) -> No
             invalid = request.model_copy(update={field: value})
             with pytest.raises(CustomException, match=message):
                 await service.validate_single(session, "tenant-a", 10, invalid)
+
+
+@pytest.mark.anyio
+async def test_single_validation_rejects_number_outside_runtime_allowlist(
+    database,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES", "19900001001")
+    prompt_id, _ = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+        request = SingleValidationRequest(
+            task_name="未授权号码",
+            task_mode="single",
+            prompt_profile_id=str(prompt_id),
+            scene_code="intro_contract",
+            voice="Tina",
+            rule_id=str(rule.id),
+            execution_mode="immediate",
+            phone_number="18518968743",
+            customer_name="王先生",
+        )
+
+        with pytest.raises(CustomException, match="被叫号码不在允许拨打前缀内"):
+            await service.validate_single(session, "tenant-a", 10, request)
+
+
+@pytest.mark.anyio
+async def test_task_creation_rechecks_runtime_allowlist(database, monkeypatch) -> None:
+    prompt_id, _ = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as session:
+        rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
+        await session.commit()
+    config = _validation_config(
+        task_mode="batch",
+        rule_id=rule.id,
+        prompt_id=prompt_id,
+    )
+    validation_id = await _seed_passed_validation(
+        database,
+        tenant_id="tenant-a",
+        config=config,
+        rows=[("18518968743", "未授权客户")],
+    )
+    monkeypatch.setenv("AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES", "19900001001")
+    service = OutboundRuleTaskService(database)
+
+    async with database() as session:
+        with pytest.raises(CustomException, match="被叫号码不在允许拨打前缀内"):
+            await service.create_task(
+                session,
+                "tenant-a",
+                10,
+                "管理员",
+                "idem-recheck-runtime-allowlist",
+                _create_task_request(config, validation_id),
+            )
 
 
 @pytest.mark.anyio

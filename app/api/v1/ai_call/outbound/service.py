@@ -23,10 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.model import AiCallPromptProfileModel
 from app.core.exceptions import CustomException
 from app.core.logger import log
+from app.services.ai_call.livekit_sip import (
+    SipOutboundConfig,
+    validate_sip_outbound_preflight,
+)
 from app.utils.id_util import generate_snowflake_id
 
 from .model import AiCallOutboundValidationModel, AiCallOutboundValidationRowModel
 from .schema import BatchValidationRequest, ValidationIssueOut, ValidationResultOut
+from .sip_line_schema import SipLineSnapshot
 from .sip_line_service import SipLineService
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -228,6 +233,10 @@ class OutboundValidationService:
                 return
 
             variable_columns = await self._prompt_variable_columns(db, validation)
+            line_snapshot = SipLineSnapshot.model_validate_json(
+                validation.line_snapshot_json
+            )
+            sip_config = self.line_service.to_sip_config(line_snapshot)
             header_map, header_reasons = self._header_map(
                 header_values,
                 variable_columns,
@@ -254,6 +263,7 @@ class OutboundValidationService:
                         values,
                         header_map,
                         variable_columns,
+                        sip_config,
                     )
                     for offset, values in enumerate(batch_values)
                     if not self._is_empty_row(values)
@@ -307,6 +317,7 @@ class OutboundValidationService:
         values: tuple[Any, ...],
         header_map: dict[str, int],
         variable_columns: dict[str, str],
+        sip_config: SipOutboundConfig,
     ) -> dict[str, Any]:
         phone = self._value_at(values, header_map["手机号"])
         business_params = {
@@ -326,6 +337,13 @@ class OutboundValidationService:
             reasons.append("手机号不能为空")
         elif not PHONE_PATTERN.fullmatch(phone):
             reasons.append("手机号格式错误")
+        else:
+            preflight = validate_sip_outbound_preflight(
+                sip_config,
+                callee_phone_number=phone,
+            )
+            if not preflight.ok:
+                reasons.append(preflight.message or "SIP 外呼配置不合法")
         if customer_name and len(customer_name) > 100:
             reasons.append("客户名称不能超过100个字符")
         for label, key in variable_columns.items():

@@ -4421,6 +4421,7 @@ async def test_command_claim_start_retry_requires_no_effect_and_no_barrier() -> 
                     entry_type="web",
                     idempotency_key="start:claim-retry",
                     payload={"business_id": "claim-retry"},
+                    allocation_timeout_seconds=30,
                 )
             )
             await WorkerRegistryRepository(session).register(
@@ -4445,6 +4446,21 @@ async def test_command_claim_start_retry_requires_no_effect_and_no_barrier() -> 
                     retry_after=timedelta(0),
                 ),
             )
+            deadlines = (
+                await session.execute(
+                    text(
+                        "select r.startup_reconcile_deadline_at, "
+                        "c.allocation_deadline_at "
+                        "from ai_call_record r "
+                        "join ai_call_runtime_command c on c.call_id=r.call_id "
+                        "where r.call_id=:call_id and c.id=:command_id"
+                    ).bindparams(
+                        call_id=start.call_id,
+                        command_id=start.command_id,
+                    )
+                )
+            ).one()
+            assert deadlines.startup_reconcile_deadline_at == deadlines.allocation_deadline_at
             retry_claim = await repository.claim_next_for_owner(lease)
             assert retry_claim is not None
             assert retry_claim.attempt_count == 2

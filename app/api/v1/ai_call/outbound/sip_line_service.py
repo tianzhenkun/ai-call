@@ -374,7 +374,10 @@ class SipLineService:
             updated_at=line.updated_at,
         )
 
-    def to_sip_config(self, line: AiCallSipLineModel) -> SipOutboundConfig:
+    def to_sip_config(
+        self,
+        line: AiCallSipLineModel | SipLineSnapshot,
+    ) -> SipOutboundConfig:
         trunk_hostname = ""
         if line.route_mode == "inline_hostname" and line.proxy_host and line.proxy_port:
             trunk_hostname = f"{line.proxy_host}:{line.proxy_port}"

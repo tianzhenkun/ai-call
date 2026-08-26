@@ -111,7 +111,9 @@ def _upload(content: bytes, filename: str = "外呼名单.xlsx") -> UploadFile:
 
 
 @pytest.fixture
-async def database(tmp_path):
+async def database(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_CALL_SIP_OUTBOUND_ENABLED", "true")
+    monkeypatch.setenv("SIP_PUBLIC_IP", "127.0.0.1")
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'outbound.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
@@ -273,6 +275,38 @@ async def test_valid_xlsx_is_streamed_to_rows_and_finishes_passed(database) -> N
     assert validation.valid_target_count == 3
     assert validation.issue_count == 0
     assert [row.row_number for row in rows] == [2, 3, 4]
+
+
+@pytest.mark.anyio
+async def test_batch_validation_rejects_number_outside_runtime_allowlist(
+    database,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES", "19900001001")
+    service = OutboundValidationService(database)
+    validation_id, _ = await _accept(
+        service,
+        database,
+        _xlsx([
+            ["手机号", "客户名称"],
+            ["19900001001", "允许客户"],
+            ["18518968743", "未授权客户"],
+        ]),
+    )
+
+    await service.process_validation("tenant-a", validation_id)
+
+    async with database() as session:
+        validation = await session.get(AiCallOutboundValidationModel, validation_id)
+        issue = await session.scalar(
+            select(AiCallOutboundValidationRowModel).where(
+                AiCallOutboundValidationRowModel.validation_id == validation_id,
+                AiCallOutboundValidationRowModel.is_valid.is_(False),
+            )
+        )
+    assert validation.status == "FAILED"
+    assert validation.valid_target_count == 1
+    assert "被叫号码不在允许拨打前缀内" in issue.reasons_json
 
 
 @pytest.mark.anyio

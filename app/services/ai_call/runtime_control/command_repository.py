@@ -588,6 +588,12 @@ class RuntimeCommandRepository:
                 raise InvalidCommandDecisionError("retry_after must not be negative")
             command.next_retry_at = now + retry_after
             command.finished_at = None
+            if (
+                claim.command_type == START_CALL
+                and command.allocation_deadline_at is not None
+                and record.startup_reconcile_deadline_at is None
+            ):
+                record.startup_reconcile_deadline_at = command.allocation_deadline_at
         else:
             command.next_retry_at = None
             command.finished_at = now
