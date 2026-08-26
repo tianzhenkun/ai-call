@@ -110,6 +110,7 @@ class HumanOnlySipSessionFactory:
         *,
         call_id: str,
         callee_phone_number: str,
+        config: SipOutboundConfig | None = None,
     ) -> HumanCallbackSessionResult:
         room_name = f"ai-call-{call_id}"
         customer_identity = f"sip-{call_id}"
@@ -122,6 +123,7 @@ class HumanOnlySipSessionFactory:
                 participant_identity=customer_identity,
                 callee_phone_number=callee_phone_number,
                 wait_until_answered=False,
+                config=config,
             )
         except Exception:
             await self.room_manager.delete_room(room_name)

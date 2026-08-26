@@ -40,6 +40,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.core.exceptions import CustomException
@@ -78,12 +79,14 @@ class AiCallFollowUpService:
         *,
         callback_factory: HumanOnlySipSessionFactory | None = None,
         recording_service: AiCallRecordingService | None = None,
+        sip_line_service: SipLineService | None = None,
     ) -> None:
         self.db = db
         self.agent_service = AiCallAgentConsoleService(db)
         self.record_repository = AiCallRecordRepository(db)
         self.callback_factory = callback_factory
         self.recording_service = recording_service
+        self.sip_line_service = sip_line_service
 
     @staticmethod
     def _callback_duration_ms(
@@ -1220,6 +1223,14 @@ class AiCallFollowUpService:
         if self.callback_factory is None:
             raise CustomException(msg="人工回拨服务未配置", status_code=503)
 
+        sip_config = None
+        if self.sip_line_service is not None:
+            line = await self.sip_line_service.resolve_default(
+                self.db,
+                profile.tenant_id,
+            )
+            sip_config = self.sip_line_service.to_sip_config(line)
+
         call_id = f"call_{generate_snowflake_id()}"
         now = datetime.now(timezone.utc)
         agent_claimed = await self.db.execute(
@@ -1296,6 +1307,7 @@ class AiCallFollowUpService:
             session = await self.callback_factory.create(
                 call_id=call_id,
                 callee_phone_number=callee_phone_number,
+                config=sip_config,
             )
         except AiCallError as exc:
             await self._record_started_callback_failure(

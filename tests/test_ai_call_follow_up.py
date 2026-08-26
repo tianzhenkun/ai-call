@@ -52,6 +52,7 @@ from app.services.ai_call.follow_up_service import AiCallFollowUpService
 from app.services.ai_call.livekit_sip import (
     HumanCallbackSessionResult,
     HumanOnlySipSessionFactory,
+    SipOutboundConfig,
 )
 
 
@@ -1691,6 +1692,23 @@ class _FakeCallbackFactory:
         return self.sip_call_status
 
 
+class _FakeSipLineService:
+    def __init__(self) -> None:
+        self.resolved_tenant_id: str | None = None
+        self.config = SipOutboundConfig(
+            enabled=True,
+            trunk_hostname="47.94.86.132:5089",
+            caller_number="6008860812",
+        )
+
+    async def resolve_default(self, _db, tenant_id: str):
+        self.resolved_tenant_id = tenant_id
+        return object()
+
+    def to_sip_config(self, _line) -> SipOutboundConfig:
+        return self.config
+
+
 class _ConcurrentStatusCallbackFactory(_FakeCallbackFactory):
     def __init__(self) -> None:
         super().__init__()
@@ -1823,6 +1841,33 @@ async def test_follow_up_data_direct_call_does_not_create_task_and_submits_resul
         assert await db.scalar(
             select(func.count()).select_from(AiCallFollowUpTaskModel)
         ) == 0
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_call_uses_tenant_default_sip_line(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+    callback_factory = _FakeCallbackFactory()
+    line_service = _FakeSipLineService()
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=callback_factory,
+            sip_line_service=line_service,
+        )
+        await service.start_follow_up_data_callback(
+            _auth(db, user_id=20),
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="default-line-call",
+        )
+
+    assert line_service.resolved_tenant_id == "tenant-a"
+    assert callback_factory.calls[0]["config"] == line_service.config
 
 
 @pytest.mark.anyio
@@ -2055,10 +2100,16 @@ async def test_human_only_factory_creates_room_and_sip_without_agent_runner() ->
         room_manager=room_manager,
         sip_client=sip_client,
     )
+    config = SipOutboundConfig(
+        enabled=True,
+        trunk_hostname="47.94.86.132:5089",
+        caller_number="6008860812",
+    )
 
     result = await factory.create(
         call_id="call-callback",
         callee_phone_number="13800000000",
+        config=config,
     )
 
     assert room_manager.created == ["ai-call-call-callback"]
@@ -2068,6 +2119,7 @@ async def test_human_only_factory_creates_room_and_sip_without_agent_runner() ->
             "participant_identity": "sip-call-callback",
             "callee_phone_number": "13800000000",
             "wait_until_answered": False,
+            "config": config,
         }
     ]
     assert result.agent_participant_identity == "human-callback-call-callback"
@@ -2121,7 +2173,11 @@ async def test_callback_requires_owner_and_available_presence_without_persisting
         assert record.callee_phone_number_masked == "138****0000"
         assert "13800000000" not in repr(record.__dict__)
         assert owner_service.callback_factory.calls == [
-            {"call_id": result.call_id, "callee_phone_number": "13800000000"}
+            {
+                "call_id": result.call_id,
+                "callee_phone_number": "13800000000",
+                "config": None,
+            }
         ]
 
         presence = (

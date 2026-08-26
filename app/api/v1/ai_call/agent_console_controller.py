@@ -10,6 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request,
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
 from app.core.dependencies import (
@@ -95,6 +96,7 @@ async def get_follow_up_service(
         db,
         callback_factory=callback_factory,
         recording_service=ai_call_service.recording_service,
+        sip_line_service=SipLineService(),
     )
 
 
