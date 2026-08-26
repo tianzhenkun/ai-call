@@ -126,20 +126,23 @@ def select_runtime_provider(
     allowed_callee = str(
         getattr(settings, "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE", "")
     ).strip()
+    allowed_callee_prefixes = str(
+        getattr(settings, "AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES", "")
+    ).strip()
     allowed = (
         bool(getattr(settings, "AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED", False))
         and bool(entries.strip())
         and bool(
             getattr(settings, "AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED", False)
         )
-        and bool(allowed_callee)
+        and bool(allowed_callee or allowed_callee_prefixes)
         and str(getattr(settings, "DATABASE_TYPE", "")) == "postgres"
         and environment != "prod"
     )
     if not allowed:
         raise RuntimeError(
             "AI Call 真实 Provider 门禁未满足：仅允许隔离 PostgreSQL、"
-            "显式 opt-in、非正式环境和单号码白名单"
+            "显式 opt-in、非正式环境和被叫号码边界"
         )
     return build_livekit_runtime_provider(
         settings=settings,

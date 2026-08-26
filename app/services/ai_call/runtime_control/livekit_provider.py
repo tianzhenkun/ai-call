@@ -635,11 +635,12 @@ class LiveKitRuntimeProvider:
         self.provider_namespace = provider_namespace
         self.main_recording_enabled = main_recording_enabled
         self._oss_config_provider = oss_config_provider or (lambda: None)
-        self._allowed_callee_phone_number = (
+        normalized_allowed_callee = (
             str(allowed_callee_phone_number).strip()
             if allowed_callee_phone_number is not None
-            else None
+            else ""
         )
+        self._allowed_callee_phone_number = normalized_allowed_callee or None
 
     async def start(self) -> None:
         if self._handoff_trigger_worker is not None:

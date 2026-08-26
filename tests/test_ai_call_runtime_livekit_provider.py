@@ -383,6 +383,28 @@ async def test_livekit_provider_rejects_callee_outside_single_number_allowlist()
 
 
 @pytest.mark.anyio
+async def test_livekit_provider_blank_single_number_allowlist_does_not_block() -> None:
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    sip_client = FakeSipClient()
+    provider = LiveKitRuntimeProvider(
+        resolver=FakeResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=sip_client,
+        egress_manager=FakeEgressManager(),
+        allowed_callee_phone_number="",
+    )
+
+    observation = await provider.apply(_effect("CREATE_SIP_PARTICIPANT"))
+
+    assert observation.kind == ProviderObservationKind.RESOURCE_PRESENT
+    assert len(sip_client.calls) == 1
+
+
+@pytest.mark.anyio
 async def test_livekit_provider_missing_callee_is_permanent_no_resource() -> None:
     class MissingCalleeResolver(FakeResolver):
         async def resolve(self, effect):

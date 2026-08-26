@@ -362,6 +362,7 @@ async def test_real_provider_gate_requires_isolated_allowlist_and_explicit_opt_i
         "AI_CALL_OWNER_COMMAND_V1_ENTRIES": "direct_sip",
         "AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": True,
         "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": "19900001001",
+        "AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES": "1",
         "DATABASE_TYPE": "postgres",
         "ENVIRONMENT": EnvironmentEnum.DEV,
     }
@@ -377,7 +378,10 @@ async def test_real_provider_gate_requires_isolated_allowlist_and_explicit_opt_i
         {"AI_CALL_RUNTIME_REAL_PROVIDER_ALLOWED": False},
         {"AI_CALL_OWNER_COMMAND_V1_ENTRIES": ""},
         {"AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED": False},
-        {"AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": ""},
+        {
+            "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": "",
+            "AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES": "",
+        },
         {"DATABASE_TYPE": "mysql"},
         {"ENVIRONMENT": EnvironmentEnum.PROD},
     ):
@@ -387,6 +391,21 @@ async def test_real_provider_gate_requires_isolated_allowlist_and_explicit_opt_i
                 session_factory=object(),
                 registry=RuntimeRegistry(),
             )
+
+    selected = lifecycle.select_runtime_provider(
+        SimpleNamespace(
+            **(
+                base
+                | {
+                    "AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE": "",
+                    "AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES": "1",
+                }
+            )
+        ),
+        session_factory=object(),
+        registry=RuntimeRegistry(),
+    )
+    assert selected is marker
 
 
 @pytest.mark.anyio
