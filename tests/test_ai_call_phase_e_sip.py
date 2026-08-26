@@ -477,15 +477,18 @@ def test_self_hosted_livekit_sip_templates_are_declared() -> None:
     assert "use_external_ip: true" in sip_config
 
 
-def test_ai_call_118_exposes_livekit_sip_on_public_interface() -> None:
+def test_ai_call_118_exposes_livekit_sip_without_rtp_port_proxies() -> None:
     compose = Path("deploy/ai-call-118/compose.yml").read_text(encoding="utf-8")
     sip_config = Path("deploy/ai-call-118/config/sip.yaml.template").read_text(
         encoding="utf-8"
     )
 
-    assert '"172.17.16.12:5060:5060/udp"' in compose
-    assert '"172.17.16.12:10000-20000:10000-20000/udp"' in compose
-    assert "use_external_ip: true" in sip_config
+    assert '"127.0.0.1:16379:6379/tcp"' in compose
+    assert "network_mode: host" in compose
+    assert '"172.17.16.12:10000-20000:10000-20000/udp"' not in compose
+    assert "listen_ip: 172.17.16.12" in sip_config
+    assert "nat_1_to_1_ip: 118.25.125.221" in sip_config
+    assert "use_external_ip: false" in sip_config
 
 
 def test_settings_expose_sip_outbound_defaults() -> None:

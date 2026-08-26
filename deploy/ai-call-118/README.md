@@ -39,6 +39,7 @@ docker compose -f compose.yml exec -T postgres sh -lc \
 
 - 118：仅向受控 Mac 的公网 IP 开放 `51820/udp`、`7881/tcp`、`50000-50100/udp`；不要开放 `19011`、`7880`、`5432`、`6379`、`5089`、`8021`。
 - 第三方 SIP 仅按其确认的源 IP 白名单开放 `5060/udp` 和 `10000-20000/udp`，公网地址为 `118.25.125.221`；不要向全网开放。
+- LiveKit SIP 使用主机网络直接监听 `172.17.16.12`，Redis 仅映射到本机 `127.0.0.1:16379`，避免为 RTP 端口范围创建大量 Docker 代理进程。
 - FreeSWITCH 的 `5060/udp` 和 `16384-16484/udp` 仍只绑定 WireGuard 地址，Linphone 通过 `10.77.0.2` 注册，账号为 `1000`。
 - 81：在独立 `reach.lingchen-ai.com` 的 443 server 内代理 LiveKit WSS `/livekit/`，不开放 `7880/tcp`。
 - 81 的 `/ai-call-agent-api/` 仅经 WireGuard 代理到 `10.77.0.2:19011`，SSE 已关闭缓冲并延长读取超时。

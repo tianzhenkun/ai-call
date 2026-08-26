@@ -1,14 +1,16 @@
 api_key: __LIVEKIT_API_KEY__
 api_secret: __LIVEKIT_API_SECRET__
-ws_url: ws://livekit:7880
+ws_url: ws://10.77.0.2:7880
 
 redis:
-  address: redis:6379
+  address: 127.0.0.1:16379
   password: "__REDIS_PASSWORD__"
 
 sip_port: 5060
 rtp_port: 10000-20000
-use_external_ip: true
+listen_ip: 172.17.16.12
+nat_1_to_1_ip: 118.25.125.221
+use_external_ip: false
 
 logging:
   level: info
