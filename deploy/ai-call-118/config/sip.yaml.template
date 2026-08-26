@@ -8,7 +8,7 @@ redis:
 
 sip_port: 5060
 rtp_port: 10000-20000
-use_external_ip: false
+use_external_ip: true
 
 logging:
   level: info

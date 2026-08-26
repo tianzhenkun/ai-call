@@ -1,6 +1,6 @@
 # 118 AI Call 受控联调部署包
 
-此目录只部署独立 AI Call 栈，不复用 UAT 的容器、网络、卷、PostgreSQL 或 Redis；不会配置 SIP 中继或真实客户号码。
+此目录只部署独立 AI Call 栈，不复用 UAT 的容器、网络、卷、PostgreSQL 或 Redis。
 
 ## 前置条件
 
@@ -38,7 +38,8 @@ docker compose -f compose.yml exec -T postgres sh -lc \
 ## 网络与安全组
 
 - 118：仅向受控 Mac 的公网 IP 开放 `51820/udp`、`7881/tcp`、`50000-50100/udp`；不要开放 `19011`、`7880`、`5432`、`6379`、`5089`、`8021`。
-- 118 的 `5060/udp` 和 `16384-16484/udp` 只绑定 WireGuard 地址，Linphone 通过 `10.77.0.2` 注册，账号为 `1000`。
+- 第三方 SIP 仅按其确认的源 IP 白名单开放 `5060/udp` 和 `10000-20000/udp`，公网地址为 `118.25.125.221`；不要向全网开放。
+- FreeSWITCH 的 `5060/udp` 和 `16384-16484/udp` 仍只绑定 WireGuard 地址，Linphone 通过 `10.77.0.2` 注册，账号为 `1000`。
 - 81：在独立 `reach.lingchen-ai.com` 的 443 server 内代理 LiveKit WSS `/livekit/`，不开放 `7880/tcp`。
 - 81 的 `/ai-call-agent-api/` 仅经 WireGuard 代理到 `10.77.0.2:19011`，SSE 已关闭缓冲并延长读取超时。
 
@@ -49,4 +50,4 @@ docker compose -f compose.yml exec -T postgres sh -lc \
 3. 从 HTTPS 页面获取 Token，确认返回 `livekitUrl` 为 `wss://reach.lingchen-ai.com/livekit`。
 4. 仅拨打白名单 `19900001001`，确认 Linphone 响铃、双向音频及主/分轨录音均写入独立 OSS bucket。
 
-真实 SIP 中继、真实客户号码和 `/voice-api/` 不属于本部署包。
+正式线路由 LiveKit SIP 直接连接第三方 SIP Provider；FreeSWITCH 只保留给本地 Linphone 联调。真实客户号码必须另行授权后才能拨打。

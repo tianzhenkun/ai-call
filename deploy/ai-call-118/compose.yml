@@ -120,6 +120,9 @@ services:
     image: ai-call-transfer/livekit-sip:v1.5.0-amd64
     restart: unless-stopped
     command: ["--config", "/etc/sip.yaml"]
+    ports:
+      - "172.17.16.12:5060:5060/udp"
+      - "172.17.16.12:10000-20000:10000-20000/udp"
     volumes:
       - ./runtime/sip.yaml:/etc/sip.yaml:ro
     depends_on:
