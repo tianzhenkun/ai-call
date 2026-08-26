@@ -1154,6 +1154,7 @@ _OUTBOUND_START_PAYLOAD_KEYS = frozenset({
     "business_params",
     "line_code",
     "line_id",
+    "sip_line",
     "prompt_profile_id",
     "prompt_snapshot",
     "scene_code",
@@ -1172,7 +1173,8 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         return None
     if (
         not isinstance(payload, dict)
-        or not _OUTBOUND_START_PAYLOAD_KEYS - {"business_params", "prompt_snapshot"}
+        or not _OUTBOUND_START_PAYLOAD_KEYS
+        - {"business_params", "prompt_snapshot", "sip_line"}
         <= set(payload)
         or not set(payload) <= _OUTBOUND_START_PAYLOAD_KEYS
     ):
@@ -1207,6 +1209,16 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         line_id = _canonical_positive_decimal(line_id_value)
         if line_id is None:
             return None
+    sip_line = payload.get("sip_line", _INVALID_LINE_ID)
+    if line_id is None:
+        if sip_line is not _INVALID_LINE_ID and sip_line is not None:
+            return None
+    elif sip_line is not _INVALID_LINE_ID and (
+        not isinstance(sip_line, dict)
+        or str(sip_line.get("lineId") or "") != str(line_id)
+        or sip_line.get("lineCode") != line_code
+    ):
+        return None
     prompt_profile_id = payload["prompt_profile_id"]
     if prompt_profile_id is not None and (
         not isinstance(prompt_profile_id, str) or not prompt_profile_id.strip()

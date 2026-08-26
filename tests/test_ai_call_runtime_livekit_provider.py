@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -406,6 +407,128 @@ async def test_livekit_provider_missing_callee_is_permanent_no_resource() -> Non
     assert observation.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE
     assert observation.error_message == "callee_phone_number_missing"
     assert sip_client.calls == []
+
+
+@pytest.mark.anyio
+async def test_livekit_provider_passes_selected_line_config_to_sip_client() -> None:
+    from app.services.ai_call.livekit_sip import SipOutboundConfig
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        LiveKitRuntimeProvider,
+    )
+
+    selected_config = SipOutboundConfig(
+        enabled=True,
+        allowed_callee_prefixes="199",
+        trunk_hostname="47.94.86.132:5089",
+        caller_number="037123124845",
+    )
+
+    class SelectedLineResolver(FakeResolver):
+        async def resolve(self, effect):
+            resource = await super().resolve(effect)
+            return replace(resource, sip_config=selected_config)
+
+    sip_client = FakeSipClient()
+    provider = LiveKitRuntimeProvider(
+        resolver=SelectedLineResolver(),
+        room_manager=FakeRoomManager(),
+        agent_manager=FakeAgentManager(),
+        sip_client=sip_client,
+        egress_manager=FakeEgressManager(),
+    )
+
+    observation = await provider.apply(_effect("CREATE_SIP_PARTICIPANT"))
+
+    assert observation.kind == ProviderObservationKind.RESOURCE_PRESENT
+    assert sip_client.calls[0]["config"] is selected_config
+
+
+@pytest.mark.anyio
+async def test_resource_resolver_builds_selected_line_config_for_outbound_sip() -> None:
+    from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.config.setting import Settings
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+        ProviderPreconditionError,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+
+    command_payload = {
+        "line_code": "provider-a",
+        "line_id": "340700000000000001",
+        "sip_line": {
+            "lineId": "340700000000000001",
+            "lineCode": "provider-a",
+            "lineName": "供应商 A",
+            "adapterType": "livekit_sip",
+            "routeMode": "inline_hostname",
+            "trunkId": None,
+            "proxyHost": "47.94.86.132",
+            "proxyPort": 5089,
+            "authMode": "ip_allowlist",
+            "callerNumber": "037123124845",
+            "destinationCountry": "CN",
+            "maxConcurrency": 1,
+            "originateTimeoutSeconds": 45,
+        },
+    }
+    rows = {
+        AiCallRecordModel: SimpleNamespace(
+            tenant_id="tenant-a",
+            call_id="call-1",
+            room_name="ai-call-call-1",
+            participant_identity="sip-call-1",
+            callee_phone_number="19900001001",
+            business_type="outbound_attempt",
+        ),
+        AiCallRuntimeCommandModel: SimpleNamespace(
+            payload_json=json.dumps(command_payload)
+        ),
+        AiCallRuntimeEffectModel: SimpleNamespace(
+            id=101,
+            tenant_id="tenant-a",
+            call_id="call-1",
+            command_id=77,
+            effect_type="CREATE_SIP_PARTICIPANT",
+            provider_namespace="livekit:test",
+            resource_generation=5,
+            provider_reference=None,
+        ),
+    }
+
+    class FakeSession:
+        async def scalar(self, statement):
+            return rows.get(statement.column_descriptions[0]["entity"])
+
+    class SessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    resolver = DatabaseRuntimeProviderResourceResolver(
+        lambda: SessionContext(),
+        sip_settings=Settings(
+            AI_CALL_SIP_OUTBOUND_ENABLED=True,
+            AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES="199",
+            SIP_PUBLIC_IP="118.25.125.221",
+        ),
+    )
+
+    resource = await resolver.resolve(_effect("CREATE_SIP_PARTICIPANT"))
+
+    assert resource.sip_config is not None
+    assert resource.sip_config.trunk_hostname == "47.94.86.132:5089"
+    assert resource.sip_config.caller_number == "037123124845"
+    assert resource.sip_config.allowed_callee_prefixes == "199"
+
+    rows[AiCallRuntimeCommandModel].payload_json = "{}"
+    with pytest.raises(ProviderPreconditionError, match="sip_line_snapshot_missing"):
+        await resolver.resolve(_effect("CREATE_SIP_PARTICIPANT"))
 
 
 @pytest.mark.anyio

@@ -63,6 +63,11 @@ class OwnerRuntimeOutboundStart:
             "business_params": request.business_params,
             "line_code": request.line.line_code if request.line is not None else None,
             "line_id": str(request.line.line_id) if request.line is not None else None,
+            "sip_line": (
+                request.line.model_dump(mode="json", by_alias=True)
+                if request.line is not None
+                else None
+            ),
             "prompt_profile_id": request.prompt_profile_id,
             "prompt_snapshot": request.prompt_snapshot,
             "scene_code": request.scene_code,

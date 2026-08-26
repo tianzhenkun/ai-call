@@ -168,9 +168,14 @@ class LiveKitSipClient:
         self.timeout_seconds = max(1.0, timeout_seconds)
         self._create_participant = create_participant
 
-    def preflight(self, *, callee_phone_number: str) -> SipOutboundPreflightResult:
+    def preflight(
+        self,
+        *,
+        callee_phone_number: str,
+        config: SipOutboundConfig | None = None,
+    ) -> SipOutboundPreflightResult:
         return validate_sip_outbound_preflight(
-            self.config,
+            config or self.config,
             callee_phone_number=callee_phone_number,
         )
 
@@ -182,8 +187,13 @@ class LiveKitSipClient:
         callee_phone_number: str,
         ringing_timeout_seconds: int | None = None,
         wait_until_answered: bool = True,
+        config: SipOutboundConfig | None = None,
     ) -> CreateSipParticipantResult:
-        preflight = self.preflight(callee_phone_number=callee_phone_number)
+        effective_config = config or self.config
+        preflight = self.preflight(
+            callee_phone_number=callee_phone_number,
+            config=effective_config,
+        )
         if not preflight.ok:
             raise AiCallError(
                 error_id=preflight.failure_reason or "sip_preflight_failed",
@@ -191,17 +201,22 @@ class LiveKitSipClient:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
-        timeout_seconds = self._ringing_timeout_seconds(ringing_timeout_seconds)
+        timeout_seconds = self._ringing_timeout_seconds(
+            ringing_timeout_seconds,
+            effective_config,
+        )
         payload = CreateSipParticipantPayload(
             room_name=room_name,
             participant_identity=participant_identity,
             sip_call_to=_normalize_required(callee_phone_number),
-            sip_number=_normalize_required(self.config.caller_number),
-            sip_trunk_id=_normalize_optional(self.config.trunk_id),
-            trunk_hostname=_normalize_optional(self.config.trunk_hostname),
-            auth_username=_normalize_optional(self.config.auth_username),
-            auth_password=_normalize_optional(self.config.auth_password),
-            destination_country=_normalize_optional(self.config.destination_country) or "CN",
+            sip_number=_normalize_required(effective_config.caller_number),
+            sip_trunk_id=_normalize_optional(effective_config.trunk_id),
+            trunk_hostname=_normalize_optional(effective_config.trunk_hostname),
+            auth_username=_normalize_optional(effective_config.auth_username),
+            auth_password=_normalize_optional(effective_config.auth_password),
+            destination_country=(
+                _normalize_optional(effective_config.destination_country) or "CN"
+            ),
             wait_until_answered=wait_until_answered,
             ringing_timeout_seconds=timeout_seconds,
         )
@@ -256,9 +271,13 @@ class LiveKitSipClient:
         finally:
             await client.aclose()
 
-    def _ringing_timeout_seconds(self, value: int | None) -> int:
-        timeout = self.config.default_ringing_timeout_seconds if value is None else int(value)
-        return min(max(1, timeout), self.config.max_ringing_timeout_seconds)
+    @staticmethod
+    def _ringing_timeout_seconds(
+        value: int | None,
+        config: SipOutboundConfig,
+    ) -> int:
+        timeout = config.default_ringing_timeout_seconds if value is None else int(value)
+        return min(max(1, timeout), config.max_ringing_timeout_seconds)
 
     def _request_timeout_seconds(self, payload: CreateSipParticipantPayload) -> float:
         if not payload.wait_until_answered:

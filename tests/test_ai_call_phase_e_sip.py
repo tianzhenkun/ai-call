@@ -667,6 +667,46 @@ async def test_livekit_sip_client_builds_create_participant_payload_for_fake_sdk
 
 
 @pytest.mark.anyio
+async def test_livekit_sip_client_uses_request_config_without_mutating_default() -> None:
+    captured_payloads: list[CreateSipParticipantPayload] = []
+
+    async def fake_create_participant(payload: CreateSipParticipantPayload) -> dict:
+        captured_payloads.append(payload)
+        return {"identity": payload.participant_identity}
+
+    default_config = SipOutboundConfig(
+        enabled=True,
+        allowed_callee_prefixes="199",
+        trunk_hostname="freeswitch:5089",
+        caller_number="1000",
+    )
+    selected_config = SipOutboundConfig(
+        enabled=True,
+        allowed_callee_prefixes="185",
+        trunk_hostname="47.94.86.132:5089",
+        caller_number="037123124845",
+        default_ringing_timeout_seconds=45,
+        public_ip="118.25.125.221",
+    )
+    client = LiveKitSipClient(
+        config=default_config,
+        create_participant=fake_create_participant,
+    )
+
+    await client.create_participant(
+        room_name="ai-call-call_1",
+        participant_identity="sip-call_1",
+        callee_phone_number="18518968743",
+        wait_until_answered=False,
+        config=selected_config,
+    )
+
+    assert captured_payloads[0].trunk_hostname == "47.94.86.132:5089"
+    assert captured_payloads[0].sip_number == "037123124845"
+    assert client.config is default_config
+
+
+@pytest.mark.anyio
 async def test_livekit_sip_client_treats_successful_sync_sdk_result_as_answered() -> None:
     async def fake_create_participant(
         payload: CreateSipParticipantPayload,

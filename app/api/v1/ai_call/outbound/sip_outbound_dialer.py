@@ -28,6 +28,34 @@ from .task_executor import ConnectedCallback, DialResult, OutboundDialRequest
 TERMINAL_STATUSES = {"completed", "failed"}
 
 
+def build_sip_line_config(
+    settings: Settings,
+    line: SipLineSnapshot,
+) -> SipOutboundConfig:
+    trunk_hostname = ""
+    if line.route_mode == "inline_hostname":
+        if not line.proxy_host or line.proxy_port is None:
+            raise ValueError("内联 SIP 线路缺少代理地址或端口")
+        trunk_hostname = f"{line.proxy_host}:{line.proxy_port}"
+    return SipOutboundConfig(
+        enabled=settings.AI_CALL_SIP_OUTBOUND_ENABLED,
+        allowed_callee_prefixes=settings.AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES,
+        default_ringing_timeout_seconds=line.originate_timeout_seconds,
+        max_ringing_timeout_seconds=settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS,
+        max_call_duration_seconds=settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS,
+        trunk_id=line.trunk_id or "",
+        trunk_hostname=trunk_hostname,
+        destination_country=line.destination_country,
+        auth_username="",
+        auth_password="",
+        caller_number=line.caller_number,
+        signaling_port=settings.SIP_SIGNALING_PORT,
+        rtp_range=settings.SIP_RTP_RANGE,
+        public_ip=settings.SIP_PUBLIC_IP,
+        use_external_ip=settings.SIP_USE_EXTERNAL_IP,
+    )
+
+
 class AiCallServiceLike(Protocol):
     async def create_sip_session(self, **kwargs): ...
 
@@ -273,28 +301,7 @@ class SipOutboundDialer:
         return True
 
     def build_sip_config(self, line: SipLineSnapshot) -> SipOutboundConfig:
-        trunk_hostname = ""
-        if line.route_mode == "inline_hostname":
-            if not line.proxy_host or line.proxy_port is None:
-                raise ValueError("内联 SIP 线路缺少代理地址或端口")
-            trunk_hostname = f"{line.proxy_host}:{line.proxy_port}"
-        return SipOutboundConfig(
-            enabled=self.settings.AI_CALL_SIP_OUTBOUND_ENABLED,
-            allowed_callee_prefixes=self.settings.AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES,
-            default_ringing_timeout_seconds=line.originate_timeout_seconds,
-            max_ringing_timeout_seconds=self.settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS,
-            max_call_duration_seconds=self.settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS,
-            trunk_id=line.trunk_id or "",
-            trunk_hostname=trunk_hostname,
-            destination_country=line.destination_country,
-            auth_username="",
-            auth_password="",
-            caller_number=line.caller_number,
-            signaling_port=self.settings.SIP_SIGNALING_PORT,
-            rtp_range=self.settings.SIP_RTP_RANGE,
-            public_ip=self.settings.SIP_PUBLIC_IP,
-            use_external_ip=self.settings.SIP_USE_EXTERNAL_IP,
-        )
+        return build_sip_line_config(self.settings, line)
 
     async def _read_evidence(
         self,

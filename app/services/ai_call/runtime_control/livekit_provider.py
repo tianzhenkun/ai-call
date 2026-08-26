@@ -13,6 +13,7 @@ from app.services.ai_call.livekit_egress import (
     LiveKitEgressAlreadyCompleteError,
     LiveKitEgressNotFoundError,
 )
+from app.services.ai_call.livekit_sip import SipOutboundConfig
 from app.services.ai_call.prompt_config import (
     PromptEffectiveConfig,
     PromptResolveContext,
@@ -55,6 +56,7 @@ class RuntimeProviderResource:
     egress_scope: str | None = None
     prompt_effective_config: PromptEffectiveConfig | None = None
     knowledge_context: KnowledgeRuntimeContext | None = None
+    sip_config: SipOutboundConfig | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -69,9 +71,11 @@ class DatabaseRuntimeProviderResourceResolver:
         session_factory: Any,
         *,
         orchestrator: Any | None = None,
+        sip_settings: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._orchestrator = orchestrator
+        self._sip_settings = sip_settings
 
     async def resolve(self, claim: EffectClaim) -> RuntimeProviderResource:
         from app.api.v1.ai_call.model import AiCallRecordModel
@@ -123,6 +127,7 @@ class DatabaseRuntimeProviderResourceResolver:
             voice = self._payload_voice(
                 getattr(command, "payload_json", None) if command is not None else None
             )
+            sip_config = self._resolve_sip_config(record, command, claim.effect_type)
             prompt_effective_config = None
             knowledge_context = None
             if claim.effect_type == "ATTACH_AGENT_PARTICIPANT":
@@ -185,7 +190,41 @@ class DatabaseRuntimeProviderResourceResolver:
                 egress_scope=egress_scope,
                 prompt_effective_config=prompt_effective_config,
                 knowledge_context=knowledge_context,
+                sip_config=sip_config,
             )
+
+    def _resolve_sip_config(
+        self,
+        record: Any,
+        command: Any,
+        effect_type: str,
+    ) -> SipOutboundConfig | None:
+        if (
+            effect_type != "CREATE_SIP_PARTICIPANT"
+            or getattr(record, "business_type", None) != "outbound_attempt"
+        ):
+            return None
+        payload = self._payload(getattr(command, "payload_json", None))
+        raw_line = payload.get("sip_line")
+        if not isinstance(raw_line, dict):
+            raise ProviderPreconditionError("sip_line_snapshot_missing")
+
+        from app.api.v1.ai_call.outbound.sip_line_schema import SipLineSnapshot
+        from app.api.v1.ai_call.outbound.sip_outbound_dialer import (
+            build_sip_line_config,
+        )
+        from app.config.setting import settings as default_settings
+
+        try:
+            line = SipLineSnapshot.model_validate(raw_line)
+        except (TypeError, ValueError) as exc:
+            raise ProviderPreconditionError("sip_line_snapshot_invalid") from exc
+        if (
+            str(payload.get("line_id") or "") != line.line_id
+            or str(payload.get("line_code") or "") != line.line_code
+        ):
+            raise ProviderPreconditionError("sip_line_snapshot_mismatch")
+        return build_sip_line_config(self._sip_settings or default_settings, line)
 
     async def _resolve_prompt_effective_config(self, session, record, command):
         if self._orchestrator is None:
@@ -719,6 +758,7 @@ class LiveKitRuntimeProvider:
                 participant_identity=resource.customer_participant_identity,
                 callee_phone_number=resource.callee_phone_number,
                 wait_until_answered=False,
+                config=resource.sip_config,
             )
             return str(getattr(result, "sip_call_id", "") or "") or None
         if effect.effect_type == "HANGUP_SIP":
@@ -1245,6 +1285,7 @@ def build_livekit_runtime_provider(
         resolver=DatabaseRuntimeProviderResourceResolver(
             session_factory,
             orchestrator=orchestrator,
+            sip_settings=settings,
         ),
         room_manager=room_manager,
         agent_manager=OwnerRuntimeAgentManager(
