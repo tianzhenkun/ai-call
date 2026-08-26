@@ -31,6 +31,7 @@ from app.api.v1.ai_call.outbound.owner_runtime_start import (
 from app.api.v1.ai_call.outbound.queue_control import OutboundQueueLimits
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
+    AiCallOutboundExceptionBatchModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -545,6 +546,7 @@ async def _reset_repository_schema(engine) -> None:
         AiCallSipLineReservationModel.__table__,
         AiCallRuntimeWorkerModel.__table__,
         AiCallOutboundAttemptModel.__table__,
+        AiCallOutboundExceptionBatchModel.__table__,
         AiCallOutboundTargetModel.__table__,
         AiCallOutboundTaskModel.__table__,
         AiCallHandoffAgentModel.__table__,
@@ -4558,6 +4560,17 @@ async def test_effect_registration_is_authorized_but_later_claim_is_command_inde
                     resource_generation=lease.fencing_token,
                 ),
             )
+            main_egress = await effects.register(
+                start_claim,
+                EffectSpec(
+                    effect_type="START_EGRESS",
+                    idempotency_key="effect:start-egress:independent",
+                    provider_namespace="stub:independent",
+                    provider_idempotency_key="provider:start-egress:independent",
+                    resource_key="egress:effect-independent:g1",
+                    resource_generation=1,
+                ),
+            )
             with pytest.raises(EffectRegistrationError):
                 await effects.register(
                     replace(start_claim, processing_token="stale-command-token"),
@@ -4624,20 +4637,40 @@ async def test_effect_registration_is_authorized_but_later_claim_is_command_inde
             graph = await effects.register_end_graph(end_claim)
             assert {effect.effect_type for effect in graph} == {
                 "HANGUP_SIP",
+                "STOP_EGRESS",
                 "DELETE_ROOM",
             }
+            main_egress_row = await session.get(
+                AiCallRuntimeEffectModel, main_egress.effect_id
+            )
+            assert main_egress_row is not None
+            assert (main_egress_row.status, main_egress_row.error_message) == (
+                "FAILED",
+                "no_resource",
+            )
             assert await commands.complete(
                 end_claim,
                 CommandDecision(status=CommandStatus.SUCCEEDED),
             )
 
-            hangup = await effects.claim_next(lease)
-            assert hangup is not None and hangup.effect_type == "HANGUP_SIP"
+            cleanup_claims = [
+                await effects.claim_next(lease),
+                await effects.claim_next(lease),
+            ]
+            assert all(claim is not None for claim in cleanup_claims)
+            assert {claim.effect_type for claim in cleanup_claims if claim} == {
+                "HANGUP_SIP",
+                "STOP_EGRESS",
+            }
             assert await effects.claim_next(lease) is None
-            assert await effects.submit(
-                hangup,
-                ProviderObservation(kind=ProviderObservationKind.TERMINAL_CONFIRMED),
-            )
+            for claim in cleanup_claims:
+                assert claim is not None
+                assert await effects.submit(
+                    claim,
+                    ProviderObservation(
+                        kind=ProviderObservationKind.TERMINAL_CONFIRMED
+                    ),
+                )
             delete_room = await effects.claim_next(lease)
             assert delete_room is not None and delete_room.effect_type == "DELETE_ROOM"
             assert await effects.submit(

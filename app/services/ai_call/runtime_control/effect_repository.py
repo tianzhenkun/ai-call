@@ -291,7 +291,7 @@ class RuntimeEffectRepository:
         )
         for create in creates:
             if (
-                create.effect_type == "START_TRACK_EGRESS"
+                create.effect_type in AUXILIARY_START_EFFECT_TYPES
                 and create.status == EffectStatus.PENDING
                 and create.attempt_count == 0
                 and create.processing_owner_id is None
@@ -381,6 +381,16 @@ class RuntimeEffectRepository:
         prerequisite = aliased(AiCallRuntimeEffectModel)
         for candidate in candidates:
             claim_gate = []
+            if candidate.effect_type == "START_EGRESS":
+                first_attempt = (
+                    candidate.status == EffectStatus.PENDING
+                    and candidate.attempt_count == 0
+                )
+                if first_attempt and (
+                    candidate.answered_at is None
+                    or candidate.terminal_requested_at is not None
+                ):
+                    continue
             if candidate.effect_type == "START_TRACK_EGRESS":
                 participant_identity = str(candidate.participant_identity or "")
                 first_attempt = (

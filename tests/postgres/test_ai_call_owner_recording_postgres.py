@@ -125,6 +125,73 @@ def _present() -> ProviderObservation:
     )
 
 
+async def test_main_recording_claim_waits_until_call_is_answered() -> None:
+    engine, session_maker = await _reset_database()
+    try:
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(minutes=5)
+        lease = OwnerLease(
+            tenant_id="tenant-a",
+            call_id="call-a",
+            owner_id="runtime-a",
+            fencing_token=7,
+            lease_expires_at=expires_at,
+            capacity_class="active",
+        )
+        async with session_maker.begin() as session:
+            session.add(
+                AiCallRecordModel(
+                    id=1,
+                    tenant_id="tenant-a",
+                    call_id="call-a",
+                    entry_type="outbound",
+                    room_name="room-a",
+                    participant_identity="customer-a",
+                    status="dialing",
+                    started_at=now,
+                    dialogue_persistence_status="pending",
+                    runtime_control_mode="owner_command_v1",
+                    runtime_owner_id="runtime-a",
+                    runtime_fencing_token=7,
+                    runtime_lease_expires_at=expires_at,
+                    runtime_capacity_class="active",
+                )
+            )
+            session.add(
+                AiCallRuntimeEffectModel(
+                    id=10,
+                    tenant_id="tenant-a",
+                    call_id="call-a",
+                    command_id=2,
+                    effect_type="START_EGRESS",
+                    idempotency_key="start:call-a:start-main-egress",
+                    fencing_token=7,
+                    status="PENDING",
+                    provider_namespace="livekit:postgres-test",
+                    provider_idempotency_key="egress:main:call-a",
+                    resource_key="egress:main:call-a",
+                    resource_generation=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        async with session_maker.begin() as session:
+            assert await RuntimeEffectRepository(session).claim_next(lease) is None
+
+        async with session_maker.begin() as session:
+            record = await session.scalar(select(AiCallRecordModel).with_for_update())
+            assert record is not None
+            record.answered_at = datetime.now(timezone.utc)
+
+        async with session_maker.begin() as session:
+            claim = await RuntimeEffectRepository(session).claim_next(lease)
+            assert claim is not None
+            assert claim.effect_type == "START_EGRESS"
+    finally:
+        await engine.dispose()
+
+
 async def test_effect_and_recording_projection_commit_atomically() -> None:
     engine, session_maker = await _reset_database()
     try:
