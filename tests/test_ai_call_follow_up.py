@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -245,8 +246,14 @@ async def _seed_unanswered_follow_up(
         )
 
 
-async def _seed_outbound_context(session_factory, *, call_id: str = "call-1") -> None:
+async def _seed_outbound_context(
+    session_factory,
+    *,
+    call_id: str = "call-1",
+    call_windows: list[dict[str, str]] | None = None,
+) -> None:
     now = datetime.now(timezone.utc)
+    windows = call_windows or [{"startTime": "09:00", "endTime": "21:00"}]
     async with session_factory() as db, db.begin():
         record = await db.scalar(
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
@@ -275,7 +282,9 @@ async def _seed_outbound_context(session_factory, *, call_id: str = "call-1") ->
                     rule_id=1,
                     rule_name="工作日规则",
                     rule_summary="全天",
-                    config_snapshot_json="{}",
+                    config_snapshot_json=json.dumps(
+                        {"rule": {"callWindows": windows}}
+                    ),
                     created_by=1,
                     created_at=now,
                     updated_at=now,
@@ -359,9 +368,13 @@ async def _link_follow_up_data(
     return data_id
 
 
-async def _seed_follow_up_data_without_task(session_factory) -> tuple[str, int]:
+async def _seed_follow_up_data_without_task(
+    session_factory,
+    *,
+    call_windows: list[dict[str, str]] | None = None,
+) -> tuple[str, int]:
     console_session_id = await _seed_completed_handoff(session_factory)
-    await _seed_outbound_context(session_factory)
+    await _seed_outbound_context(session_factory, call_windows=call_windows)
     async with session_factory() as db:
         source = await db.scalar(
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == "call-1")
@@ -1858,6 +1871,7 @@ async def test_follow_up_data_call_uses_tenant_default_sip_line(
             db,
             callback_factory=callback_factory,
             sip_line_service=line_service,
+            clock=lambda: datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
         )
         await service.start_follow_up_data_callback(
             _auth(db, user_id=20),
@@ -1868,6 +1882,76 @@ async def test_follow_up_data_call_uses_tenant_default_sip_line(
 
     assert line_service.resolved_tenant_id == "tenant-a"
     assert callback_factory.calls[0]["config"] == line_service.config
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_call_rejects_outside_source_task_window_before_dial(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory,
+        call_windows=[{"startTime": "10:00", "endTime": "11:00"}],
+    )
+    callback_factory = _FakeCallbackFactory()
+    line_service = _FakeSipLineService()
+    async with session_factory() as db:
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=callback_factory,
+            sip_line_service=line_service,
+            # Asia/Shanghai 09:30：在线路 09:00–21:00 内，但不在原任务 10:00–11:00 内。
+            clock=lambda: datetime(2026, 8, 27, 1, 30, tzinfo=timezone.utc),
+        )
+        with pytest.raises(CustomException) as outside_window:
+            await service.start_follow_up_data_callback(
+                _auth(db, user_id=20),
+                follow_up_data_id=data_id,
+                payload=FollowUpDataCallIn(console_session_id=console_session_id),
+                idempotency_key="outside-source-task-window",
+            )
+
+        assert _error_code(outside_window.value) == "CALLBACK_OUTSIDE_TASK_WINDOW"
+        assert line_service.resolved_tenant_id is None
+        assert callback_factory.calls == []
+
+
+@pytest.mark.anyio
+async def test_follow_up_data_call_rejects_outside_carrier_window_before_dial(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory,
+        call_windows=[{"startTime": "00:00", "endTime": "23:59"}],
+    )
+    callback_factory = _FakeCallbackFactory()
+    line_service = _FakeSipLineService()
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=callback_factory,
+            sip_line_service=line_service,
+            clock=lambda: datetime(2026, 8, 27, 0, 22, tzinfo=timezone.utc),
+        )
+        with pytest.raises(CustomException) as outside_window:
+            await service.start_follow_up_data_callback(
+                _auth(db, user_id=20),
+                follow_up_data_id=data_id,
+                payload=FollowUpDataCallIn(console_session_id=console_session_id),
+                idempotency_key="outside-carrier-window",
+            )
+
+        assert _error_code(outside_window.value) == "CALLBACK_OUTSIDE_CALL_WINDOW"
+        assert line_service.resolved_tenant_id is None
+        assert callback_factory.calls == []
+        assert await db.scalar(
+            select(func.count())
+            .select_from(AiCallRecordModel)
+            .where(AiCallRecordModel.entry_type == "sip_callback")
+        ) == 0
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpCallRequestModel)
+        ) == 0
 
 
 @pytest.mark.anyio
@@ -2530,6 +2614,65 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             )
         ).scalar_one()
         assert attempt.attempt_result == "no_answer"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("webhook_payload", "expected_result", "expected_status", "expected_reason"),
+    [
+        (
+            {"participant": {"attributes": {"sip.callStatus": "active"}}},
+            "connected",
+            "completed",
+            "callback_completed",
+        ),
+        (
+            {"participant": {"disconnectReason": "CLIENT_REQUEST_LEAVE"}},
+            "technical_failure",
+            "failed",
+            "callback_technical_failure",
+        ),
+    ],
+)
+async def test_callback_left_always_terminalizes_direct_call(
+    session_factory,
+    webhook_payload: dict,
+    expected_result: str,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        auth = _auth(db, user_id=20)
+        callback, _ = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-left",
+        )
+
+        result = await service.handle_livekit_webhook_event(
+            event_type="participant_left",
+            room_name=f"ai-call-{callback.call_id}",
+            participant_identity=f"sip-{callback.call_id}",
+            payload=webhook_payload,
+        )
+
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        assert result["attemptResult"] == expected_result
+        assert record is not None
+        assert record.status == expected_status
+        assert (record.answered_at is not None) == (expected_result == "connected")
+        assert record.ended_at is not None
+        assert record.end_reason == expected_reason
 
 
 @pytest.mark.anyio

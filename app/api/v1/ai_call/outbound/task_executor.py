@@ -28,6 +28,7 @@ from .attempt_projection import (
     outbound_retry_interval,
     refresh_task_counters,
 )
+from .call_window import task_allows_call_at
 from .media_evidence import has_persisted_media_evidence
 from .queue_control import (
     DEFAULT_OUTBOUND_QUEUE_LIMITS,
@@ -1342,24 +1343,7 @@ class OutboundTaskExecutor:
         task: AiCallOutboundTaskModel,
         now: datetime,
     ) -> bool:
-        try:
-            snapshot = json.loads(task.config_snapshot_json)
-            windows = snapshot["rule"].get("callWindows")
-        except (KeyError, TypeError, json.JSONDecodeError):
-            return False
-        if windows is None:
-            return True
-        if not isinstance(windows, list) or not windows:
-            return False
-        aware_now = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-        current_time = aware_now.astimezone(self.business_timezone).strftime("%H:%M")
-        return any(
-            isinstance(window, dict)
-            and isinstance(window.get("startTime"), str)
-            and isinstance(window.get("endTime"), str)
-            and window["startTime"] <= current_time < window["endTime"]
-            for window in windows
-        )
+        return task_allows_call_at(task, now, self.business_timezone)
 
     @staticmethod
     def _task_line_snapshot(

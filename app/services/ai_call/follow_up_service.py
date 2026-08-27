@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NoReturn
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import status
 from sqlalchemy import and_, func, or_, select, update
@@ -35,6 +37,7 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffModel,
     AiCallRecordModel,
 )
+from app.api.v1.ai_call.outbound.call_window import task_allows_call_at
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -43,6 +46,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
+from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
@@ -80,6 +84,7 @@ class AiCallFollowUpService:
         callback_factory: HumanOnlySipSessionFactory | None = None,
         recording_service: AiCallRecordingService | None = None,
         sip_line_service: SipLineService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.db = db
         self.agent_service = AiCallAgentConsoleService(db)
@@ -87,6 +92,7 @@ class AiCallFollowUpService:
         self.callback_factory = callback_factory
         self.recording_service = recording_service
         self.sip_line_service = sip_line_service
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     @staticmethod
     def _callback_duration_ms(
@@ -1039,6 +1045,15 @@ class AiCallFollowUpService:
                     "当前跟进数据存在进行中或待提交的人工通话",
                     "FOLLOW_UP_CALL_BLOCKED",
                 )
+        outbound_task = (
+            await self._callback_outbound_task(
+                tenant_id=profile.tenant_id,
+                source_call_id=task.source_call_id,
+                follow_up_data=data,
+            )
+            if self.sip_line_service is not None
+            else None
+        )
         callee_phone_number = await self._callback_callee_phone_number(
             tenant_id=profile.tenant_id,
             source_call_id=task.source_call_id,
@@ -1057,6 +1072,7 @@ class AiCallFollowUpService:
             business_id=task.business_id,
             follow_up_task=task,
             follow_up_data=data,
+            outbound_task=outbound_task,
         )
 
     async def start_follow_up_data_callback(
@@ -1104,6 +1120,11 @@ class AiCallFollowUpService:
                 "当前跟进数据存在进行中或待提交的人工通话",
                 "FOLLOW_UP_CALL_BLOCKED",
             )
+        outbound_task = await self._callback_outbound_task(
+            tenant_id=profile.tenant_id,
+            source_call_id=data.source_call_id,
+            follow_up_data=data,
+        )
 
         task = await self._active_follow_up_for_data(
             profile.tenant_id, follow_up_data_id
@@ -1153,17 +1174,6 @@ class AiCallFollowUpService:
             business_type = task.business_type
             business_id = task.business_id
         else:
-            outbound_task = await self.db.scalar(
-                select(AiCallOutboundTaskModel).where(
-                    AiCallOutboundTaskModel.tenant_id == profile.tenant_id,
-                    AiCallOutboundTaskModel.id == data.task_id,
-                )
-            )
-            if outbound_task is None:
-                self._raise_conflict(
-                    "跟进数据缺少外呼任务上下文",
-                    "FOLLOW_UP_DATA_CONTEXT_MISSING",
-                )
             source_record = await self._record(data.source_call_id)
             scene_code = outbound_task.scene_code
             source_call_id = data.source_call_id
@@ -1195,6 +1205,7 @@ class AiCallFollowUpService:
             business_id=business_id,
             follow_up_task=task,
             follow_up_data=data,
+            outbound_task=outbound_task,
             call_request={
                 "idempotency_key": normalized_key,
                 "request_fingerprint": fingerprint,
@@ -1218,13 +1229,21 @@ class AiCallFollowUpService:
         business_id: str | None,
         follow_up_task: AiCallFollowUpTaskModel | None,
         follow_up_data: AiCallFollowUpDataModel | None,
+        outbound_task: AiCallOutboundTaskModel | None,
         call_request: dict | None = None,
     ) -> FollowUpCallbackAccepted:
         if self.callback_factory is None:
             raise CustomException(msg="人工回拨服务未配置", status_code=503)
 
+        now = self.clock()
         sip_config = None
         if self.sip_line_service is not None:
+            if outbound_task is None:
+                self._raise_conflict(
+                    "跟进数据缺少原外呼任务上下文",
+                    "FOLLOW_UP_DATA_CONTEXT_MISSING",
+                )
+            self._require_callback_window(outbound_task, now)
             line = await self.sip_line_service.resolve_default(
                 self.db,
                 profile.tenant_id,
@@ -1232,7 +1251,6 @@ class AiCallFollowUpService:
             sip_config = self.sip_line_service.to_sip_config(line)
 
         call_id = f"call_{generate_snowflake_id()}"
-        now = datetime.now(timezone.utc)
         agent_claimed = await self.db.execute(
             update(AiCallHandoffAgentModel)
             .where(
@@ -1341,6 +1359,41 @@ class AiCallFollowUpService:
             participant_identity=session.agent_participant_identity,
             expires_in_seconds=session.expires_in_seconds,
         )
+
+    @staticmethod
+    def _require_callback_window(
+        outbound_task: AiCallOutboundTaskModel,
+        now: datetime,
+    ) -> None:
+        start_value = settings.AI_CALL_MANUAL_CALLBACK_WINDOW_START
+        end_value = settings.AI_CALL_MANUAL_CALLBACK_WINDOW_END
+        try:
+            start = datetime.strptime(start_value, "%H:%M").time()
+            end = datetime.strptime(end_value, "%H:%M").time()
+            business_timezone = ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)
+            local_time = now.astimezone(business_timezone).time()
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise CustomException(
+                msg="人工回拨时段配置错误",
+                status_code=503,
+                data={"errorCode": "CALLBACK_WINDOW_INVALID"},
+            ) from exc
+        if start >= end:
+            raise CustomException(
+                msg="人工回拨时段配置错误",
+                status_code=503,
+                data={"errorCode": "CALLBACK_WINDOW_INVALID"},
+            )
+        if not task_allows_call_at(outbound_task, now, business_timezone):
+            AiCallFollowUpService._raise_conflict(
+                f"当前时间不在原任务「{outbound_task.rule_name}」允许的外呼时段内",
+                "CALLBACK_OUTSIDE_TASK_WINDOW",
+            )
+        if not start <= local_time < end:
+            AiCallFollowUpService._raise_conflict(
+                f"人工回拨仅允许在 {start_value}–{end_value} 发起",
+                "CALLBACK_OUTSIDE_CALL_WINDOW",
+            )
 
     async def end_callback(
         self,
@@ -1846,8 +1899,21 @@ class AiCallFollowUpService:
             connected = (
                 existing_attempt is not None
                 and existing_attempt.attempt_result == "connected"
-            ) or (record.follow_up_id is None and record.answered_at is not None)
+            ) or record.answered_at is not None or (
+                self._callback_sip_status(payload or {}) in CONNECTED_SIP_STATUSES
+            )
             if connected:
+                if record.answered_at is None:
+                    if record.follow_up_id is not None:
+                        await self.record_callback_outcome(
+                            call_id=call_id,
+                            attempt_result="connected",
+                        )
+                    else:
+                        await self._record_follow_up_data_callback_outcome(
+                            call_id=call_id,
+                            attempt_result="connected",
+                        )
                 task = (
                     await self._required_task_by_id(record.follow_up_id)
                     if record.follow_up_id is not None
@@ -1878,7 +1944,7 @@ class AiCallFollowUpService:
                 }
             attempt_result = self._callback_attempt_result(payload or {})
             if attempt_result is None:
-                return {"handled": False, "reason": "callback_status_unknown"}
+                attempt_result = "technical_failure"
         else:
             return {"handled": False, "reason": "unsupported_event"}
 
@@ -2603,6 +2669,38 @@ class AiCallFollowUpService:
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
         )
         return result.scalar_one_or_none()
+
+    async def _callback_outbound_task(
+        self,
+        *,
+        tenant_id: str,
+        source_call_id: str,
+        follow_up_data: AiCallFollowUpDataModel | None,
+    ) -> AiCallOutboundTaskModel:
+        task_id = follow_up_data.task_id if follow_up_data is not None else None
+        if task_id is None:
+            task_id = await self.db.scalar(
+                select(AiCallOutboundAttemptModel.task_id).where(
+                    AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                    AiCallOutboundAttemptModel.call_id == source_call_id,
+                )
+            )
+        outbound_task = (
+            await self.db.scalar(
+                select(AiCallOutboundTaskModel).where(
+                    AiCallOutboundTaskModel.tenant_id == tenant_id,
+                    AiCallOutboundTaskModel.id == task_id,
+                )
+            )
+            if task_id is not None
+            else None
+        )
+        if outbound_task is None:
+            self._raise_conflict(
+                "跟进数据缺少原外呼任务上下文",
+                "FOLLOW_UP_DATA_CONTEXT_MISSING",
+            )
+        return outbound_task
 
     async def _callback_callee_phone_number(
         self,
