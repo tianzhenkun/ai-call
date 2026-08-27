@@ -2146,6 +2146,63 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
 
 
 @pytest.mark.anyio
+async def test_follow_up_data_ringing_timeout_uses_line_deadline(
+    session_factory,
+) -> None:
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory
+    )
+    started_at = datetime(2026, 8, 27, 3, 0, tzinfo=timezone.utc)
+    now = [started_at]
+
+    async with session_factory() as db:
+        factory = _FakeCallbackFactory()
+        factory.sip_call_status = "ringing"
+        line_service = _FakeSipLineService()
+        line_service.config = SipOutboundConfig(
+            enabled=True,
+            trunk_hostname="source.example.com:5089",
+            caller_number="6008860812",
+            default_ringing_timeout_seconds=30,
+        )
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            sip_line_service=line_service,
+            clock=lambda: now[0],
+        )
+        auth = _auth(db, user_id=20)
+        callback, _ = await service.start_follow_up_data_callback(
+            auth,
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="direct-call-timeout",
+        )
+
+        now[0] += timedelta(minutes=161)
+        assert await service.reconcile_callback_timeout(
+            auth,
+            console_session_id=console_session_id,
+        ) is True
+
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        data = await db.get(AiCallFollowUpDataModel, data_id)
+        assert record is not None
+        assert record.ended_at is not None
+        assert record.ended_at.replace(tzinfo=timezone.utc) == started_at + timedelta(
+            seconds=30
+        )
+        assert record.duration_ms == 30_000
+        assert data is not None
+        assert data.blocking_human_call_id is None
+        assert factory.ended_calls == [callback.call_id]
+
+
+@pytest.mark.anyio
 async def test_follow_up_data_direct_call_can_schedule_owned_task(
     session_factory,
 ) -> None:
