@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -71,6 +72,25 @@ class AttemptTerminalDecision:
     attempt_status: str
     call_result: str
     error_message: str | None
+    provider_status_code: str | None = None
+    provider_reason: str | None = None
+    hangup_cause: str | None = None
+
+
+def extract_provider_status_code(*values: str | None) -> str | None:
+    for value in values:
+        match = re.search(r"(?i)\bsip[_\s:-]?([1-6]\d{2})\b", value or "")
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_hangup_cause(value: str | None) -> str | None:
+    match = re.search(
+        r"(?i)\bhangup[_\s-]?cause\s*[:=]\s*([A-Z0-9_-]+)",
+        value or "",
+    )
+    return match.group(1) if match else None
 
 
 def terminal_attempt_decision(
@@ -88,6 +108,11 @@ def terminal_attempt_decision(
         )
     reason = str(record.end_reason or "").strip().lower()
     error_message = record.failure_message or record.end_reason
+    provider_status_code = extract_provider_status_code(
+        record.end_reason,
+        record.failure_message,
+    )
+    hangup_cause = extract_hangup_cause(record.failure_message)
     if reason in BUSY_END_REASONS:
         call_result = "busy"
     elif reason in NO_ANSWER_END_REASONS:
@@ -102,6 +127,9 @@ def terminal_attempt_decision(
         attempt_status="FAILED",
         call_result=call_result,
         error_message=error_message or "外呼未成功接通",
+        provider_status_code=provider_status_code,
+        provider_reason=error_message,
+        hangup_cause=hangup_cause,
     )
 
 
@@ -117,6 +145,9 @@ def apply_terminal_projection(
     attempt.status = decision.attempt_status
     attempt.call_result = decision.call_result
     attempt.error_message = decision.error_message
+    attempt.provider_status_code = decision.provider_status_code
+    attempt.provider_reason = decision.provider_reason
+    attempt.hangup_cause = decision.hangup_cause
     attempt.active_slot = None
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
@@ -205,6 +236,9 @@ async def apply_exception_terminal_projection(
     attempt.status = decision.attempt_status
     attempt.call_result = decision.call_result
     attempt.error_message = decision.error_message
+    attempt.provider_status_code = decision.provider_status_code
+    attempt.provider_reason = decision.provider_reason
+    attempt.hangup_cause = decision.hangup_cause
     attempt.active_slot = None
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -20,6 +19,8 @@ from .attempt_projection import (
     INVALID_NUMBER_END_REASONS,
     NO_ANSWER_END_REASONS,
     REJECTED_END_REASONS,
+    extract_hangup_cause,
+    extract_provider_status_code,
 )
 from .media_evidence import has_persisted_media_evidence
 from .sip_line_schema import SipLineSnapshot
@@ -344,11 +345,11 @@ class SipOutboundDialer:
     @staticmethod
     def map_terminal_record(record: AiCallRecordModel) -> DialResult:
         provider_reason = record.failure_message or record.end_reason
-        provider_status_code = SipOutboundDialer._provider_status_code(
+        provider_status_code = extract_provider_status_code(
             record.end_reason,
             record.failure_message,
         )
-        hangup_cause = SipOutboundDialer._hangup_cause(record.failure_message)
+        hangup_cause = extract_hangup_cause(record.failure_message)
         if record.answered_at is not None:
             return DialResult(
                 call_result="connected",
@@ -429,33 +430,15 @@ class SipOutboundDialer:
                 call_result="call_failed",
                 error_message="未检测到媒体接通证据",
                 duration_ms=max(0, int(record.duration_ms or 0)),
-                provider_status_code=SipOutboundDialer._provider_status_code(
+                provider_status_code=extract_provider_status_code(
                     record.end_reason,
                     record.failure_message,
                 ),
                 provider_reason=record.failure_message or record.end_reason,
-                hangup_cause=SipOutboundDialer._hangup_cause(
-                    record.failure_message
-                ),
+                hangup_cause=extract_hangup_cause(record.failure_message),
                 retry_allowed=False,
             )
         return SipOutboundDialer.map_terminal_record(record)
-
-    @staticmethod
-    def _provider_status_code(*values: str | None) -> str | None:
-        for value in values:
-            match = re.search(r"(?i)\bsip[_\s:-]?([1-6]\d{2})\b", value or "")
-            if match:
-                return match.group(1)
-        return None
-
-    @staticmethod
-    def _hangup_cause(value: str | None) -> str | None:
-        match = re.search(
-            r"(?i)\bhangup[_\s-]?cause\s*[:=]\s*([A-Z0-9_-]+)",
-            value or "",
-        )
-        return match.group(1) if match else None
 
     @staticmethod
     def _error_message(exc: Exception) -> str:

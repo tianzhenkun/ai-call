@@ -1835,9 +1835,9 @@ async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
                 error_message="browser_connection_failed",
                 line_id=task.line_id,
                 line_code="default-tenant-a",
-                provider_status_code=None,
-                provider_reason=None,
-                hangup_cause=None,
+                provider_status_code="480",
+                provider_reason="SIP 480 Temporarily Unavailable",
+                hangup_cause="USER_UNAVAILABLE",
                 started_at=now,
                 ended_at=now,
                 created_at=now,
@@ -1865,6 +1865,9 @@ async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
     assert task_out.next_dispatch_at == "2026-08-06 13:30:00"
     assert total == 1
     assert targets[0].latest_dialer_type == "mock"
+    assert targets[0].provider_status_code == "480"
+    assert targets[0].provider_reason == "SIP 480 Temporarily Unavailable"
+    assert targets[0].hangup_cause == "USER_UNAVAILABLE"
 
 
 @pytest.mark.anyio

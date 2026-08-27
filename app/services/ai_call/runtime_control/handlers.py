@@ -221,12 +221,13 @@ class EndCallHandler:
                     .with_for_update()
                 )
                 if record is not None:
+                    business_ended_at = record.terminal_requested_at or ended_at
                     record.status = "completed"
-                    record.ended_at = ended_at
+                    record.ended_at = business_ended_at
                     if record.answered_at is not None:
                         record.duration_ms = _connected_duration_ms(
                             record.answered_at,
-                            ended_at,
+                            business_ended_at,
                         )
                 if dialogue_result.status in {"complete", "uncertain"}:
                     await self._dialogue_repository_factory(session).finalize(

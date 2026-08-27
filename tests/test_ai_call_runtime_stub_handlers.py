@@ -88,6 +88,7 @@ class _FakeSession:
         self.record = SimpleNamespace(
             status="ending",
             answered_at=None,
+            terminal_requested_at=None,
             ended_at=None,
             duration_ms=None,
         )
@@ -480,6 +481,37 @@ async def test_end_handler_persists_connected_duration(
     assert result.logical_end_completed is True
     assert factory.session.record.ended_at == ended_at
     assert factory.session.record.duration_ms == 127_096
+
+
+@pytest.mark.anyio
+async def test_end_handler_excludes_resource_cleanup_from_connected_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ai_call.runtime_control import handlers
+
+    answered_at = datetime(2026, 8, 27, 2, 30, 24, 664_000, tzinfo=timezone.utc)
+    session_ended_at = datetime(2026, 8, 27, 2, 33, 49, 130_000, tzinfo=timezone.utc)
+    cleanup_ended_at = datetime(2026, 8, 27, 2, 33, 56, 72_000, tzinfo=timezone.utc)
+
+    async def _fixed_database_time(_session) -> datetime:
+        return cleanup_ended_at
+
+    monkeypatch.setattr(handlers, "read_database_time", _fixed_database_time)
+    factory = _FakeSessionFactory()
+    factory.session.record.answered_at = answered_at
+    factory.session.record.terminal_requested_at = session_ended_at
+
+    await EndCallHandler(
+        factory,
+        ScriptedProviderStub({}),
+        effect_repository_factory=lambda session: _FakeEffectRepository([], clean=True),
+        command_repository_factory=lambda session: _FakeCommandRepository(),
+        recovery_owner_repository_factory=lambda session: _FakeRecoveryOwnerRepository(),
+        dialogue_repository_factory=lambda session: _FakeDialogueRepository(),
+    ).handle(_command_claim("END_CALL"), _owner_lease())
+
+    assert factory.session.record.ended_at == session_ended_at
+    assert factory.session.record.duration_ms == 204_466
 
 
 @pytest.mark.anyio

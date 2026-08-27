@@ -125,7 +125,7 @@ def sanitize_webhook_payload(
             sanitized[key] = value
     for key, allowed in (
         ("room", ("name", "sid")),
-        ("participant", ("identity", "sid", "kind")),
+        ("participant", ("identity", "sid", "kind", "disconnectReason")),
         ("track", ("sid", "type", "source", "muted")),
     ):
         value = source.get(key)
@@ -237,6 +237,9 @@ class RuntimeWebhookRepository:
         participant_data = participant if isinstance(participant, dict) else {}
         track_data = track if isinstance(track, dict) else {}
         participant_identity = self._optional_string(participant_data.get("identity"))
+        disconnect_reason = self._optional_string(
+            participant_data.get("disconnectReason")
+        )
 
         record = await self._session.scalar(
             select(AiCallRecordModel)
@@ -253,6 +256,17 @@ class RuntimeWebhookRepository:
             and participant_identity
             and participant_identity == record.participant_identity
         ):
+            user_unavailable = (
+                record.entry_type != "web"
+                and str(disconnect_reason or "").strip().upper()
+                == "USER_UNAVAILABLE"
+            )
+            if user_unavailable:
+                record.failure_stage = record.failure_stage or "sip"
+                record.failure_message = record.failure_message or (
+                    "SIP 480 Temporarily Unavailable; "
+                    "hangup_cause=USER_UNAVAILABLE"
+                )
             decision = await RuntimeCommandRepository(
                 self._session,
                 id_generator=self._id_generator,
@@ -265,7 +279,11 @@ class RuntimeWebhookRepository:
                     end_reason=(
                         "browser_disconnect"
                         if record.entry_type == "web"
-                        else "sip_participant_left"
+                        else (
+                            "user_unavailable"
+                            if user_unavailable
+                            else "sip_participant_left"
+                        )
                     ),
                     dedupe_key=self._end_dedupe_key(claim),
                     provider=claim.provider,

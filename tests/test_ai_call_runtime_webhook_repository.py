@@ -475,12 +475,17 @@ async def test_old_processing_token_cannot_write_evidence_or_command(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("entry_type", "expected_end_reason"),
-    (("web", "browser_disconnect"), ("direct_sip", "sip_participant_left")),
+    ("entry_type", "disconnect_reason", "expected_end_reason"),
+    (
+        ("web", None, "browser_disconnect"),
+        ("direct_sip", None, "sip_participant_left"),
+        ("direct_sip", "USER_UNAVAILABLE", "user_unavailable"),
+    ),
 )
 async def test_customer_participant_left_uses_entry_specific_end_reason(
     webhook_session_factory,
     entry_type: str,
+    disconnect_reason: str | None,
     expected_end_reason: str,
 ) -> None:
     from app.services.ai_call.runtime_control.webhook_repository import (
@@ -497,7 +502,15 @@ async def test_customer_participant_left_uses_entry_specific_end_reason(
             "event": "participant_left",
             "id": "EV_sip_left_1",
             "room": {"name": "ai-call-call-1"},
-            "participant": {"identity": "caller-call-1", "sid": "PA_SIP_1"},
+            "participant": {
+                "identity": "caller-call-1",
+                "sid": "PA_SIP_1",
+                **(
+                    {"disconnectReason": disconnect_reason}
+                    if disconnect_reason
+                    else {}
+                ),
+            },
         },
     )
     ids = iter((9400, 9401, 9402))
@@ -531,6 +544,12 @@ async def test_customer_participant_left_uses_entry_specific_end_reason(
     assert evidence.source == "livekit_webhook"
     assert evidence.end_reason == expected_end_reason
     assert evidence.provider_event_id == "EV_sip_left_1"
+    if disconnect_reason:
+        assert disconnect_reason in evidence.evidence_json
+        assert record.failure_stage == "sip"
+        assert record.failure_message == (
+            "SIP 480 Temporarily Unavailable; hangup_cause=USER_UNAVAILABLE"
+        )
     assert inbox.status == "SUCCEEDED"
 
 

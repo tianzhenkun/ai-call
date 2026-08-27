@@ -929,7 +929,7 @@ class OutboundRuleTaskService:
                 .limit(page_size)
             )
         ).all()
-        latest_dialer_types = await self._latest_dialer_types_by_target(
+        latest_attempts = await self._latest_attempts_by_target(
             db,
             tenant_id,
             [target.id for target in targets],
@@ -939,15 +939,27 @@ class OutboundRuleTaskService:
             tenant_id,
             [target.id for target in targets],
         )
-        return [
-            self.target_out(
-                target,
-                latest_dialer_type=latest_dialer_types.get(target.id),
-                active_call_id=(active_call_ids.get(target.id) or (None, None))[0],
-                active_call_status=(active_call_ids.get(target.id) or (None, None))[1],
+        outputs: list[OutboundTargetOut] = []
+        for target in targets:
+            dialer_type, status_code, provider_reason, hangup_cause = (
+                latest_attempts.get(target.id) or (None, None, None, None)
             )
-            for target in targets
-        ], total
+            active_call_id, active_call_status = active_call_ids.get(
+                target.id,
+                (None, None),
+            )
+            outputs.append(
+                self.target_out(
+                    target,
+                    latest_dialer_type=dialer_type,
+                    provider_status_code=status_code,
+                    provider_reason=provider_reason,
+                    hangup_cause=hangup_cause,
+                    active_call_id=active_call_id,
+                    active_call_status=active_call_status,
+                )
+            )
+        return outputs, total
 
     async def _resolve_references(
         self,
@@ -1184,6 +1196,9 @@ class OutboundRuleTaskService:
         target: AiCallOutboundTargetModel,
         *,
         latest_dialer_type: str | None = None,
+        provider_status_code: str | None = None,
+        provider_reason: str | None = None,
+        hangup_cause: str | None = None,
         active_call_id: str | None = None,
         active_call_status: str | None = None,
     ) -> OutboundTargetOut:
@@ -1196,6 +1211,9 @@ class OutboundRuleTaskService:
             attempt_count=target.attempt_count,
             latest_result=target.latest_result,
             latest_dialer_type=latest_dialer_type,
+            provider_status_code=provider_status_code,
+            provider_reason=provider_reason,
+            hangup_cause=hangup_cause,
             active_call_id=active_call_id,
             active_call_status=active_call_status,
             updated_at=OutboundRuleTaskService._format_datetime(target.updated_at) or "",
@@ -1257,11 +1275,14 @@ class OutboundRuleTaskService:
         return {task_id: int(count) for task_id, count in rows}
 
     @staticmethod
-    async def _latest_dialer_types_by_target(
+    async def _latest_attempts_by_target(
         db: AsyncSession,
         tenant_id: str,
         target_ids: list[int],
-    ) -> dict[int, str | None]:
+    ) -> dict[
+        int,
+        tuple[str | None, str | None, str | None, str | None],
+    ]:
         if not target_ids:
             return {}
         rows = (
@@ -1269,6 +1290,9 @@ class OutboundRuleTaskService:
                 select(
                     AiCallOutboundAttemptModel.target_id,
                     AiCallOutboundAttemptModel.dialer_type,
+                    AiCallOutboundAttemptModel.provider_status_code,
+                    AiCallOutboundAttemptModel.provider_reason,
+                    AiCallOutboundAttemptModel.hangup_cause,
                 )
                 .where(
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
@@ -1280,9 +1304,21 @@ class OutboundRuleTaskService:
                 )
             )
         ).all()
-        result: dict[int, str | None] = {}
-        for target_id, dialer_type in rows:
-            result.setdefault(target_id, dialer_type)
+        result: dict[
+            int,
+            tuple[str | None, str | None, str | None, str | None],
+        ] = {}
+        for (
+            target_id,
+            dialer_type,
+            status_code,
+            provider_reason,
+            hangup_cause,
+        ) in rows:
+            result.setdefault(
+                target_id,
+                (dialer_type, status_code, provider_reason, hangup_cause),
+            )
         return result
 
     @staticmethod

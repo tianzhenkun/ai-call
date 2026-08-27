@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select, update
@@ -17,9 +18,11 @@ from app.api.v1.ai_call.model import (
     AiCallRecordModel,
 )
 from app.api.v1.ai_call.outbound.attempt_projection import (
+    apply_terminal_projection,
     enroll_terminal_exception,
     exception_category_for,
     outbound_retry_interval,
+    terminal_attempt_decision,
 )
 from app.api.v1.ai_call.outbound.exception_schema import ExceptionPolicyIn
 from app.api.v1.ai_call.outbound.exception_service import OutboundExceptionService
@@ -775,6 +778,61 @@ async def test_executor_persists_provider_diagnostics(database) -> None:
     assert attempt.provider_status_code == "508"
     assert attempt.provider_reason == "Q.850 cause=31"
     assert attempt.hangup_cause == "NORMAL_UNSPECIFIED"
+
+
+def test_terminal_projection_persists_sip_480_diagnostics() -> None:
+    now = datetime(2026, 8, 27, 2, 30, tzinfo=timezone.utc)
+    record = SimpleNamespace(
+        status="completed",
+        answered_at=None,
+        ended_at=now,
+        end_reason="user_unavailable",
+        failure_message=(
+            "SIP 480 Temporarily Unavailable; hangup_cause=USER_UNAVAILABLE"
+        ),
+    )
+    decision = terminal_attempt_decision(record, media_connected=False)
+
+    assert decision is not None
+    task = SimpleNamespace(
+        status="RUNNING",
+        next_dispatch_at=now,
+        config_snapshot_json=json.dumps(
+            {
+                "rule": {
+                    "retryCount": 0,
+                    "retryableResults": [],
+                    "retryIntervalsMinutes": [],
+                }
+            }
+        ),
+    )
+    target = SimpleNamespace(status="DIALING", next_attempt_at=None, updated_at=None)
+    attempt = SimpleNamespace(
+        attempt_no=1,
+        status="DIALING",
+        call_result=None,
+        error_message=None,
+        provider_status_code=None,
+        provider_reason=None,
+        hangup_cause=None,
+        active_slot="sip:1",
+        ended_at=None,
+        updated_at=None,
+    )
+    apply_terminal_projection(
+        task=task,
+        target=target,
+        attempt=attempt,
+        record=record,
+        decision=decision,
+        now=now,
+    )
+
+    assert attempt.call_result == "no_answer"
+    assert attempt.provider_status_code == "480"
+    assert attempt.provider_reason == record.failure_message
+    assert attempt.hangup_cause == "USER_UNAVAILABLE"
 
 
 @pytest.mark.anyio

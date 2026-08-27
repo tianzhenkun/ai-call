@@ -213,6 +213,9 @@ class OutboundTargetOut(OutboundSchema):
     attempt_count: int
     latest_result: str | None = None
     latest_dialer_type: str | None = None
+    provider_status_code: str | None = None
+    provider_reason: str | None = None
+    hangup_cause: str | None = None
     active_call_id: str | None = None
     active_call_status: str | None = None
     updated_at: str
