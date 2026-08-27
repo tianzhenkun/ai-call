@@ -2081,9 +2081,14 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
     console_session_id, data_id = await _seed_follow_up_data_without_task(
         session_factory
     )
+    now = [datetime(2026, 8, 27, 3, 0, tzinfo=timezone.utc)]
 
     async with session_factory() as db:
-        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=_FakeCallbackFactory(),
+            clock=lambda: now[0],
+        )
         auth = _auth(db, user_id=20)
         callback, _ = await service.start_follow_up_data_callback(
             auth,
@@ -2091,6 +2096,7 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
             payload=FollowUpDataCallIn(console_session_id=console_session_id),
             idempotency_key="direct-call-no-answer",
         )
+        now[0] += timedelta(seconds=9)
         outcome = await service.handle_livekit_webhook_event(
             event_type="participant_left",
             room_name=f"ai-call-{callback.call_id}",
@@ -2127,6 +2133,9 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
             "disconnectReason=USER_UNAVAILABLE; "
             "sip.callStatus=hangup; sip.callID=sip-call-direct"
         )
+        assert record.ended_at is not None
+        assert record.ended_at.replace(tzinfo=timezone.utc) == now[0]
+        assert record.duration_ms == 9_000
         callback_item = next(
             item for item in detail["timeline"] if item["call_id"] == callback.call_id
         )
@@ -2644,6 +2653,7 @@ async def test_ringing_callback_timeout_auto_settles_and_releases_presence(
         sip_line_snapshot=source_line,
     )
     now = [datetime(2026, 8, 27, 2, 0, tzinfo=timezone.utc)]
+    started_at = now[0]
 
     async with session_factory() as db:
         factory = _FakeCallbackFactory()
@@ -2669,7 +2679,7 @@ async def test_ringing_callback_timeout_auto_settles_and_releases_presence(
             payload=FollowUpCallIn(console_session_id=console_session_id),
         )
 
-        now[0] += timedelta(seconds=31)
+        now[0] += timedelta(minutes=161)
         factory.sip_call_status = "active"
         assert await service.reconcile_callback_timeout(
             auth,
@@ -2699,9 +2709,16 @@ async def test_ringing_callback_timeout_auto_settles_and_releases_presence(
         assert record is not None
         assert record.status == "completed"
         assert record.end_reason == "callback_no_answer"
+        assert record.ended_at is not None
+        assert record.ended_at.replace(tzinfo=timezone.utc) == started_at + timedelta(
+            seconds=30
+        )
+        assert record.duration_ms == 30_000
         assert attempt is not None
         assert attempt.attempt_result == "no_answer"
         assert attempt.ring_duration_seconds == 30
+        assert attempt.contacted_at.replace(tzinfo=timezone.utc) == started_at
+        assert attempt.created_at.replace(tzinfo=timezone.utc) == now[0]
         assert presence is not None
         assert presence.status == "available"
         assert presence.active_call_id is None
@@ -2757,9 +2774,14 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
         agent_identity="agent-20",
     )
     await _seed_unanswered_follow_up(session_factory)
+    now = [datetime(2026, 8, 27, 4, 0, tzinfo=timezone.utc)]
 
     async with session_factory() as db:
-        service = AiCallFollowUpService(db, callback_factory=_FakeCallbackFactory())
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=_FakeCallbackFactory(),
+            clock=lambda: now[0],
+        )
         auth = _auth(db, user_id=20)
         await service.claim_follow_up(auth, follow_up_id=100)
         callback = await service.start_callback(
@@ -2769,6 +2791,7 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
                 console_session_id=console_session_id,
             ),
         )
+        now[0] += timedelta(seconds=7)
 
         result = await service.handle_livekit_webhook_event(
             event_type="participant_left",
@@ -2799,6 +2822,10 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             )
         ).scalar_one()
         assert attempt.attempt_result == "no_answer"
+        assert attempt.contacted_at.replace(tzinfo=timezone.utc) == now[0] - timedelta(
+            seconds=7
+        )
+        assert attempt.created_at.replace(tzinfo=timezone.utc) == now[0]
         assert attempt.error_message == (
             "disconnectReason=USER_UNAVAILABLE; "
             "sip.callStatus=hangup; sip.callID=sip-call-task"
@@ -2809,6 +2836,9 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             )
         )
         assert record is not None
+        assert record.ended_at is not None
+        assert record.ended_at.replace(tzinfo=timezone.utc) == now[0]
+        assert record.duration_ms == 7_000
         assert record.failure_stage == "sip_callback"
         assert record.failure_message == attempt.error_message
 

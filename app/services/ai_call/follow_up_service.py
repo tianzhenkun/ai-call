@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1554,7 +1554,8 @@ class AiCallFollowUpService:
         started_at = record.started_at
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=timezone.utc)
-        if (self.clock() - started_at).total_seconds() < timeout_seconds:
+        timeout_at = started_at + timedelta(seconds=timeout_seconds)
+        if self.clock() < timeout_at:
             return False
 
         sip_status = await self.callback_factory.get_call_status(call_id=record.call_id)
@@ -1569,12 +1570,14 @@ class AiCallFollowUpService:
                 attempt_result="no_answer",
                 ring_duration_seconds=timeout_seconds,
                 error_message=message,
+                timeout_at=timeout_at,
             )
         else:
             await self._record_follow_up_data_callback_outcome(
                 call_id=record.call_id,
                 attempt_result="no_answer",
                 error_message=message,
+                timeout_at=timeout_at,
             )
         return True
 
@@ -1864,6 +1867,7 @@ class AiCallFollowUpService:
         call_id: str,
         attempt_result: str,
         error_message: str | None = None,
+        timeout_at: datetime | None = None,
     ) -> AiCallRecordModel:
         allowed_results = {
             "connected",
@@ -1884,7 +1888,7 @@ class AiCallFollowUpService:
             or record.follow_up_id is not None
         ):
             raise CustomException(msg="跟进数据人工外呼记录不存在", status_code=404)
-        now = datetime.now(timezone.utc)
+        now = self.clock()
         if record.answered_at is None and attempt_result != "connected":
             await self.db.execute(
                 update(AiCallFollowUpDataModel)
@@ -1905,7 +1909,7 @@ class AiCallFollowUpService:
             record.status = (
                 "failed" if attempt_result == "technical_failure" else "completed"
             )
-            record.ended_at = record.ended_at or now
+            record.ended_at = record.ended_at or timeout_at or now
             record.duration_ms = self._callback_duration_ms(record, record.ended_at)
             record.end_reason = f"callback_{attempt_result}"
             if error_message:
@@ -1941,6 +1945,7 @@ class AiCallFollowUpService:
         attempt_result: str,
         ring_duration_seconds: int | None = None,
         error_message: str | None = None,
+        timeout_at: datetime | None = None,
     ) -> AiCallFollowUpAttemptModel:
         existing = await self._attempt_by_call_id(call_id)
         if existing is not None:
@@ -1962,7 +1967,7 @@ class AiCallFollowUpService:
         if attempt_result == "technical_failure" and not (error_message or "").strip():
             raise CustomException(msg="技术失败必须提供错误摘要", status_code=422)
 
-        now = datetime.now(timezone.utc)
+        now = self.clock()
         attempt = AiCallFollowUpAttemptModel(
             id=generate_snowflake_id(),
             tenant_id=task.tenant_id,
@@ -1974,7 +1979,7 @@ class AiCallFollowUpService:
             ring_duration_seconds=ring_duration_seconds,
             error_message=(error_message or "").strip() or None,
             remark=None,
-            contacted_at=now,
+            contacted_at=record.started_at or now,
             customer_callback_at=None,
             created_at=now,
         )
@@ -1985,7 +1990,7 @@ class AiCallFollowUpService:
             task.status = "processing"
         else:
             record.status = "failed" if attempt_result == "technical_failure" else "completed"
-            ended_at = record.ended_at or now
+            ended_at = record.ended_at or timeout_at or now
             record.ended_at = ended_at
             record.duration_ms = self._callback_duration_ms(record, ended_at)
             record.end_reason = f"callback_{attempt_result}"
