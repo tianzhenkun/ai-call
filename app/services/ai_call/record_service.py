@@ -478,8 +478,12 @@ class AiCallRecordService:
                 raw_summary = parsed_analysis.get("summary")
                 if isinstance(raw_summary, str) and raw_summary.strip():
                     semantic_summary = raw_summary.strip()
-        call_result = outbound_context.get("callResult")
-        if call_result is None and record.entry_type == "sip_callback":
+        call_result = (
+            None
+            if record.entry_type == "sip_callback"
+            else outbound_context.get("callResult")
+        )
+        if record.entry_type == "sip_callback":
             if record.answered_at is not None:
                 call_result = "connected"
             elif record.end_reason and record.end_reason.startswith("callback_"):

@@ -339,6 +339,7 @@ class RecordOut(AiCallBaseSchema):
     id: str
     call_id: str
     task_id: str | None = None
+    call_result: str | None = None
     follow_up_data_id: str | None = None
     operator_agent_identity: str | None = None
     after_call_result_status: Literal[

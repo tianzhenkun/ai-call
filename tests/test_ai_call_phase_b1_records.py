@@ -1862,6 +1862,7 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
                     status="completed",
                     started_at=now,
                     ended_at=now,
+                    end_reason="callback_no_answer",
                     duration_ms=0,
                 ),
             ]
@@ -1881,6 +1882,12 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
     assert row["taskName"] == "回拨来源任务"
     assert row["customerName"] == "刘先生"
     assert row["phoneNumber"] == "19900001001"
+    assert row["callResult"] == "no_answer"
+
+    detail = RecordDetailOut.model_validate(
+        await b1_service.service.get_record_detail(callback_call_id)
+    ).model_dump(mode="json", by_alias=True)
+    assert detail["record"]["callResult"] == "no_answer"
 
 
 @pytest.mark.anyio
