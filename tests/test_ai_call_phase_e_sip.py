@@ -220,12 +220,14 @@ class FakeRecordService:
         end_reason: str,
         failure_stage: str | None,
         failure_message: str | None,
+        ended_at=None,
     ) -> None:
         self.failed_sessions.append({
             "call_id": call_id,
             "end_reason": end_reason,
             "failure_stage": failure_stage,
             "failure_message": failure_message,
+            "ended_at": ended_at,
         })
 
     async def get_active_sip_record_by_callee_hash(self, callee_phone_number_hash: str):
@@ -1262,7 +1264,11 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
         {
             "call_id": result.call_id,
             "end_reason": "remote_hangup",
-            "ended_at": None,
+            "ended_at": next(
+                event.timestamp
+                for event in service.orchestrator.event_store.list_all(result.call_id)
+                if event.type == "sip_hangup"
+            ),
         }
     ]
     event_types = [
@@ -1315,7 +1321,11 @@ async def test_livekit_sip_participant_left_ends_persisted_session_without_local
         {
             "call_id": result.call_id,
             "end_reason": "remote_hangup",
-            "ended_at": None,
+            "ended_at": next(
+                event.timestamp
+                for event in service.orchestrator.event_store.list_all(result.call_id)
+                if event.type == "sip_hangup"
+            ),
         }
     ]
     event_types = [

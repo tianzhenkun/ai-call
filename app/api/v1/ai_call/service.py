@@ -1122,7 +1122,7 @@ class AiCallService:
         if session.status not in RUNNING_STATUSES:
             return {"handled": False, "reason": "session_not_running"}
 
-        self._record_sip_event(
+        hangup_event = self._record_sip_event(
             call_id=call_id,
             event_type="sip_hangup",
             source="livekit",
@@ -1133,7 +1133,11 @@ class AiCallService:
                 payload=payload,
             ),
         )
-        await self.end_session(call_id, end_reason="remote_hangup")
+        await self.end_session(
+            call_id,
+            end_reason="remote_hangup",
+            ended_at=hangup_event.timestamp if hangup_event is not None else None,
+        )
         return {
             "handled": True,
             "action": "end_session",
@@ -1170,6 +1174,7 @@ class AiCallService:
         await self.record_service.complete_session(
             call_id,
             end_reason="remote_hangup",
+            ended_at=hangup_event.timestamp,
         )
         await self._finalize_handoffs_for_call(
             call_id,
@@ -1259,7 +1264,9 @@ class AiCallService:
         call_id: str,
         *,
         end_reason: str = "web_user_end",
+        ended_at: datetime | None = None,
     ) -> EndSessionResult:
+        terminal_at = ended_at or datetime.now(timezone.utc)
         try:
             session = await self.orchestrator.get_session(call_id)
             if self.recording_service is not None and session.status != CallSessionStatus.COMPLETED:
@@ -1275,6 +1282,7 @@ class AiCallService:
                 await self.record_service.complete_session(
                     call_id,
                     end_reason=end_reason,
+                    ended_at=terminal_at,
                 )
                 await self._finalize_handoffs_for_call(
                     call_id,
@@ -1287,6 +1295,7 @@ class AiCallService:
                     end_reason="unknown",
                     failure_stage="runtime",
                     failure_message="会话已失败",
+                    ended_at=terminal_at,
                 )
                 await self._finalize_handoffs_for_call(call_id, end_reason="runtime_failed")
                 await self._enqueue_offline_asr_if_recordings_closed(call_id)
