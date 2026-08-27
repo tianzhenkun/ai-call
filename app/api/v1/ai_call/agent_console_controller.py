@@ -277,7 +277,12 @@ async def heartbeat_controller(
     payload: AgentPresenceSessionIn,
     auth: AuthenticatedUser,
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    follow_up_service: Annotated[AiCallFollowUpService, Depends(get_follow_up_service)],
 ):
+    await follow_up_service.reconcile_callback_timeout(
+        auth,
+        console_session_id=str(payload.console_session_id),
+    )
     presence = await service.heartbeat(
         auth,
         console_session_id=str(payload.console_session_id),

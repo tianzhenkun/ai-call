@@ -1391,6 +1391,51 @@ class AiCallFollowUpService:
             )
         return line
 
+    async def _callback_ringing_timeout_seconds(
+        self,
+        record: AiCallRecordModel,
+    ) -> int:
+        follow_up_data = (
+            await self.db.get(AiCallFollowUpDataModel, record.follow_up_data_id)
+            if record.follow_up_data_id is not None
+            else None
+        )
+        source_call_id = follow_up_data.source_call_id if follow_up_data else None
+        if record.follow_up_id is not None:
+            task = await self._required_task_by_id(record.follow_up_id)
+            source_call_id = task.source_call_id
+            if follow_up_data is None and task.follow_up_data_id is not None:
+                follow_up_data = await self.db.get(
+                    AiCallFollowUpDataModel,
+                    task.follow_up_data_id,
+                )
+        if source_call_id is None:
+            return settings.AI_CALL_SIP_DEFAULT_RINGING_TIMEOUT_SECONDS
+
+        outbound_task = await self._callback_outbound_task(
+            tenant_id=record.tenant_id,
+            source_call_id=source_call_id,
+            follow_up_data=follow_up_data,
+        )
+        line = self._source_task_sip_line(outbound_task)
+        if self.sip_line_service is None:
+            return min(
+                line.originate_timeout_seconds
+                if line is not None
+                else settings.AI_CALL_SIP_DEFAULT_RINGING_TIMEOUT_SECONDS,
+                settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS,
+            )
+        if line is None:
+            line = await self.sip_line_service.resolve_default(
+                self.db,
+                record.tenant_id,
+            )
+        config = self.sip_line_service.to_sip_config(line)
+        return min(
+            config.default_ringing_timeout_seconds,
+            config.max_ringing_timeout_seconds,
+        )
+
     @staticmethod
     def _require_callback_window(
         outbound_task: AiCallOutboundTaskModel,
@@ -1473,6 +1518,65 @@ class AiCallFollowUpService:
         attempt = await self._attempt_by_call_id(call_id)
         assert attempt is not None
         return attempt
+
+    async def reconcile_callback_timeout(
+        self,
+        auth: AuthSchema,
+        *,
+        console_session_id: str,
+    ) -> bool:
+        profile = await self.agent_service.require_current_agent(auth)
+        presence = await self.db.scalar(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.tenant_id == profile.tenant_id,
+                AiCallHandoffAgentModel.agent_identity == profile.agent_identity,
+            )
+        )
+        if (
+            self.callback_factory is None
+            or presence is None
+            or presence.console_session_id != console_session_id
+            or not presence.active_call_id
+        ):
+            return False
+        record = await self.db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.tenant_id == profile.tenant_id,
+                AiCallRecordModel.call_id == presence.active_call_id,
+                AiCallRecordModel.operator_agent_identity == profile.agent_identity,
+                AiCallRecordModel.entry_type == "sip_callback",
+            )
+        )
+        if record is None or record.status != "ringing" or record.answered_at is not None:
+            return False
+
+        timeout_seconds = await self._callback_ringing_timeout_seconds(record)
+        started_at = record.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        if (self.clock() - started_at).total_seconds() < timeout_seconds:
+            return False
+
+        sip_status = await self.callback_factory.get_call_status(call_id=record.call_id)
+        if str(sip_status or "").strip().lower() in CONNECTED_SIP_STATUSES:
+            return False
+
+        await self.callback_factory.end(call_id=record.call_id)
+        message = "超过原任务线路振铃时限，未收到接通事件"
+        if record.follow_up_id is not None:
+            await self.record_callback_outcome(
+                call_id=record.call_id,
+                attempt_result="no_answer",
+                ring_duration_seconds=timeout_seconds,
+                error_message=message,
+            )
+        else:
+            await self._record_follow_up_data_callback_outcome(
+                call_id=record.call_id,
+                attempt_result="no_answer",
+                error_message=message,
+            )
+        return True
 
     async def confirm_follow_up_data_callback_connected(
         self,

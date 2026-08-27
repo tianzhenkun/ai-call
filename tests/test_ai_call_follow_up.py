@@ -2614,6 +2614,101 @@ async def test_callback_connection_requires_active_livekit_sip_status(
 
 
 @pytest.mark.anyio
+async def test_ringing_callback_timeout_auto_settles_and_releases_presence(
+    session_factory,
+) -> None:
+    source_line = {
+        "lineId": "901",
+        "lineCode": "source-line",
+        "lineName": "原任务线路",
+        "adapterType": "livekit_sip",
+        "routeMode": "inline_hostname",
+        "trunkId": None,
+        "proxyHost": "source.example.com",
+        "proxyPort": 5089,
+        "authMode": "ip_allowlist",
+        "callerNumber": "6008860812",
+        "destinationCountry": "CN",
+        "maxConcurrency": 8,
+        "originateTimeoutSeconds": 30,
+    }
+    console_session_id = await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+    )
+    await _seed_unanswered_follow_up(session_factory)
+    await _seed_outbound_context(
+        session_factory,
+        call_id="call-unanswered-100",
+        sip_line_snapshot=source_line,
+    )
+    now = [datetime(2026, 8, 27, 2, 0, tzinfo=timezone.utc)]
+
+    async with session_factory() as db:
+        factory = _FakeCallbackFactory()
+        factory.sip_call_status = "ringing"
+        line_service = _FakeSipLineService()
+        line_service.config = SipOutboundConfig(
+            enabled=True,
+            trunk_hostname="source.example.com:5089",
+            caller_number="6008860812",
+            default_ringing_timeout_seconds=30,
+        )
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=factory,
+            sip_line_service=line_service,
+            clock=lambda: now[0],
+        )
+        auth = _auth(db, user_id=20)
+        await service.claim_follow_up(auth, follow_up_id=100)
+        callback = await service.start_callback(
+            auth,
+            follow_up_id=100,
+            payload=FollowUpCallIn(console_session_id=console_session_id),
+        )
+
+        now[0] += timedelta(seconds=31)
+        factory.sip_call_status = "active"
+        assert await service.reconcile_callback_timeout(
+            auth,
+            console_session_id=console_session_id,
+        ) is False
+        factory.sip_call_status = "ringing"
+        assert await service.reconcile_callback_timeout(
+            auth,
+            console_session_id=console_session_id,
+        ) is True
+
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        attempt = await db.scalar(
+            select(AiCallFollowUpAttemptModel).where(
+                AiCallFollowUpAttemptModel.related_call_id == callback.call_id
+            )
+        )
+        presence = await db.scalar(
+            select(AiCallHandoffAgentModel).where(
+                AiCallHandoffAgentModel.agent_identity == "agent-20"
+            )
+        )
+        assert record is not None
+        assert record.status == "completed"
+        assert record.end_reason == "callback_no_answer"
+        assert attempt is not None
+        assert attempt.attempt_result == "no_answer"
+        assert attempt.ring_duration_seconds == 30
+        assert presence is not None
+        assert presence.status == "available"
+        assert presence.active_call_id is None
+        assert factory.ended_calls == [callback.call_id]
+
+
+@pytest.mark.anyio
 async def test_callback_joined_while_sip_is_ringing_is_not_connected(
     session_factory,
 ) -> None:
