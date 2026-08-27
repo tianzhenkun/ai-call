@@ -49,6 +49,7 @@ from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
+from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
 from app.services.ai_call.livekit_sip import (
     HumanCallbackSessionResult,
@@ -2008,7 +2009,7 @@ async def test_follow_up_data_callback_connection_requires_active_sip_status(
 
 
 @pytest.mark.anyio
-async def test_follow_up_data_direct_call_keeps_classification_when_not_connected(
+async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
     session_factory,
 ) -> None:
     console_session_id, data_id = await _seed_follow_up_data_without_task(
@@ -2024,30 +2025,30 @@ async def test_follow_up_data_direct_call_keeps_classification_when_not_connecte
             payload=FollowUpDataCallIn(console_session_id=console_session_id),
             idempotency_key="direct-call-no-answer",
         )
-        await service.handle_livekit_webhook_event(
+        outcome = await service.handle_livekit_webhook_event(
             event_type="participant_left",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
             payload={"participant": {"attributes": {"sip.callStatus": "no_answer"}}},
         )
 
-        data, task, _ = await service.submit_follow_up_data_handling_result(
-            auth,
-            follow_up_data_id=data_id,
-            payload=FollowUpHandlingResultIn(
-                call_id=callback.call_id,
-                contact_result="no_answer",
-                remark="本次人工外呼无人接听。",
-                schedule_follow_up=False,
-                expected_version=1,
-            ),
-            idempotency_key="direct-result-no-answer",
+        data = await db.get(AiCallFollowUpDataModel, data_id)
+        detail = await AiCallFollowUpDataService.from_session(db).get_detail(
+            tenant_id="tenant-a", follow_up_data_id=data_id
         )
 
-        assert task is None
+        assert outcome["attemptResult"] == "no_answer"
+        assert data is not None
         assert data.classification == "interested"
-        assert data.latest_conclusion == "本次人工外呼无人接听。"
+        assert data.latest_conclusion == "客户希望继续了解产品。"
         assert data.blocking_human_call_id is None
+        callback_item = next(
+            item for item in detail["timeline"] if item["call_id"] == callback.call_id
+        )
+        assert callback_item["after_call_result_status"] == "not_applicable"
+        assert await db.scalar(
+            select(func.count()).select_from(AiCallFollowUpHandlingResultModel)
+        ) == 0
 
 
 @pytest.mark.anyio

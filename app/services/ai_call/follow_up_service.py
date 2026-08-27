@@ -1749,10 +1749,20 @@ class AiCallFollowUpService:
             or record.follow_up_id is not None
         ):
             raise CustomException(msg="跟进数据人工外呼记录不存在", status_code=404)
+        now = datetime.now(timezone.utc)
+        if record.answered_at is None and attempt_result != "connected":
+            await self.db.execute(
+                update(AiCallFollowUpDataModel)
+                .where(
+                    AiCallFollowUpDataModel.id == record.follow_up_data_id,
+                    AiCallFollowUpDataModel.tenant_id == record.tenant_id,
+                    AiCallFollowUpDataModel.blocking_human_call_id == call_id,
+                )
+                .values(blocking_human_call_id=None, updated_at=now)
+            )
         if record.status in {"completed", "failed"}:
             return record
 
-        now = datetime.now(timezone.utc)
         if attempt_result == "connected":
             record.status = "running"
             record.answered_at = record.answered_at or now

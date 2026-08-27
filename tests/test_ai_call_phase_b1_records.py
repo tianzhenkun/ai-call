@@ -1650,7 +1650,13 @@ async def test_record_list_filters_and_projects_after_call_result_status(
 ) -> None:
     now = datetime.now(timezone.utc)
 
-    def record(row_id: int, call_id: str, operator: str | None):
+    def record(
+        row_id: int,
+        call_id: str,
+        operator: str | None,
+        *,
+        answered: bool = True,
+    ):
         return AiCallRecordModel(
             id=row_id,
             tenant_id="000000",
@@ -1662,7 +1668,9 @@ async def test_record_list_filters_and_projects_after_call_result_status(
             participant_identity=f"sip-{call_id}",
             status="completed",
             started_at=now,
+            answered_at=now if answered else None,
             ended_at=now,
+            end_reason="callback_no_answer" if not answered and operator else None,
         )
 
     async with b1_service.session_maker.begin() as db:
@@ -1671,7 +1679,8 @@ async def test_record_list_filters_and_projects_after_call_result_status(
                 record(9101, "call-result-pending", "agent-a"),
                 record(9102, "call-result-acw", "agent-a"),
                 record(9103, "call-result-handling", "agent-a"),
-                record(9104, "call-result-na", None),
+                record(9104, "call-result-na", None, answered=False),
+                record(9105, "call-result-unanswered", "agent-a", answered=False),
                 AiCallFollowUpDataModel(
                     id=9001,
                     tenant_id="000000",
@@ -1754,6 +1763,9 @@ async def test_record_list_filters_and_projects_after_call_result_status(
         "call-result-handling",
     }
     assert "call-result-na" in {row["callId"] for row in not_applicable["rows"]}
+    assert "call-result-unanswered" in {
+        row["callId"] for row in not_applicable["rows"]
+    }
 
     pending_detail = RecordDetailOut.model_validate(
         await b1_service.service.get_record_detail("call-result-pending")

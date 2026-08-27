@@ -806,7 +806,11 @@ class AiCallFollowUpDataService:
         )
         if handling_result is not None or after_call_work is not None:
             result_status = "submitted"
-        elif record.operator_agent_identity and record.status in {"completed", "failed"}:
+        elif (
+            record.operator_agent_identity
+            and record.answered_at is not None
+            and record.status in {"completed", "failed"}
+        ):
             result_status = "pending"
         else:
             result_status = "not_applicable"

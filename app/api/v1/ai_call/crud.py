@@ -729,6 +729,7 @@ class AiCallRecordRepository:
                 if record.call_id in submitted_call_ids
                 else "pending"
                 if record.operator_agent_identity
+                and record.answered_at is not None
                 and record.status in {"completed", "failed"}
                 else "not_applicable"
             )
@@ -3392,6 +3393,7 @@ class AiCallRecordRepository:
             elif after_call_result_status == "pending":
                 stmt = stmt.where(
                     AiCallRecordModel.operator_agent_identity.is_not(None),
+                    AiCallRecordModel.answered_at.is_not(None),
                     AiCallRecordModel.status.in_({"completed", "failed"}),
                     ~submitted,
                 )
@@ -3400,6 +3402,7 @@ class AiCallRecordRepository:
                     ~submitted,
                     or_(
                         AiCallRecordModel.operator_agent_identity.is_(None),
+                        AiCallRecordModel.answered_at.is_(None),
                         AiCallRecordModel.status.not_in({"completed", "failed"}),
                     ),
                 )
