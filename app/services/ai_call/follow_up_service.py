@@ -43,6 +43,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.outbound.sip_line_schema import SipLineSnapshot
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
@@ -1244,10 +1245,12 @@ class AiCallFollowUpService:
                     "FOLLOW_UP_DATA_CONTEXT_MISSING",
                 )
             self._require_callback_window(outbound_task, now)
-            line = await self.sip_line_service.resolve_default(
-                self.db,
-                profile.tenant_id,
-            )
+            line = self._source_task_sip_line(outbound_task)
+            if line is None:
+                line = await self.sip_line_service.resolve_default(
+                    self.db,
+                    profile.tenant_id,
+                )
             sip_config = self.sip_line_service.to_sip_config(line)
 
         call_id = f"call_{generate_snowflake_id()}"
@@ -1359,6 +1362,34 @@ class AiCallFollowUpService:
             participant_identity=session.agent_participant_identity,
             expires_in_seconds=session.expires_in_seconds,
         )
+
+    @staticmethod
+    def _source_task_sip_line(
+        outbound_task: AiCallOutboundTaskModel,
+    ) -> SipLineSnapshot | None:
+        try:
+            raw_line = json.loads(outbound_task.config_snapshot_json).get("sipLine")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return None
+        if raw_line is None:
+            return None
+        try:
+            line = SipLineSnapshot.model_validate(raw_line)
+        except (TypeError, ValueError) as exc:
+            raise CustomException(
+                msg="原外呼任务的线路快照无效",
+                status_code=409,
+                data={"errorCode": "SOURCE_SIP_LINE_SNAPSHOT_INVALID"},
+            ) from exc
+        if (
+            outbound_task.line_id is not None
+            and line.line_id != str(outbound_task.line_id)
+        ):
+            AiCallFollowUpService._raise_conflict(
+                "原外呼任务的线路快照不匹配",
+                "SOURCE_SIP_LINE_SNAPSHOT_MISMATCH",
+            )
+        return line
 
     @staticmethod
     def _require_callback_window(
@@ -1773,9 +1804,9 @@ class AiCallFollowUpService:
             record.ended_at = record.ended_at or now
             record.duration_ms = self._callback_duration_ms(record, record.ended_at)
             record.end_reason = f"callback_{attempt_result}"
-            if attempt_result == "technical_failure":
+            if error_message:
                 record.failure_stage = "sip_callback"
-                record.failure_message = (error_message or "").strip()
+                record.failure_message = error_message.strip()
         await self._settle_callback_presence(
             tenant_id=record.tenant_id,
             agent_identity=record.operator_agent_identity,
@@ -1854,7 +1885,7 @@ class AiCallFollowUpService:
             record.ended_at = ended_at
             record.duration_ms = self._callback_duration_ms(record, ended_at)
             record.end_reason = f"callback_{attempt_result}"
-            if attempt_result == "technical_failure":
+            if attempt.error_message:
                 record.failure_stage = "sip_callback"
                 record.failure_message = attempt.error_message
             task.status = "processing"
@@ -1958,11 +1989,9 @@ class AiCallFollowUpService:
         else:
             return {"handled": False, "reason": "unsupported_event"}
 
-        error_message = (
-            "SIP/LiveKit 人工回拨技术失败"
-            if attempt_result == "technical_failure"
-            else None
-        )
+        error_message = self._callback_sip_failure_message(payload or {})
+        if attempt_result == "technical_failure" and not error_message:
+            error_message = "SIP/LiveKit 人工回拨技术失败"
         if attempt_result == "connected":
             connected = await self._ensure_callback_connected(record)
             if connected:
@@ -3160,7 +3189,9 @@ class AiCallFollowUpService:
     def _callback_sip_status(payload: dict) -> str:
         participant = payload.get("participant")
         participant = participant if isinstance(participant, dict) else {}
-        attributes = participant.get("attributes") or payload.get("attributes") or {}
+        attributes = (
+            participant.get("attributes") or payload.get("attributes") or {}
+        )
         attributes = attributes if isinstance(attributes, dict) else {}
         raw_status = (
             attributes.get("sip.callStatus")
@@ -3206,6 +3237,35 @@ class AiCallFollowUpService:
             "agent_error": "technical_failure",
         }
         return reason_mapping.get(str(disconnect_reason or "").strip().lower())
+
+    @staticmethod
+    def _callback_sip_failure_message(payload: dict) -> str | None:
+        participant = payload.get("participant")
+        participant = participant if isinstance(participant, dict) else {}
+        attributes = participant.get("attributes") or payload.get("attributes") or {}
+        attributes = attributes if isinstance(attributes, dict) else {}
+        values = (
+            (
+                "disconnectReason",
+                payload.get("disconnectReason")
+                or payload.get("disconnect_reason")
+                or participant.get("disconnectReason")
+                or participant.get("disconnect_reason"),
+            ),
+            (
+                "sip.callStatus",
+                attributes.get("sip.callStatus")
+                or payload.get("sipCallStatus")
+                or payload.get("sip_call_status"),
+            ),
+            ("sip.callID", attributes.get("sip.callID")),
+        )
+        parts = [
+            f"{key}={str(value).strip()[:200]}"
+            for key, value in values
+            if value not in (None, "")
+        ]
+        return "; ".join(parts)[:500] or None
 
     @staticmethod
     def _callback_ring_duration(payload: dict) -> int | None:

@@ -252,6 +252,7 @@ async def _seed_outbound_context(
     *,
     call_id: str = "call-1",
     call_windows: list[dict[str, str]] | None = None,
+    sip_line_snapshot: dict | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
     windows = call_windows or [{"startTime": "09:00", "endTime": "21:00"}]
@@ -284,7 +285,19 @@ async def _seed_outbound_context(
                     rule_name="工作日规则",
                     rule_summary="全天",
                     config_snapshot_json=json.dumps(
-                        {"rule": {"callWindows": windows}}
+                        {
+                            "rule": {"callWindows": windows},
+                            **(
+                                {"sipLine": sip_line_snapshot}
+                                if sip_line_snapshot is not None
+                                else {}
+                            ),
+                        }
+                    ),
+                    line_id=(
+                        int(sip_line_snapshot["lineId"])
+                        if sip_line_snapshot is not None
+                        else None
                     ),
                     created_by=1,
                     created_at=now,
@@ -373,9 +386,14 @@ async def _seed_follow_up_data_without_task(
     session_factory,
     *,
     call_windows: list[dict[str, str]] | None = None,
+    sip_line_snapshot: dict | None = None,
 ) -> tuple[str, int]:
     console_session_id = await _seed_completed_handoff(session_factory)
-    await _seed_outbound_context(session_factory, call_windows=call_windows)
+    await _seed_outbound_context(
+        session_factory,
+        call_windows=call_windows,
+        sip_line_snapshot=sip_line_snapshot,
+    )
     async with session_factory() as db:
         source = await db.scalar(
             select(AiCallRecordModel).where(AiCallRecordModel.call_id == "call-1")
@@ -1709,6 +1727,7 @@ class _FakeCallbackFactory:
 class _FakeSipLineService:
     def __init__(self) -> None:
         self.resolved_tenant_id: str | None = None
+        self.converted_line = None
         self.config = SipOutboundConfig(
             enabled=True,
             trunk_hostname="47.94.86.132:5089",
@@ -1720,6 +1739,7 @@ class _FakeSipLineService:
         return object()
 
     def to_sip_config(self, _line) -> SipOutboundConfig:
+        self.converted_line = _line
         return self.config
 
 
@@ -1886,6 +1906,52 @@ async def test_follow_up_data_call_uses_tenant_default_sip_line(
 
 
 @pytest.mark.anyio
+async def test_follow_up_data_call_prefers_source_task_sip_line_snapshot(
+    session_factory,
+) -> None:
+    source_line = {
+        "lineId": "901",
+        "lineCode": "source-line",
+        "lineName": "原任务线路",
+        "adapterType": "livekit_sip",
+        "routeMode": "inline_hostname",
+        "trunkId": None,
+        "proxyHost": "source.example.com",
+        "proxyPort": 5089,
+        "authMode": "ip_allowlist",
+        "callerNumber": "6008860812",
+        "destinationCountry": "CN",
+        "maxConcurrency": 8,
+        "originateTimeoutSeconds": 30,
+    }
+    console_session_id, data_id = await _seed_follow_up_data_without_task(
+        session_factory,
+        sip_line_snapshot=source_line,
+    )
+    callback_factory = _FakeCallbackFactory()
+    line_service = _FakeSipLineService()
+
+    async with session_factory() as db:
+        service = AiCallFollowUpService(
+            db,
+            callback_factory=callback_factory,
+            sip_line_service=line_service,
+            clock=lambda: datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
+        )
+        await service.start_follow_up_data_callback(
+            _auth(db, user_id=20),
+            follow_up_data_id=data_id,
+            payload=FollowUpDataCallIn(console_session_id=console_session_id),
+            idempotency_key="source-line-call",
+        )
+
+    assert line_service.resolved_tenant_id is None
+    assert line_service.converted_line.line_id == "901"
+    assert line_service.converted_line.proxy_host == "source.example.com"
+    assert callback_factory.calls[0]["config"] == line_service.config
+
+
+@pytest.mark.anyio
 async def test_follow_up_data_call_rejects_outside_source_task_window_before_dial(
     session_factory,
 ) -> None:
@@ -2029,7 +2095,15 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
             event_type="participant_left",
             room_name=f"ai-call-{callback.call_id}",
             participant_identity=f"sip-{callback.call_id}",
-            payload={"participant": {"attributes": {"sip.callStatus": "no_answer"}}},
+            payload={
+                "participant": {
+                    "attributes": {
+                        "sip.callStatus": "hangup",
+                        "sip.callID": "sip-call-direct",
+                    },
+                    "disconnectReason": "USER_UNAVAILABLE",
+                }
+            },
         )
 
         data = await db.get(AiCallFollowUpDataModel, data_id)
@@ -2042,6 +2116,17 @@ async def test_follow_up_data_direct_call_auto_settles_when_not_connected(
         assert data.classification == "interested"
         assert data.latest_conclusion == "客户希望继续了解产品。"
         assert data.blocking_human_call_id is None
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        assert record is not None
+        assert record.failure_stage == "sip_callback"
+        assert record.failure_message == (
+            "disconnectReason=USER_UNAVAILABLE; "
+            "sip.callStatus=hangup; sip.callID=sip-call-direct"
+        )
         callback_item = next(
             item for item in detail["timeline"] if item["call_id"] == callback.call_id
         )
@@ -2596,7 +2681,11 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             participant_identity=f"sip-{callback.call_id}",
             payload={
                 "participant": {
-                    "attributes": {"sip.callStatus": "no_answer"},
+                    "attributes": {
+                        "sip.callStatus": "hangup",
+                        "sip.callID": "sip-call-task",
+                    },
+                    "disconnectReason": "USER_UNAVAILABLE",
                 }
             },
         )
@@ -2615,6 +2704,18 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
             )
         ).scalar_one()
         assert attempt.attempt_result == "no_answer"
+        assert attempt.error_message == (
+            "disconnectReason=USER_UNAVAILABLE; "
+            "sip.callStatus=hangup; sip.callID=sip-call-task"
+        )
+        record = await db.scalar(
+            select(AiCallRecordModel).where(
+                AiCallRecordModel.call_id == callback.call_id
+            )
+        )
+        assert record is not None
+        assert record.failure_stage == "sip_callback"
+        assert record.failure_message == attempt.error_message
 
 
 @pytest.mark.anyio
