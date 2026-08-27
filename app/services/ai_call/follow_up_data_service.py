@@ -455,7 +455,7 @@ class AiCallFollowUpDataService:
             or latest_history is None
             or latest_history.call_id != analysis.call_id
             or (
-                latest_history.source != "ai_auto"
+                latest_history.source not in {"ai_auto", "handoff_after_call"}
                 and not (
                     latest_history.source == "transfer_failed"
                     and data.classification_source == "system"

@@ -765,6 +765,23 @@ def test_semantic_analysis_result_strips_leading_dangling_summary_punctuation() 
     assert result["summary"] == "客户表现出对AI话术的误解与抵触；随后关注识别准确率。"
 
 
+def test_semantic_analysis_result_strips_unmatched_closing_parenthesis_prefix() -> None:
+    module = _semantic_module()
+
+    result = module.enforce_semantic_evidence_on_result(
+        module.normalize_analysis_result({
+            "summary": "）。客户主动提出转人工，随后对话偏离业务主题。",
+            "feedback_type": "中性",
+            "key_points": [],
+            "time_hint": {},
+            "tags": [],
+        }),
+        {"turns": []},
+    )
+
+    assert result["summary"] == "客户主动提出转人工，随后对话偏离业务主题。"
+
+
 def test_semantic_analysis_result_adds_customer_subject_after_prefix_cleanup() -> None:
     module = _semantic_module()
 

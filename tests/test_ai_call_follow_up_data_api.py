@@ -970,6 +970,125 @@ async def test_high_confidence_ai_mismatch_requires_review_and_can_keep_current(
 
 
 @pytest.mark.anyio
+async def test_same_call_after_call_classification_can_be_reviewed_once(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(
+        session_factory,
+        classification="interested",
+        with_active_task=False,
+    )
+    now = datetime.now(timezone.utc)
+    analysis_result = {
+        "classification": "low_value",
+        "low_value_reason": "non_target_customer",
+        "confidence": "high",
+        "valid_dialogue": False,
+        "reason": "客户并非目标客户。",
+        "evidence": ["客户：请转人工"],
+        "evidence_conflict": True,
+    }
+
+    async with session_factory() as db, db.begin():
+        data = await db.get(AiCallFollowUpDataModel, 100)
+        assert data is not None
+        data.classification_source = "human"
+        data.classification_updated_by = "agent-admin"
+        analysis = AiCallSemanticAnalysisModel(
+            id=504,
+            call_id="call-source-1",
+            scene_code="intro_product",
+            analysis_scene_code="ai_call_semantic_analysis",
+            analysis_status="2",
+            analysis_version=1,
+            analysis_result=json.dumps(analysis_result, ensure_ascii=False),
+            customer_intent="negative",
+            follow_up_suggested=False,
+            follow_up_consent=None,
+            follow_up_reason=None,
+            follow_up_preferred_at=None,
+            follow_up_confidence=None,
+            follow_up_review_status=None,
+            follow_up_reviewed_by=None,
+            follow_up_reviewed_by_name=None,
+            follow_up_reviewed_at=None,
+            analysis_error=None,
+            analysis_retry_count=0,
+            analysis_started_at=now,
+            analysis_finished_at=now,
+            transcript_hash=None,
+            transcript_snapshot_json=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(analysis)
+        db.add(
+            AiCallFollowUpClassificationHistoryModel(
+                id=505,
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                from_classification=None,
+                to_classification="interested",
+                change_reason="坐席确认客户有意向。",
+                source="handoff_after_call",
+                call_id="call-source-1",
+                semantic_analysis_id=None,
+                semantic_analysis_version=None,
+                ai_suggested_classification=None,
+                ai_confidence=None,
+                ai_reason=None,
+                ai_evidence_json=None,
+                ai_conflict=None,
+                ai_adopted=None,
+                idempotency_key="after-call-work-1",
+                request_fingerprint="after-call-work-fingerprint-1",
+                result_version=1,
+                changed_by="agent-admin",
+                changed_by_name="管理员",
+                created_at=now,
+            )
+        )
+        await db.flush()
+
+        service = AiCallFollowUpDataService.from_session(db)
+        await service.review_classification(
+            tenant_id="tenant-a",
+            follow_up_data_id=100,
+            analysis=analysis,
+            payload=FollowUpDataClassificationIn(
+                classification="interested",
+                reason="人工复核后保留当前业务分类。",
+                expected_version=1,
+            ),
+            idempotency_key="classification-review-after-call",
+            changed_by="20",
+            changed_by_name="管理员",
+        )
+
+        assert data.classification == "interested"
+        assert data.version == 2
+        assert analysis.follow_up_review_status == "adjusted"
+
+        analysis.follow_up_review_status = None
+
+        with pytest.raises(CustomException) as stale:
+            await service.review_classification(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                analysis=analysis,
+                payload=FollowUpDataClassificationIn(
+                    classification="interested",
+                    reason="不得重复覆盖人工复核。",
+                    expected_version=2,
+                ),
+                idempotency_key="classification-review-after-manual-review",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+        assert stale.value.data["errorCode"] == "CLASSIFICATION_REVIEW_STALE"
+
+
+@pytest.mark.anyio
 async def test_schedule_follow_up_creates_one_unassigned_task_idempotently(
     session_factory,
 ) -> None:

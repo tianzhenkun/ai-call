@@ -17,6 +17,7 @@ from app.services.ai_call.dialogue_merge import (
     is_cross_source_customer_transcript_conflict,
     is_duplicate_dialogue_segment,
     normalize_dialogue_text,
+    prefers_offline_availability_answer,
 )
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
 from app.services.ai_call.transcript_trust import (
@@ -1230,6 +1231,9 @@ class AiCallDialogueService:
             ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
                 row,
                 rows,
+            ) or AiCallDialogueService._is_realtime_customer_shadowed_by_offline_answer(
+                row,
+                rows,
             ) or AiCallDialogueService._is_offline_customer_shadowed_by_realtime(
                 row,
                 realtime_rows,
@@ -1282,6 +1286,9 @@ class AiCallDialogueService:
                 row,
                 rows,
             ) or AiCallDialogueService._is_realtime_customer_prefix_fragment(
+                row,
+                rows,
+            ) or AiCallDialogueService._is_realtime_customer_shadowed_by_offline_answer(
                 row,
                 rows,
             ) or AiCallDialogueService._is_offline_customer_shadowed_by_realtime(
@@ -1463,6 +1470,16 @@ class AiCallDialogueService:
         return any(
             candidate.source == QWEN_REALTIME_SOURCE
             and candidate.speaker_type == "customer"
+            and not prefers_offline_availability_answer(
+                source=row.source,
+                text=AiCallDialogueService._dialogue_text(row),
+                started_at=row.started_at,
+                ended_at=row.ended_at,
+                candidate_source=candidate.source,
+                candidate_text=AiCallDialogueService._dialogue_text(candidate),
+                candidate_started_at=candidate.started_at,
+                candidate_ended_at=candidate.ended_at,
+            )
             and (
                 (
                     candidate.audio_end_ms is not None
@@ -1482,6 +1499,29 @@ class AiCallDialogueService:
                 )
             )
             for candidate in realtime_rows
+        )
+
+    @staticmethod
+    def _is_realtime_customer_shadowed_by_offline_answer(
+        row: AiCallDialogueSegmentModel | DialogueSegmentSnapshot,
+        rows: list[AiCallDialogueSegmentModel] | list[DialogueSegmentSnapshot],
+    ) -> bool:
+        if row.source != QWEN_REALTIME_SOURCE or row.speaker_type != "customer":
+            return False
+        return any(
+            candidate.source == OFFLINE_ASR_SOURCE
+            and candidate.speaker_type == "customer"
+            and prefers_offline_availability_answer(
+                source=candidate.source,
+                text=AiCallDialogueService._dialogue_text(candidate),
+                started_at=candidate.started_at,
+                ended_at=candidate.ended_at,
+                candidate_source=row.source,
+                candidate_text=AiCallDialogueService._dialogue_text(row),
+                candidate_started_at=row.started_at,
+                candidate_ended_at=row.ended_at,
+            )
+            for candidate in rows
         )
 
     @staticmethod

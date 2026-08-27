@@ -32,6 +32,7 @@ from app.services.ai_call.classification_review import requires_classification_r
 from app.services.ai_call.dialogue_merge import (
     dialogue_time_ranges_touch,
     is_cross_source_customer_transcript_conflict,
+    prefers_offline_availability_answer,
 )
 from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
 from app.services.ai_call.post_call_follow_up_service import requires_manual_follow_up_review
@@ -62,7 +63,7 @@ TRANSCRIPT_LISTING_PREFIX_PATTERN = re.compile(
     r"^[’”\"'\s]*(?:[‘“\"'][^’”\"']{1,30}[’”\"']\s*){2,}"
     r"等表达参与对话[。！？!?；;]?"
 )
-SUMMARY_LEADING_JUNK_PATTERN = re.compile(r"^[，,。；;、’”\"'\s]+")
+SUMMARY_LEADING_JUNK_PATTERN = re.compile(r"^[，,。；;、’”\"'）)\]】》\s]+")
 ASR_CORRECTION_PARENTHESES_PATTERN = re.compile(
     r"[（(][^（）()]{0,40}应为[^（）()]{0,80}ASR错误[^（）()]{0,20}[）)]"
 )
@@ -779,6 +780,17 @@ class SemanticTranscriptBuilder:
         realtime_row: AiCallDialogueSegmentModel,
         overlapping_realtime_rows: list[AiCallDialogueSegmentModel],
     ) -> str | None:
+        if prefers_offline_availability_answer(
+            source=offline_row.source,
+            text=cls._text(offline_row),
+            started_at=offline_row.started_at,
+            ended_at=offline_row.ended_at,
+            candidate_source=realtime_row.source,
+            candidate_text=cls._text(realtime_row),
+            candidate_started_at=realtime_row.started_at,
+            candidate_ended_at=realtime_row.ended_at,
+        ):
+            return None
         has_nearby_conflict = is_cross_source_customer_transcript_conflict(
             source=offline_row.source,
             speaker_type=offline_row.speaker_type,
@@ -849,6 +861,16 @@ class SemanticTranscriptBuilder:
         return (
             cls._time_ranges_overlap(left, right)
             or has_nearby_containment
+            or prefers_offline_availability_answer(
+                source=left.source,
+                text=cls._text(left),
+                started_at=left.started_at,
+                ended_at=left.ended_at,
+                candidate_source=right.source,
+                candidate_text=cls._text(right),
+                candidate_started_at=right.started_at,
+                candidate_ended_at=right.ended_at,
+            )
             or (
                 is_cross_source_customer_transcript_conflict(
                     source=left.source,

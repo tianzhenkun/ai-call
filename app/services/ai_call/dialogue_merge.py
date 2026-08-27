@@ -11,6 +11,7 @@ DUPLICATE_TIME_GAP_MS = 1200
 CROSS_SOURCE_CONFLICT_TIME_GAP_MS = 500
 CROSS_SOURCE_CONFLICT_MIN_TEXT_SIMILARITY = 1 / 3
 CROSS_SOURCE_CONFLICT_MIN_LENGTH_RATIO = 0.5
+OFFLINE_AVAILABILITY_ANSWER = "方便"
 
 
 def normalize_dialogue_text(text: str | None) -> str:
@@ -92,6 +93,40 @@ def is_cross_source_customer_transcript_conflict(
     return (
         SequenceMatcher(None, normalized, candidate_normalized).ratio()
         >= CROSS_SOURCE_CONFLICT_MIN_TEXT_SIMILARITY
+    )
+
+
+def prefers_offline_availability_answer(
+    *,
+    source: str,
+    text: str,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+    candidate_source: str,
+    candidate_text: str,
+    candidate_started_at: datetime | None,
+    candidate_ended_at: datetime | None,
+) -> bool:
+    if {source, candidate_source} != {OFFLINE_ASR_SOURCE, QWEN_REALTIME_SOURCE}:
+        return False
+    offline_text = text if source == OFFLINE_ASR_SOURCE else candidate_text
+    realtime_text = candidate_text if source == OFFLINE_ASR_SOURCE else text
+    normalized_offline = normalize_dialogue_text(offline_text)
+    normalized_realtime = normalize_dialogue_text(realtime_text)
+    if normalized_offline != OFFLINE_AVAILABILITY_ANSWER:
+        return False
+    if not normalized_realtime or len(normalized_realtime) > 2:
+        return False
+    if normalized_realtime.startswith(("不", "没", "无")):
+        return False
+    if normalized_realtime in {"什么", "怎么", "为啥", "哪里", "哪儿"}:
+        return False
+    return dialogue_time_ranges_touch(
+        started_at,
+        ended_at,
+        candidate_started_at,
+        candidate_ended_at,
+        max_gap_ms=CROSS_SOURCE_CONFLICT_TIME_GAP_MS,
     )
 
 

@@ -186,6 +186,33 @@ def test_semantic_snapshot_marks_nearby_cross_source_conflict() -> None:
     assert snapshot["metadata"]["offline_asr_quality_rejected_count"] == 1
 
 
+def test_availability_short_answer_prefers_offline_asr_over_garbled_realtime() -> None:
+    offline = _segment(
+        segment_no=1,
+        source="offline_asr",
+        text="方便。",
+        started_ms=0,
+        ended_ms=240,
+    )
+    realtime = _segment(
+        segment_no=2,
+        source="qwen_realtime",
+        text="大面。",
+        started_ms=674,
+        ended_ms=1383,
+    )
+
+    selected = SemanticTranscriptBuilder().select_customer_rows([offline, realtime])
+    displayed = AiCallDialogueService._canonical_segments([offline, realtime])
+
+    assert [(row.source, row.segment_text) for row in selected] == [
+        ("offline_asr", "方便。"),
+    ]
+    assert [(row.source, row.segment_text) for row in displayed] == [
+        ("offline_asr", "方便。"),
+    ]
+
+
 @pytest.mark.anyio
 async def test_record_dialogue_uses_semantic_customer_selection_and_time_order() -> None:
     opening = _segment(
