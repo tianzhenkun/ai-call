@@ -145,7 +145,15 @@ class AiCallAgentConsoleService:
     ) -> list[AiCallHandoffModel]:
         profile = await self.require_current_agent(auth)
         presence = await self._require_console_presence(profile, console_session_id)
-        await self._ensure_available(presence)
+        if presence.status == "available":
+            await self._ensure_available(presence)
+        elif presence.status not in {
+            "claiming",
+            "in_call",
+            "reconnecting",
+            "wrap_up_quick",
+        }:
+            self._raise_conflict("坐席当前不可查看待接池", "AGENT_NOT_AVAILABLE")
         return await self.repository.list_console_pending_handoffs(
             tenant_id=profile.tenant_id,
             scene_codes=await self._scene_codes(profile),
