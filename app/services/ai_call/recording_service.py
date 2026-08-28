@@ -22,6 +22,7 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.oss.service import OssService
 from app.core.logger import log
 from app.services.ai_call.livekit_egress import (
+    LiveKitEgressAlreadyCompleteError,
     LiveKitEgressManager,
     LiveKitEgressRequestTimeout,
 )
@@ -967,6 +968,8 @@ class AiCallRecordingService:
 
     @staticmethod
     def _is_already_completed_stop_error(exc: Exception) -> bool:
+        if isinstance(exc, LiveKitEgressAlreadyCompleteError):
+            return True
         message = str(exc).lower()
         return "egress_complete" in message and "cannot be stopped" in message
 
