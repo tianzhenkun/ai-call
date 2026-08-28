@@ -68,6 +68,7 @@ from app.services.ai_call.handoff_trigger_service import (
     RuleBasedHandoffIntentClassifier,
 )
 from app.services.ai_call.livekit_egress import (
+    LiveKitEgressAlreadyCompleteError,
     LiveKitEgressManager,
     LiveKitEgressRequestTimeout,
     LiveKitEgressStartResult,
@@ -593,10 +594,7 @@ class AlreadyCompletedAiTrackStopEgressManager(FakeEgressManager):
     async def stop_egress(self, egress_id: str) -> LiveKitEgressStopResult:
         if "_ai_" in egress_id:
             self.stopped.append(egress_id)
-            raise RuntimeError(
-                'StopEgress HTTP 412: {"code":"failed_precondition",'
-                '"msg":"egress with status EGRESS_COMPLETE cannot be stopped"}'
-            )
+            raise LiveKitEgressAlreadyCompleteError(egress_id)
         return await super().stop_egress(egress_id)
 
 
