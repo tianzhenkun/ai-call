@@ -224,12 +224,14 @@ class AliyunQwenRealtimeProvider:
         self.model = model
         self.websocket_factory = websocket_factory or _default_websocket_factory
         self._websocket: QwenWebSocketProtocol | None = None
+        self._emitted_tool_call_ids: set[str] = set()
 
     async def connect(self) -> None:
         self._websocket = await self.websocket_factory(
             self._build_connect_url(),
             {"Authorization": f"Bearer {self.api_key}"},
         )
+        self._emitted_tool_call_ids.clear()
 
     async def update_session(self, config: QwenRealtimeSessionConfig) -> None:
         await self._send(build_session_update_event(config))
@@ -276,6 +278,21 @@ class AliyunQwenRealtimeProvider:
             except StopAsyncIteration:
                 return
             event_type = map_qwen_server_event(payload)
+            tool_payload: dict[str, Any] | None = None
+            if event_type == "tool_call_done":
+                tool_payload = payload
+            elif payload.get("type") == "response.output_item.done":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    tool_payload = item
+            if tool_payload is not None:
+                tool_call_id = tool_payload.get("call_id")
+                if isinstance(tool_call_id, str):
+                    if tool_call_id in self._emitted_tool_call_ids:
+                        continue
+                    self._emitted_tool_call_ids.add(tool_call_id)
+                yield ProviderEvent(type="tool_call_done", payload=tool_payload)
+                continue
             if event_type is not None:
                 yield ProviderEvent(type=event_type, payload=payload)
             else:

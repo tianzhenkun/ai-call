@@ -3383,6 +3383,42 @@ async def test_qwen_provider_receives_mapped_events_and_preserves_payload() -> N
 
 
 @pytest.mark.anyio
+async def test_qwen_provider_normalizes_output_item_done_tool_call_once() -> None:
+    item = {
+        "type": "function_call",
+        "call_id": "call_tool_1",
+        "name": "search_scene_knowledge",
+        "arguments": '{"query":"有试用吗？"}',
+    }
+    socket = FakeQwenWebSocket(
+        incoming=[
+            {"type": "response.output_item.done", "item": item},
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_tool_1",
+                "name": "search_scene_knowledge",
+                "arguments": '{"query":"有试用吗？"}',
+            },
+        ]
+    )
+
+    async def websocket_factory(url: str, headers: dict[str, str]) -> FakeQwenWebSocket:
+        return socket
+
+    provider = AliyunQwenRealtimeProvider(
+        realtime_url="wss://dashscope.test/api-ws/v1/realtime",
+        api_key="dashscope-secret",
+        model="qwen3.5-omni-plus-realtime",
+        websocket_factory=websocket_factory,
+    )
+
+    await provider.connect()
+    events = [event async for event in provider.receive_events()]
+
+    assert events == [ProviderEvent(type="tool_call_done", payload=item)]
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_records_provider_events_and_updates_session_state() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
