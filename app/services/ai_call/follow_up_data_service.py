@@ -539,27 +539,9 @@ class AiCallFollowUpDataService:
                     "currentVersion": data.version,
                 },
             )
-        latest_history = await self.db.scalar(
-            select(AiCallFollowUpClassificationHistoryModel)
-            .where(
-                AiCallFollowUpClassificationHistoryModel.tenant_id == tenant_id,
-                AiCallFollowUpClassificationHistoryModel.follow_up_data_id
-                == follow_up_data_id,
-            )
-            .order_by(
-                AiCallFollowUpClassificationHistoryModel.created_at.desc(),
-                AiCallFollowUpClassificationHistoryModel.id.desc(),
-            )
-            .limit(1)
-        )
-        if (
-            data.suggest_review
-            and latest_history is not None
-            and latest_history.ai_suggested_classification
-            and latest_history.ai_suggested_classification != data.classification
-        ):
+        if data.suggest_review:
             raise CustomException(
-                msg="AI 建议分类与当前业务分类不一致，请先完成分类复核",
+                msg="当前分类待人工复核，请先完成分类复核",
                 status_code=409,
                 data={"errorCode": "CLASSIFICATION_REVIEW_REQUIRED"},
             )

@@ -1089,6 +1089,40 @@ async def test_same_call_after_call_classification_can_be_reviewed_once(
 
 
 @pytest.mark.anyio
+async def test_schedule_follow_up_rejects_pending_same_classification_review(
+    session_factory,
+) -> None:
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    payload = FollowUpDataScheduleIn(
+        follow_up_reason="客户要求下周回访",
+        next_follow_up_at=datetime.now(timezone.utc) + timedelta(days=7),
+        expected_version=1,
+    )
+
+    async with session_factory() as db, db.begin():
+        data = await db.get(AiCallFollowUpDataModel, 100)
+        assert data is not None
+        data.suggest_review = True
+
+        with pytest.raises(CustomException) as review_required:
+            await AiCallFollowUpDataService.from_session(db).schedule_follow_up(
+                tenant_id="tenant-a",
+                follow_up_data_id=100,
+                payload=payload,
+                idempotency_key="schedule-before-same-classification-review",
+                changed_by="20",
+                changed_by_name="管理员",
+            )
+
+        assert review_required.value.status_code == 409
+        assert (
+            review_required.value.data["errorCode"]
+            == "CLASSIFICATION_REVIEW_REQUIRED"
+        )
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
+
+
+@pytest.mark.anyio
 async def test_schedule_follow_up_creates_one_unassigned_task_idempotently(
     session_factory,
 ) -> None:
