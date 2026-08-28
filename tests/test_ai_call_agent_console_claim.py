@@ -517,6 +517,39 @@ async def test_pending_pool_filters_tenant_status_expiry_and_scene_scope(session
 
 
 @pytest.mark.anyio
+async def test_pending_pool_remains_visible_while_agent_is_in_call(
+    session_factory,
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+        status="in_call",
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="waiting")
+    async with session_factory() as db, db.begin():
+        presence = (
+            await db.execute(
+                select(AiCallHandoffAgentModel).where(
+                    AiCallHandoffAgentModel.agent_identity == "agent-20"
+                )
+            )
+        ).scalar_one()
+        presence.active_handoff_id = "active"
+        presence.active_call_id = "call-active"
+
+    async with session_factory() as db:
+        rows = await AiCallAgentConsoleService(db).list_pending_handoffs(
+            _auth(db, user_id=20),
+            console_session_id=console_session_id,
+        )
+
+    assert [row.handoff_id for row in rows] == ["waiting"]
+
+
+@pytest.mark.anyio
 async def test_handoff_payloads_include_batched_business_context_and_recent_dialogue(
     session_factory,
 ) -> None:
