@@ -605,6 +605,15 @@ async def test_repository_counts_current_pending_follow_ups_outside_call_period(
             started_at=begin,
             ended_at=begin + timedelta(days=1),
             include_pending_follow_ups=True,
+            scene_code="product_intro",
+            task_id=100,
+        )
+        other_scene = await OutboundStatisticsRepository(session).aggregate_overview(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+            include_pending_follow_ups=True,
+            scene_code="support",
             task_id=100,
         )
 
@@ -612,6 +621,7 @@ async def test_repository_counts_current_pending_follow_ups_outside_call_period(
 
     assert overview.dial_attempts == 0
     assert overview.pending_follow_ups == 1
+    assert other_scene.pending_follow_ups == 0
 
 
 @pytest.mark.anyio

@@ -517,8 +517,12 @@ async def test_pending_pool_filters_tenant_status_expiry_and_scene_scope(session
 
 
 @pytest.mark.anyio
-async def test_pending_pool_remains_visible_while_agent_is_in_call(
-    session_factory,
+@pytest.mark.parametrize(
+    "presence_status",
+    ["claiming", "in_call", "reconnecting", "wrap_up_quick"],
+)
+async def test_pending_pool_remains_visible_while_agent_is_busy(
+    session_factory, presence_status: str
 ) -> None:
     console_session_id = str(uuid4())
     await _seed_agent(
@@ -526,7 +530,7 @@ async def test_pending_pool_remains_visible_while_agent_is_in_call(
         user_id=20,
         agent_identity="agent-20",
         console_session_id=console_session_id,
-        status="in_call",
+        status=presence_status,
     )
     await _seed_handoff(session_factory, row_id=1, handoff_id="waiting")
     async with session_factory() as db, db.begin():
@@ -547,6 +551,30 @@ async def test_pending_pool_remains_visible_while_agent_is_in_call(
         )
 
     assert [row.handoff_id for row in rows] == ["waiting"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("presence_status", ["paused", "offline"])
+async def test_pending_pool_rejects_unavailable_agent(
+    session_factory, presence_status: str
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory,
+        user_id=20,
+        agent_identity="agent-20",
+        console_session_id=console_session_id,
+        status=presence_status,
+    )
+
+    async with session_factory() as db:
+        with pytest.raises(CustomException) as conflict:
+            await AiCallAgentConsoleService(db).list_pending_handoffs(
+                _auth(db, user_id=20),
+                console_session_id=console_session_id,
+            )
+
+    assert _error_code(conflict.value) == "AGENT_NOT_AVAILABLE"
 
 
 @pytest.mark.anyio

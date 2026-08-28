@@ -50,6 +50,10 @@ class HandoffClaimResult:
 class AiCallAgentConsoleService:
     """坐席身份、在线状态、场景路由和原子认领。"""
 
+    _BUSY_PRESENCE_STATUSES = frozenset(
+        {"claiming", "in_call", "reconnecting", "wrap_up_quick"}
+    )
+
     def __init__(
         self,
         db: AsyncSession,
@@ -147,12 +151,7 @@ class AiCallAgentConsoleService:
         presence = await self._require_console_presence(profile, console_session_id)
         if presence.status == "available":
             await self._ensure_available(presence)
-        elif presence.status not in {
-            "claiming",
-            "in_call",
-            "reconnecting",
-            "wrap_up_quick",
-        }:
+        elif presence.status not in self._BUSY_PRESENCE_STATUSES:
             self._raise_conflict("坐席当前不可查看待接池", "AGENT_NOT_AVAILABLE")
         return await self.repository.list_console_pending_handoffs(
             tenant_id=profile.tenant_id,
@@ -1084,12 +1083,10 @@ class AiCallAgentConsoleService:
             cls._raise_conflict("当前标签页不拥有坐席控制权", "CONSOLE_SESSION_CONFLICT")
 
     async def _ensure_available(self, presence: AiCallHandoffAgentModel) -> None:
-        if presence.active_handoff_id or presence.status in {
-            "claiming",
-            "in_call",
-            "reconnecting",
-            "wrap_up_quick",
-        }:
+        if (
+            presence.active_handoff_id
+            or presence.status in self._BUSY_PRESENCE_STATUSES
+        ):
             self._raise_conflict("坐席当前正在处理其他通话", "AGENT_ALREADY_IN_CALL")
         if presence.status != "available":
             self._raise_conflict("坐席当前不可接单", "AGENT_NOT_AVAILABLE")
