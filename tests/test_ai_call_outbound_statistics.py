@@ -364,6 +364,7 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
             (14, "web", "no_answer"),
             (15, "web", "busy"),
             (16, "web", "invalid_number"),
+            (17, "sip_callback", "connected"),
         ):
             started_at = begin + timedelta(hours=2)
             session.add_all([
@@ -561,6 +562,56 @@ async def test_repository_counts_each_interested_target_once_across_attempts() -
 
     assert overview.dial_attempts == 2
     assert overview.intent_leads == 1
+
+
+@pytest.mark.anyio
+async def test_repository_counts_current_pending_follow_ups_outside_call_period() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    begin = datetime(2026, 7, 25, tzinfo=ZoneInfo("UTC"))
+    source_call_at = begin - timedelta(days=1)
+
+    async with session_maker() as session:
+        session.add_all([
+            _task(task_id=100, tenant_id="tenant-a", now=source_call_at),
+            _target(
+                target_id=1,
+                tenant_id="tenant-a",
+                task_id=100,
+                now=source_call_at,
+            ),
+            _record(row_id=1, started_at=source_call_at),
+            _attempt(
+                row_id=1,
+                tenant_id="tenant-a",
+                task_id=100,
+                call_result="connected",
+                started_at=source_call_at,
+            ),
+            _follow_up(
+                follow_up_id=9001,
+                tenant_id="tenant-a",
+                source_call_id="call-1",
+                status="pending",
+                now=source_call_at,
+            ),
+        ])
+        await session.commit()
+
+        overview = await OutboundStatisticsRepository(session).aggregate_overview(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+            include_pending_follow_ups=True,
+            task_id=100,
+        )
+
+    await engine.dispose()
+
+    assert overview.dial_attempts == 0
+    assert overview.pending_follow_ups == 1
 
 
 @pytest.mark.anyio

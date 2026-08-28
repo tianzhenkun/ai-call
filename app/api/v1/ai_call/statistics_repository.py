@@ -96,20 +96,29 @@ class OutboundStatisticsRepository:
         scene_code: str | None = None,
         task_id: int | None = None,
     ) -> StatisticsOverviewAggregate:
-        pending_exists = (
-            select(AiCallFollowUpTaskModel.id)
-            .where(
-                AiCallFollowUpTaskModel.tenant_id == tenant_id,
-                AiCallFollowUpTaskModel.status == "pending",
-                or_(
-                    AiCallFollowUpTaskModel.id == AiCallRecordModel.follow_up_id,
-                    AiCallFollowUpTaskModel.source_call_id == AiCallRecordModel.call_id,
-                ),
-            )
-            .exists()
+        pending_statement = select(func.count(AiCallFollowUpTaskModel.id)).where(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id,
+            AiCallFollowUpTaskModel.status == "pending",
         )
+        if scene_code:
+            pending_statement = pending_statement.where(
+                AiCallFollowUpTaskModel.scene_code == scene_code
+            )
+        if task_id is not None:
+            source_attempt = AiCallOutboundAttemptModel.__table__.alias(
+                "pending_source_attempt"
+            )
+            pending_statement = pending_statement.where(
+                select(source_attempt.c.id)
+                .where(
+                    source_attempt.c.tenant_id == tenant_id,
+                    source_attempt.c.task_id == task_id,
+                    source_attempt.c.call_id == AiCallFollowUpTaskModel.source_call_id,
+                )
+                .exists()
+            )
         pending_expression = (
-            func.sum(case((pending_exists, 1), else_=0))
+            pending_statement.scalar_subquery()
             if include_pending_follow_ups
             else literal(0)
         )
