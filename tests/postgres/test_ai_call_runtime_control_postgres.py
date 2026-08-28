@@ -19,6 +19,7 @@ from app.api.v1.ai_call.model import (
     AiCallEventModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallRecordingModel,
     AiCallRecordModel,
 )
 from app.api.v1.ai_call.outbound.attempt_reconciler import (
@@ -552,6 +553,7 @@ async def _reset_repository_schema(engine) -> None:
         AiCallHandoffAgentModel.__table__,
         AiCallHandoffModel.__table__,
         AiCallEventModel.__table__,
+        AiCallRecordingModel.__table__,
         AiCallRecordModel.__table__,
     )
     async with engine.begin() as connection:
