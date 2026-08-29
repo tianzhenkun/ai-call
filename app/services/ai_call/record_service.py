@@ -506,6 +506,11 @@ class AiCallRecordService:
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
             "callResult": call_result,
+            "answerType": (
+                semantic_context.get("answerType")
+                if call_result == "connected"
+                else None
+            ),
             "summary": semantic_summary,
             "analysisStatus": semantic_context.get("analysisStatus"),
             "customerIntent": semantic_context.get("customerIntent"),

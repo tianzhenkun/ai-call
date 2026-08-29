@@ -39,6 +39,8 @@ class ExceptionActiveBatchOut(OutboundSchema):
     batch_id: str
     target_count: int
     completed_count: int
+    created_by: str
+    created_by_name: str | None = None
     started_at: str
 
 
@@ -65,6 +67,8 @@ class ExceptionBatchOut(OutboundSchema):
     target_count: int
     interval_days: int
     max_retry_count: int
+    created_by: str
+    created_by_name: str | None = None
     started_at: str
 
 

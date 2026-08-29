@@ -450,6 +450,10 @@ def test_semantic_analysis_result_removes_internal_evidence_annotations() -> Non
                 "后续重复‘三个吧’但semantic_evidence.analysis_usage=record_only且无supports_strong_fact",
                 "客户承诺由秘书提供资料（多轮出现'supports_commitment_fact'，但未明确资料内容）",
             ],
+            "reason": (
+                "客户未实际接入；所有 customer 轮次均为系统提示。"
+                "semantic_evidence.analysis_usage=record_only 且 role=user 不成立。"
+            ),
             "time_hint": {},
             "tags": [],
         }),
@@ -473,6 +477,7 @@ def test_semantic_analysis_result_removes_internal_evidence_annotations() -> Non
         "人工接入后存在转写噪声",
         "客户承诺由秘书提供资料",
     ]
+    assert result["reason"] == "客户未实际接入；所有 customer 轮次均为系统提示。"
     assert result["summary"] == "客户确认当前方便沟通。客户结束通话。"
 
 

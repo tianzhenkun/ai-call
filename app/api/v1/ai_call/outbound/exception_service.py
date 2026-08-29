@@ -120,6 +120,8 @@ class OutboundExceptionService:
                 batch_id=str(batch.id),
                 target_count=batch.target_count,
                 completed_count=completed_by_batch.get(batch.id, 0),
+                created_by=str(batch.created_by),
+                created_by_name=batch.created_by_name,
                 started_at=_format_datetime(batch.started_at) or "",
             )
             for batch in active_batch_rows
@@ -181,6 +183,7 @@ class OutboundExceptionService:
         db: AsyncSession,
         tenant_id: str,
         user_id: int,
+        user_name: str | None,
         category: str,
         idempotency_key: str,
     ) -> ExceptionBatchOut:
@@ -280,6 +283,7 @@ class OutboundExceptionService:
             request_fingerprint=fingerprint,
             active_slot=category,
             created_by=user_id,
+            created_by_name=user_name,
             started_at=cutoff_at,
             ended_at=None,
             created_at=cutoff_at,
@@ -569,6 +573,8 @@ class OutboundExceptionService:
             target_count=batch.target_count,
             interval_days=batch.interval_days,
             max_retry_count=batch.max_retry_count,
+            created_by=str(batch.created_by),
+            created_by_name=batch.created_by_name,
             started_at=_format_datetime(batch.started_at) or "",
         )
 

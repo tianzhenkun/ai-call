@@ -1872,6 +1872,9 @@ class AiCallSemanticAnalysisService:
             review_status=analysis.follow_up_review_status,
             current_classification=current_classification,
         )
+        analysis_result = _remove_internal_evidence_annotations(
+            analysis.analysis_result_dict or {}
+        )
         return {
             "id": str(analysis.id),
             "callId": analysis.call_id,
@@ -1879,7 +1882,7 @@ class AiCallSemanticAnalysisService:
             "analysisSceneCode": analysis.analysis_scene_code,
             "analysisStatus": analysis.analysis_status,
             "analysisVersion": analysis.analysis_version,
-            "analysisResult": analysis.analysis_result_dict,
+            "analysisResult": analysis_result,
             "analysisError": analysis.analysis_error,
             "analysisRetryCount": analysis.analysis_retry_count,
             "followUpReviewStatus": analysis.follow_up_review_status,
@@ -1993,22 +1996,33 @@ def enforce_semantic_evidence_on_result(
 
 def _remove_internal_evidence_annotations(result: dict[str, Any]) -> dict[str, Any]:
     cleaned_summary = _clean_summary_text(
-        _strip_internal_evidence_annotations(result["summary"])
+        _strip_internal_evidence_annotations(_string_value(result.get("summary")))
     )
     cleaned_key_points = [
         cleaned
         for cleaned in (
             _strip_internal_evidence_annotations(point).strip(" ，,；;、")
-            for point in result["key_points"]
+            for point in _string_list(result.get("key_points"))
         )
         if cleaned
     ]
-    if cleaned_summary == result["summary"] and cleaned_key_points == result["key_points"]:
+    original_reason = _string_value(result.get("reason"))
+    cleaned_reason = _strip_internal_evidence_annotations(original_reason).strip(
+        " ，,；;、"
+    )
+    if original_reason and not cleaned_reason:
+        cleaned_reason = "分类依据包含内部分析标记，建议人工复核。"
+    if (
+        cleaned_summary == result.get("summary")
+        and cleaned_key_points == result.get("key_points")
+        and cleaned_reason == original_reason
+    ):
         return result
     return {
         **result,
         "summary": cleaned_summary,
         "key_points": cleaned_key_points,
+        "reason": cleaned_reason,
     }
 
 

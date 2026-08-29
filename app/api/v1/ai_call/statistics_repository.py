@@ -9,6 +9,7 @@ from .model import (
     AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
 )
 from .outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
@@ -38,6 +39,53 @@ class StatisticsTrendAggregate:
 class OutboundStatisticsRepository:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    @staticmethod
+    def _connected_outcomes():
+        raw_connected = AiCallOutboundAttemptModel.call_result == "connected"
+        valid_dialogue = (
+            select(AiCallSemanticAnalysisModel.id)
+            .where(
+                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
+                AiCallSemanticAnalysisModel.analysis_scene_code
+                == "ai_call_semantic_analysis",
+                AiCallSemanticAnalysisModel.analysis_status == "2",
+                or_(
+                    AiCallSemanticAnalysisModel.analysis_result.contains(
+                        '"valid_dialogue": true'
+                    ),
+                    AiCallSemanticAnalysisModel.analysis_result.contains(
+                        '"valid_dialogue":true'
+                    ),
+                ),
+            )
+            .exists()
+        )
+        voicemail = (
+            select(AiCallSemanticAnalysisModel.id)
+            .where(
+                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
+                AiCallSemanticAnalysisModel.analysis_scene_code
+                == "ai_call_semantic_analysis",
+                AiCallSemanticAnalysisModel.analysis_status == "2",
+                or_(
+                    AiCallSemanticAnalysisModel.analysis_result.contains("语音信箱"),
+                    AiCallSemanticAnalysisModel.analysis_result.contains("语音留言"),
+                    AiCallSemanticAnalysisModel.analysis_result.contains(
+                        "提示音后录制留言"
+                    ),
+                    AiCallSemanticAnalysisModel.analysis_result.contains(
+                        "录音完成后挂断"
+                    ),
+                ),
+            )
+            .exists()
+        )
+        return (
+            and_(raw_connected, valid_dialogue, ~voicemail),
+            and_(raw_connected, voicemail),
+            and_(raw_connected, ~valid_dialogue, ~voicemail),
+        )
 
     @staticmethod
     def _formal_outbound_from() -> Selectable:
@@ -133,7 +181,7 @@ class OutboundStatisticsRepository:
             )
             .scalar_subquery()
         )
-        connected = AiCallOutboundAttemptModel.call_result == "connected"
+        connected, _, _ = self._connected_outcomes()
         statement = select(
             func.count(AiCallRecordModel.id),
             func.coalesce(
@@ -178,7 +226,7 @@ class OutboundStatisticsRepository:
         scene_code: str | None = None,
         task_id: int | None = None,
     ) -> dict[str, int]:
-        connected = AiCallOutboundAttemptModel.call_result == "connected"
+        connected, voicemail, transport_connected = self._connected_outcomes()
         early_hangup = and_(
             connected,
             AiCallRecordModel.answered_at.is_not(None),
@@ -201,7 +249,9 @@ class OutboundStatisticsRepository:
         )
         result_group = case(
             (early_hangup, "early_hangup"),
+            (voicemail, "voicemail"),
             (connected, "connected"),
+            (transport_connected, "transport_connected"),
             (AiCallOutboundAttemptModel.call_result == "no_answer", "no_answer"),
             (rejected, "rejected"),
             (invalid_number, "invalid_number"),
@@ -235,6 +285,7 @@ class OutboundStatisticsRepository:
             return []
 
         statements = []
+        connected, _, _ = self._connected_outcomes()
         for bucket_index, (bucket_start, bucket_end) in enumerate(buckets):
             statement = select(
                 literal(bucket_index).label("bucket_index"),
@@ -243,7 +294,7 @@ class OutboundStatisticsRepository:
                     func.sum(
                         case(
                             (
-                                AiCallOutboundAttemptModel.call_result == "connected",
+                                connected,
                                 1,
                             ),
                             else_=0,

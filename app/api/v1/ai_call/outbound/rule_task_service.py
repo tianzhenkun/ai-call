@@ -13,11 +13,13 @@ from app.api.v1.ai_call.model import (
     AiCallPromptProfileModel,
     AiCallPromptProfileVersionModel,
     AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
     AiCallVoiceProfileModel,
 )
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import settings
 from app.core.exceptions import CustomException
+from app.services.ai_call.call_outcome import detect_answer_type
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     validate_sip_outbound_preflight,
@@ -941,8 +943,8 @@ class OutboundRuleTaskService:
         )
         outputs: list[OutboundTargetOut] = []
         for target in targets:
-            dialer_type, status_code, provider_reason, hangup_cause = (
-                latest_attempts.get(target.id) or (None, None, None, None)
+            dialer_type, status_code, provider_reason, hangup_cause, answer_type = (
+                latest_attempts.get(target.id) or (None, None, None, None, None)
             )
             active_call_id, active_call_status = active_call_ids.get(
                 target.id,
@@ -951,6 +953,7 @@ class OutboundRuleTaskService:
             outputs.append(
                 self.target_out(
                     target,
+                    answer_type=answer_type,
                     latest_dialer_type=dialer_type,
                     provider_status_code=status_code,
                     provider_reason=provider_reason,
@@ -1195,6 +1198,7 @@ class OutboundRuleTaskService:
     def target_out(
         target: AiCallOutboundTargetModel,
         *,
+        answer_type: str | None = None,
         latest_dialer_type: str | None = None,
         provider_status_code: str | None = None,
         provider_reason: str | None = None,
@@ -1210,6 +1214,7 @@ class OutboundRuleTaskService:
             status=target.status,
             attempt_count=target.attempt_count,
             latest_result=target.latest_result,
+            answer_type=answer_type,
             latest_dialer_type=latest_dialer_type,
             provider_status_code=provider_status_code,
             provider_reason=provider_reason,
@@ -1281,7 +1286,7 @@ class OutboundRuleTaskService:
         target_ids: list[int],
     ) -> dict[
         int,
-        tuple[str | None, str | None, str | None, str | None],
+        tuple[str | None, str | None, str | None, str | None, str | None],
     ]:
         if not target_ids:
             return {}
@@ -1293,6 +1298,18 @@ class OutboundRuleTaskService:
                     AiCallOutboundAttemptModel.provider_status_code,
                     AiCallOutboundAttemptModel.provider_reason,
                     AiCallOutboundAttemptModel.hangup_cause,
+                    AiCallOutboundAttemptModel.call_result,
+                    AiCallSemanticAnalysisModel.analysis_status,
+                    AiCallSemanticAnalysisModel.analysis_result,
+                )
+                .outerjoin(
+                    AiCallSemanticAnalysisModel,
+                    and_(
+                        AiCallSemanticAnalysisModel.call_id
+                        == AiCallOutboundAttemptModel.call_id,
+                        AiCallSemanticAnalysisModel.analysis_scene_code
+                        == "ai_call_semantic_analysis",
+                    ),
                 )
                 .where(
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
@@ -1306,7 +1323,7 @@ class OutboundRuleTaskService:
         ).all()
         result: dict[
             int,
-            tuple[str | None, str | None, str | None, str | None],
+            tuple[str | None, str | None, str | None, str | None, str | None],
         ] = {}
         for (
             target_id,
@@ -1314,10 +1331,27 @@ class OutboundRuleTaskService:
             status_code,
             provider_reason,
             hangup_cause,
+            call_result,
+            analysis_status,
+            analysis_result_raw,
         ) in rows:
+            try:
+                analysis_result = json.loads(analysis_result_raw or "{}")
+            except (TypeError, ValueError):
+                analysis_result = {}
             result.setdefault(
                 target_id,
-                (dialer_type, status_code, provider_reason, hangup_cause),
+                (
+                    dialer_type,
+                    status_code,
+                    provider_reason,
+                    hangup_cause,
+                    detect_answer_type(
+                        call_result=call_result,
+                        analysis_status=analysis_status,
+                        analysis_result=analysis_result,
+                    ),
+                ),
             )
         return result
 

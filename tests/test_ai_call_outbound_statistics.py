@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -257,6 +258,26 @@ def _attempt(
     )
 
 
+def _analysis(
+    *,
+    row_id: int,
+    result: dict[str, object],
+    now: datetime,
+) -> AiCallSemanticAnalysisModel:
+    return AiCallSemanticAnalysisModel(
+        id=20_000 + row_id,
+        call_id=f"call-{row_id}",
+        scene_code="product_intro",
+        analysis_scene_code="ai_call_semantic_analysis",
+        analysis_status="2",
+        analysis_result=json.dumps(result, ensure_ascii=False),
+        follow_up_suggested=False,
+        analysis_retry_count=0,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def _follow_up(
     *,
     follow_up_id: int,
@@ -390,6 +411,9 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
 
         session.add(_record(row_id=12, started_at=begin + timedelta(hours=2)))
         session.add_all([
+            _analysis(row_id=1, result={"valid_dialogue": True}, now=begin),
+            _analysis(row_id=2, result={"valid_dialogue": True}, now=begin),
+            _analysis(row_id=9, result={"valid_dialogue": True}, now=begin),
             _target(
                 target_id=13,
                 tenant_id="tenant-b",
@@ -505,6 +529,68 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
         (8, 3),
         (4, 0),
     ]
+
+
+@pytest.mark.anyio
+async def test_repository_splits_human_voicemail_and_transport_connections() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    begin = datetime(2026, 8, 29, tzinfo=ZoneInfo("UTC"))
+
+    async with session_maker() as session:
+        session.add(_task(task_id=100, tenant_id="tenant-a", now=begin))
+        for row_id in (1, 2, 3):
+            session.add_all([
+                _target(
+                    target_id=row_id,
+                    tenant_id="tenant-a",
+                    task_id=100,
+                    now=begin,
+                ),
+                _record(
+                    row_id=row_id,
+                    started_at=begin,
+                    answered_at=begin,
+                    duration_ms={1: 10_000, 2: 2_000, 3: 30_000}[row_id],
+                ),
+                _attempt(
+                    row_id=row_id,
+                    tenant_id="tenant-a",
+                    task_id=100,
+                    call_result="connected",
+                    started_at=begin,
+                ),
+            ])
+        session.add_all([
+            _analysis(row_id=1, result={"valid_dialogue": True}, now=begin),
+            _analysis(
+                row_id=2,
+                result={"valid_dialogue": False, "tags": ["语音留言"]},
+                now=begin,
+            ),
+        ])
+        await session.commit()
+
+        repository = OutboundStatisticsRepository(session)
+        overview = await repository.aggregate_overview(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+            include_pending_follow_ups=False,
+        )
+        counts = await repository.aggregate_results(
+            tenant_id="tenant-a",
+            started_at=begin,
+            ended_at=begin + timedelta(days=1),
+        )
+
+    await engine.dispose()
+
+    assert overview.connected_calls == 1
+    assert overview.total_duration_ms == 10_000
+    assert counts == {"connected": 1, "voicemail": 1, "transport_connected": 1}
 
 
 @pytest.mark.anyio
@@ -729,6 +815,8 @@ class _StatisticsRepositoryStub:
         del tenant_id, started_at, ended_at, scene_code, task_id
         return {
             "connected": 2,
+            "voicemail": 0,
+            "transport_connected": 0,
             "no_answer": 2,
             "rejected": 1,
             "early_hangup": 1,
@@ -784,6 +872,8 @@ async def test_service_builds_comparison_buckets_and_ordered_results() -> None:
     assert repository.buckets[-1][1] == NOW
     assert [item.result for item in result.results] == [
         "connected",
+        "voicemail",
+        "transport_connected",
         "no_answer",
         "rejected",
         "early_hangup",

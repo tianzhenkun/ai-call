@@ -136,6 +136,7 @@ async def start_exception_batch_controller(
         auth.db,
         tenant_id,
         user_id,
+        auth.user.nick_name if auth.user else None,
         category,
         idempotency_key,
     )

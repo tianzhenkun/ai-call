@@ -212,6 +212,7 @@ class OutboundTargetOut(OutboundSchema):
     status: str
     attempt_count: int
     latest_result: str | None = None
+    answer_type: Literal["human", "voicemail", "transport"] | None = None
     latest_dialer_type: str | None = None
     provider_status_code: str | None = None
     provider_reason: str | None = None

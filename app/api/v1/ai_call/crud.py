@@ -42,6 +42,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTaskModel,
 )
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+from app.services.ai_call.call_outcome import detect_answer_type
 from app.services.ai_call.classification_review import requires_classification_review
 from app.utils.id_util import generate_snowflake_id
 
@@ -242,6 +243,9 @@ class AiCallRecordRepository:
             "retryCount": retry_count,
             "maxRetryCount": max_retry_count,
             "lastResult": target.latest_result,
+            "createdBy": str(batch.created_by) if batch is not None else None,
+            "createdByName": batch.created_by_name if batch is not None else None,
+            "startedAt": batch.started_at if batch is not None else None,
         }
 
     async def get_follow_up_relation(
@@ -859,6 +863,11 @@ class AiCallRecordRepository:
             analysis_by_call_id[row.call_id] = {
                 "analysisStatus": row.analysis_status,
                 "analysisResult": row.analysis_result,
+                "answerType": detect_answer_type(
+                    call_result="connected",
+                    analysis_status=row.analysis_status,
+                    analysis_result=analysis_result,
+                ),
                 "customerIntent": row.customer_intent,
                 "followUpSuggested": bool(row.follow_up_suggested),
                 "followUpRequiresReview": (

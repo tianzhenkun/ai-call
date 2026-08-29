@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_exception_batch (
     request_fingerprint VARCHAR(64) NOT NULL,
     active_slot VARCHAR(32),
     created_by BIGINT NOT NULL,
+    created_by_name VARCHAR(100),
     started_at TIMESTAMPTZ NOT NULL,
     ended_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
@@ -34,6 +35,9 @@ CREATE TABLE IF NOT EXISTS ai_call_outbound_exception_batch (
     CONSTRAINT uk_outbound_exception_batch_tenant_active
         UNIQUE (tenant_id, active_slot)
 );
+
+ALTER TABLE ai_call_outbound_exception_batch
+    ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(100);
 
 ALTER TABLE ai_call_outbound_target
     ADD COLUMN IF NOT EXISTS exception_category VARCHAR(32),

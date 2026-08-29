@@ -84,6 +84,7 @@ def test_outbound_exception_models_and_migration() -> None:
         "max_retry_count",
         "cutoff_at",
         "active_slot",
+        "created_by_name",
     } <= {column.name for column in AiCallOutboundExceptionBatchModel.__table__.columns}
     assert {
         "exception_category",
@@ -510,6 +511,7 @@ async def test_exception_batch_claims_only_current_pending_targets(database) -> 
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "exception-batch-1",
         )
@@ -529,6 +531,7 @@ async def test_exception_batch_claims_only_current_pending_targets(database) -> 
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "exception-batch-1",
         )
@@ -646,6 +649,7 @@ async def test_exception_batch_executes_without_reopening_source_task(database) 
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "completed-task-exception",
         )
@@ -695,6 +699,9 @@ async def test_exception_batch_executes_without_reopening_source_task(database) 
             "retryCount": 1,
             "maxRetryCount": 3,
             "lastResult": "connected",
+            "createdBy": "1",
+            "createdByName": None,
+            "startedAt": batch.started_at,
         }
 
 
@@ -2693,10 +2700,13 @@ async def test_exception_batch_snapshots_policy_and_uses_last_attempt_end_time(
             session,
             "tenant-a",
             1,
+            "测试坐席",
             "no_answer",
             "snapshot-policy-batch",
         )
         await session.commit()
+        assert batch_out.created_by == "1"
+        assert batch_out.created_by_name == "测试坐席"
 
     async with database() as session:
         await service.update_policy(
@@ -2744,6 +2754,7 @@ async def test_active_exception_batch_blocks_same_category_only(database) -> Non
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "active-no-answer",
         )
@@ -2755,6 +2766,7 @@ async def test_active_exception_batch_blocks_same_category_only(database) -> Non
                 session,
                 "tenant-a",
                 1,
+                None,
                 "no_answer",
                 "second-no-answer",
             )
@@ -2766,6 +2778,7 @@ async def test_active_exception_batch_blocks_same_category_only(database) -> Non
             session,
             "tenant-a",
             1,
+            None,
             "rejected",
             "active-rejected",
         )
@@ -2799,6 +2812,7 @@ async def test_exception_retry_stops_at_batch_limit_and_is_tenant_isolated(
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "max-two-batch",
         )
@@ -2882,6 +2896,7 @@ async def test_exception_retry_invalid_number_is_unavailable(database) -> None:
             session,
             "tenant-a",
             1,
+            None,
             "no_answer",
             "invalid-number-batch",
         )

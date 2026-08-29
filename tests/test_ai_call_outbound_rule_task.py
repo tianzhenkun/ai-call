@@ -20,6 +20,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
     AiCallPromptProfileVersionModel,
+    AiCallSemanticAnalysisModel,
     AiCallVoiceProfileModel,
 )
 from app.api.v1.ai_call.outbound.model import (
@@ -1868,6 +1869,47 @@ async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
     assert targets[0].provider_status_code == "480"
     assert targets[0].provider_reason == "SIP 480 Temporarily Unavailable"
     assert targets[0].hangup_cause == "USER_UNAVAILABLE"
+
+    async with database() as session:
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == "attempt-provenance-call"
+            )
+        )
+        assert attempt is not None
+        attempt.status = "COMPLETED"
+        attempt.call_result = "connected"
+        session.add(
+            AiCallSemanticAnalysisModel(
+                id=generate_snowflake_id(),
+                call_id=attempt.call_id,
+                scene_code="intro_contract",
+                analysis_scene_code="ai_call_semantic_analysis",
+                analysis_status="2",
+                analysis_result=json.dumps(
+                    {"valid_dialogue": False, "tags": ["语音留言"]},
+                    ensure_ascii=False,
+                ),
+                follow_up_suggested=False,
+                analysis_retry_count=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+    async with database() as session:
+        targets, _ = await service.list_targets(
+            session,
+            "tenant-a",
+            task_id,
+            page_num=1,
+            page_size=20,
+            phone_number=None,
+            customer_name=None,
+            target_status=None,
+        )
+    assert targets[0].answer_type == "voicemail"
 
 
 @pytest.mark.anyio

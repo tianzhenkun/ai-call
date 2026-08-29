@@ -252,6 +252,7 @@ class AiCallOutboundExceptionBatchModel(MappedBase):
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     active_slot: Mapped[str | None] = mapped_column(String(32))
     created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_by_name: Mapped[str | None] = mapped_column(String(100))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -340,6 +340,7 @@ class RecordOut(AiCallBaseSchema):
     call_id: str
     task_id: str | None = None
     call_result: str | None = None
+    answer_type: Literal["human", "voicemail", "transport"] | None = None
     follow_up_data_id: str | None = None
     operator_agent_identity: str | None = None
     after_call_result_status: Literal[
@@ -401,6 +402,9 @@ class RecordExceptionHandlingOut(AiCallBaseSchema):
     retry_count: int
     max_retry_count: int
     last_result: str | None = None
+    created_by: str | None = None
+    created_by_name: str | None = None
+    started_at: datetime | None = None
 
 
 class RecordAfterCallWorkOut(AiCallBaseSchema):

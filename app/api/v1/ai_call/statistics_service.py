@@ -86,6 +86,8 @@ class StatisticsPeriodFactory:
 class OutboundStatisticsService:
     _RESULT_ORDER = (
         CallResultGroup.CONNECTED,
+        CallResultGroup.VOICEMAIL,
+        CallResultGroup.TRANSPORT_CONNECTED,
         CallResultGroup.NO_ANSWER,
         CallResultGroup.REJECTED,
         CallResultGroup.EARLY_HANGUP,

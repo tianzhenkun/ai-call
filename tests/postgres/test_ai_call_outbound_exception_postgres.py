@@ -125,6 +125,7 @@ async def test_concurrent_same_category_starts_only_one_batch() -> None:
                         session,
                         "tenant-a",
                         1,
+                        None,
                         "no_answer",
                         key,
                     )
