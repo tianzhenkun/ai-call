@@ -1872,7 +1872,7 @@ class AiCallSemanticAnalysisService:
             review_status=analysis.follow_up_review_status,
             current_classification=current_classification,
         )
-        analysis_result = _remove_internal_evidence_annotations(
+        analysis_result = sanitize_analysis_result_for_response(
             analysis.analysis_result_dict or {}
         )
         return {
@@ -1951,7 +1951,7 @@ def enforce_semantic_evidence_on_result(
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = normalize_analysis_result(result)
-    normalized = _remove_internal_evidence_annotations(normalized)
+    normalized = sanitize_analysis_result_for_response(normalized)
     normalized = _remove_transcript_listing_summary(normalized)
     normalized = _remove_record_only_claims(
         normalized,
@@ -1994,7 +1994,9 @@ def enforce_semantic_evidence_on_result(
     })
 
 
-def _remove_internal_evidence_annotations(result: dict[str, Any]) -> dict[str, Any]:
+def sanitize_analysis_result_for_response(
+    result: dict[str, Any],
+) -> dict[str, Any]:
     cleaned_summary = _clean_summary_text(
         _strip_internal_evidence_annotations(_string_value(result.get("summary")))
     )

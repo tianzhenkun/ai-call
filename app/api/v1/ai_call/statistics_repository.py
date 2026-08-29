@@ -5,6 +5,8 @@ from sqlalchemy import Select, and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Selectable
 
+from app.services.ai_call.call_outcome import VOICEMAIL_MARKERS
+
 from .model import (
     AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
@@ -69,14 +71,10 @@ class OutboundStatisticsRepository:
                 == "ai_call_semantic_analysis",
                 AiCallSemanticAnalysisModel.analysis_status == "2",
                 or_(
-                    AiCallSemanticAnalysisModel.analysis_result.contains("语音信箱"),
-                    AiCallSemanticAnalysisModel.analysis_result.contains("语音留言"),
-                    AiCallSemanticAnalysisModel.analysis_result.contains(
-                        "提示音后录制留言"
-                    ),
-                    AiCallSemanticAnalysisModel.analysis_result.contains(
-                        "录音完成后挂断"
-                    ),
+                    *(
+                        AiCallSemanticAnalysisModel.analysis_result.contains(marker)
+                        for marker in VOICEMAIL_MARKERS
+                    )
                 ),
             )
             .exists()

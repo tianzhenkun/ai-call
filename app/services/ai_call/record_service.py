@@ -6,9 +6,13 @@ from typing import Any
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.services.ai_call.call_outcome import detect_answer_type
 from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.runtime_control.customer_media_repository import (
     OwnerCustomerMediaRepository,
+)
+from app.services.ai_call.semantic_analysis import (
+    sanitize_analysis_result_for_response,
 )
 from app.services.ai_call.session_registry import CallSessionStatus, utc_now
 
@@ -468,6 +472,7 @@ class AiCallRecordService:
         follow_up_context = getattr(record, "_follow_up_context", {})
         quality_context = getattr(record, "_quality_context", {})
         semantic_summary = None
+        parsed_analysis = None
         semantic_analysis_result = getattr(record, "_semantic_analysis_result", None)
         if semantic_analysis_result:
             try:
@@ -475,6 +480,7 @@ class AiCallRecordService:
             except (TypeError, ValueError):
                 parsed_analysis = None
             if isinstance(parsed_analysis, dict):
+                parsed_analysis = sanitize_analysis_result_for_response(parsed_analysis)
                 raw_summary = parsed_analysis.get("summary")
                 if isinstance(raw_summary, str) and raw_summary.strip():
                     semantic_summary = raw_summary.strip()
@@ -496,6 +502,15 @@ class AiCallRecordService:
                     "technical_failure",
                 }:
                     call_result = candidate
+        answer_type = semantic_context.get("answerType")
+        if call_result == "connected" and answer_type is None:
+            answer_type = detect_answer_type(
+                call_result=call_result,
+                analysis_status=semantic_context.get("analysisStatus"),
+                analysis_result=(
+                    parsed_analysis if isinstance(parsed_analysis, dict) else None
+                ),
+            )
         return {
             "id": str(record.id),
             "callId": record.call_id,
@@ -506,11 +521,7 @@ class AiCallRecordService:
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
             "callResult": call_result,
-            "answerType": (
-                semantic_context.get("answerType")
-                if call_result == "connected"
-                else None
-            ),
+            "answerType": answer_type if call_result == "connected" else None,
             "summary": semantic_summary,
             "analysisStatus": semantic_context.get("analysisStatus"),
             "customerIntent": semantic_context.get("customerIntent"),
