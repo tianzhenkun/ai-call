@@ -1210,6 +1210,7 @@ def build_livekit_runtime_provider(
     registry: Any,
 ) -> LiveKitRuntimeProvider:
     from app.api.v1.ai_call.crud import AiCallRecordRepository
+    from app.api.v1.ai_call.model import AiCallRecordModel
     from app.api.v1.ai_call.service import (
         AiCallService,
         attach_ai_call_event_persistence,
@@ -1229,9 +1230,32 @@ def build_livekit_runtime_provider(
     from app.services.ai_call.livekit_room import LiveKitRoomManager
     from app.services.ai_call.livekit_sip import LiveKitSipClient, SipOutboundConfig
     from app.services.ai_call.orchestrator import AiCallOrchestrator
+    from app.services.ai_call.runtime_control.command_repository import (
+        EndCallIntent,
+        RuntimeCommandRepository,
+    )
     from app.services.ai_call.runtime_control.webhook_service import (
         livekit_provider_namespace,
     )
+
+    async def request_owner_end(call_id: str, end_reason: str) -> bool:
+        async with session_factory.begin() as session:
+            record = await session.scalar(
+                select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+            )
+            if record is None or record.runtime_control_mode != "owner_command_v1":
+                return False
+            await RuntimeCommandRepository(session).request_end(
+                EndCallIntent(
+                    tenant_id=str(record.tenant_id),
+                    call_id=call_id,
+                    source="agent_runner",
+                    end_reason=end_reason,
+                    dedupe_key=f"agent_runner:{call_id}",
+                    evidence={"endReason": end_reason},
+                )
+            )
+        return True
 
     room_manager = LiveKitRoomManager(
         livekit_url=settings.LIVEKIT_URL,
@@ -1240,7 +1264,10 @@ def build_livekit_runtime_provider(
         api_secret=settings.LIVEKIT_API_SECRET,
         browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
     )
-    orchestrator = AiCallOrchestrator.from_settings(settings)
+    orchestrator = AiCallOrchestrator.from_settings(
+        settings,
+        auto_end_requester=request_owner_end,
+    )
     attach_ai_call_event_persistence(orchestrator.event_store)
     dialogue_bridge = OwnerRuntimeDialogueBridge(session_factory)
     dialogue_bridge.attach_event_store(orchestrator.event_store)

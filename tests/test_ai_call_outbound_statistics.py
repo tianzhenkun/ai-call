@@ -564,7 +564,11 @@ async def test_repository_splits_human_voicemail_and_transport_connections() -> 
                 ),
             ])
         session.add_all([
-            _analysis(row_id=1, result={"valid_dialogue": True}, now=begin),
+            _analysis(
+                row_id=1,
+                result={"valid_dialogue": True, "tags": ["提到语音信箱"]},
+                now=begin,
+            ),
             _analysis(
                 row_id=2,
                 result={"valid_dialogue": False, "tags": ["语音留言"]},

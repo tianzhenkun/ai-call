@@ -315,6 +315,67 @@ def test_livekit_owner_provider_attaches_event_persistence_worker() -> None:
         configure_ai_call_event_persistence(None)
 
     assert provider._agent_manager._orchestrator.event_store in worker.stores
+    assert provider._agent_manager._orchestrator._auto_end_requester is not None
+
+
+@pytest.mark.anyio
+async def test_livekit_owner_provider_requests_end_before_local_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config.setting import settings
+    from app.services.ai_call.runtime_control import command_repository
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        build_livekit_runtime_provider,
+    )
+
+    requests = []
+
+    class FakeCommandRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def request_end(self, request) -> None:
+            requests.append(request)
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return SimpleNamespace(
+                tenant_id="tenant-a",
+                runtime_control_mode="owner_command_v1",
+            )
+
+    class SessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class SessionFactory:
+        def begin(self):
+            return SessionContext()
+
+    monkeypatch.setattr(
+        command_repository,
+        "RuntimeCommandRepository",
+        FakeCommandRepository,
+    )
+    provider = build_livekit_runtime_provider(
+        settings=settings,
+        session_factory=SessionFactory(),
+        registry=RuntimeRegistry(),
+    )
+
+    requested = await provider._agent_manager._orchestrator._auto_end_requester(
+        "call-owner-end",
+        "customer_end",
+    )
+
+    assert requested is True
+    assert len(requests) == 1
+    assert requests[0].source == "agent_runner"
+    assert requests[0].end_reason == "customer_end"
+    assert requests[0].dedupe_key == "agent_runner:call-owner-end"
 
 
 @pytest.mark.anyio

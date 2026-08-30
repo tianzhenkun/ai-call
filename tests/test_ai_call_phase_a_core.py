@@ -1704,6 +1704,7 @@ async def test_livekit_delete_room_treats_not_found_as_success(monkeypatch) -> N
 def build_orchestrator(
     agent_runner: FakeAgentRunner | None = None,
     browser_ready_timeout_seconds: float = 90.0,
+    auto_end_requester=None,
 ) -> tuple[AiCallOrchestrator, FakeLiveKitRoomManager, FakeAgentRunner]:
     livekit = FakeLiveKitRoomManager()
     agent = agent_runner or FakeAgentRunner()
@@ -1731,6 +1732,7 @@ def build_orchestrator(
         registry=InMemorySessionRegistry(),
         event_store=InMemoryEventStore(),
         browser_ready_timeout_seconds=browser_ready_timeout_seconds,
+        auto_end_requester=auto_end_requester,
     )
     return orchestrator, livekit, agent
 
@@ -2132,6 +2134,58 @@ async def test_orchestrator_auto_end_session_completes_with_model_reason() -> No
     assert agent.stopped_call_ids == [created.call_id]
     assert livekit.deleted_rooms == [created.room_name]
     assert events.rows[-1].type == "session_completed"
+    assert events.rows[-1].payload == {"endReason": "customer_end"}
+
+
+@pytest.mark.anyio
+async def test_orchestrator_auto_end_requests_terminal_barrier_before_cleanup() -> None:
+    requests: list[tuple[str, str]] = []
+
+    async def request_terminal_barrier(call_id: str, end_reason: str) -> bool:
+        requests.append((call_id, end_reason))
+        return True
+
+    orchestrator, livekit, agent = build_orchestrator(
+        auto_end_requester=request_terminal_barrier,
+    )
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    orchestrator._schedule_auto_end_session(created.call_id, "customer_end")
+
+    await asyncio.wait_for(
+        _wait_until(lambda: requests == [(created.call_id, "customer_end")]),
+        timeout=1,
+    )
+
+    assert agent.stopped_call_ids == []
+    assert livekit.deleted_rooms == []
+    assert orchestrator.registry.get(created.call_id).status == CallSessionStatus.READY
+
+
+@pytest.mark.anyio
+async def test_orchestrator_auto_end_falls_back_when_terminal_barrier_request_fails() -> None:
+    async def fail_terminal_barrier(_call_id: str, _end_reason: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    orchestrator, livekit, agent = build_orchestrator(
+        auto_end_requester=fail_terminal_barrier,
+    )
+    created = await orchestrator.create_web_session(voice=None, prompt=None)
+
+    orchestrator._schedule_auto_end_session(created.call_id, "customer_end")
+
+    await asyncio.wait_for(
+        _wait_until(
+            lambda: orchestrator.registry.get(created.call_id).status
+            == CallSessionStatus.COMPLETED
+        ),
+        timeout=1,
+    )
+    events = await orchestrator.list_events(created.call_id)
+
+    assert agent.stopped_call_ids == [created.call_id]
+    assert livekit.deleted_rooms == [created.room_name]
+    assert "call_end_terminal_barrier_failed" in [event.type for event in events.rows]
     assert events.rows[-1].payload == {"endReason": "customer_end"}
 
 
@@ -4593,12 +4647,18 @@ async def test_realtime_agent_runner_cancels_pending_call_end_when_user_speaks_a
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_schedules_explicit_customer_end_without_extra_response() -> None:
+async def test_realtime_agent_runner_plays_fallback_closing_before_explicit_customer_end() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
+    publisher = FakeAudioPublisher()
     scheduler_calls: list[tuple[str, str]] = []
-    call_id = "call_end_explicit_without_extra_response"
+    call_id = "call_end_explicit_with_fallback_closing"
+    output_pcm = b"\x01\x02" * 240
+    closing_instruction = (
+        "请直接回复：“好的，那我先不打扰您了，祝您工作顺利。”"
+        "不要添加其他内容，不要再提出问题。"
+    )
     session = CallSession(
         call_id=call_id,
         room_name=f"ai-call-{call_id}",
@@ -4618,6 +4678,8 @@ async def test_realtime_agent_runner_schedules_explicit_customer_end_without_ext
         provider_factory=lambda _session: provider,
         registry=registry,
         event_store=store,
+        audio_publisher=publisher,
+        ai_speaking_tail_grace_seconds=0,
         user_turn_stability_delay_seconds=0,
         call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
     )
@@ -4635,15 +4697,47 @@ async def test_realtime_agent_runner_schedules_explicit_customer_end_without_ext
             )
         )
         await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
-        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            _wait_until(lambda: provider.created_responses == [closing_instruction]),
+            timeout=1,
+        )
+
+        assert scheduler_calls == []
+
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_started",
+                payload={"response": {"id": "resp_fallback_goodbye"}},
+            )
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_fallback_goodbye",
+                    "delta": base64.b64encode(output_pcm).decode("ascii"),
+                },
+            )
+        )
+        await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_done",
+                payload={"response": {"id": "resp_fallback_goodbye", "status": "completed"}},
+            )
+        )
+        await asyncio.wait_for(
+            _wait_until(lambda: scheduler_calls == [(call_id, "customer_end")]),
+            timeout=1,
+        )
 
         event_types = [event.type for event in store.list(call_id)]
         assert scheduler_calls == [(call_id, "customer_end")]
-        assert provider.created_responses == []
+        assert provider.created_responses == [closing_instruction]
         assert "call_end_intent_detected" in event_types
         assert "call_end_tool_missing" in event_types
         assert "call_end_scheduled" in event_types
-        assert "model_response_started" not in event_types
+        assert "model_response_started" in event_types
     finally:
         await runner.stop(call_id)
 
@@ -4657,6 +4751,10 @@ async def test_realtime_agent_runner_fast_ends_explicit_customer_end_during_ai_a
     scheduler_calls: list[tuple[str, str]] = []
     call_id = "call_end_explicit_during_ai_audio"
     output_pcm = b"\x01\x02" * 240
+    closing_instruction = (
+        "请直接回复：“好的，那我先不打扰您了，祝您工作顺利。”"
+        "不要添加其他内容，不要再提出问题。"
+    )
     session = CallSession(
         call_id=call_id,
         room_name=f"ai-call-{call_id}",
@@ -4705,11 +4803,54 @@ async def test_realtime_agent_runner_fast_ends_explicit_customer_end_during_ai_a
             ProviderEvent(type="user_transcript_done", payload={"transcript": "挂了吧。"})
         )
         await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
-        await asyncio.wait_for(_wait_until(lambda: bool(scheduler_calls)), timeout=1)
+
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_done",
+                payload={"response": {"id": "resp_long_goodbye", "status": "cancelled"}},
+            )
+        )
+        await asyncio.wait_for(
+            _wait_until(lambda: provider.created_responses == [closing_instruction]),
+            timeout=1,
+        )
+
+        assert scheduler_calls == []
+
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_started",
+                payload={"response": {"id": "resp_fallback_after_interrupt"}},
+            )
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_audio_delta",
+                payload={
+                    "response_id": "resp_fallback_after_interrupt",
+                    "delta": base64.b64encode(output_pcm).decode("ascii"),
+                },
+            )
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_done",
+                payload={
+                    "response": {
+                        "id": "resp_fallback_after_interrupt",
+                        "status": "completed",
+                    }
+                },
+            )
+        )
+        await asyncio.wait_for(
+            _wait_until(lambda: scheduler_calls == [(call_id, "customer_end")]),
+            timeout=1,
+        )
 
         event_types = [event.type for event in store.list(call_id)]
         assert scheduler_calls == [(call_id, "customer_end")]
-        assert provider.created_responses == []
+        assert provider.created_responses == [closing_instruction]
         assert provider.cancelled_response_count == 1
         assert publisher.stopped_call_ids == [call_id]
         assert "call_end_intent_detected" in event_types
@@ -4739,6 +4880,10 @@ async def test_realtime_agent_runner_schedules_customer_end_when_model_misses_ca
     publisher = ImmediatePlayoutAudioPublisher()
     scheduler_calls: list[tuple[str, str]] = []
     output_pcm = b"\x01\x02" * 240
+    closing_instruction = (
+        "请直接回复：“好的，那我先不打扰您了，祝您工作顺利。”"
+        "不要添加其他内容，不要再提出问题。"
+    )
     session = CallSession(
         call_id=call_id,
         room_name=f"ai-call-{call_id}",
@@ -4776,6 +4921,11 @@ async def test_realtime_agent_runner_schedules_customer_end_when_model_misses_ca
         )
     )
     await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await asyncio.wait_for(
+        _wait_until(lambda: provider.created_responses == [closing_instruction]),
+        timeout=1,
+    )
+    assert scheduler_calls == []
     await provider.emit(
         ProviderEvent(
             type="model_response_started",
@@ -4808,6 +4958,78 @@ async def test_realtime_agent_runner_schedules_customer_end_when_model_misses_ca
     assert "call_end_intent_detected" in event_types
     assert "call_end_tool_missing" in event_types
     assert "call_end_scheduled" in event_types
+
+
+@pytest.mark.anyio
+async def test_realtime_agent_runner_requires_model_confirmation_for_polite_goodbye() -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    scheduler_calls: list[tuple[str, str]] = []
+    call_id = "call_end_polite_goodbye_requires_model"
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"browser-{call_id}",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "voice": "Tina",
+            "prompt": "简短回答",
+            "vad_type": "server_vad",
+            "vad_threshold": 0.5,
+            "vad_silence_duration_ms": 800,
+        },
+    )
+    registry.add(session)
+
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        user_turn_stability_delay_seconds=0,
+        call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
+    )
+
+    try:
+        await runner.start(session)
+        await provider.emit(
+            ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
+        )
+        await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
+        await provider.emit(
+            ProviderEvent(
+                type="user_transcript_done",
+                payload={"transcript": "嗯，再见。"},
+            )
+        )
+        await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+        await asyncio.wait_for(
+            _wait_until(lambda: provider.created_responses == [None]),
+            timeout=1,
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_started",
+                payload={"response": {"id": "resp_polite_goodbye"}},
+            )
+        )
+        await provider.emit(
+            ProviderEvent(
+                type="model_response_done",
+                payload={"response": {"id": "resp_polite_goodbye", "status": "completed"}},
+            )
+        )
+        await asyncio.sleep(0)
+
+        events = store.list(call_id)
+        event_types = [event.type for event in events]
+        intent = next(event for event in events if event.type == "call_end_intent_detected")
+        assert intent.payload["reason"] == "polite_customer_end"
+        assert scheduler_calls == []
+        assert "call_end_tool_missing" not in event_types
+        assert "call_end_scheduled" not in event_types
+    finally:
+        await runner.stop(call_id)
 
 
 @pytest.mark.anyio

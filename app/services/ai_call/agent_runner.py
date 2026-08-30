@@ -7844,7 +7844,7 @@ class RealtimeCallAgentRunner:
             return
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
         stability_delay_seconds = self._turn_response_stability_delay_seconds(call_id)
-        if await self._maybe_schedule_explicit_call_end_without_response(
+        if await self._maybe_schedule_explicit_call_end_with_fallback_closing(
             call_id,
             provider,
             turn,
@@ -7911,7 +7911,7 @@ class RealtimeCallAgentRunner:
             if self._turn_response_tasks.get(call_id) is asyncio.current_task():
                 self._turn_response_tasks.pop(call_id, None)
 
-    async def _maybe_schedule_explicit_call_end_without_response(
+    async def _maybe_schedule_explicit_call_end_with_fallback_closing(
         self,
         call_id: str,
         provider: RealtimeProviderProtocol,
@@ -7921,10 +7921,10 @@ class RealtimeCallAgentRunner:
         session = self.registry.get(call_id)
         if not self._is_barge_in_enabled_for_session(session):
             return False
-        if call_id not in self._pending_call_end_intents:
+        intent = self._pending_call_end_intents.get(call_id)
+        if intent is None or intent.reason != "explicit_customer_end":
             return False
-        self._promote_missing_call_end_tool(call_id)
-        if call_id not in self._pending_call_ends:
+        if not self._promote_missing_call_end_tool(call_id):
             return False
         turn.response_requested = True
         self._cancel_turn_response_task_nowait(call_id)
@@ -7932,7 +7932,11 @@ class RealtimeCallAgentRunner:
         await self._stop_ai_for_explicit_call_end(call_id, provider, timestamp)
         self._move_running_session_to_connected_for_call_end(call_id)
 
-        self._schedule_pending_call_end_nowait(call_id)
+        await self._request_response(
+            call_id,
+            provider,
+            input_text=self._call_end_final_response_tool_result("customer_end"),
+        )
         return True
 
     async def _stop_ai_for_explicit_call_end(
@@ -9373,7 +9377,13 @@ class RealtimeCallAgentRunner:
         if not lifecycle.pending_create:
             if await self._maybe_recover_sip_confirmed_without_transcript(call_id, provider):
                 return
-            self._promote_missing_call_end_tool(call_id)
+            if self._promote_missing_call_end_tool(call_id):
+                await self._request_response(
+                    call_id,
+                    provider,
+                    input_text=self._call_end_final_response_tool_result("customer_end"),
+                )
+                return
             self._schedule_pending_call_end_nowait(call_id)
             return
         if self._drop_unmaterialized_no_barge_pending_response_if_needed(call_id):
@@ -9489,19 +9499,23 @@ class RealtimeCallAgentRunner:
         )
         return True
 
-    def _promote_missing_call_end_tool(self, call_id: str) -> None:
+    def _promote_missing_call_end_tool(self, call_id: str) -> bool:
         if call_id in self._pending_call_ends:
-            return
-        intent = self._pending_call_end_intents.pop(call_id, None)
+            return False
+        intent = self._pending_call_end_intents.get(call_id)
         if intent is None:
-            return
+            return False
+        if intent.reason != "explicit_customer_end":
+            self._pending_call_end_intents.pop(call_id, None)
+            return False
+        self._pending_call_end_intents.pop(call_id, None)
 
         tool_call_id = f"local_call_end_intent:{intent.reason}"
         self._pending_call_ends[call_id] = PendingCallEnd(
             tool_call_id=tool_call_id,
             tool_reason="customer_end",
             end_reason="customer_end",
-            final_response_started=True,
+            final_response_started=False,
             local_explicit_intent=True,
         )
         self._append_event(
@@ -9519,6 +9533,7 @@ class RealtimeCallAgentRunner:
                 "transcriptPreview": self._text_preview(intent.transcript),
             },
         )
+        return True
 
     def _schedule_pending_call_end_nowait(self, call_id: str) -> None:
         pending_call_end = self._pending_call_ends.get(call_id)

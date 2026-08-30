@@ -700,6 +700,8 @@ async def test_prompt_components_include_runtime_common_constraints(b4_service) 
     assert components["rows"][0]["name"] == "平台关键约束"
     assert "当前日期：" in components["rows"][0]["content"]
     assert "Asia/Shanghai" in components["rows"][0]["content"]
+    assert "不得作确定性承诺" in components["rows"][0]["content"]
+    assert "工具未调用、失败、超时或结果未知时，不得声称成功" in components["rows"][0]["content"]
     assert "暂时没有人工接入" in components["rows"][1]["content"]
     assert "不要自行承诺后续联系" in components["rows"][1]["content"]
     assert "schedule_call_end" in components["rows"][2]["content"]

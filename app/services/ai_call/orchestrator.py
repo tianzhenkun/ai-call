@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -327,6 +328,7 @@ class AiCallOrchestrator:
         metrics_by_call_id: dict[str, CallMetrics] | None = None,
         end_cleanup_timeout_seconds: float = END_CLEANUP_TIMEOUT_SECONDS,
         browser_ready_timeout_seconds: float = BROWSER_READY_TIMEOUT_SECONDS,
+        auto_end_requester: Callable[[str, str], Awaitable[bool]] | None = None,
     ) -> None:
         self.config = config
         self.registry = registry or InMemorySessionRegistry()
@@ -337,6 +339,7 @@ class AiCallOrchestrator:
             0.001,
             browser_ready_timeout_seconds,
         )
+        self._auto_end_requester = auto_end_requester
         self.livekit_room_manager = livekit_room_manager or LiveKitRoomManager(
             livekit_url=config.livekit_url,
             api_key=config.livekit_api_key,
@@ -354,8 +357,16 @@ class AiCallOrchestrator:
         self.agent_runner = agent_runner or self._build_default_agent_runner()
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> AiCallOrchestrator:
-        return cls(config=AiCallRuntimeConfig.from_settings(settings))
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        auto_end_requester: Callable[[str, str], Awaitable[bool]] | None = None,
+    ) -> AiCallOrchestrator:
+        return cls(
+            config=AiCallRuntimeConfig.from_settings(settings),
+            auto_end_requester=auto_end_requester,
+        )
 
     def _build_default_agent_runner(self) -> RealtimeAgentRunnerProtocol:
         from app.core.database import async_db_session
@@ -1248,6 +1259,21 @@ class AiCallOrchestrator:
                 )
 
     async def _auto_end_session(self, call_id: str, end_reason: str) -> None:
+        if self._auto_end_requester is not None:
+            try:
+                if await self._auto_end_requester(call_id, end_reason):
+                    return
+            except Exception as exc:
+                with suppress(Exception):
+                    self._append_event(
+                        call_id,
+                        "call_end_terminal_barrier_failed",
+                        "orchestrator",
+                        {
+                            "errorType": type(exc).__name__,
+                            "endReason": end_reason,
+                        },
+                    )
         try:
             await self.end_session(call_id, end_reason=end_reason)
         except AiCallError as exc:

@@ -63,7 +63,7 @@ class OutboundStatisticsRepository:
             )
             .exists()
         )
-        voicemail = (
+        voicemail_marker = (
             select(AiCallSemanticAnalysisModel.id)
             .where(
                 AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
@@ -79,8 +79,9 @@ class OutboundStatisticsRepository:
             )
             .exists()
         )
+        voicemail = and_(~valid_dialogue, voicemail_marker)
         return (
-            and_(raw_connected, valid_dialogue, ~voicemail),
+            and_(raw_connected, valid_dialogue),
             and_(raw_connected, voicemail),
             and_(raw_connected, ~valid_dialogue, ~voicemail),
         )

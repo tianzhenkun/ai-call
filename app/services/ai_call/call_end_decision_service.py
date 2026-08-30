@@ -56,6 +56,8 @@ class RuleBasedCallEndDecisionService:
         "先这样吧",
         "就这样吧",
         "到这吧",
+    )
+    POLITE_END_PATTERNS = (
         "再见",
         "拜拜",
     )
@@ -89,6 +91,13 @@ class RuleBasedCallEndDecisionService:
                 confidence=0.95,
                 reason="explicit_customer_end",
                 summary="用户明确要求结束通话",
+            )
+        if any(pattern in normalized for pattern in self.POLITE_END_PATTERNS):
+            return CallEndDecision(
+                action="explicit_end",
+                confidence=0.8,
+                reason="polite_customer_end",
+                summary="用户使用礼貌结束语，需要模型结合上下文确认",
             )
         return CallEndDecision(
             action="uncertain",
