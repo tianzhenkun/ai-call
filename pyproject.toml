@@ -20,6 +20,7 @@ dependencies = [
     "itsdangerous==2.2.0",
     "livekit>=1.1,<2.0",
     "livekit-api>=1.0,<2.0",
+    "lingchen-platform-sdk[nacos]",
     "loguru==0.7.3",
     "mutagen==1.47.0",
     "openpyxl==3.1.5",
@@ -65,6 +66,7 @@ explicit = true
 
 [tool.uv.sources]
 cos-python-sdk-v5 = { index = "pypi-cos" }
+lingchen-platform-sdk = { git = "ssh://git@github.com/tianzhenkun/lingchen-python-sdk.git", rev = "485b8a77e203bc769c9d24e4109fea723ef1c9b9", subdirectory = "packages/lingchen-platform-sdk" }
 
 [tool.ruff]
 line-length = 100

@@ -13,6 +13,7 @@ from fastapi.openapi.docs import (
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.common.enums import EnvironmentEnum
 from app.config.setting import settings
 from app.core.exceptions import handle_exception
 from app.core.logger import log
@@ -37,6 +38,7 @@ class AiCallRoleWorkerHandles:
     runtime_webhook_worker: Any = None
     knowledge_worker: Any = None
     outbound_task_worker: Any = None
+    credit_usage_worker: Any = None
     linphone_test_worker: Any = None
     voice_worker: Any = None
     voice_preview_started: bool = False
@@ -47,6 +49,7 @@ class SystemServiceHandles:
     events_loaded: bool = False
     scheduler_started: bool = False
     console_started: bool = False
+    nacos_registration: Any = None
 
 
 @dataclass(slots=True)
@@ -65,14 +68,43 @@ class _OutboundOwnerRuntimeWorker:
             await self.task_worker.stop()
 
 
+def validate_reach_api_runtime_contract(config=None) -> None:
+    config = settings if config is None else config
+    errors: list[str] = []
+    if config.ROOT_PATH != "/reach-api/v1":
+        errors.append("ROOT_PATH必须固定为/reach-api/v1")
+    if not config.PLATFORM_AUTH_ALLOWED_CLIENT_IDS.strip():
+        errors.append("PLATFORM_AUTH_ALLOWED_CLIENT_IDS不能为空")
+    platform_tenant_id = config.AI_CALL_PLATFORM_TENANT_ID.strip()
+    legacy_data_tenant_id = config.AI_CALL_LEGACY_DATA_TENANT_ID.strip()
+    if bool(platform_tenant_id) != bool(legacy_data_tenant_id):
+        errors.append("AI_CALL_PLATFORM_TENANT_ID与AI_CALL_LEGACY_DATA_TENANT_ID必须同时配置")
+    if config.ENVIRONMENT == EnvironmentEnum.PROD:
+        if not config.JWT_ENABLE:
+            errors.append("生产Reach API必须启用平台JWT校验")
+        if not config.NACOS_ENABLE:
+            errors.append("生产Reach API必须启用Nacos服务注册")
+        if config.AI_CALL_STANDALONE_ENABLE:
+            errors.append("生产Reach API禁止使用standalone模式")
+        if not config.REACH_CREDIT_GATEWAY_BASE_URL.strip():
+            errors.append("REACH_CREDIT_GATEWAY_BASE_URL不能为空")
+        if not config.REACH_CREDIT_METERING_CLIENT_ID.strip():
+            errors.append("REACH_CREDIT_METERING_CLIENT_ID不能为空")
+        if not config.REACH_CREDIT_METERING_SECRET.strip():
+            errors.append("REACH_CREDIT_METERING_SECRET不能为空")
+    if errors:
+        raise RuntimeError("Reach API运行契约不完整: " + "; ".join(errors))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     roles = validate_runtime_role_settings(settings)
+    if ProcessRole.JOBS in roles:
+        await _init_ai_call_standalone_oss_config()
     role_handles = await _start_ai_call_role_workers(app, roles, start_voice=False)
     if settings.AI_CALL_STANDALONE_ENABLE:
         try:
             if ProcessRole.JOBS in roles:
-                await _init_ai_call_standalone_oss_config()
                 role_handles.voice_worker = await _start_ai_call_voice_worker(app)
             log.info("✅ AI Call standalone 模式启动，跳过系统服务初始化")
             yield
@@ -86,7 +118,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
         if ProcessRole.API in roles:
             system_handles = await _start_system_services(app, roles, role_handles)
         elif ProcessRole.JOBS in roles:
-            await _init_ai_call_standalone_oss_config()
             role_handles.voice_worker = await _start_ai_call_voice_worker(app)
     except Exception as exc:
         await _stop_ai_call_role_workers(app, role_handles)
@@ -123,23 +154,16 @@ async def _start_ai_call_role_workers(
             handles.voice_preview_started = True
         if ProcessRole.OUTBOUND in roles:
             await _recover_ai_call_outbound_validations()
+            handles.credit_usage_worker = await _start_reach_credit_usage_worker()
             handles.outbound_task_worker = await _start_ai_call_outbound_task_worker()
             handles.linphone_test_worker = await _start_ai_call_linphone_test_worker()
         if ProcessRole.JOBS in roles:
-            handles.semantic_analysis_worker = (
-                await _start_ai_call_semantic_analysis_worker()
-            )
+            handles.semantic_analysis_worker = await _start_ai_call_semantic_analysis_worker()
             handles.quality_scoring_worker = await _start_ai_call_quality_scoring_worker()
             handles.offline_asr_worker = await _start_ai_call_offline_asr_worker()
-            handles.recording_reconcile_worker = (
-                await _start_ai_call_recording_reconcile_worker()
-            )
-            handles.handoff_trigger_worker = (
-                await _start_ai_call_handoff_trigger_worker()
-            )
-            handles.runtime_webhook_worker = (
-                await _start_ai_call_runtime_webhook_worker()
-            )
+            handles.recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
+            handles.handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
+            handles.runtime_webhook_worker = await _start_ai_call_runtime_webhook_worker()
             handles.knowledge_worker = await _start_ai_call_knowledge_worker()
             if start_voice:
                 handles.voice_worker = await _start_ai_call_voice_worker(app)
@@ -167,6 +191,8 @@ async def _stop_ai_call_role_workers(
         await _stop_ai_call_linphone_test_worker(handles.linphone_test_worker)
     if handles.outbound_task_worker is not None:
         await _stop_ai_call_outbound_task_worker(handles.outbound_task_worker)
+    if handles.credit_usage_worker is not None:
+        await handles.credit_usage_worker.stop()
     if handles.handoff_trigger_worker is not None:
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
     if handles.runtime_webhook_worker is not None:
@@ -176,17 +202,13 @@ async def _stop_ai_call_role_workers(
     if handles.event_worker is not None:
         await _stop_ai_call_event_worker(handles.event_worker)
     if handles.recording_reconcile_worker is not None:
-        await _stop_ai_call_recording_reconcile_worker(
-            handles.recording_reconcile_worker
-        )
+        await _stop_ai_call_recording_reconcile_worker(handles.recording_reconcile_worker)
     if handles.offline_asr_worker is not None:
         await _stop_ai_call_offline_asr_worker(handles.offline_asr_worker)
     if handles.quality_scoring_worker is not None:
         await _stop_ai_call_quality_scoring_worker(handles.quality_scoring_worker)
     if handles.semantic_analysis_worker is not None:
-        await _stop_ai_call_semantic_analysis_worker(
-            handles.semantic_analysis_worker
-        )
+        await _stop_ai_call_semantic_analysis_worker(handles.semantic_analysis_worker)
     if handles.dialogue_worker is not None:
         await _stop_ai_call_dialogue_worker(handles.dialogue_worker)
 
@@ -198,9 +220,9 @@ async def _start_system_services(
 ) -> SystemServiceHandles:
     from app.api.v1.system.dict.service import DictDataService
     from app.api.v1.system.oss.service import OssService
-    from app.common.enums import EnvironmentEnum
     from app.core.ap_scheduler import SchedulerUtil
 
+    validate_reach_api_runtime_contract()
     handles = SystemServiceHandles()
     try:
         await import_modules_async(
@@ -224,16 +246,19 @@ async def _start_system_services(
             await SchedulerUtil.init_scheduler(redis=app.state.redis)
             handles.scheduler_started = True
             log.info("✅ 定时任务调度器初始化完成")
+        if settings.NACOS_ENABLE:
+            from app.integrations.nacos_registration import (
+                register_reach_api_with_nacos,
+            )
+
+            handles.nacos_registration = await register_reach_api_with_nacos(app)
         console_run(
             host=settings.SERVER_HOST,
             port=settings.SERVER_PORT,
-            reload=settings.ENVIRONMENT
-            in {EnvironmentEnum.LOCAL, EnvironmentEnum.DEV},
+            reload=settings.ENVIRONMENT in {EnvironmentEnum.LOCAL, EnvironmentEnum.DEV},
             database_ready=True,
             redis_ready=settings.REDIS_ENABLE,
-            scheduler_ready=(
-                SchedulerUtil.is_running() if handles.scheduler_started else False
-            ),
+            scheduler_ready=(SchedulerUtil.is_running() if handles.scheduler_started else False),
         )
         handles.console_started = True
     except Exception:
@@ -249,6 +274,9 @@ async def _stop_system_services(
     from app.core.ap_scheduler import SchedulerUtil
 
     try:
+        if handles.nacos_registration is not None:
+            await handles.nacos_registration.close()
+            log.info("reach_nacos_deregistered")
         if handles.events_loaded:
             await import_modules_async(
                 modules=settings.EVENT_LIST,
@@ -268,7 +296,9 @@ async def _stop_system_services(
 
 async def _init_ai_call_standalone_oss_config() -> None:
     if not settings.SQL_DB_ENABLE or not (
-        settings.AI_CALL_RECORDING_ENABLED or settings.AI_CALL_VOICE_WORKER_ENABLED
+        settings.AI_CALL_RECORDING_ENABLED
+        or settings.AI_CALL_VOICE_WORKER_ENABLED
+        or settings.AI_CALL_KNOWLEDGE_WORKER_ENABLED
     ):
         return
     from app.api.v1.system.oss.service import OssService
@@ -332,9 +362,7 @@ async def _start_ai_call_runtime_webhook_worker():
     if (
         not settings.SQL_DB_ENABLE
         or settings.DATABASE_TYPE != "postgres"
-        or not parse_owner_command_entries(
-            str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES)
-        )
+        or not parse_owner_command_entries(str(settings.AI_CALL_OWNER_COMMAND_V1_ENTRIES))
     ):
         return None
     from app.core.database import async_db_session
@@ -362,7 +390,7 @@ async def _start_ai_call_knowledge_worker():
     from app.core.database import async_db_session
     from app.services.ai_call.knowledge import (
         KnowledgeWorker,
-        build_cos_knowledge_store,
+        build_knowledge_store,
     )
     from app.services.ai_call.knowledge_binary_parser import (
         KnowledgeBinaryParserClient,
@@ -372,15 +400,11 @@ async def _start_ai_call_knowledge_worker():
 
     worker = KnowledgeWorker(
         async_db_session,
-        build_cos_knowledge_store(settings),
+        build_knowledge_store(settings),
         worker_id=f"jobs:knowledge:{uuid4().hex}",
-        poll_interval_seconds=(
-            settings.AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS
-        ),
+        poll_interval_seconds=(settings.AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS),
         lease_seconds=settings.AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS,
-        upload_reconcile_after_seconds=(
-            settings.AI_CALL_KNOWLEDGE_UPLOAD_RECONCILE_AFTER_SECONDS
-        ),
+        upload_reconcile_after_seconds=(settings.AI_CALL_KNOWLEDGE_UPLOAD_RECONCILE_AFTER_SECONDS),
         binary_parser=(
             KnowledgeBinaryParserClient(
                 parser_socket,
@@ -625,14 +649,14 @@ async def _start_ai_call_outbound_task_worker():
         OutboundTaskWorker,
     )
     from app.core.database import async_db_session
+    from app.services.ai_call.credit_metering import CreditMeteringClient
     from app.services.ai_call.runtime_control.roles import (
         runtime_control_mode_for_entry,
     )
     from app.services.ai_call.runtime_control.types import OwnerCommandEntry
 
     owner_mode = (
-        runtime_control_mode_for_entry(settings, OwnerCommandEntry.OUTBOUND)
-        == "owner_command_v1"
+        runtime_control_mode_for_entry(settings, OwnerCommandEntry.OUTBOUND) == "owner_command_v1"
     )
     owner_runtime_start = None
     owner_executor_options = {}
@@ -644,9 +668,7 @@ async def _start_ai_call_outbound_task_worker():
 
         dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
         owner_runtime_start = OwnerRuntimeOutboundStart(
-            allocation_timeout_seconds=(
-                settings.AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS
-            )
+            allocation_timeout_seconds=(settings.AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS)
         )
         owner_executor_options["owner_queue_limits"] = OutboundQueueLimits(
             per_tenant=settings.AI_CALL_OUTBOUND_QUEUED_LIMIT_PER_TENANT,
@@ -655,9 +677,7 @@ async def _start_ai_call_outbound_task_worker():
         )
     elif settings.AI_CALL_OUTBOUND_DIALER_MODE == "sip":
         if not settings.AI_CALL_SIP_OUTBOUND_ENABLED:
-            raise RuntimeError(
-                "AI Call 正式 SIP 拨号模式已启用，但 SIP 外呼总开关未启用"
-            )
+            raise RuntimeError("AI Call 正式 SIP 拨号模式已启用，但 SIP 外呼总开关未启用")
         from app.api.v1.ai_call.outbound.sip_outbound_dialer import (
             SipOutboundDialer,
         )
@@ -679,6 +699,7 @@ async def _start_ai_call_outbound_task_worker():
             + 60
         ),
         owner_runtime_start=owner_runtime_start,
+        credit_metering_client=CreditMeteringClient.from_settings(),
         **owner_executor_options,
     )
     task_worker = OutboundTaskWorker(
@@ -692,14 +713,9 @@ async def _start_ai_call_outbound_task_worker():
 
         reconcile_worker = OutboundAttemptReconcileWorker(
             async_db_session,
-            worker_id=(
-                f"outbound-reconciler:{settings.AI_CALL_RUNTIME_INSTANCE_ID}:"
-                f"{uuid4().hex}"
-            ),
+            worker_id=(f"outbound-reconciler:{settings.AI_CALL_RUNTIME_INSTANCE_ID}:{uuid4().hex}"),
             batch_size=settings.AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE,
-            poll_interval_seconds=(
-                settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS
-            ),
+            poll_interval_seconds=(settings.AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS),
         )
         worker = _OutboundOwnerRuntimeWorker(task_worker, reconcile_worker)
         await task_worker.start()
@@ -712,9 +728,19 @@ async def _start_ai_call_outbound_task_worker():
         worker = task_worker
         await worker.start()
     log.warning(
-        "AI Call 通用外呼执行器已启动，"
-        f"dialer_type={dialer.dialer_type}, owner_mode={owner_mode}"
+        f"AI Call 通用外呼执行器已启动，dialer_type={dialer.dialer_type}, owner_mode={owner_mode}"
     )
+    return worker
+
+
+async def _start_reach_credit_usage_worker():
+    if not settings.SQL_DB_ENABLE:
+        return None
+    from app.core.database import async_db_session
+    from app.services.ai_call.credit_metering import CreditUsageDispatcher
+
+    worker = CreditUsageDispatcher(async_db_session)
+    await worker.start()
     return worker
 
 
@@ -726,10 +752,7 @@ async def _stop_ai_call_outbound_task_worker(worker) -> None:
 
 
 async def _start_ai_call_linphone_test_worker():
-    if (
-        not settings.SQL_DB_ENABLE
-        or not settings.AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED
-    ):
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED:
         return None
     from app.api.v1.ai_call.outbound.linphone_test_service import (
         LinphoneTestRecoveryWorker,
@@ -743,10 +766,7 @@ async def _start_ai_call_linphone_test_worker():
         poll_interval_seconds=settings.AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS,
     )
     await worker.start()
-    log.warning(
-        "AI Call 本机 Linphone 测试恢复 worker 已启动；"
-        "普通任务自动执行器保持独立开关"
-    )
+    log.warning("AI Call 本机 Linphone 测试恢复 worker 已启动；普通任务自动执行器保持独立开关")
     return worker
 
 

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_ai_call_statistics_viewer
 from app.core.exceptions import CustomException
 
 from .controller import ai_call_db_getter
@@ -35,7 +35,7 @@ async def get_outbound_statistics_controller(
     started_at_end: Annotated[datetime, Query(alias="startedAtEnd")],
     time_zone: Annotated[str, Query(alias="timeZone", min_length=1)],
     granularity: Annotated[StatisticsGranularity, Query()],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(get_ai_call_statistics_viewer)],
     service: Annotated[
         OutboundStatisticsService,
         Depends(get_outbound_statistics_service),

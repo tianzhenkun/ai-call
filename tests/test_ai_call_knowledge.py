@@ -42,6 +42,8 @@ from app.services.ai_call.knowledge import (
     KnowledgeService,
     KnowledgeTextParseError,
     KnowledgeWorker,
+    PlatformOssKnowledgeStore,
+    build_knowledge_store,
     parse_byte_range,
     parse_text_knowledge,
 )
@@ -74,6 +76,105 @@ def test_knowledge_module_imports_before_ai_call_router() -> None:
         cwd=Path(__file__).parents[1],
         check=True,
     )
+
+
+def test_knowledge_store_prefers_the_platform_active_oss_config(monkeypatch) -> None:
+    from app.api.v1.system.oss.service import OssService
+
+    monkeypatch.setattr(
+        OssService,
+        "_active_config",
+        {
+            "endpoint": "minio.internal:9000",
+            "bucket_name": "lingchen",
+            "access_key": "test-access",
+            "secret_key": "test-secret",
+            "prefix": "products",
+        },
+    )
+    config = type("Config", (), {"AI_CALL_KNOWLEDGE_OSS_PREFIX": "reach"})()
+
+    store = build_knowledge_store(config)
+
+    assert isinstance(store, PlatformOssKnowledgeStore)
+    assert store.physical_key("knowledge/tenant-a/source.md") == (
+        "products/reach/knowledge/tenant-a/source.md"
+    )
+
+
+def test_knowledge_store_rejects_legacy_direct_secret_fallback(monkeypatch) -> None:
+    from app.api.v1.system.oss.service import OssService
+
+    monkeypatch.setattr(OssService, "_active_config", None)
+    config = type("Config", (), {"AI_CALL_KNOWLEDGE_OSS_PREFIX": "reach"})()
+
+    with pytest.raises(RuntimeError, match="sys_oss_config"):
+        build_knowledge_store(config)
+
+
+@pytest.mark.anyio
+async def test_platform_oss_knowledge_store_keeps_upload_and_range_contract(
+    monkeypatch,
+) -> None:
+    from app.utils.minio_util import MinioUtil
+
+    payload = b"platform knowledge"
+    calls: list[tuple[str, str, tuple[int, int] | None]] = []
+
+    async def put_object(config, object_name, data, content_type):
+        assert data == payload
+        assert content_type == "text/plain"
+        calls.append(("put", object_name, None))
+
+    async def head_object_size(config, object_name):
+        calls.append(("stat", object_name, None))
+        return len(payload)
+
+    async def get_object(config, object_name, *, byte_range=None):
+        calls.append(("get", object_name, byte_range))
+        if byte_range is None:
+            return payload
+        start, end = byte_range
+        return payload[start : end + 1]
+
+    async def delete_object(config, object_name):
+        calls.append(("delete", object_name, None))
+
+    monkeypatch.setattr(MinioUtil, "put_object", put_object)
+    monkeypatch.setattr(MinioUtil, "head_object_size", head_object_size)
+    monkeypatch.setattr(MinioUtil, "get_object", get_object)
+    monkeypatch.setattr(MinioUtil, "delete_object", delete_object)
+    store = PlatformOssKnowledgeStore(
+        {
+            "endpoint": "minio.internal:9000",
+            "bucket_name": "lingchen",
+            "access_key": "test-access",
+            "secret_key": "test-secret",
+            "prefix": "products",
+        },
+        prefix="reach",
+    )
+
+    stored = await store.put(
+        "knowledge/tenant-a/source.txt",
+        BytesIO(payload),
+        content_type="text/plain",
+        expected_size=len(payload),
+    )
+    remote = await store.stat("knowledge/tenant-a/source.txt")
+    opened = await store.open("knowledge/tenant-a/source.txt", byte_range=(2, 7))
+    ranged = b"".join([chunk async for chunk in opened.body])
+    await store.delete("knowledge/tenant-a/source.txt")
+
+    assert stored.byte_size == remote.byte_size == len(payload)
+    assert stored.sha256 == hashlib.sha256(payload).hexdigest()
+    assert ranged == payload[2:8]
+    assert calls == [
+        ("put", "products/reach/knowledge/tenant-a/source.txt", None),
+        ("stat", "products/reach/knowledge/tenant-a/source.txt", None),
+        ("get", "products/reach/knowledge/tenant-a/source.txt", (2, 7)),
+        ("delete", "products/reach/knowledge/tenant-a/source.txt", None),
+    ]
 
 
 def test_knowledge_models_freeze_tenant_version_and_chunk_contract() -> None:

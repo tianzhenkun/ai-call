@@ -316,6 +316,12 @@ async def test_api_role_does_not_start_ai_call_workers_or_require_redis(
             AI_CALL_OWNER_COMMAND_V1_ENTRIES="",
             AI_CALL_RUNTIME_INSTANCE_ID="",
             AI_CALL_STANDALONE_ENABLE=False,
+            ROOT_PATH="/reach-api/v1",
+            PLATFORM_AUTH_ALLOWED_CLIENT_IDS="reach-client",
+            AI_CALL_PLATFORM_TENANT_ID="",
+            AI_CALL_LEGACY_DATA_TENANT_ID="",
+            JWT_ENABLE=True,
+            NACOS_ENABLE=False,
             REDIS_ENABLE=False,
             DATABASE_TYPE="postgres",
             EVENT_LIST=[],
@@ -342,6 +348,24 @@ async def test_api_role_does_not_start_ai_call_workers_or_require_redis(
     dict_init.assert_not_awaited()
     scheduler_init.assert_not_awaited()
     scheduler_shutdown.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_jobs_oss_config_is_loaded_when_only_knowledge_worker_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1.system.oss.service import OssService
+
+    init_active_config = AsyncMock(return_value=None)
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_RECORDING_ENABLED", False)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_VOICE_WORKER_ENABLED", False)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_KNOWLEDGE_WORKER_ENABLED", True)
+    monkeypatch.setattr(OssService, "init_active_config", init_active_config)
+
+    await init_app._init_ai_call_standalone_oss_config()
+
+    init_active_config.assert_awaited_once_with()
 
 
 @pytest.mark.anyio

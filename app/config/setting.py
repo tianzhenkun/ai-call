@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     SERVER_PORT: int = 19010  # 服务端口
 
     # ================================================= #
+    # ******************** Nacos配置 ******************* #
+    # ================================================= #
+    NACOS_ENABLE: bool = False
+    NACOS_SERVER_ADDRESS: str = "127.0.0.1:8848"
+    NACOS_NAMESPACE_ID: str = "local"
+    NACOS_DISCOVERY_NAMESPACE_ID: str = ""
+    NACOS_GROUP_NAME: str = "DEFAULT_GROUP"
+    NACOS_USERNAME: str = ""
+    NACOS_PASSWORD: str = ""
+    NACOS_INSTANCE_IP: str = "127.0.0.1"
+
+    # ================================================= #
     # ******************* API文档配置 ****************** #
     # ================================================= #
     DEBUG: bool = True  # 调试模式
@@ -43,7 +55,7 @@ class Settings(BaseSettings):
     )
     SUMMARY: str = "接口汇总"  # 文档概述
     DOCS_URL: str = "/docs"  # Swagger UI路径
-    ROOT_PATH: str = "/ai-call-api/v1"  # API路由前缀
+    ROOT_PATH: str = "/reach-api/v1"  # Gateway转发上下文
 
     # ================================================= #
     # ******************** 日志配置 ******************** #
@@ -65,9 +77,25 @@ class Settings(BaseSettings):
     # ================================================= #
     JWT_ENABLE: bool = True  # 是否启用JWT认证
     SECRET_KEY: str = "abcdefghijklmnopqrstuvwxyz"  # JWT密钥
+    PLATFORM_JWT_SECRET: str = ""  # 平台JWT密钥；为空时兼容旧SECRET_KEY配置
+    PLATFORM_AUTH_ALLOWED_CLIENT_IDS: str = "e5cd7e4891bf95d1d19206ce24a7b32e"
+    AI_CALL_PLATFORM_TENANT_ID: str = ""
+    AI_CALL_LEGACY_DATA_TENANT_ID: str = ""
     ALGORITHM: str = "HS256"  # JWT算法
+    JWT_LEEWAY_SECONDS: int = 0
+    JWT_AUDIENCE: str = ""
+    JWT_ISSUER: str = ""
     TOKEN_TYPE: str = "bearer"  # token类型
-    TOKEN_REQUEST_PATH_EXCLUDE: list[str] = ["ai-call-api/v1/auth/login"]  # JWT路由白名单
+    TOKEN_REQUEST_PATH_EXCLUDE: list[str] = ["reach-api/v1/auth/login"]  # JWT路由白名单
+
+    # 信用点计费由平台产品状态统一控制；此处只有连接与签名配置，没有业务启停开关。
+    REACH_CREDIT_GATEWAY_BASE_URL: str = ""
+    REACH_CREDIT_METERING_CLIENT_ID: str = "reach"
+    REACH_CREDIT_METERING_SECRET: str = ""
+    REACH_CREDIT_METERING_REQUEST_TIMEOUT_SECONDS: float = 10.0
+    REACH_CREDIT_VERIFY_TLS: bool = True
+    REACH_CREDIT_USAGE_POLL_INTERVAL_SECONDS: float = 1.0
+    REACH_CREDIT_USAGE_LEASE_SECONDS: int = 60
 
     # ================================================= #
     # ******************** 数据库配置 ******************* #
@@ -209,11 +237,7 @@ class Settings(BaseSettings):
     AI_CALL_RECORDING_RECONCILE_ENABLED: bool = True
     AI_CALL_RECORDING_RECONCILE_INTERVAL_SECONDS: float = 5.0
     AI_CALL_RECORDING_RECONCILE_BATCH_SIZE: int = 50
-    AI_CALL_KNOWLEDGE_COS_SECRET_ID: str = ""
-    AI_CALL_KNOWLEDGE_COS_SECRET_KEY: str = ""
-    AI_CALL_KNOWLEDGE_COS_BUCKET: str = ""
-    AI_CALL_KNOWLEDGE_COS_REGION: str = ""
-    AI_CALL_KNOWLEDGE_COS_PREFIX: str = "ai-call"
+    AI_CALL_KNOWLEDGE_OSS_PREFIX: str = "reach"
     AI_CALL_KNOWLEDGE_WORKER_ENABLED: bool = False
     AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS: float = 2.0
     AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS: int = 300
@@ -278,9 +302,7 @@ class Settings(BaseSettings):
     AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-busy-waiting.wav"
     )
-    AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT: str = (
-        "当前人工坐席繁忙，正在为您排队转接，请稍候。"
-    )
+    AI_CALL_HANDOFF_BUSY_WAITING_PROMPT_TEXT: str = "当前人工坐席繁忙，正在为您排队转接，请稍候。"
     AI_CALL_HANDOFF_WAITING_TONE_ENABLED: bool = True
     AI_CALL_HANDOFF_WAITING_TONE_AUDIO_PATH: str = str(
         BASE_DIR / "static/ai-call/audio/handoff-ringback.wav"
@@ -301,9 +323,7 @@ class Settings(BaseSettings):
     AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-busy-timeout.wav"
     )
-    AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT: str = (
-        "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
-    )
+    AI_CALL_HANDOFF_BUSY_TIMEOUT_PROMPT_TEXT: str = "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
     AI_CALL_HANDOFF_SERVICE_UNAVAILABLE_PROMPT_AUDIO_PATH: str | None = str(
         BASE_DIR / "static/ai-call/audio/handoff-service-unavailable.wav"
     )

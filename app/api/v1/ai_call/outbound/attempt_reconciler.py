@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
+from app.services.ai_call.credit_metering import enqueue_connected_call_usage
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
@@ -84,9 +85,7 @@ class OutboundAttemptReconciler:
         attempt = await self._session.scalar(
             select(AiCallOutboundAttemptModel)
             .where(
-                AiCallOutboundAttemptModel.status.in_(
-                    {"QUEUED", "STARTING", "DIALING", "IN_CALL"}
-                ),
+                AiCallOutboundAttemptModel.status.in_({"QUEUED", "STARTING", "DIALING", "IN_CALL"}),
                 or_(
                     AiCallOutboundAttemptModel.reconcile_after.is_(None),
                     AiCallOutboundAttemptModel.reconcile_after <= now,
@@ -205,8 +204,7 @@ class OutboundAttemptReconciler:
                     AiCallRuntimeEffectModel.tenant_id == claim.tenant_id,
                     AiCallRuntimeEffectModel.call_id == claim.call_id,
                     AiCallRuntimeEffectModel.command_id == command.id,
-                    AiCallRuntimeEffectModel.effect_type
-                    == "CREATE_SIP_PARTICIPANT",
+                    AiCallRuntimeEffectModel.effect_type == "CREATE_SIP_PARTICIPANT",
                 )
                 .with_for_update()
             )
@@ -257,6 +255,21 @@ class OutboundAttemptReconciler:
                     )
                     await refresh_task_counters(self._session, task, now)
                 terminal_projected = True
+                if (
+                    decision.call_result == "connected"
+                    and task.answer_mode == "linphone"
+                    and attempt.test_scenario is None
+                    and attempt.dialer_type not in {None, "mock"}
+                    and record is not None
+                ):
+                    await enqueue_connected_call_usage(
+                        self._session,
+                        tenant_id=task.tenant_id,
+                        owner_id=str(task.created_by),
+                        attempt_id=attempt.id,
+                        call_id=attempt.call_id,
+                        duration_ms=max(0, int(record.duration_ms or 0)),
+                    )
         if graph_valid and not terminal_projected:
             if _dialing_facts_complete(
                 attempt=attempt,
@@ -279,11 +292,7 @@ class OutboundAttemptReconciler:
         attempt.reconcile_owner_id = None
         attempt.reconcile_token = None
         attempt.reconcile_expires_at = None
-        attempt.reconcile_after = (
-            None
-            if terminal_projected
-            else now + self._retry_after
-        )
+        attempt.reconcile_after = None if terminal_projected else now + self._retry_after
         attempt.updated_at = now
         await self._session.flush()
         return AttemptProjectionResult(

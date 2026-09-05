@@ -35,7 +35,7 @@ from app.api.v1.ai_call.statistics_service import (
     StatisticsPeriodFactory,
 )
 from app.core.base_model import MappedBase
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_ai_call_statistics_viewer
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -931,7 +931,7 @@ def test_statistics_controller_uses_camel_case_contract() -> None:
     app = FastAPI()
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_outbound_statistics_service] = lambda: service
-    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+    app.dependency_overrides[get_ai_call_statistics_viewer] = lambda: SimpleNamespace(
         user=SimpleNamespace(tenant_id="tenant-a", user_id=1),
     )
 

@@ -290,16 +290,26 @@ class MinioUtil:
         config: dict,
         object_name: str,
         *,
+        byte_range: tuple[int, int] | None = None,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         now: datetime | None = None,
     ) -> bytes:
         """读取私有对象，只向 MinIO 发送服务端 SigV4 凭据。"""
+        if byte_range is not None:
+            start, end = byte_range
+            if start < 0 or end < start:
+                raise ValueError("对象读取区间不合法")
         try:
             response = await cls._signed_empty_body_request(
                 "GET",
                 config,
                 object_name,
+                request_headers=(
+                    {"Range": f"bytes={start}-{end}"}
+                    if byte_range is not None
+                    else None
+                ),
                 timeout=timeout,
                 transport=transport,
                 now=now,
@@ -379,6 +389,7 @@ class MinioUtil:
         config: dict,
         object_name: str,
         *,
+        request_headers: dict[str, str] | None = None,
         timeout: float,
         transport: httpx.AsyncBaseTransport | None,
         now: datetime | None,
@@ -389,6 +400,7 @@ class MinioUtil:
             object_name,
             data=b"",
             content_type=None,
+            request_headers=request_headers,
             timeout=timeout,
             transport=transport,
             now=now,
@@ -403,6 +415,7 @@ class MinioUtil:
         *,
         data: bytes,
         content_type: str | None,
+        request_headers: dict[str, str] | None = None,
         timeout: float,
         transport: httpx.AsyncBaseTransport | None,
         now: datetime | None,
@@ -418,7 +431,12 @@ class MinioUtil:
         object_url = (
             f"{endpoint_base}/{bucket}/{quote(object_path, safe='/')}"
         )
-        request = httpx.Request(method, object_url, content=data)
+        request = httpx.Request(
+            method,
+            object_url,
+            content=data,
+            headers=request_headers,
+        )
         host = request.headers["host"]
         canonical_uri = request.url.raw_path.decode("ascii")
 

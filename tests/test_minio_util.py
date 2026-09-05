@@ -391,6 +391,36 @@ async def test_get_and_delete_object_use_signed_private_requests() -> None:
 
 
 @pytest.mark.anyio
+async def test_get_object_passes_valid_range_without_exposing_secret() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(206, content=b"mple")
+
+    data = await MinioUtil.get_object(
+        _private_object_config(),
+        "ai-call/knowledge/source.txt",
+        byte_range=(2, 5),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert data == b"mple"
+    assert requests[0].headers["range"] == "bytes=2-5"
+    assert "private-secret" not in str(requests[0].headers)
+
+
+@pytest.mark.anyio
+async def test_get_object_rejects_invalid_range_before_request() -> None:
+    with pytest.raises(ValueError, match="读取区间"):
+        await MinioUtil.get_object(
+            _private_object_config(),
+            "ai-call/knowledge/source.txt",
+            byte_range=(5, 2),
+        )
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("status_code", [200, 204])
 async def test_delete_object_accepts_success_statuses(status_code: int) -> None:
     transport = httpx.MockTransport(

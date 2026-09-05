@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Protocol
 
 from fastapi import UploadFile
 from sqlalchemy import BigInteger, and_, bindparam, delete, func, or_, select, text, update
@@ -1196,6 +1196,30 @@ class KnowledgeUploadResult:
     replayed: bool = False
 
 
+class KnowledgeObjectStore(Protocol):
+    async def put(
+        self,
+        logical_key: str,
+        source: BinaryIO,
+        *,
+        content_type: str,
+        expected_size: int,
+    ) -> StoredUpload: ...
+
+    async def stat(self, logical_key: str) -> StoredObject: ...
+
+    async def stat_or_none(self, logical_key: str) -> StoredObject | None: ...
+
+    async def open(
+        self,
+        logical_key: str,
+        *,
+        byte_range: tuple[int, int] | None = None,
+    ) -> OpenedObject: ...
+
+    async def delete(self, logical_key: str) -> None: ...
+
+
 @dataclass(frozen=True)
 class KnowledgeDownload:
     filename: str
@@ -1218,7 +1242,7 @@ class _HashingReader:
             size = _STREAM_CHUNK_BYTES
         chunk = self.source.read(size)
         if not isinstance(chunk, bytes):
-            raise TypeError("COS 上传流必须返回 bytes")
+            raise TypeError("对象存储上传流必须返回 bytes")
         self.byte_size += len(chunk)
         if self.byte_size > self.max_bytes:
             raise ValueError("文件正文不能超过 100 MB")
@@ -1319,34 +1343,127 @@ class CosKnowledgeStore:
         )
 
 
-def build_cos_knowledge_store(config: Any) -> CosKnowledgeStore:
-    fields = {
-        "AI_CALL_KNOWLEDGE_COS_SECRET_ID": config.AI_CALL_KNOWLEDGE_COS_SECRET_ID,
-        "AI_CALL_KNOWLEDGE_COS_SECRET_KEY": config.AI_CALL_KNOWLEDGE_COS_SECRET_KEY,
-        "AI_CALL_KNOWLEDGE_COS_BUCKET": config.AI_CALL_KNOWLEDGE_COS_BUCKET,
-        "AI_CALL_KNOWLEDGE_COS_REGION": config.AI_CALL_KNOWLEDGE_COS_REGION,
-        "AI_CALL_KNOWLEDGE_COS_PREFIX": config.AI_CALL_KNOWLEDGE_COS_PREFIX,
-    }
-    missing = [name for name, value in fields.items() if not str(value).strip()]
-    if missing:
-        raise RuntimeError(f"知识库 COS 配置缺失：{', '.join(missing)}")
+class PlatformOssKnowledgeStore:
+    """通过平台当前启用的 sys_oss_config 访问 S3 兼容对象存储。"""
 
-    from qcloud_cos import CosConfig, CosS3Client
-
-    client = CosS3Client(
-        CosConfig(
-            Region=config.AI_CALL_KNOWLEDGE_COS_REGION,
-            SecretId=config.AI_CALL_KNOWLEDGE_COS_SECRET_ID,
-            SecretKey=config.AI_CALL_KNOWLEDGE_COS_SECRET_KEY,
-            Scheme="https",
-            AllowRedirects=False,
+    def __init__(self, config: dict[str, Any], *, prefix: str = "reach") -> None:
+        required = ("endpoint", "bucket_name", "access_key", "secret_key")
+        missing = [name for name in required if not str(config.get(name) or "").strip()]
+        if missing:
+            raise ValueError(f"平台 OSS 配置缺失：{', '.join(missing)}")
+        self.config = dict(config)
+        self.prefix = "/".join(
+            part.strip().strip("/")
+            for part in (str(config.get("prefix") or ""), prefix)
+            if part.strip().strip("/")
         )
-    )
-    return CosKnowledgeStore(
-        client=client,
-        bucket=config.AI_CALL_KNOWLEDGE_COS_BUCKET,
-        prefix=config.AI_CALL_KNOWLEDGE_COS_PREFIX,
-    )
+        if not self.prefix:
+            raise ValueError("知识库 OSS 前缀不能为空")
+
+    def physical_key(self, logical_key: str) -> str:
+        normalized = logical_key.strip().strip("/")
+        segments = normalized.split("/")
+        if (
+            not normalized
+            or "\\" in normalized
+            or "//" in normalized
+            or any(segment in {"", ".", ".."} for segment in segments)
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise ValueError("OSS 对象 Key 不合法")
+        return f"{self.prefix}/{normalized}"
+
+    async def put(
+        self,
+        logical_key: str,
+        source: BinaryIO,
+        *,
+        content_type: str,
+        expected_size: int,
+    ) -> StoredUpload:
+        from app.utils.minio_util import MinioUtil
+
+        reader = _HashingReader(source, MAX_UPLOAD_BYTES)
+
+        def read_payload() -> bytes:
+            payload = bytearray()
+            while chunk := reader.read(_STREAM_CHUNK_BYTES):
+                payload.extend(chunk)
+            return bytes(payload)
+
+        payload = await asyncio.to_thread(read_payload)
+        if reader.byte_size != expected_size:
+            raise ValueError("上传文件大小与声明不一致")
+        await MinioUtil.put_object(
+            self.config,
+            self.physical_key(logical_key),
+            payload,
+            content_type,
+        )
+        return StoredUpload(byte_size=reader.byte_size, sha256=reader.sha256)
+
+    async def stat(self, logical_key: str) -> StoredObject:
+        from app.utils.minio_util import MinioUtil
+
+        size = await MinioUtil.head_object_size(
+            self.config,
+            self.physical_key(logical_key),
+        )
+        if size is None:
+            raise FileNotFoundError(logical_key)
+        return StoredObject(byte_size=size, content_type="application/octet-stream")
+
+    async def stat_or_none(self, logical_key: str) -> StoredObject | None:
+        try:
+            return await self.stat(logical_key)
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) == 404:
+                return None
+            raise
+
+    async def open(
+        self,
+        logical_key: str,
+        *,
+        byte_range: tuple[int, int] | None = None,
+    ) -> OpenedObject:
+        from app.utils.minio_util import MinioUtil
+
+        payload = await MinioUtil.get_object(
+            self.config,
+            self.physical_key(logical_key),
+            byte_range=byte_range,
+        )
+
+        async def body() -> AsyncIterator[bytes]:
+            for offset in range(0, len(payload), _STREAM_CHUNK_BYTES):
+                yield payload[offset : offset + _STREAM_CHUNK_BYTES]
+
+        return OpenedObject(body=body())
+
+    async def delete(self, logical_key: str) -> None:
+        from app.utils.minio_util import MinioUtil
+
+        await MinioUtil.delete_object(
+            self.config,
+            self.physical_key(logical_key),
+        )
+
+
+def build_knowledge_store(config: Any) -> KnowledgeObjectStore:
+    from app.api.v1.system.oss.service import OssService
+
+    active_config = OssService.active_config()
+    if active_config is not None:
+        try:
+            return PlatformOssKnowledgeStore(
+                active_config,
+                prefix=config.AI_CALL_KNOWLEDGE_OSS_PREFIX,
+            )
+        except ValueError as exc:
+            raise RuntimeError("平台 OSS 配置不完整") from exc
+    raise RuntimeError("平台未启用 sys_oss_config，知识库对象存储不可用")
 
 
 def _response_header(response: dict[str, Any], name: str, default: Any = None) -> Any:
@@ -1415,7 +1532,7 @@ class _ValidatedUpload:
 class KnowledgeService:
     def __init__(
         self,
-        store: CosKnowledgeStore,
+        store: KnowledgeObjectStore,
         *,
         binary_parser_enabled: bool = False,
     ) -> None:
@@ -1541,7 +1658,7 @@ class KnowledgeService:
             )
             remote = await self.store.stat(object_key)
             if stored.byte_size != upload.byte_size or remote.byte_size != upload.byte_size:
-                raise ValueError("COS 文件大小校验失败")
+                raise ValueError("对象存储文件大小校验失败")
             if stored.sha256 != upload.sha256:
                 raise _UploadChecksumMismatch
         except Exception as exc:
@@ -1554,7 +1671,11 @@ class KnowledgeService:
                 db,
                 tenant_id=tenant_id,
                 version_id=version_id,
-                code="SHA256_MISMATCH" if checksum_mismatch else "COS_UPLOAD_FAILED",
+                code=(
+                    "SHA256_MISMATCH"
+                    if checksum_mismatch
+                    else "OBJECT_STORE_UPLOAD_FAILED"
+                ),
                 message=(
                     "文件 SHA-256 与声明不一致" if checksum_mismatch else "对象存储上传或校验失败"
                 ),
@@ -2304,7 +2425,7 @@ class KnowledgeWorker:
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
-        store: CosKnowledgeStore,
+        store: KnowledgeObjectStore,
         *,
         worker_id: str,
         poll_interval_seconds: float = 2.0,
@@ -2377,7 +2498,7 @@ class KnowledgeWorker:
             await self._fail(
                 claimed,
                 code="SOURCE_CHECKSUM_MISMATCH",
-                message="COS 原文件校验失败",
+                message="对象存储原文件校验失败",
                 retryable=False,
             )
         except Exception as exc:

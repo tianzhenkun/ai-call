@@ -20,6 +20,10 @@ from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.call_outcome import detect_answer_type
+from app.services.ai_call.credit_metering import (
+    CreditMeteringClient,
+    require_credit_eligible_for_request,
+)
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     validate_sip_outbound_preflight,
@@ -85,10 +89,12 @@ class OutboundRuleTaskService:
         *,
         target_copy_batch_size: int = DEFAULT_TARGET_COPY_BATCH_SIZE,
         line_service: SipLineService | None = None,
+        credit_metering_client: CreditMeteringClient | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.target_copy_batch_size = max(1, target_copy_batch_size)
         self.line_service = line_service or SipLineService()
+        self.credit_metering_client = credit_metering_client
 
     @staticmethod
     def metadata_out() -> CallRuleMetadataOut:
@@ -266,12 +272,8 @@ class OutboundRuleTaskService:
         user_id: int,
         request: SingleValidationRequest,
     ) -> AiCallOutboundValidationModel:
-        if (
-            request.answer_mode == "linphone"
-            and (
-                not request.phone_number
-                or not PHONE_PATTERN.fullmatch(request.phone_number)
-            )
+        if request.answer_mode == "linphone" and (
+            not request.phone_number or not PHONE_PATTERN.fullmatch(request.phone_number)
         ):
             raise CustomException(
                 msg="手机号格式错误",
@@ -321,9 +323,7 @@ class OutboundRuleTaskService:
             phone_number=request.phone_number,
             customer_name=request.customer_name,
             business_params_json=_json(
-                {"customerName": request.customer_name}
-                if request.customer_name
-                else {}
+                {"customerName": request.customer_name} if request.customer_name else {}
             ),
             normalized_phone=request.phone_number,
             is_valid=True,
@@ -369,6 +369,13 @@ class OutboundRuleTaskService:
                     status_code=status.HTTP_409_CONFLICT,
                 )
             return existing, False
+
+        if request.answer_mode == "linphone" and self.credit_metering_client is not None:
+            await require_credit_eligible_for_request(
+                self.credit_metering_client,
+                tenant_id=tenant_id,
+                owner_id=str(user_id),
+            )
 
         validation = await db.scalar(
             select(AiCallOutboundValidationModel).where(
@@ -573,9 +580,7 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_409_CONFLICT,
             )
         try:
-            snapshot = SipLineSnapshot.model_validate_json(
-                validation.line_snapshot_json
-            )
+            snapshot = SipLineSnapshot.model_validate_json(validation.line_snapshot_json)
         except Exception as exc:
             raise CustomException(
                 msg="校验结果中的 SIP 线路快照无效，请重新校验",
@@ -807,9 +812,7 @@ class OutboundRuleTaskService:
         now = _now()
         if action == "pause":
             task.status = (
-                "PAUSING"
-                if await self._active_target_count(db, tenant_id, task_id)
-                else "PAUSED"
+                "PAUSING" if await self._active_target_count(db, tenant_id, task_id) else "PAUSED"
             )
         elif action == "resume":
             task.status = "RUNNING"
@@ -853,9 +856,7 @@ class OutboundRuleTaskService:
                 if batch is not None:
                     await complete_exception_batch_if_done(db, batch, now)
             if action == "stop":
-                has_active_target = bool(
-                    await self._active_target_count(db, tenant_id, task_id)
-                )
+                has_active_target = bool(await self._active_target_count(db, tenant_id, task_id))
                 task.status = "STOPPING" if has_active_target else "STOPPED"
                 task.ended_at = None if has_active_target else now
             else:
@@ -1250,10 +1251,7 @@ class OutboundRuleTaskService:
         for task_id, dialer_type in rows:
             if dialer_type:
                 result.setdefault(task_id, set()).add(dialer_type)
-        return {
-            task_id: sorted(dialer_types)
-            for task_id, dialer_types in result.items()
-        }
+        return {task_id: sorted(dialer_types) for task_id, dialer_types in result.items()}
 
     @staticmethod
     async def _failed_attempt_counts_by_task(
@@ -1305,8 +1303,7 @@ class OutboundRuleTaskService:
                 .outerjoin(
                     AiCallSemanticAnalysisModel,
                     and_(
-                        AiCallSemanticAnalysisModel.call_id
-                        == AiCallOutboundAttemptModel.call_id,
+                        AiCallSemanticAnalysisModel.call_id == AiCallOutboundAttemptModel.call_id,
                         AiCallSemanticAnalysisModel.analysis_scene_code
                         == "ai_call_semantic_analysis",
                     ),
@@ -1373,18 +1370,19 @@ class OutboundRuleTaskService:
                 .outerjoin(
                     AiCallRecordModel,
                     and_(
-                        AiCallRecordModel.tenant_id
-                        == AiCallOutboundAttemptModel.tenant_id,
-                        AiCallRecordModel.call_id
-                        == AiCallOutboundAttemptModel.call_id,
+                        AiCallRecordModel.tenant_id == AiCallOutboundAttemptModel.tenant_id,
+                        AiCallRecordModel.call_id == AiCallOutboundAttemptModel.call_id,
                     ),
                 )
                 .where(
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
                     AiCallOutboundAttemptModel.target_id.in_(target_ids),
-                    AiCallOutboundAttemptModel.status.in_(
-                        {"QUEUED", "STARTING", "DIALING", "IN_CALL"}
-                    ),
+                    AiCallOutboundAttemptModel.status.in_({
+                        "QUEUED",
+                        "STARTING",
+                        "DIALING",
+                        "IN_CALL",
+                    }),
                 )
                 .order_by(
                     AiCallOutboundAttemptModel.target_id,
@@ -1440,7 +1438,8 @@ class OutboundRuleTaskService:
             )
         try:
             return (
-                datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+                datetime
+                .strptime(value, "%Y-%m-%d %H:%M:%S")
                 .replace(tzinfo=ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE))
                 .astimezone(timezone.utc)
             )
@@ -1455,9 +1454,9 @@ class OutboundRuleTaskService:
         if value is None:
             return None
         aware_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return aware_value.astimezone(
-            ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        return aware_value.astimezone(ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     @staticmethod
     def _format_business_datetime(value: datetime | None) -> str | None:

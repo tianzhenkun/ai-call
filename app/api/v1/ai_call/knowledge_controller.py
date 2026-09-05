@@ -59,12 +59,12 @@ async def get_knowledge_db() -> AsyncGenerator[AsyncSession, None]:
 def get_knowledge_service() -> Any:
     from app.services.ai_call.knowledge import (
         KnowledgeService,
-        build_cos_knowledge_store,
+        build_knowledge_store,
     )
 
     try:
         return KnowledgeService(
-            build_cos_knowledge_store(settings),
+            build_knowledge_store(settings),
             binary_parser_enabled=bool(
                 settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
             ),

@@ -5,11 +5,18 @@
 """
 
 import json
+import os
 
 import httpx
+import pytest
 
-BASE_URL = "http://127.0.0.1:19010"
-API_PREFIX = "/ai-call-api/v1"
+pytestmark = pytest.mark.skipif(
+    os.getenv("AI_CALL_RUN_LIVE_HTTP_TESTS") != "1",
+    reason="现场 HTTP 测试需显式设置 AI_CALL_RUN_LIVE_HTTP_TESTS=1",
+)
+
+BASE_URL = os.getenv("AI_CALL_INTEGRATION_BASE_URL", "http://127.0.0.1:19013")
+API_PREFIX = "/reach-api/v1"
 
 
 def print_response(name: str, response: httpx.Response):

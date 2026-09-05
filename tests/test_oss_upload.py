@@ -10,12 +10,19 @@ OSS 上传功能集成测试脚本（HTTP 接口版）
 """
 
 import json
+import os
 import sys
 
 import httpx
+import pytest
 
-BASE_URL = "http://127.0.0.1:19010"
-API_PREFIX = "/ai-call-api/v1"
+pytestmark = pytest.mark.skipif(
+    os.getenv("AI_CALL_RUN_LIVE_HTTP_TESTS") != "1",
+    reason="现场 OSS 写入测试需显式设置 AI_CALL_RUN_LIVE_HTTP_TESTS=1",
+)
+
+BASE_URL = os.getenv("AI_CALL_INTEGRATION_BASE_URL", "http://127.0.0.1:19013")
+API_PREFIX = "/reach-api/v1"
 UPLOAD_URL = f"{BASE_URL}{API_PREFIX}/system/oss/upload"
 GET_URL = f"{BASE_URL}{API_PREFIX}/system/oss"
 

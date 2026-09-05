@@ -165,7 +165,11 @@ def test_answer_mode_rejects_invalid_task_combinations(payload: dict) -> None:
 @pytest.mark.anyio
 async def test_web_single_validation_and_task_creation_skip_sip_line(database) -> None:
     prompt_id, _ = await _seed_references(database)
-    service = OutboundRuleTaskService(database)
+    credit_metering_client = AsyncMock()
+    service = OutboundRuleTaskService(
+        database,
+        credit_metering_client=credit_metering_client,
+    )
     async with database() as session:
         rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
         await session.commit()
@@ -229,6 +233,7 @@ async def test_web_single_validation_and_task_creation_skip_sip_line(database) -
     assert task_snapshot["prompt"]["versionId"] == str(current_version_id)
     assert total == 1
     assert targets[0].phone_number is None
+    credit_metering_client.require_eligible.assert_not_awaited()
 
 
 @pytest.mark.anyio

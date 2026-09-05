@@ -1,7 +1,7 @@
-import json
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends, Query, Request
+from lingchen_sdk.auth import PlatformAuthError, PlatformTokenVerifier, VerifiedToken
 from redis.asyncio.client import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +11,10 @@ from app.api.v1.system.user.model import UserModel
 from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.exceptions import CustomException
-from app.core.security import OAuth2Schema, decode_access_token
+from app.core.security import OAuth2Schema
+
+REACH_PRODUCT_CODE = "reach"
+REACH_PORTAL_SCOPE = "PRODUCT"
 
 
 def _subject_permissions(user_info: dict) -> frozenset[str]:
@@ -22,6 +25,93 @@ def _subject_permissions(user_info: dict) -> frozenset[str]:
         permission.strip()
         for permission in raw_permissions
         if isinstance(permission, str) and permission.strip()
+    )
+
+
+def _allowed_client_ids() -> tuple[str, ...]:
+    return tuple(
+        client_id.strip()
+        for client_id in settings.PLATFORM_AUTH_ALLOWED_CLIENT_IDS.split(",")
+        if client_id.strip()
+    )
+
+
+def _resolve_data_tenant_id(platform_tenant_id: str) -> str:
+    """将指定的平台租户映射到存量 Reach 数据分区。"""
+
+    expected_platform_tenant_id = settings.AI_CALL_PLATFORM_TENANT_ID.strip()
+    legacy_data_tenant_id = settings.AI_CALL_LEGACY_DATA_TENANT_ID.strip()
+    if (
+        expected_platform_tenant_id
+        and legacy_data_tenant_id
+        and platform_tenant_id == expected_platform_tenant_id
+    ):
+        return legacy_data_tenant_id
+    return platform_tenant_id
+
+
+def _verify_platform_token(token: str, client_id: str | None = None) -> VerifiedToken:
+    authorization = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+    verifier = PlatformTokenVerifier(
+        key=settings.PLATFORM_JWT_SECRET or settings.SECRET_KEY,
+        algorithms=(settings.ALGORITHM,),
+        leeway_seconds=settings.JWT_LEEWAY_SECONDS,
+        audience=settings.JWT_AUDIENCE or None,
+        issuer=settings.JWT_ISSUER or None,
+        allowed_client_ids=_allowed_client_ids(),
+        allowed_product_codes=(REACH_PRODUCT_CODE,),
+        allowed_portal_scopes=(REACH_PORTAL_SCOPE,),
+    )
+    try:
+        return verifier.verify_authorization(authorization, client_id=client_id)
+    except PlatformAuthError as exc:
+        raise CustomException(msg=exc.message, code=10401, status_code=401) from exc
+
+
+def _auth_from_verified_token(
+    verified: VerifiedToken,
+    db: AsyncSession,
+    request: Request | None = None,
+) -> AuthSchema:
+    context = verified.context
+    platform_tenant_id = context.tenant_id
+    data_tenant_id = _resolve_data_tenant_id(platform_tenant_id)
+    try:
+        user_id = int(context.user_id)
+        dept_id = int(context.dept_id) if context.dept_id is not None else None
+    except ValueError as exc:
+        raise CustomException(
+            msg="认证缺少用户身份，请重新登录",
+            code=10401,
+            status_code=401,
+        ) from exc
+
+    user = UserModel()
+    user.user_id = user_id
+    user.user_name = context.username
+    user.nick_name = context.username
+    user.tenant_id = data_tenant_id
+    user.dept_id = dept_id
+
+    if request is not None:
+        request.scope.update({
+            "user_id": user_id,
+            "user_username": context.username,
+            "username": context.username,
+            "nickname": context.username,
+            "tenant_id": data_tenant_id,
+            "platform_tenant_id": platform_tenant_id,
+            "dept_id": dept_id,
+            "client_id": context.client_id,
+            "product_code": context.product_code,
+            "portal_scope": context.portal_scope,
+        })
+
+    return AuthSchema(
+        db=db,
+        check_data_scope=False,
+        permissions=_subject_permissions(dict(verified.claims)),
+        user=user,
     )
 
 
@@ -53,9 +143,12 @@ async def redis_getter(request: Request) -> Redis | None:
     返回:
     - Redis: Redis连接
     """
+    redis = getattr(request.app.state, "redis", None)
     if settings.AI_CALL_STANDALONE_ENABLE:
-        return getattr(request.app.state, "redis", None)
-    return request.app.state.redis
+        return redis
+    if settings.REDIS_ENABLE and redis is None:
+        raise RuntimeError("Redis 已启用，但应用连接尚未初始化")
+    return redis
 
 
 async def get_current_user(
@@ -94,53 +187,9 @@ async def get_current_user(
     if not token:
         raise CustomException(msg="认证已失效", code=10401, status_code=401)
 
-    # 处理Bearer token
-    if token.startswith("Bearer"):
-        token = token.split(" ")[1]
-
-    payload = decode_access_token(token)
-    if not payload or not hasattr(payload, "is_refresh") or payload.is_refresh:
-        raise CustomException(msg="非法凭证", code=10401, status_code=401)
-
-    online_user_info = payload.sub
-    # 解析用户信息
-    user_info = json.loads(online_user_info)  # 确保是字典类型
-
-    # 获取用户基本信息
-    user_id = user_info.get("user_id")
-    username = user_info.get("user_name")
-    tenant_id = str(user_info.get("tenant_id") or "").strip()  # 获取租户ID
-    dept_id = user_info.get("dept_id")  # 获取部门ID
-
-    if not user_id or not username:
-        raise CustomException(msg="认证已失效", code=10401, status_code=401)
-    if not tenant_id:
-        raise CustomException(msg="租户上下文缺失，请重新登录", code=10401, status_code=401)
-
-    # 创建一个简单的用户对象（不查询数据库）
-    user = UserModel()
-    user.user_id = user_id
-    user.user_name = username
-    user.nick_name = user_info.get("name", username)
-    user.tenant_id = tenant_id  # 设置租户ID
-    user.dept_id = dept_id  # 设置部门ID
-
-    # 设置请求上下文
-    request.scope["user_id"] = user_id
-    request.scope["user_username"] = username
-    request.scope["username"] = username
-    request.scope["nickname"] = user.nick_name
-    request.scope["tenant_id"] = tenant_id
-    request.scope["dept_id"] = dept_id
-
-    # 创建认证对象
-    auth = AuthSchema(
-        db=db,
-        check_data_scope=False,
-        permissions=_subject_permissions(user_info),
-    )
-    auth.user = user
-    return auth
+    request_headers = getattr(request, "headers", {})
+    verified = _verify_platform_token(token, request_headers.get("clientid"))
+    return _auth_from_verified_token(verified, db, request)
 
 
 async def get_current_user_ws(
@@ -187,44 +236,8 @@ async def _verify_token(
     if not token:
         raise CustomException(msg="认证已失效", code=10401, status_code=401)
 
-    # 处理Bearer token（如果通过查询参数传递时包含Bearer前缀）
-    if token.startswith("Bearer"):
-        token = token.split(" ")[1]
-
-    payload = decode_access_token(token)
-    if not payload or not hasattr(payload, "is_refresh") or payload.is_refresh:
-        raise CustomException(msg="非法凭证", code=10401, status_code=401)
-
-    online_user_info = payload.sub
-    # 解析用户信息
-    user_info = json.loads(online_user_info)  # 确保是字典类型
-
-    # 获取用户基本信息
-    user_id = user_info.get("user_id")
-    username = user_info.get("user_name")
-    tenant_id = str(user_info.get("tenant_id") or "").strip()  # 获取租户ID
-    dept_id = user_info.get("dept_id")  # 获取部门ID
-
-    if not user_id or not username:
-        raise CustomException(msg="认证已失效", code=10401, status_code=401)
-    if not tenant_id:
-        raise CustomException(msg="租户上下文缺失，请重新登录", code=10401, status_code=401)
-
-    # 创建一个简单的用户对象（不查询数据库）
-    user = UserModel()
-    user.user_id = user_id
-    user.user_name = username
-    user.nick_name = user_info.get("name", username)
-    user.tenant_id = tenant_id
-    user.dept_id = dept_id
-
-    auth = AuthSchema(
-        db=db,
-        check_data_scope=False,
-        permissions=_subject_permissions(user_info),
-    )
-    auth.user = user
-    return auth
+    verified = _verify_platform_token(token)
+    return _auth_from_verified_token(verified, db)
 
 
 async def get_voice_manager(
@@ -250,6 +263,22 @@ async def get_ai_call_manager(
         return auth
 
     allowed_permissions = {"ai_call:agent:manage", "*:*:*"}
+    if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
+        raise CustomException(
+            msg="无权限操作",
+            code=10403,
+            status_code=403,
+        )
+    return auth
+
+
+async def get_ai_call_statistics_viewer(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if auth.user and auth.user.is_superuser:
+        return auth
+
+    allowed_permissions = {"ai_call:statistics:view", "*:*:*"}
     if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
         raise CustomException(
             msg="无权限操作",

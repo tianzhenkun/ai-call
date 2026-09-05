@@ -11,6 +11,7 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.core.database import async_db_session
 from app.core.dependencies import get_ai_call_manager, get_current_user
+from app.services.ai_call.credit_metering import CreditMeteringClient
 
 from .controller import _identity
 from .exception_schema import (
@@ -36,7 +37,10 @@ from .schema import ValidationResultOut
 from .service import OutboundValidationService
 
 OutboundRuleTaskRouter = APIRouter(tags=["通用外呼规则与任务"])
-_default_service = OutboundRuleTaskService(async_db_session)
+_default_service = OutboundRuleTaskService(
+    async_db_session,
+    credit_metering_client=CreditMeteringClient.from_settings(),
+)
 _default_exception_service = OutboundExceptionService()
 
 
