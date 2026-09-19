@@ -7,6 +7,7 @@
 相关资料：
 
 - [2026-09-18 实际发布及验收记录](production-deployed-20260918.md)
+- [2026-09-19 Git 提交发布记录](production-deployed-20260919.md)
 - [菜单权限配置记录](production-permissions-20260918.md)
 - [邮件 Compose 模板](../../deploy/email-worker/compose.production.yml)
 - [计费 Compose 模板](../../deploy/email-worker/compose.credit.yml)
@@ -61,6 +62,8 @@ df -h /home
 4. 禁止打包 `.env`、本地数据库、录音、邮箱凭据和其他密钥。密钥通过受限部署通道单独配置。
 5. 正式 `lingchen-release` 发布按其当前 `source-lock.json`、`release-plan.json` 和干净源码要求执行。本次这类含未提交改动的候选快照，必须明确记录逐文件哈希，不能仅以 Git HEAD 表示来源。
 
+后续要求 Git 留档的发布，应先将业务代码和必要文档提交、推送，确认远端提交一致，再从对应提交构建。分支发生分叉时不强推；独立发布分支应注明尚未合入主分支。部署后的执行记录可单独提交，记录中的构建提交保持原值。
+
 **可验证结果：**本地归档校验通过，来源可追踪，部署的确为已测试产物。Docker 的 OCI index digest 与旧版 Docker 显示的 image config ID 可能不同，应读取导出包的 `index.json`、`manifest.json` 确认层级；不能看到 ID 不同就跳过验证。
 
 ## 3. 切换前补齐配置、权限和迁移
@@ -94,6 +97,8 @@ df -h /home
 - 在隔离数据库验证适用迁移及重复执行。生产上只执行本次已审阅的迁移，不使用全量 `metadata.create_all` 代替差异分析。
 - 核对外呼任务调度和 LiveKit 实际房间/参与者，安排无活跃通话的窗口；不能仅凭历史 `ending` 状态判断当前通话。切换前再次复核，防止检查后新任务启动。
 - 后续升级还需处理**邮件发送中的任务**：停止新增执行入口、等待当前 SMTP 操作收尾，再按既有租约规则切换 worker。`unknown` 邮件不能盲目重发，也不能删除租约抢占。
+
+当前 worker 全局租约有效期为 120 秒，容器停止宽限期为 90 秒。旧进程退出后租约可能仍有效；先读 `reach_email_worker_lease.expires_at`，等到过期再启动新 worker。若新 worker 已启动并因 `EMAIL_WORKER_ALREADY_RUNNING` 重启，等待租约自然过期并确认新 token、持续续租和稳定进程，不能仅凭健康接口看到旧租约就判定接管成功。未来排队但尚未到期的邮件应保留原状态和时间。
 
 **可验证结果：**权限、依赖配置和迁移均有明确结论；不存在影响现有外呼的未解决缺项，切换窗口可用。
 
@@ -166,6 +171,8 @@ dc=(docker compose -p ai-call-118
 "${dc[@]}" exec -T email-worker python -m app.services.reach_email.health
 "${dc[@]}" exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:19011/ai-call/health', timeout=5).status)"
 ```
+
+通过 SSH 执行多行脚本时，优先上传脚本后按文件执行。`docker compose run` 默认可读取标准输入，可能消费 `ssh ... bash -s` 后续脚本文本；需要明确禁用交互输入，不能只凭 SSH 退出码认定后续切换命令执行过。
 
 **可验证结果：**实际容器 image ID 正确，API 和 worker 都 healthy；worker 输出 `workerOnline=true`、`overdueCount=0`、`status=ok`；Nacos 注册地址对应真实 API；启动及观察窗口无未解决异常。计费资格检查使用真实目标租户/用户，不能改平台计费开关或伪造身份绕过失败。
 
