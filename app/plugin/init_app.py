@@ -1123,6 +1123,9 @@ def register_routers(app: FastAPI) -> None:
     from app.api.v1.ai_call import AiCallRouter
 
     app.include_router(AiCallRouter)
+    from app.api.v1.reach_email.controller import EmailRouter
+
+    app.include_router(EmailRouter)
     if settings.AI_CALL_STANDALONE_ENABLE:
         return
 

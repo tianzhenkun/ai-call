@@ -359,6 +359,14 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_MODEL: str = ""
 
+    # 邮件模型和凭据加密独立配置，不回退到通话或平台密钥。
+    REACH_EMAIL_LLM_BASE_URL: str = "https://api.deepseek.com"
+    REACH_EMAIL_LLM_MODEL: str = "deepseek-v4-pro"
+    REACH_EMAIL_LLM_API_KEY: str = ""
+    REACH_EMAIL_LLM_API_KEY_FILE: str = ""
+    REACH_EMAIL_ENCRYPTION_KEY: str = ""
+    REACH_EMAIL_ENCRYPTION_KEY_FILE: str = ""
+
     TTS_PROVIDER: str = ""
     TTS_MODEL: str = ""
     TTS_API_KEY: str = ""

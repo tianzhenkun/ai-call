@@ -1,0 +1,39 @@
+# 在现有主 Compose 和 REACH 覆盖文件之后加载；不替换媒体服务。
+x-email-environment: &email-environment
+  REACH_EMAIL_LLM_BASE_URL: https://api.deepseek.com
+  REACH_EMAIL_LLM_MODEL: deepseek-v4-pro
+  REACH_EMAIL_LLM_API_KEY_FILE: /run/secrets/email/llm-api-key
+  REACH_EMAIL_ENCRYPTION_KEY_FILE: /run/secrets/email/encryption-key
+
+services:
+  api:
+    image: ${REACH_EMAIL_IMAGE:?必须指定已验证的邮件版本镜像}
+    environment: *email-environment
+    volumes:
+      - /opt/ai-call/runtime/secrets/email:/run/secrets/email:ro
+
+  email-worker:
+    image: ${REACH_EMAIL_IMAGE:?必须指定已验证的邮件版本镜像}
+    restart: unless-stopped
+    env_file: /opt/ai-call/runtime/.env
+    environment:
+      <<: *email-environment
+      ENVIRONMENT: dev
+      DEBUG: "false"
+      NACOS_ENABLE: "false"
+    command: ["python", "-m", "app.services.reach_email.worker"]
+    volumes:
+      - /opt/ai-call/runtime/secrets/email:/run/secrets/email:ro
+    networks: [ai-call]
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.services.reach_email.health"]
+      interval: 60s
+      timeout: 30s
+      retries: 2
+      start_period: 150s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

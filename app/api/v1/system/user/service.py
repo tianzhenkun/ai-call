@@ -67,8 +67,9 @@ class UserService:
         if not auth.user:
             raise CustomException(msg="用户不存在")
 
-        user = await UserCRUD(auth).get_by_id_crud(user_id=auth.user.id)
-        if not user:
-            raise CustomException(msg="用户不存在")
-
-        return UserOutSchema.model_validate(user).model_dump(by_alias=True)
+        user_info = {
+            field: value
+            for field in UserOutSchema.model_fields
+            if (value := getattr(auth.user, field, None)) is not None
+        }
+        return UserOutSchema.model_validate(user_info).model_dump(by_alias=True)

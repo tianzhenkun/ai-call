@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
+from app.api.v1.system.user.service import UserService
 from app.config.setting import settings
 from app.core import dependencies
 from app.core.dependencies import (
@@ -114,6 +115,27 @@ def test_platform_tenant_can_reuse_explicit_legacy_data_partition(monkeypatch) -
     assert request.scope["platform_tenant_id"] == "960001"
     assert request.scope["tenant_id"] == "000000"
     assert auth.user.tenant_id == "000000"
+
+
+@pytest.mark.anyio
+async def test_current_user_info_uses_verified_platform_identity_without_local_user() -> None:
+    user = UserModel(
+        user_id=2096000000000000300,
+        tenant_id="960001",
+        dept_id=2096000000000000202,
+        user_name="admin",
+        nick_name="admin",
+    )
+    db = AsyncMock(spec=AsyncSession)
+
+    result = await UserService.get_current_user_info_service(
+        AuthSchema(db=db, user=user),
+    )
+
+    db.execute.assert_not_awaited()
+    assert result["userId"] == 2096000000000000300
+    assert result["tenantId"] == "960001"
+    assert result["userName"] == "admin"
 
 
 def test_legacy_data_partition_mapping_does_not_capture_other_tenants(

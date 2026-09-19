@@ -1,0 +1,21 @@
+[Unit]
+Description=REACH email consumer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=reach
+WorkingDirectory=/opt/ai-call
+Environment=ENVIRONMENT=prod
+EnvironmentFile=/etc/reach/email-worker.env
+ExecStart=/opt/ai-call/.venv/bin/python -m app.services.reach_email.worker
+Restart=always
+RestartSec=15
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

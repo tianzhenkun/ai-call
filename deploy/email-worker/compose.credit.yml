@@ -1,0 +1,15 @@
+# 当前后端包含正式外呼计费接入；沿用生产平台的 REACH 专用密钥。
+services:
+  api:
+    environment:
+      REACH_CREDIT_GATEWAY_BASE_URL: http://geo-uat-ruoyi-gateway:19090
+      REACH_CREDIT_METERING_CLIENT_ID: reach
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export PLATFORM_JWT_SECRET="$$(cat /run/secrets/platform/platform-jwt-secret)"
+        export NACOS_PASSWORD="$$(cat /run/secrets/platform/nacos-password)"
+        export REACH_CREDIT_METERING_SECRET="$$(cat /run/secrets/platform/reach-credit-metering-secret)"
+        exec uvicorn main:create_app --factory --host 0.0.0.0 --port 19011
+    command: []

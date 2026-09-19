@@ -1,0 +1,14 @@
+[Unit]
+Description=REACH email heartbeat and overdue queue check
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=reach
+WorkingDirectory=/opt/ai-call
+Environment=ENVIRONMENT=prod
+EnvironmentFile=/etc/reach/email-worker.env
+ExecStart=/opt/ai-call/.venv/bin/python -m app.services.reach_email.health
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
