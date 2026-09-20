@@ -9,6 +9,7 @@
 - [2026-09-18 实际发布及验收记录](production-deployed-20260918.md)
 - [2026-09-19 Git 提交发布记录](production-deployed-20260919.md)
 - [2026-09-20 Git 提交发布记录](production-deployed-20260920.md)
+- [2026-09-20 任务编辑更新发布记录](production-deployed-20260920-task-edit.md)
 - [菜单权限配置记录](production-permissions-20260918.md)
 - [邮件 Compose 模板](../../deploy/email-worker/compose.production.yml)
 - [计费 Compose 模板](../../deploy/email-worker/compose.credit.yml)
