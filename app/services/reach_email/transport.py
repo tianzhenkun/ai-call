@@ -15,7 +15,14 @@ from email.utils import formatdate, getaddresses
 
 import bleach
 
-MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+from app.services.reach_email.limits import (
+    ATTACHMENT_ERROR_CODES,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_COUNT,
+    MAX_INBOUND_MESSAGE_BYTES,
+    MAX_OUTBOUND_MESSAGE_BYTES,
+)
+
 TIMEOUT = 20
 ATTACHMENT_EXTENSIONS = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
                          '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
@@ -123,8 +130,8 @@ def _close(conn):
 def _error(exc):
     if isinstance(exc, ValueError) and str(exc) in {
         'INVALID_ENDPOINT', 'DNS_FAILED', 'UNSAFE_ENDPOINT', 'TLS_REQUIRED',
-        'INVALID_MESSAGE', 'ATTACHMENT_LIMIT', 'IMAP_ID_FAILED', 'IMAP_SELECT_FAILED',
-    }:
+        'INVALID_MESSAGE', 'ATTACHMENT_LIMIT', 'MESSAGE_TOO_LARGE', 'IMAP_ID_FAILED', 'IMAP_SELECT_FAILED',
+    } | ATTACHMENT_ERROR_CODES:
         return str(exc)
     if isinstance(exc, (smtplib.SMTPAuthenticationError, imaplib.IMAP4.error)):
         return 'AUTH_OR_PROTOCOL_FAILED'
@@ -168,13 +175,22 @@ def send_message(config, *, recipient, subject, html, attachments, message_id,
         for address in (sender, recipient):
             if not re.fullmatch(r'[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+', address):
                 raise ValueError('INVALID_MESSAGE')
-        if len(attachments) > 5 or sum(len(a['content']) for a in attachments) > 8 * 1024 * 1024:
-            raise ValueError('ATTACHMENT_LIMIT')
+        if len(attachments) > MAX_ATTACHMENT_COUNT:
+            raise ValueError('ATTACHMENT_COUNT_LIMIT')
         for item in attachments:
             name = item['filename']
-            if ('/' in name or '\\' in name or any(ord(c) < 32 for c in name)
-                    or '.' + name.rsplit('.', 1)[-1].lower() not in ATTACHMENT_EXTENSIONS):
+            if len(name) > 255:
+                raise ValueError('ATTACHMENT_NAME_TOO_LONG')
+            if '/' in name or '\\' in name or any(ord(c) < 32 for c in name):
                 raise ValueError('INVALID_MESSAGE')
+            if '.' + name.rsplit('.', 1)[-1].lower() not in ATTACHMENT_EXTENSIONS:
+                raise ValueError('ATTACHMENT_TYPE_UNSUPPORTED')
+            if not item['content']:
+                raise ValueError('ATTACHMENT_EMPTY')
+            if len(item['content']) > MAX_ATTACHMENT_BYTES:
+                raise ValueError('ATTACHMENT_TOO_LARGE')
+        if sum(len(a['content']) for a in attachments) > MAX_ATTACHMENT_BYTES:
+            raise ValueError('ATTACHMENT_TOTAL_TOO_LARGE')
         msg = EmailMessage(policy=policy.SMTP)
         from email.utils import formataddr
 
@@ -201,8 +217,8 @@ def send_message(config, *, recipient, subject, html, attachments, message_id,
             msg.add_attachment(item['content'], maintype=main, subtype=sub,
                                filename=item['filename'])
         wire = msg.as_bytes()
-        if len(wire) > MAX_MESSAGE_BYTES:
-            raise ValueError('ATTACHMENT_LIMIT')
+        if len(wire) > MAX_OUTBOUND_MESSAGE_BYTES:
+            raise ValueError('MESSAGE_TOO_LARGE')
         conn = _connect(config, 'smtp')
         dsn = conn.has_extn('dsn')
         code, _ = conn.mail(sender, options=['RET=HDRS']) if dsn else conn.mail(sender)
@@ -305,13 +321,13 @@ def sync_messages(config, *, uidvalidity=None, last_uid=0, limit=50) -> dict:
         uids = sorted({int(u) for u in (values[0] or b'').split() if int(u) > cursor})
         messages = []
         for uid in uids[:max(1, min(int(limit), 100))]:
-            status, data = conn.uid('fetch', str(uid), f'(BODY.PEEK[]<0.{MAX_MESSAGE_BYTES + 1}>)')
+            status, data = conn.uid('fetch', str(uid), f'(BODY.PEEK[]<0.{MAX_INBOUND_MESSAGE_BYTES + 1}>)')
             if status != 'OK':
                 raise ValueError('IMAP_FETCH_FAILED')
             raw = next((row[1] for row in data if isinstance(row, tuple)), None)
             if raw is None:
                 raise ValueError('IMAP_FETCH_FAILED')
-            if len(raw) > MAX_MESSAGE_BYTES:
+            if len(raw) > MAX_INBOUND_MESSAGE_BYTES:
                 raise ValueError('IMAP_MESSAGE_TOO_LARGE')
             messages.append(_parse_message(raw, uid))
             cursor = uid

@@ -12,6 +12,15 @@ from app.services.reach_email.schema import AIInput, ContentInput, TaskInput
 from app.services.reach_email.service import EmailService
 
 
+@pytest.mark.parametrize('website', [
+    ' HTTPS://example.com/path ', 'https://lingchen-ai.com',
+    'https://www.example.co.uk/path?q=1', 'https://例子.中国',
+])
+def test_company_website_accepts_complete_domains(website, task_settings):
+    task = TaskInput(name='任务', importId='i', settings={**task_settings, 'companyWebsite': website})
+    assert task.settings.company_website == website.strip()
+
+
 def test_import_checks_domain_dns_and_reports_each_original_row(monkeypatch):
     import dns.exception
     import dns.resolver
@@ -313,6 +322,12 @@ def test_required_settings_and_empty_body_block_start_without_enqueuing(valid_em
                 ("companyWebsite", "example.com", "http 或 https"),
                 ("companyWebsite", "https:example.com", "http 或 https"),
                 ("companyWebsite", "ftp://example.com", "http 或 https"),
+                ("companyWebsite", "https://lingchen-ai", "完整域名"),
+                ("companyWebsite", "https://localhost", "完整域名"),
+                ("companyWebsite", "https://127.0.0.1", "完整域名"),
+                ("companyWebsite", "https://a..com", "完整域名"),
+                ("companyWebsite", "https://-a.com", "完整域名"),
+                ("companyWebsite", "https://a_b.com", "完整域名"),
                 ("dailyLimit", 0, "dailyLimit"),
                 ("followUpIntervalDays", 0, "followUpIntervalDays"),
                 ("followUpCount", 6, "followUpCount"),

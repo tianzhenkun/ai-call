@@ -10,6 +10,7 @@ from pathlib import Path
 from sqlalchemy import delete, func, select, update
 
 from app.services.reach_email.ai import PROMPT_VERSION
+from app.services.reach_email.limits import MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_COUNT
 from app.services.reach_email.content import (
     clean_html,
     has_email_content,
@@ -333,6 +334,79 @@ class EmailService:
         await self.db.flush()
         return self.task_json(task)
 
+    async def update_settings(self, identifier, data):
+        task = await self.task(identifier, lock=True)
+        if task.status == "ended":
+            raise ValueError("任务已结束，不能修改邮件设置")
+        if task.version != data.version:
+            raise ValueError("邮件设置已被更新，请关闭弹窗后重新打开再修改")
+        settings = data.settings.model_dump(by_alias=True)
+        previous = json.loads(task.settings)
+        previous_limit = task.daily_limit
+        task.settings = dump(settings)
+        task.daily_limit = data.settings.daily_limit
+        task.version += 1
+        if task.status == "running" and task.daily_limit > previous_limit:
+            await self.db.execute(update(Message).where(
+                *scope(Message, self.tenant, self.owner), Message.task_id == task.id,
+                Message.status.in_(("queued", "retryable")), Message.error_code == "TASK_DAILY_LIMIT",
+            ).values(due_at=now(), error_code=None))
+        if task.status in {"scheduled", "running"} and any(
+            previous.get(key) != settings[key]
+            for key in ("followUpEnabled", "followUpCount", "followUpIntervalDays")
+        ):
+            # 与领取、发送回写保持 Task -> Message -> Lead 顺序，人工邮件不参与排期。
+            cursor = ""
+            while True:
+                identities = (await self.db.scalars(self.query(Lead).with_only_columns(Lead.id).where(
+                    Lead.task_id == task.id, Lead.id > cursor,
+                ).order_by(Lead.id).limit(200))).all()
+                if not identities:
+                    break
+                cursor = identities[-1]
+                messages = (await self.db.scalars(self.query(Message).where(
+                    Message.task_id == task.id, Message.lead_id.in_(identities),
+                    Message.direction == "outbound", ~Message.dedup_key.like("manual:%"),
+                ).order_by(Message.id).with_for_update())).all()
+                by_lead = {}
+                for message in messages:
+                    by_lead.setdefault(message.lead_id, []).append(message)
+                leads = (await self.db.scalars(self.query(Lead).where(
+                    Lead.id.in_(identities),
+                ).order_by(Lead.id).with_for_update().execution_options(populate_existing=True))).all()
+                for lead in leads:
+                    history = by_lead.get(lead.id, [])
+                    if any(message.status in {"sending", "unknown"} for message in history):
+                        continue
+                    lead.next_follow_up_at = None
+                    first = next((message for message in history if message.id == lead.first_message_id), None)
+                    stamps = [message.sent_at for message in history
+                              if message.status == "accepted" and message.sent_at]
+                    enabled = (settings["followUpEnabled"] and not lead.stopped_reason
+                               and lead.follow_up_count < settings["followUpCount"]
+                               and first and first.status == "accepted" and stamps)
+                    due = max(stamps) + timedelta(days=settings["followUpIntervalDays"]) if enabled else None
+                    pending = next((message for message in history
+                                    if message.dedup_key == f"followup:{lead.id}:{lead.follow_up_count + 1}"), None)
+                    if pending:
+                        if pending.status in {"queued", "retryable"} or (
+                            pending.status == "cancelled" and pending.error_code == "FOLLOWUP_SETTINGS_CHANGED"
+                        ):
+                            if due:
+                                # 排期变化不能缩短已发生失败的退避；尝试更新时间保留实际回写时间。
+                                retry_at = await self.db.scalar(self.query(Attempt).with_only_columns(Attempt.updated_at).where(
+                                    Attempt.message_id == pending.id, Attempt.status == "retryable",
+                                ).order_by(Attempt.created_at.desc()).limit(1)) if pending.attempt_count else None
+                                pending.status = "retryable" if pending.attempt_count else "queued"
+                                pending.due_at = max(due, retry_at + timedelta(minutes=2 ** pending.attempt_count)) if retry_at else due
+                                pending.error_code = None
+                            else:
+                                pending.status, pending.error_code = "cancelled", "FOLLOWUP_SETTINGS_CHANGED"
+                    else:
+                        lead.next_follow_up_at = due
+        await self.db.flush()
+        return self.task_json(task)
+
     async def restore(self, identifier, data):
         task = await self.editable(identifier, data.version)
         version = await self.owned(Version, data.version_id)
@@ -357,11 +431,18 @@ class EmailService:
         await self.db.delete(task)
 
     async def attachments(self, ids):
-        if len(ids) > 5 or len(set(ids)) != len(ids):
-            raise ValueError("最多 5 个不重复附件")
+        if len(ids) > MAX_ATTACHMENT_COUNT:
+            raise ValueError(f"最多 {MAX_ATTACHMENT_COUNT} 个附件，当前选择了 {len(ids)} 个")
+        if len(set(ids)) != len(ids):
+            raise ValueError("不能重复添加同一附件，请移除重复项")
         result = [await self.owned(Attachment, identifier) for identifier in ids]
-        if sum(a.size for a in result) > 8 * 1024 * 1024:
-            raise ValueError("附件合计不能超过 8 MB")
+        for attachment in result:
+            if attachment.size <= 0:
+                raise ValueError("附件不能为空文件，请重新上传")
+            if attachment.size > MAX_ATTACHMENT_BYTES:
+                raise ValueError("单个附件不能超过 15 MB，请压缩或更换文件")
+        if sum(a.size for a in result) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("附件合计不能超过 15 MB，请移除部分附件或压缩文件")
         return result
 
     async def save_attachment(self, filename, payload, content_type):
@@ -384,13 +465,14 @@ class EmailService:
             ".gif",
             ".webp",
         }
-        if (
-            suffix not in allowed
-            or not payload
-            or len(payload) > 8 * 1024 * 1024
-            or len(name) > 255
-        ):
-            raise ValueError("附件格式或大小不符合要求")
+        if len(name) > 255:
+            raise ValueError("附件文件名不能超过 255 个字符，请缩短文件名")
+        if suffix not in allowed:
+            raise ValueError(f"不支持 {suffix or '无扩展名'} 附件，请上传 PDF、Office 文档或图片（PNG、JPG、JPEG、GIF、WEBP）")
+        if not payload:
+            raise ValueError("附件不能为空文件，请选择有内容的文件")
+        if len(payload) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("单个附件不能超过 15 MB，请压缩或更换文件")
         # Check real formats; renamed executables are not accepted.
         if suffix == ".pdf" and not payload.startswith(b"%PDF-"):
             raise ValueError("PDF 文件格式不正确")
@@ -582,11 +664,15 @@ class EmailService:
 
     async def transition(self, identifier, version, action):
         task = await self.task(identifier, lock=True)
+        if action == "stop" and task.status == "ended":
+            return self.task_json(task)
+        if action == "withdraw" and task.status != "scheduled":
+            reason = {"running": "任务已开始执行", "ended": "任务已结束"}.get(task.status, "任务未安排定时执行")
+            raise ValueError(f"{reason}，不能撤回")
         if task.version != version:
-            raise ValueError("版本冲突，请刷新后重试")
+            label = "撤回" if action == "withdraw" else "停止"
+            raise ValueError(f"任务状态或设置已更新，请刷新后重新{label}")
         if action == "withdraw":
-            if task.status != "scheduled":
-                raise ValueError("任务已开始，不能撤回")
             await self.db.execute(
                 delete(Message).where(
                     *scope(Message, self.tenant, self.owner),
@@ -645,9 +731,13 @@ class EmailService:
         target = None
         if data.inbound_id:
             target = await self.owned(Message, data.inbound_id)
-            if target.lead_id != lead.id or target.task_id != task.id or target.direction != "inbound":
+            if target.lead_id != lead.id or target.task_id != task.id or target.direction != "inbound" or target.kind != "reply":
                 raise ValueError("请选择当前往来的来信")
-        query = self.query(Message).where(Message.lead_id == lead.id, Message.task_id == task.id)
+        query = self.query(Message).where(
+            Message.lead_id == lead.id, Message.task_id == task.id,
+            ((Message.direction == 'inbound') & (Message.kind == 'reply'))
+            | ((Message.direction == 'outbound') & (Message.status == 'accepted')),
+        )
         if target:
             query = query.where(Message.created_at <= target.created_at)
         recent = (await self.db.scalars(query.order_by(Message.created_at.desc()).limit(10))).all()
@@ -664,7 +754,7 @@ class EmailService:
                 "replyTo": {"subject": target.subject, "content": target.html[:20000]} if target else None,
                 "messages": [{"direction": m.direction, "subject": m.subject, "content": m.html[:10000]} for m in reversed(recent)],
             },
-            "allowed_variables": [],
+            "allowed_variables": list(json.loads(lead.values)),
         }
         return await self.enqueue_ai(task, payload)
 
@@ -824,6 +914,27 @@ class EmailService:
         await self.db.flush()
         return self.message_json(message)
 
+    async def manual_send_context(self, lead):
+        first = await self.db.scalar(self.query(Message).where(
+            Message.id == lead.first_message_id, Message.lead_id == lead.id,
+            Message.task_id == lead.task_id, Message.direction == 'outbound', Message.kind == 'initial',
+        )) if lead.first_message_id else None
+        if not first:
+            return None, '首封尚未发送，暂不能发送回复或主动跟进'
+        if first.status != 'accepted':
+            reason = {
+                'queued': '首封正在排队', 'sending': '首封发送中',
+                'retryable': '首封等待重试', 'failed': '首封发送失败',
+                'unknown': '首封发送结果不确定，请先核实', 'cancelled': '首封已取消',
+            }.get(first.status, '首封尚未确认发送成功')
+            return first, reason
+        account = await self.db.scalar(self.query(Account).where(Account.id == lead.account_id))
+        if not account or not account.enabled:
+            return first, '原发件邮箱已停用或不可用'
+        if await self.db.scalar(self.query(Suppression).where(Suppression.email == lead.email)):
+            return first, '该邮箱已禁止联系'
+        return first, ''
+
     async def reply(self, identifier, data, kind):
         lead = await self.owned(Lead, identifier, lock=True)
         existing = await self.db.scalar(
@@ -831,21 +942,23 @@ class EmailService:
         )
         if existing:
             return self.message_json(existing)
-        if not lead.account_id or not lead.first_message_id:
-            raise ValueError("首封尚未发送，不能回复或主动跟进")
+        first, reason = await self.manual_send_context(lead)
+        if reason:
+            raise ValueError(reason)
         account = await self.owned(Account, lead.account_id)
-        if not account.enabled:
-            raise ValueError("原发件邮箱已停用")
-        if await self.db.scalar(self.query(Suppression).where(Suppression.email == lead.email)):
-            raise ValueError("该邮箱已禁止联系")
-        parent = await self.owned(
-            Message, data.inbound_id if kind == "reply" else lead.first_message_id
-        )
-        if parent.lead_id != lead.id or (kind == "reply" and parent.direction != "inbound"):
+        parent = await self.owned(Message, data.inbound_id) if kind == 'reply' else first
+        if parent.lead_id != lead.id or parent.task_id != lead.task_id or (kind == "reply" and (parent.direction != "inbound" or parent.kind != "reply")):
             raise ValueError("回复邮件不属于此会话")
         await self.attachments(data.attachment_ids)
-        if "{{" in data.subject + data.html:
-            raise ValueError("人工回复请填写实际内容，不支持未替换变量")
+        values = json.loads(lead.values)
+        subject, empty_subject = render_content(data.subject, values, html=False)
+        html, empty_body = render_content(data.html, values)
+        if empty_subject or empty_body:
+            raise ValueError('请填写变量值：' + '、'.join(sorted(set(empty_subject + empty_body))))
+        # 替换后重新走内容校验，防止客户资料中的换行或长文本绕过输入约束。
+        content = Content(subject=subject, html=html)
+        if not content.subject.strip() or not has_email_content({'html': content.html}):
+            raise ValueError('请填写邮件主题和正文')
         row = self.add(
             Message,
             task_id=lead.task_id,
@@ -854,8 +967,8 @@ class EmailService:
             kind=kind,
             from_email=account.email,
             to_email=lead.email,
-            subject=data.subject,
-            html=data.html,
+            subject=content.subject,
+            html=content.html,
             attachment_ids=dump(data.attachment_ids),
             message_id=f"<{new_id()}@reach.local>",
             in_reply_to=parent.message_id,

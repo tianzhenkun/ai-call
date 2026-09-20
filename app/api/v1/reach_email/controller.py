@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
+from pydantic.alias_generators import to_camel
 from sqlalchemy import func, or_, select, update
 
 from app.api.v1.system.auth.schema import AuthSchema
@@ -18,6 +20,7 @@ from app.core.database import async_db_session
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 from app.services.reach_email.content import COLUMNS, MAX_BYTES, has_email_content, xlsx_bytes
+from app.services.reach_email.limits import MAX_ATTACHMENT_BYTES
 from app.services.reach_email.models import (
     Account,
     AIJob,
@@ -33,11 +36,12 @@ from app.services.reach_email.schema import (
     AIInput,
     ClassificationInput,
     ContentInput,
-    ReplyInput,
-    ReplyAIInput,
     ReadInput,
+    ReplyAIInput,
+    ReplyInput,
     ResolveInput,
     RestoreInput,
+    SettingsInput,
     StartInput,
     SuppressInput,
     TaskInput,
@@ -45,6 +49,66 @@ from app.services.reach_email.schema import (
 )
 from app.services.reach_email.security import CredentialCipher, configured_secret
 from app.services.reach_email.service import EmailService, scope
+
+
+def email_validation_message(errors):
+    labels = {
+        'settings': '邮件设置', 'name': '名称', 'importId': '收件名单',
+        'companyName': '公司名称', 'companyWebsite': '公司官网', 'companyDescription': '公司简介',
+        'dailyLimit': '24 小时发送上限', 'followUpEnabled': '自动跟进开关',
+        'followUpIntervalDays': '跟进间隔', 'followUpCount': '追加跟进次数',
+        'subject': '邮件主题', 'html': '邮件正文', 'content': '邮件内容',
+        'signature': '邮件签名', 'signatureName': '签名名称', 'attachmentIds': '附件',
+        'scheduledAt': '定时执行时间', 'version': '版本号', 'requestId': '请求标识',
+        'email': '邮箱', 'smtpPassword': 'SMTP 密码', 'imapPassword': 'IMAP 密码',
+        'smtpPort': 'SMTP 端口', 'imapPort': 'IMAP 端口',
+        'smtpHost': 'SMTP 服务器', 'imapHost': 'IMAP 服务器',
+        'smtpUsername': 'SMTP 用户名', 'imapUsername': 'IMAP 用户名',
+        'smtpSecurity': 'SMTP 加密方式', 'imapSecurity': 'IMAP 加密方式',
+        'providerType': '邮箱类型', 'fromName': '发件人名称', 'enabled': '启用状态',
+        'weight': '邮箱权重', 'hourlyLimit': '每小时发送上限', 'intervalSeconds': '发送间隔',
+        'action': '操作类型', 'instruction': 'AI 指令', 'inboundId': '回复目标',
+        'versionId': '历史版本', 'lastReplyAt': '最近回复时间', 'classification': '线索分类',
+        'outcome': '处理结果', 'note': '处理说明', 'reason': '原因',
+    }
+    safe_messages = {
+        '请完善邮件设置：请输入公司名称', '请完善邮件设置：请输入公司官网',
+        '请完善邮件设置：请输入公司简介',
+        '请完善邮件设置：公司官网须填写完整的 http 或 https 地址',
+        '公司官网须填写包含完整域名的地址，例如 https://example.com',
+        '主题不能包含换行', '邮箱格式不正确', '发件人名称不能包含换行',
+        '邮箱类型不受支持，请选择已有类型或自定义邮箱',
+    }
+    messages = []
+    for error in errors:
+        # 只返回固定校验文案和约束值，不回显 input、未知字段名或异常上下文。
+        reason = error['msg'].removeprefix('Value error, ')
+        if reason not in safe_messages:
+            loc = error['loc']
+            field = to_camel(str(loc[-1])) if loc else 'settings'
+            label = labels.get(field, '参数')
+            if field == 'dailyLimit' and ('settings' in loc or not any(part in loc for part in ('body', 'query'))):
+                label = '本任务 24 小时发送上限'
+            kind, context = error['type'], error.get('ctx', {})
+            if kind == 'missing':
+                reason = f'请填写{label}'
+            elif kind in ('greater_than_equal', 'less_than_equal'):
+                limit = context.get('ge' if kind == 'greater_than_equal' else 'le')
+                reason = f'{label}不能{"小于" if kind == "greater_than_equal" else "大于"} {limit}'
+            elif kind in ('string_too_long', 'too_long'):
+                if field == 'attachmentIds' and kind == 'too_long':
+                    reason = f'最多 {context["max_length"]} 个附件，当前选择了 {context["actual_length"]} 个'
+                else:
+                    reason = f'{label}不能超过 {context["max_length"]} {"字符" if kind == "string_too_long" else "项"}'
+            elif kind in ('string_too_short', 'too_short'):
+                reason = f'{label}至少需要 {context["min_length"]} {"字符" if kind == "string_too_short" else "项"}'
+            elif kind in ('int_type', 'int_parsing', 'int_from_float'):
+                reason = f'{label}须填写整数'
+            else:
+                reason = f'{label}格式不正确'
+        if reason not in messages:
+            messages.append(reason)
+    return '参数校验失败：' + '；'.join(messages)
 
 
 class EmailRoute(APIRoute):
@@ -55,9 +119,7 @@ class EmailRoute(APIRoute):
             try:
                 return await handler(request)
             except RequestValidationError as exc:
-                # The shared handler echoes exc.body; credentials must never reach it.
-                fields = sorted({str(error["loc"][-1]) for error in exc.errors()})
-                return ErrorResponse(msg="参数校验失败：" + "、".join(fields), status_code=422)
+                return ErrorResponse(msg=email_validation_message(exc.errors()), status_code=422)
 
         return safe_handler
 
@@ -84,6 +146,9 @@ async def service(request: Request, auth: AuthSchema = Depends(get_current_user)
         try:
             yield EmailService(db, str(tenant), str(owner), encryption_key())
             await db.commit()
+        except ValidationError as exc:
+            await db.rollback()
+            raise CustomException(msg=email_validation_message(exc.errors()), status_code=422) from None
         except ValueError as exc:
             await db.rollback()
             message = str(exc)
@@ -300,6 +365,13 @@ async def delete_task(identifier: str, s: Annotated[EmailService, Depends(servic
     return SuccessResponse()
 
 
+@EmailRouter.put("/tasks/{identifier}/settings")
+async def task_settings(
+    identifier: str, data: SettingsInput, s: Annotated[EmailService, Depends(service)]
+):
+    return SuccessResponse(data=await s.update_settings(identifier, data))
+
+
 @EmailRouter.put("/tasks/{identifier}/content")
 async def content(
     identifier: str, data: ContentInput, s: Annotated[EmailService, Depends(service)]
@@ -427,7 +499,7 @@ async def attachment(
     file: Annotated[UploadFile, File()], s: Annotated[EmailService, Depends(service)]
 ):
     attach_store(s)
-    payload = await file.read(8 * 1024 * 1024 + 1)
+    payload = await file.read(MAX_ATTACHMENT_BYTES + 1)
     return SuccessResponse(
         data=await s.save_attachment(file.filename or "", payload, file.content_type)
     )
@@ -570,6 +642,10 @@ async def conversation(
     rows, meta = await s.page(Message, page, pageSize, [Message.lead_id == lead.id])
     from app.services.reach_email.reporting import delivery_evidence
     all_messages = (await s.db.scalars(s.query(Message).where(Message.lead_id == lead.id))).all()
+    latest_inbound = max(
+        (row for row in all_messages if row.direction == 'inbound' and row.kind == 'reply'),
+        key=lambda row: (row.created_at, row.id), default=None,
+    )
     delivered, failed, _ = delivery_evidence(all_messages)
     parent_headers = {row.in_reply_to for row in rows if row.in_reply_to}
     parents = list((await s.db.scalars(s.query(Message).where(
@@ -578,9 +654,11 @@ async def conversation(
     parent_map = {}
     for parent in parents:
         parent_map.setdefault(parent.message_id, []).append(parent)
-    attachment_ids = {identifier for row in [*rows, *parents] for identifier in json.loads(row.attachment_ids)}
+    attachment_ids = {identifier for row in [*rows, *parents, *([latest_inbound] if latest_inbound else [])]
+                      for identifier in json.loads(row.attachment_ids)}
     attachments = list((await s.db.scalars(s.query(Attachment).where(Attachment.id.in_(attachment_ids)))).all()) if attachment_ids else []
     files = {row.id: {"id": row.id, "name": row.name, "size": row.size} for row in attachments}
+
     def present(row):
         return dict(s.message_json(row),
             deliveryStatus="delivered" if row.id in delivered else "failed" if row.id in failed else "unconfirmed",
@@ -589,10 +667,16 @@ async def conversation(
     for row in reversed(rows):
         matches = parent_map.get(row.in_reply_to, [])
         messages.append(dict(present(row), replyTo=present(matches[0]) if len(matches) == 1 else None))
+    first, send_blocked_reason = await s.manual_send_context(lead)
     return SuccessResponse(
         data=dict(
             **(await s.lead_json(lead)),
             messages=messages,
+            variables=json.loads(lead.values),
+            firstMessage=present(first) if first else None,
+            latestInbound=present(latest_inbound) if latest_inbound else None,
+            canSend=not send_blocked_reason,
+            sendBlockedReason=send_blocked_reason,
             doNotContact=bool(
                 await s.db.scalar(s.query(Suppression).where(Suppression.email == lead.email))
             ),

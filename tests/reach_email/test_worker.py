@@ -334,7 +334,8 @@ def test_headerless_reply_uses_exact_marker_and_scoped_participants(mismatch):
     asyncio.run(check())
 
 
-def test_auto_reply_does_not_stop_and_oversized_attachments_do_not_advance_cursor():
+@pytest.mark.parametrize('oversized', ['count', 'size'])
+def test_auto_reply_does_not_stop_and_oversized_attachments_do_not_advance_cursor(oversized):
     async def check():
         async with setup() as (worker, sessions):
             async with sessions() as db, db.begin():
@@ -345,7 +346,8 @@ def test_auto_reply_does_not_stop_and_oversized_attachments_do_not_advance_curso
             result = {'uidvalidity': '1', 'last_uid': 1, 'messages': [item]}
             with patch('app.services.reach_email.worker.transport.sync_messages', return_value=result):
                 await worker.sync_account('a')
-                item['attachments'] = [{'content': b'x'}] * 6
+                item['attachments'] = ([{'content': b'x'}] * 6 if oversized == 'count'
+                                       else [{'content': b'x' * (8 * 1024 * 1024 + 1)}])
                 result['last_uid'] = 2
                 try:
                     await worker.sync_account('a')
@@ -580,6 +582,44 @@ def test_disable_during_attachment_load_prevents_smtp():
             async with sessions() as db:
                 message = await db.get(Message, 'm')
                 assert message.status == 'retryable' and message.error_code == 'ACCOUNT_CHANGED'
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('ids,expected', [
+    (['a'] * 6, 'ATTACHMENT_COUNT_LIMIT'),
+    (['a', 'a'], 'ATTACHMENT_DUPLICATE'),
+    (['missing'], 'ATTACHMENT_INVALID'),
+])
+def test_attachment_prepare_failure_preserves_specific_safe_error(ids, expected):
+    async def check():
+        async with setup() as (worker, sessions):
+            async with sessions() as db, db.begin():
+                (await db.get(Message, 'm')).attachment_ids = json.dumps(ids)
+            with patch('app.services.reach_email.worker.transport.send_message') as send:
+                await worker.send_one('m')
+            send.assert_not_called()
+            async with sessions() as db:
+                message = await db.get(Message, 'm')
+                assert message.status == 'failed' and message.error_code == expected
+    asyncio.run(check())
+
+
+def test_attachment_prepare_failure_never_exposes_storage_error():
+    from app.services.reach_email.models import Attachment
+
+    async def check():
+        async with setup() as (worker, sessions):
+            async with sessions() as db, db.begin():
+                db.add(Attachment(id='file', tenant_id='t', owner_id='o', name='file.pdf', size=5,
+                                  content_type='application/pdf', object_key='key', sha256='unused'))
+                (await db.get(Message, 'm')).attachment_ids = '["file"]'
+            worker.store.open.side_effect = ValueError('password=private-storage-secret')
+            with patch('app.services.reach_email.worker.transport.send_message') as send:
+                await worker.send_one('m')
+            send.assert_not_called()
+            async with sessions() as db:
+                message = await db.get(Message, 'm')
+                assert message.status == 'failed' and message.error_code == 'PREPARE_SEND_FAILED'
     asyncio.run(check())
 
 

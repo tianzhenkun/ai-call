@@ -15,6 +15,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.services.reach_email import transport
 from app.services.reach_email.ai import EmailAI
+from app.services.reach_email.limits import (
+    ATTACHMENT_ERROR_CODES,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_COUNT,
+    MAX_INBOUND_ATTACHMENT_BYTES,
+)
 from app.services.reach_email.models import (
     Account,
     AIJob,
@@ -166,12 +172,18 @@ class EmailWorker:
     async def load_attachments(self, db, message):
         result = []
         identities = json.loads(message.attachment_ids)
-        if len(identities) > 5:
-            raise ValueError('ATTACHMENT_LIMIT')
+        if len(identities) > MAX_ATTACHMENT_COUNT:
+            raise ValueError('ATTACHMENT_COUNT_LIMIT')
+        if len(set(identities)) != len(identities):
+            raise ValueError('ATTACHMENT_DUPLICATE')
         for identity in identities:
             attachment = await db.scalar(owned(Attachment, message, identity))
-            if not attachment or attachment.size > 8 * 1024 * 1024:
+            if not attachment:
                 raise ValueError('ATTACHMENT_INVALID')
+            if attachment.size <= 0:
+                raise ValueError('ATTACHMENT_EMPTY')
+            if attachment.size > MAX_ATTACHMENT_BYTES:
+                raise ValueError('ATTACHMENT_TOO_LARGE')
             source = await self.store.open(attachment.object_key)
             data = bytearray()
             async for chunk in source.body:
@@ -182,8 +194,8 @@ class EmailWorker:
                 raise ValueError('ATTACHMENT_CHANGED')
             result.append({'filename': attachment.name, 'content': bytes(data),
                            'content_type': attachment.content_type})
-        if sum(len(item['content']) for item in result) > 8 * 1024 * 1024:
-            raise ValueError('ATTACHMENT_LIMIT')
+        if sum(len(item['content']) for item in result) > MAX_ATTACHMENT_BYTES:
+            raise ValueError('ATTACHMENT_TOTAL_TOO_LARGE')
         return result
 
     async def claim(self, identity):
@@ -211,6 +223,12 @@ class EmailWorker:
                 return None
             if not message.dedup_key.startswith('manual:') and task.status != 'running':
                 return None
+            if message.kind == 'follow_up' and not message.dedup_key.startswith('manual:'):
+                settings = json.loads(task.settings)
+                if not settings.get('followUpEnabled') or lead.follow_up_count >= settings.get('followUpCount', 0):
+                    message.status, message.error_code = 'cancelled', 'FOLLOWUP_SETTINGS_CHANGED'
+                    lead.next_follow_up_at = None
+                    return None
             if message.kind == 'follow_up' and not message.dedup_key.startswith('manual:') and lead.account_id not in self.sync_ok:
                 message.due_at = now() + timedelta(seconds=30)
                 return None
@@ -218,7 +236,10 @@ class EmailWorker:
             manual_reply = message.kind == 'reply' and message.dedup_key.startswith('manual:')
             if not manual_reply and await self.count_attempts(db, message, day, task_id=task.id) >= task.daily_limit:
                 message.due_at = await self.quota_release(db, message, 24, task_id=task.id)
+                message.error_code = 'TASK_DAILY_LIMIT'
                 return None
+            if message.error_code == 'TASK_DAILY_LIMIT':
+                message.error_code = None
             account = await self.choose_account(db, message, lead)
             if account is None:
                 return None
@@ -269,19 +290,24 @@ class EmailWorker:
                     recipient=message.to_email, subject=message.subject, html=message.html,
                     attachments=attachments, message_id=message.message_id,
                     in_reply_to=message.in_reply_to, references=message.references)
-        except Exception:
+        except Exception as exc:
             outcome = {'status': 'unknown' if submitted else 'failed',
-                       'errorCode': 'SEND_INTERRUPTED' if submitted else 'PREPARE_SEND_FAILED'}
+                       'errorCode': ('SEND_INTERRUPTED' if submitted else
+                                     str(exc) if isinstance(exc, ValueError) and str(exc) in ATTACHMENT_ERROR_CODES
+                                     else 'PREPARE_SEND_FAILED')}
         async with self.sessions() as db, db.begin():
             await self.require_lease(db)
+            task = await db.scalar(owned(Task, message, message.task_id).with_for_update())
             current = await db.scalar(owned(Message, message, message.id).with_for_update())
             if current.status != 'sending' or current.lease_token != self.token:
                 return
             current.status, current.error_code = outcome['status'], outcome.get('errorCode')
             current.lease_until = None
             attempt = await db.scalar(owned(Attempt, message, attempt_id))
+            finished_at = now()
             if submitted:
                 attempt.status = current.status
+                attempt.updated_at = finished_at
             else:
                 # No SMTP call occurred: release the reservation, never an unknown submission.
                 await db.delete(attempt)
@@ -290,7 +316,6 @@ class EmailWorker:
                 if reserved_account:
                     reserved_account.next_send_at = None
             lead = await db.scalar(owned(Lead, message, message.lead_id))
-            task = await db.scalar(owned(Task, message, message.task_id))
             if current.status == 'accepted':
                 current.sent_at = lead.last_sent_at = now()
                 if current.kind == 'follow_up' and not current.dedup_key.startswith('manual:'):
@@ -308,7 +333,19 @@ class EmailWorker:
                     current.status = 'failed'
                     current.error_code = 'RETRY_LIMIT_REACHED'
                 else:
-                    current.due_at = now() + timedelta(minutes=2 ** current.attempt_count)
+                    current.due_at = finished_at + timedelta(minutes=2 ** current.attempt_count)
+                    if current.kind == 'follow_up' and not current.dedup_key.startswith('manual:'):
+                        settings = json.loads(task.settings)
+                        if not settings.get('followUpEnabled') or lead.follow_up_count >= settings.get('followUpCount', 0):
+                            current.status, current.error_code = 'cancelled', 'FOLLOWUP_SETTINGS_CHANGED'
+                        else:
+                            last_sent = await db.scalar(select(func.max(Message.sent_at)).where(
+                                *scope(Message, current), Message.lead_id == lead.id,
+                                Message.direction == 'outbound', Message.status == 'accepted',
+                                ~Message.dedup_key.like('manual:%')))
+                            if last_sent:
+                                current.due_at = max(current.due_at,
+                                    last_sent + timedelta(days=settings.get('followUpIntervalDays', 2)))
             if current.status in ('failed', 'cancelled') and not current.dedup_key.startswith('manual:'):
                 lead.next_follow_up_at = None
 
@@ -320,8 +357,13 @@ class EmailWorker:
             leads = (await db.scalars(select(Lead).where(Lead.next_follow_up_at <= now(),
                 Lead.stopped_reason.is_(None), Lead.account_id.in_(self.sync_ok))
                 .order_by(Lead.next_follow_up_at).limit(self.batch_size))).all()
-            for lead in leads:
-                task = await db.scalar(owned(Task, lead, lead.task_id))
+            for candidate in leads:
+                task = await db.scalar(owned(Task, candidate, candidate.task_id).with_for_update()
+                                       .execution_options(populate_existing=True))
+                lead = await db.scalar(owned(Lead, candidate, candidate.id).with_for_update()
+                                       .execution_options(populate_existing=True))
+                if not lead or lead.stopped_reason or not lead.next_follow_up_at or lead.next_follow_up_at > now():
+                    continue
                 first = await db.scalar(owned(Message, lead, lead.first_message_id))
                 if not task or task.status != 'running' or not first or first.status != 'accepted':
                     continue
@@ -413,7 +455,7 @@ class EmailWorker:
             processed = 0
             for incoming in result['messages']:
                 attachments = incoming.get('attachments', [])
-                if len(attachments) > 5 or sum(len(a['content']) for a in attachments) > 8 * 1024 * 1024:
+                if len(attachments) > MAX_ATTACHMENT_COUNT or sum(len(a['content']) for a in attachments) > MAX_INBOUND_ATTACHMENT_BYTES:
                     raise ValueError('INBOUND_ATTACHMENT_LIMIT')
                 fingerprint = hashlib.sha256(json.dumps({k: v for k, v in incoming.items()
                     if k not in ('uid', 'attachments')}, sort_keys=True).encode())

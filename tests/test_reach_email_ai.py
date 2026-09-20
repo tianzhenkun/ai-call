@@ -68,6 +68,23 @@ def test_reply_generation_prompt_treats_incoming_as_quoted_context():
     assert result['content'] == '<p>产品说明</p>'
 
 
+def test_followup_generation_uses_customer_variables_without_inventing_a_reply():
+    def handler(request):
+        messages = json.loads(request.content)['messages']
+        prompt = messages[0]['content']
+        assert '不得暗示客户已经回复或表达兴趣' in prompt
+        assert '正文仅可使用 allowedVariables' in prompt
+        assert '不声称附有未提供的附件' in prompt
+        assert json.loads(messages[1]['content'])['allowedVariables'] == ['客户姓名']
+        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps({
+            'subject': 'Re: 产品', 'content': '<p>{{客户姓名}}，请问方便交流吗？</p>',
+        })}}]})
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    result = asyncio.run(client.run('generate', subject='Re: 产品',
+                                   context={'mode': 'reply', 'replyTo': None}, allowed_variables=['客户姓名']))
+    assert '{{客户姓名}}' in result['content']
+
+
 def test_generation_keeps_requirement_in_body_and_rejects_subject_variable():
     def handler(request):
         prompt = json.loads(request.content)['messages'][0]['content']

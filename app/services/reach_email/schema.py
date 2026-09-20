@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -5,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, mod
 from pydantic.alias_generators import to_camel
 
 from app.services.reach_email.content import clean_html, email_address
+from app.services.reach_email.limits import MAX_ATTACHMENT_COUNT
 
 
 class Input(BaseModel):
@@ -94,9 +96,15 @@ class TaskSettings(Input):
         try:
             if not self.company_website.lower().startswith(("http://", "https://")):
                 raise ValueError("缺少完整协议前缀")
-            HttpUrl(self.company_website)
+            url = HttpUrl(self.company_website)
         except ValueError:
             raise ValueError("请完善邮件设置：公司官网须填写完整的 http 或 https 地址") from None
+        host = (url.host or '').removesuffix('.')
+        labels = host.split('.')
+        if (len(host) > 253 or len(labels) < 2
+                or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels)
+                or not re.fullmatch(r'(?:[a-z]{2,63}|xn--[a-z0-9-]+)', labels[-1])):
+            raise ValueError('公司官网须填写包含完整域名的地址，例如 https://example.com')
         return self
 
 
@@ -105,7 +113,7 @@ class Content(Input):
     html: str = Field(default="", max_length=100000)
     signature: str = Field(default="", max_length=20000)
     signature_name: str = Field(default="", max_length=255)
-    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENT_COUNT)
 
     @field_validator("subject")
     @classmethod
@@ -127,6 +135,10 @@ class TaskInput(Input):
 
 class VersionInput(Input):
     version: int = Field(ge=1)
+
+
+class SettingsInput(VersionInput):
+    settings: TaskSettings
 
 
 class ContentInput(Content):
@@ -160,7 +172,7 @@ class ReplyAIInput(Input):
 class ReplyInput(Input):
     subject: str = Field(min_length=1, max_length=512)
     html: str = Field(min_length=1, max_length=100000)
-    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENT_COUNT)
     inbound_id: str | None = None
     request_id: str = Field(min_length=1, max_length=128)
     _html = field_validator("html")(clean_html)
