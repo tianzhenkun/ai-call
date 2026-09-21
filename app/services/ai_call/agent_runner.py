@@ -9329,7 +9329,7 @@ class RealtimeCallAgentRunner:
         input_text: str | None = None,
         opening_response: bool = False,
     ) -> bool:
-        if call_id in self._handoff_tool_results:
+        if self._providers.get(call_id) is not provider or call_id in self._handoff_tool_results:
             return False
         lifecycle = self._response_lifecycle(call_id)
         if self.registry.get(call_id).status in {
@@ -9373,12 +9373,27 @@ class RealtimeCallAgentRunner:
         try:
             await provider.create_response(input_text)
         except Exception as exc:
+            if self._providers.get(call_id) is not provider:
+                # 转人工关闭或替换模型后，旧请求的失败不能结束仍存活的客户通话。
+                self._append_event(
+                    call_id,
+                    "model_response_create_discarded",
+                    "agent",
+                    {
+                        "reason": "provider_no_longer_current",
+                        "errorType": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                return False
             self._fail_running_session(
                 call_id,
                 end_reason="model_error",
                 failure_stage="model_response_create",
                 failure_message=f"创建模型响应失败: {exc}",
             )
+            return False
+        if self._providers.get(call_id) is not provider:
             return False
         if self.registry.get(call_id).status in {
             CallSessionStatus.ENDING,

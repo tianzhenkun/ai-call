@@ -212,15 +212,16 @@ class OutboundAttemptReconciler:
         previous_status = attempt.status
         graph_valid = _projection_graph_matches(task, target, attempt)
         terminal_projected = False
-        if graph_valid and _terminal_facts_complete(record=record, command=command):
-            media_connected = bool(
-                record is not None
-                and record.answered_at is not None
-                and (
-                    record.entry_type == "web"
-                    or await has_persisted_media_evidence(self._session, claim.call_id)
-                )
+        media_connected = bool(
+            graph_valid
+            and record is not None
+            and record.answered_at is not None
+            and (
+                record.entry_type == "web"
+                or await has_persisted_media_evidence(self._session, claim.call_id)
             )
+        )
+        if graph_valid and _terminal_facts_complete(record=record, command=command):
             decision = terminal_attempt_decision(
                 record,
                 media_connected=media_connected,
@@ -279,7 +280,13 @@ class OutboundAttemptReconciler:
                 effect=effect,
                 answer_mode=task.answer_mode,
             ):
-                attempt.status = "DIALING"
+                if media_connected:
+                    attempt.status = "IN_CALL"
+                    if target.status != "IN_CALL":
+                        target.status = "IN_CALL"
+                        target.updated_at = now
+                elif attempt.status != "IN_CALL":
+                    attempt.status = "DIALING"
             elif attempt.status == "QUEUED" and _starting_facts_complete(
                 attempt=attempt,
                 record=record,
@@ -462,7 +469,7 @@ def _dialing_facts_complete(
         and record.entry_type == ("web" if answer_mode == "web" else "outbound")
         and record.business_type == "outbound_attempt"
         and record.business_id == str(attempt.id)
-        and record.status == "ready"
+        and record.status in {"ready", "connected"}
         and command is not None
         and command.status == CommandStatus.SUCCEEDED
     )

@@ -228,6 +228,58 @@ async def test_successful_transfer_uses_system_prompt_not_closed_provider():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("late_error", [False, True])
+@pytest.mark.parametrize("replace_provider", [False, True])
+async def test_inflight_response_cannot_fail_or_reactivate_agent_after_handoff(
+    late_error, replace_provider
+):
+    runner, provider, _publisher, store = make_runner()
+    call_id = "call-handoff-result"
+    entered = asyncio.Event()
+    released = asyncio.Event()
+    scheduled_ends = []
+    runner.call_end_scheduler = lambda *args: scheduled_ends.append(args)
+
+    async def create_response(_input=None):
+        assert not provider.closed
+        entered.set()
+        await released.wait()
+        if late_error:
+            raise RuntimeError("sent 1000 (OK); then received 1000 (OK)")
+
+    provider.create_response = create_response
+    runner._clear_response_lifecycle(call_id)
+    pending = asyncio.create_task(runner._request_response(call_id, provider))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await runner.suspend_for_handoff(call_id)
+        if replace_provider:
+            runner._providers[call_id] = Provider()
+            runner._mark_response_started(call_id, {"response_id": "new-response"})
+        released.set()
+        assert not await asyncio.wait_for(pending, timeout=1)
+        assert not await runner._request_response(call_id, provider)
+        assert runner.registry.get(call_id).status != CallSessionStatus.FAILED
+        assert scheduled_ends == []
+        assert not any(event.type == "session_failed" for event in store.list_all(call_id))
+        if replace_provider:
+            assert runner._response_lifecycles[call_id].active
+            assert runner._playback_guards[call_id].current_response_id == "new-response"
+        else:
+            assert call_id not in runner._response_lifecycles
+            assert call_id not in runner._playback_guards
+        if late_error:
+            discarded = [event for event in store.list_all(call_id)
+                         if event.type == "model_response_create_discarded"]
+            assert len(discarded) == 1
+            assert "sent 1000 (OK)" in discarded[0].payload["message"]
+    finally:
+        released.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 async def test_missing_worker_result_reports_unconfirmed_instead_of_success(monkeypatch):
     monkeypatch.setattr(runner_module, "HANDOFF_TOOL_RESULT_TIMEOUT_SECONDS", 0)
     runner, provider, _publisher, store = make_runner()

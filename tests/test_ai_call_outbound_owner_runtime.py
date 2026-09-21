@@ -1022,6 +1022,68 @@ async def test_attempt_reconciler_projects_complete_start_facts_to_dialing(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "answer_mode,record_status,answered,media_connected,initial_status,expected_status",
+    [
+        ("linphone", "ready", True, True, "DIALING", "IN_CALL"),
+        ("linphone", "connected", True, True, "DIALING", "IN_CALL"),
+        ("linphone", "connected", True, False, "DIALING", "DIALING"),
+        ("linphone", "ready", False, True, "DIALING", "DIALING"),
+        ("web", "connected", True, False, "DIALING", "IN_CALL"),
+        ("linphone", "ready", False, False, "IN_CALL", "IN_CALL"),
+    ],
+)
+async def test_attempt_reconciler_projects_answered_call_without_regression(
+    database, answer_mode, record_status, answered, media_connected,
+    initial_status, expected_status,
+) -> None:
+    from app.api.v1.ai_call.outbound.attempt_reconciler import OutboundAttemptReconciler
+
+    now = datetime(2026, 8, 2, 1, tzinfo=timezone.utc)
+    _task_id, target_id, call_id, _worker_id = await _seed_owner_assigned_chain(
+        database, now, answer_mode=answer_mode,
+    )
+    await _seed_start_completion_facts(
+        database, call_id=call_id, now=now, answer_mode=answer_mode,
+    )
+    database_now = now.replace(tzinfo=None)
+    async with database.begin() as session:
+        record = await session.scalar(
+            select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id)
+        )
+        attempt = await session.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.call_id == call_id)
+        )
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+        assert record is not None and attempt is not None and target is not None
+        record.status = record_status
+        record.answered_at = database_now if answered else None
+        attempt.status = target.status = initial_status
+        if media_connected:
+            session.add(AiCallEventModel(
+                id=generate_snowflake_id(), call_id=call_id,
+                event_id="answered-media", event_type="media_connected",
+                source="agent", event_time=database_now,
+            ))
+    async with database.begin() as session:
+        claim = await OutboundAttemptReconciler(
+            session, worker_id="reconciler-answer",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).claim_next()
+    assert claim is not None
+    async with database.begin() as session:
+        result = await OutboundAttemptReconciler(
+            session, worker_id="reconciler-answer",
+            database_clock=lambda _session: _constant_time(database_now),
+        ).submit(claim)
+    assert result is not None and result.status == expected_status
+    async with database() as session:
+        target = await session.get(AiCallOutboundTargetModel, target_id)
+        assert target is not None and target.status == expected_status
+        assert target.latest_result is None
+
+
+@pytest.mark.anyio
 async def test_web_attempt_reconciler_projects_browser_answer_without_sip_evidence(
     database,
 ) -> None:
