@@ -3531,6 +3531,7 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
         "user_speech_started",
         "user_transcript_delta",
         "user_speech_stopped",
+        "call_policy_customer_turn",
         "model_audio_delta",
         "model_response_done",
     ]

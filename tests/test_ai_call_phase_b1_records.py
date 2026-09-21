@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -765,8 +766,13 @@ def _availability_agent_rows(
 
 
 @pytest.fixture
-async def b1_service():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def b1_service(request, tmp_path):
+    database_url = (
+        f"sqlite+aiosqlite:///{tmp_path / 'b1-service.db'}"
+        if getattr(request, "param", None) == "file"
+        else "sqlite+aiosqlite:///:memory:"
+    )
+    engine = create_async_engine(database_url)
     async with engine.begin() as conn:
         await conn.run_sync(MappedBase.metadata.create_all)
 
@@ -2097,6 +2103,152 @@ async def test_handoff_requested_event_is_published_after_commit(
         assert committed_when_published == [True]
 
     await engine.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "commit", "nested_commit", "nested_rollback", "accepted", "rollback", "rollback_ended",
+        "commit_error", "failed", "connected", "canceled", "expired", "completed",
+        "duplicate_rollback",
+    ],
+)
+async def test_handoff_waiting_side_effects_follow_transaction_outcome(
+    tmp_path,
+    monkeypatch,
+    outcome: str,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'handoff-waiting-commit.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    scheduled: list[tuple[str, str]] = []
+    published: list[dict] = []
+    owner_end_requests: list[tuple[str, str]] = []
+
+    async def capture_requested_event(_tenant_id, _event_type, payload):
+        published.append(payload)
+
+    async def request_owner_end(call_id, reason):
+        owner_end_requests.append((call_id, reason))
+        return True
+
+    monkeypatch.setattr(
+        "app.services.ai_call.agent_console_reconciler.publish_agent_console_event",
+        capture_requested_event,
+    )
+    try:
+        async with session_maker() as db:
+            repository = AiCallRecordRepository(db)
+            service = AiCallService(
+                build_b1_orchestrator(),
+                AiCallRecordService(repository),
+                handoff_service=AiCallHandoffService(repository),
+                handoff_exception_manager=SimpleNamespace(
+                    schedule_timeout=lambda handoff: scheduled.append(
+                        ("timeout", handoff.handoff_id)
+                    ),
+                    start_waiting_tone=lambda handoff, **_kwargs: scheduled.append(
+                        ("waiting", handoff.handoff_id)
+                    ),
+                ),
+            )
+            service.orchestrator._auto_end_requester = request_owner_end
+            result = await service.create_web_session(
+                voice=None, prompt=None, business_id=None,
+            )
+            await db.commit()
+            savepoint = await db.begin_nested() if outcome == "nested_rollback" else None
+            handoff = await service.create_handoff(
+                call_id=result.call_id,
+                source="customer",
+                reason="customer_request",
+                request_message="转人工",
+            )
+            await asyncio.sleep(0)
+            assert scheduled == []
+            assert published == []
+            assert owner_end_requests == []
+
+            if outcome == "nested_rollback":
+                await savepoint.rollback()
+                await db.commit()
+            elif outcome in {"rollback", "rollback_ended"}:
+                if outcome == "rollback_ended":
+                    await service.orchestrator.end_session(
+                        result.call_id, end_reason="browser_hangup",
+                    )
+                await db.rollback()
+            elif outcome == "commit_error":
+                def fail_commit(_session):
+                    raise RuntimeError("injected commit failure")
+
+                sqlalchemy_event.listen(db.sync_session, "before_commit", fail_commit, once=True)
+                with pytest.raises(RuntimeError, match="injected commit failure"):
+                    await db.commit()
+                await db.rollback()
+            else:
+                if outcome == "nested_commit":
+                    async with db.begin_nested():
+                        await db.execute(text("SELECT 1"))
+                    await asyncio.sleep(0)
+                    assert scheduled == []
+                    assert published == []
+                    assert owner_end_requests == []
+                elif outcome not in {"commit", "duplicate_rollback"}:
+                    await repository.update_handoff(handoff["handoffId"], status=outcome)
+                await db.commit()
+            await asyncio.sleep(0)
+
+            expected = [
+                ("timeout", handoff["handoffId"]),
+                ("waiting", handoff["handoffId"]),
+            ] if outcome in {"commit", "nested_commit", "accepted", "duplicate_rollback"} else []
+            assert scheduled == expected
+            assert len(published) == (1 if expected else 0)
+            assert not db.sync_session.dispatch.after_commit
+            assert not db.sync_session.dispatch.after_transaction_end
+            expected_end_requests = [
+                (result.call_id, "handoff_service_unavailable")
+            ] if outcome in {"rollback", "nested_rollback", "commit_error"} else []
+            assert owner_end_requests == expected_end_requests
+
+            if outcome == "duplicate_rollback":
+                duplicate = await service.create_handoff(
+                    call_id=result.call_id,
+                    source="customer",
+                    reason="customer_request",
+                    request_message="转人工",
+                )
+                assert duplicate["handoffId"] == handoff["handoffId"]
+                await db.rollback()
+
+            # 回滚后复用同一 Session，不能把旧转接回调带入下一次提交。
+            await db.execute(text("SELECT 1"))
+            await db.commit()
+            await asyncio.sleep(0)
+            assert scheduled == expected
+            assert len(published) == (1 if expected else 0)
+            assert owner_end_requests == expected_end_requests
+            assert service.orchestrator.livekit_room_manager.deleted_rooms == (
+                [result.room_name] if outcome == "rollback_ended" else []
+            )
+            rollback_events = [
+                event for event in service.orchestrator.event_store.list_all(result.call_id)
+                if event.type == "handoff_auto_trigger_failed"
+                and event.payload.get("stage") == "transaction_commit"
+            ]
+            assert len(rollback_events) == len(expected_end_requests)
+            async with session_maker() as read_db:
+                saved = await AiCallRecordRepository(read_db).get_handoff_by_id(handoff["handoffId"])
+                assert (saved is None) == (
+                    outcome in {"rollback", "nested_rollback", "rollback_ended", "commit_error"}
+                )
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -4238,6 +4390,7 @@ async def test_handoff_busy_waiting_prompt_is_selected(
             request_message="转人工",
             waiting_prompt_kind="busy",
         )
+        await service.handoff_service.repository.db.commit()
         await wait_until(lambda: len(prompt_player.played) == 1)
 
         assert prompt_player.played == [
@@ -4288,6 +4441,7 @@ async def test_handoff_timeout_plays_unavailable_prompt_before_auto_end(
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
 
         await wait_until(
             lambda: (
@@ -4368,6 +4522,7 @@ async def test_handoff_timeout_closes_room_by_name_when_runtime_session_is_missi
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
         service.orchestrator.registry._sessions.pop(result.call_id)
 
         await wait_until(
@@ -4384,7 +4539,8 @@ async def test_handoff_timeout_closes_room_by_name_when_runtime_session_is_missi
             attempts=50,
             delay_seconds=0.05,
         )
-        await manager.shutdown()
+        # 事件先于后台事务提交，须等待任务收尾，不能在提交中途取消共享 SQLite 连接。
+        await wait_until(lambda: not manager._closure_tasks)
         await b1_service.flush_events()
 
         record_service.repository.db.expire_all()
@@ -4450,6 +4606,7 @@ async def test_handoff_timeout_does_not_mark_auto_ended_when_room_fallback_fails
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
         service.orchestrator.registry._sessions.pop(result.call_id)
 
         await wait_until(
@@ -4503,6 +4660,7 @@ async def test_handoff_connected_cancels_timeout_auto_end(
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
         await service.set_handoff_agent_status(
             human_agent_identity="agent-debug-001",
             status="online",
@@ -4553,6 +4711,7 @@ async def test_handoff_waiting_tone_stops_when_agent_connected(
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
 
         await wait_until(lambda: prompt_player.started.is_set())
         assert prompt_player.played == [
@@ -4676,6 +4835,7 @@ async def test_handoff_prompt_plays_before_waiting_tone_and_stops_when_agent_con
             reason="customer_request",
             request_message=None,
         )
+        await service.handoff_service.repository.db.commit()
 
         await wait_until(lambda: prompt_player.second_started.is_set())
         assert prompt_player.played == [
@@ -4779,6 +4939,7 @@ async def test_handoff_fail_plays_unavailable_prompt_before_auto_end(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("b1_service", ["file"], indirect=True)
 async def test_handoff_cancel_plays_unavailable_prompt_before_auto_end(
     b1_service,
     tmp_path,
@@ -4800,17 +4961,21 @@ async def test_handoff_cancel_plays_unavailable_prompt_before_auto_end(
             prompt=None,
             business_id=None,
         )
+        # 后台收尾与事件落库各用独立连接，显式模拟每次请求的事务提交。
+        await record_service.repository.db.commit()
         handoff = await service.create_handoff(
             call_id=result.call_id,
             source="operator",
             reason="customer_request",
             request_message=None,
         )
+        await record_service.repository.db.commit()
 
         canceled = await service.cancel_handoff(
             handoff_id=handoff["handoffId"],
             reason="operator_cancelled",
         )
+        await record_service.repository.db.commit()
         assert canceled["status"] == "canceled"
 
         await wait_until(

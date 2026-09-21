@@ -408,9 +408,31 @@ class AiCallHandoffService:
     ) -> AiCallHandoffModel | None:
         if handoff.status in HANDOFF_TERMINAL_STATUSES:
             return None
-        if handoff.status not in HANDOFF_EXPIRABLE_STATUSES or handoff.expires_at is None:
+        deadline = handoff.pending_deadline_at
+        if handoff.status not in HANDOFF_EXPIRABLE_STATUSES or deadline is None:
             return handoff
-        if self._ensure_utc(handoff.expires_at) > utc_now():
+        if self._ensure_utc(deadline) > utc_now():
+            return handoff
+        if handoff.status == HANDOFF_STATUS_ACCEPTED and handoff.claim_expires_at is not None:
+            from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+
+            reconciled = await AiCallAgentConsoleService(self.repository.db).reconcile_handoff_timeout(
+                handoff.tenant_id, handoff.handoff_id,
+            )
+            if reconciled is not None and reconciled.status == HANDOFF_STATUS_EXPIRED:
+                self._expired_handoffs.append(reconciled)
+            return reconciled
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=handoff.tenant_id,
+            handoff_id=handoff.handoff_id,
+        )
+        if handoff is None or handoff.status in HANDOFF_TERMINAL_STATUSES:
+            return None
+        if (
+            handoff.status not in HANDOFF_EXPIRABLE_STATUSES
+            or handoff.pending_deadline_at is None
+            or self._ensure_utc(handoff.pending_deadline_at) > utc_now()
+        ):
             return handoff
         expired = await self._finish(
             handoff,

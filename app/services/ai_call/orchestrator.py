@@ -1021,10 +1021,12 @@ class AiCallOrchestrator:
         *,
         end_reason: str = "session_aborted",
         strict_agent_stop: bool = True,
+        ensure_room_deleted: bool = False,
     ) -> EndSessionResult:
+        """中止会话；ensure_room_deleted 用于持久化上下文已确认存在过的房间。"""
         self._cancel_browser_ready_watchdog(call_id)
         session = self.registry.get(call_id)
-        if session.status == CallSessionStatus.COMPLETED:
+        if session.status == CallSessionStatus.COMPLETED and not ensure_room_deleted:
             return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
         events = self.event_store.list_all(call_id)
         event_types = {event.type for event in events}
@@ -1032,7 +1034,9 @@ class AiCallOrchestrator:
             call_id in self._agent_start_attempts or "agent_started" in event_types
         )
         should_delete_room = bool(
-            call_id in self._room_create_attempts or "room_created" in event_types
+            ensure_room_deleted
+            or call_id in self._room_create_attempts
+            or "room_created" in event_types
         )
         if session.status in RUNNING_STATUSES and session.status != CallSessionStatus.ENDING:
             self.registry.transition(call_id, CallSessionStatus.ENDING)
@@ -1052,6 +1056,8 @@ class AiCallOrchestrator:
                 awaitable=self.livekit_room_manager.delete_room(session.room_name),
             )
 
+        if session.status == CallSessionStatus.COMPLETED:
+            return EndSessionResult(call_id=call_id, status=CallSessionStatus.COMPLETED)
         if session.status in {
             CallSessionStatus.CREATED,
             CallSessionStatus.PREPARING,

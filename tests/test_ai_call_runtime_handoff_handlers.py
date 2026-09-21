@@ -234,6 +234,57 @@ async def test_media_ready_requires_current_owner_command_and_provider_query(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("handoff_status", ["accepted", "reconnecting"])
+@pytest.mark.parametrize("expires_during_query", [False, True])
+async def test_media_ready_respects_stage_deadline_after_provider_query(
+    handoff_handler_session_factory, handoff_status: str, expires_during_query: bool,
+) -> None:
+    from app.services.ai_call.runtime_control.handoff_handlers import AgentMediaReadyHandler
+
+    claim = await _seed_command(
+        handoff_handler_session_factory, command_type="AGENT_MEDIA_READY",
+        handoff_status=handoff_status,
+    )
+    async with handoff_handler_session_factory.begin() as session:
+        handoff = await session.get(AiCallHandoffModel, 201)
+        handoff.expires_at = NOW - timedelta(seconds=1)
+        handoff.claim_expires_at = NOW + timedelta(seconds=2)
+        handoff.reconnect_expires_at = NOW + timedelta(seconds=2)
+
+    current = NOW + timedelta(seconds=1)
+
+    async def clock(_session):
+        return current
+
+    async def after_query():
+        nonlocal current
+        if expires_during_query:
+            current = NOW + timedelta(seconds=2)
+
+    result = await AgentMediaReadyHandler(
+        handoff_handler_session_factory,
+        MediaProviderStub(_ready_observation(), after_query=after_query),
+        database_clock=clock,
+    ).handle(claim, _lease())
+
+    async with handoff_handler_session_factory() as session:
+        handoff = await session.get(AiCallHandoffModel, 201)
+        presence = await session.get(AiCallHandoffAgentModel, 202)
+        command = await session.get(AiCallRuntimeCommandModel, claim.command_id)
+    assert result.state_changed is not expires_during_query
+    if expires_during_query:
+        assert handoff.status == handoff_status
+        assert handoff.connected_at is None
+        assert presence.status == "claiming"
+        assert command.status == "SUPERSEDED"
+        assert json.loads(command.result_json) == {"reason": "handoff_deadline_expired"}
+    else:
+        assert handoff.status == "connected"
+        assert presence.status == "in_call"
+        assert command.status == "SUCCEEDED"
+
+
+@pytest.mark.anyio
 async def test_media_ready_version_race_changes_zero_rows(
     handoff_handler_session_factory,
 ) -> None:

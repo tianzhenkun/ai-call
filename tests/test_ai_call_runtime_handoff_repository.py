@@ -154,6 +154,31 @@ async def test_accept_locks_record_handoff_presence_then_appends_command(
 
 
 @pytest.mark.anyio
+async def test_late_owner_claim_keeps_full_window_and_retry_does_not_extend_it(
+    handoff_session_factory,
+) -> None:
+    from app.services.ai_call.runtime_control.handoff_repository import RuntimeHandoffRepository
+
+    await _seed_owner_handoff(handoff_session_factory)
+    now = datetime(2026, 8, 2, 2, 0, 57, tzinfo=timezone.utc)
+    async with handoff_session_factory() as session, session.begin():
+        repository = RuntimeHandoffRepository(
+            session, id_generator=lambda: 9001,
+            database_clock=lambda _session: _constant_time(now),
+        )
+        first = await repository.accept(_accept_intent())
+        handoff = await session.scalar(select(AiCallHandoffModel))
+        deadline = handoff.claim_expires_at.replace(tzinfo=timezone.utc)
+        assert deadline == now + timedelta(seconds=15)
+        assert handoff.expires_at.replace(tzinfo=timezone.utc) < deadline
+
+        now += timedelta(seconds=5)
+        second = await repository.accept(_accept_intent())
+        assert second == first
+        assert handoff.claim_expires_at.replace(tzinfo=timezone.utc) == deadline
+
+
+@pytest.mark.anyio
 async def test_accept_retry_is_idempotent(handoff_session_factory) -> None:
     from app.services.ai_call.runtime_control.handoff_repository import (
         RuntimeHandoffRepository,

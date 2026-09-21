@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
-from app.api.v1.ai_call.model import AiCallHandoffModel
+from app.api.v1.ai_call.model import AiCallHandoffModel, AiCallRecordModel
 from app.core.logger import log
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.exceptions import AiCallError
@@ -45,6 +47,9 @@ DEFAULT_NO_ONLINE_AGENT_PROMPT_TEXT = (
 DEFAULT_BUSY_TIMEOUT_PROMPT_TEXT = "当前人工坐席繁忙，暂未接通，我先为您记录需求。"
 DEFAULT_SERVICE_UNAVAILABLE_PROMPT_TEXT = "人工转接服务暂时不可用，我先为您记录需求。"
 WAITING_TONE_STATE_POLL_SECONDS = 0.25
+EXCEPTION_CLOSE_LEASE_SECONDS = 60
+EXCEPTION_CLOSE_RENEW_SECONDS = 20
+EXCEPTION_CLOSE_RECOVERY_SECONDS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +144,80 @@ class AiCallHandoffExceptionManager:
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._closure_tasks: dict[str, asyncio.Task] = {}
         self._waiting_tone_tasks: dict[str, asyncio.Task] = {}
+        self._recovery_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        if self.exception_close_enabled and (
+            self._recovery_task is None or self._recovery_task.done()
+        ):
+            self._recovery_task = asyncio.create_task(self._recover_exception_closures())
+
+    async def _recover_exception_closures(self) -> None:
+        while True:
+            try:
+                await self.reconcile_pending_closures()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.opt(exception=exc).warning("转人工异常收尾恢复扫描失败")
+            await asyncio.sleep(EXCEPTION_CLOSE_RECOVERY_SECONDS)
+
+    async def reconcile_pending_closures(self) -> None:
+        async with self.session_factory.begin() as db:
+            rows = await db.scalars(
+                select(AiCallHandoffModel)
+                .join(AiCallRecordModel, AiCallRecordModel.call_id == AiCallHandoffModel.call_id)
+                .where(
+                    AiCallRecordModel.status.notin_({"completed", "failed"}),
+                    AiCallRecordModel.ended_at.is_(None),
+                    AiCallHandoffModel.connected_at.is_(None),
+                    or_(
+                        AiCallHandoffModel.status.in_({"expired", "failed", "canceled"}),
+                        and_(
+                            AiCallHandoffModel.status == "requested",
+                            AiCallHandoffModel.expires_at <= func.current_timestamp(),
+                        ),
+                        and_(
+                            AiCallHandoffModel.status == "accepted",
+                            func.coalesce(
+                                AiCallHandoffModel.claim_expires_at,
+                                AiCallHandoffModel.expires_at,
+                            ) <= func.current_timestamp(),
+                        ),
+                    ),
+                    or_(
+                        AiCallHandoffModel.exception_close_token.is_(None),
+                        AiCallHandoffModel.exception_close_expires_at.is_(None),
+                        AiCallHandoffModel.exception_close_expires_at <= func.current_timestamp(),
+                    ),
+                )
+                .order_by(AiCallHandoffModel.requested_at)
+                .limit(100)
+            )
+            handoffs = list(rows.all())
+        for handoff in handoffs:
+            if handoff.status in {HANDOFF_STATUS_REQUESTED, HANDOFF_STATUS_ACCEPTED}:
+                await self._timeout_worker(
+                    handoff_id=handoff.handoff_id,
+                    call_id=handoff.call_id,
+                    room_name=handoff.room_name,
+                    delay_seconds=0,
+                )
+                continue
+            if handoff.status == "expired":
+                reason = "handoff_timeout"
+            elif handoff.status == "canceled":
+                reason = handoff.end_reason or "handoff_canceled"
+            else:
+                reason = (
+                    handoff.end_reason
+                    if handoff.end_reason in self.exception_prompts
+                    else "handoff_failed"
+                )
+            self.trigger_exception_close(handoff, call_end_reason=reason)
 
     def schedule_timeout(self, handoff: AiCallHandoffModel) -> None:
-        if not self.exception_close_enabled or handoff.expires_at is None:
+        if not self.exception_close_enabled:
             return
         if handoff.status not in {
             HANDOFF_STATUS_REQUESTED,
@@ -149,17 +225,10 @@ class AiCallHandoffExceptionManager:
             "reconnecting",
         }:
             return
-        deadlines = [handoff.expires_at]
-        if handoff.status == HANDOFF_STATUS_ACCEPTED:
-            deadlines.append(handoff.claim_expires_at)
-        elif handoff.status == "reconnecting":
-            deadlines = [handoff.reconnect_expires_at]
-        deadline = min(
-            (self._ensure_utc(value) for value in deadlines if value is not None),
-            default=None,
-        )
+        deadline = handoff.pending_deadline_at
         if deadline is None:
             return
+        deadline = self._ensure_utc(deadline)
         handoff_id = handoff.handoff_id
         self.cancel_timeout(handoff_id)
         delay_seconds = max(0.0, (deadline - utc_now()).total_seconds())
@@ -303,13 +372,6 @@ class AiCallHandoffExceptionManager:
         )
         if self._closure_tasks.get(handoff.handoff_id) is not None:
             return
-        self._record_handoff_event(
-            call_id=handoff.call_id,
-            event_type="handoff_auto_end_scheduled",
-            handoff_id=handoff.handoff_id,
-            handoff_status=handoff.status,
-            payload={"reason": call_end_reason},
-        )
         try:
             task = asyncio.create_task(
                 self._close_after_exception(
@@ -339,10 +401,12 @@ class AiCallHandoffExceptionManager:
             list(self._timeout_tasks.values())
             + list(self._closure_tasks.values())
             + list(self._waiting_tone_tasks.values())
+            + ([self._recovery_task] if self._recovery_task is not None else [])
         )
         self._timeout_tasks.clear()
         self._closure_tasks.clear()
         self._waiting_tone_tasks.clear()
+        self._recovery_task = None
         for task in tasks:
             task.cancel()
         if tasks:
@@ -377,13 +441,6 @@ class AiCallHandoffExceptionManager:
                 return
             if reconciled.status != "expired":
                 return
-            self._record_handoff_event(
-                call_id=reconciled.call_id,
-                event_type="handoff_expired",
-                handoff_id=reconciled.handoff_id,
-                handoff_status=reconciled.status,
-                payload={"reason": reconciled.end_reason},
-            )
             self._timeout_tasks.pop(handoff_id, None)
             self.trigger_exception_close(reconciled, call_end_reason="handoff_timeout")
         except asyncio.CancelledError:
@@ -514,13 +571,16 @@ class AiCallHandoffExceptionManager:
     async def _expire_handoff_if_due(self, handoff_id: str) -> AiCallHandoffModel | None:
         async with self.session_factory() as db:
             async with db.begin():
-                repository = AiCallRecordRepository(db)
-                handoff = await repository.get_handoff_by_id(handoff_id)
-                if handoff is None:
+                tenant_id = await db.scalar(
+                    select(AiCallHandoffModel.tenant_id).where(
+                        AiCallHandoffModel.handoff_id == handoff_id,
+                    )
+                )
+                if tenant_id is None:
                     return None
                 return await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
-                    handoff.tenant_id,
-                    handoff.handoff_id,
+                    tenant_id,
+                    handoff_id,
                     now=utc_now(),
                 )
 
@@ -533,13 +593,120 @@ class AiCallHandoffExceptionManager:
         handoff_status: str,
         call_end_reason: str,
     ) -> None:
-        await self._play_unavailable_prompt(
-            call_id=call_id,
-            room_name=room_name,
-            handoff_id=handoff_id,
-            handoff_status=handoff_status,
-            call_end_reason=call_end_reason,
+        token = str(uuid4())
+        async with self.session_factory.begin() as db:
+            now = self._ensure_utc(await db.scalar(select(func.current_timestamp())))
+            claim = await db.execute(
+                update(AiCallHandoffModel)
+                .where(
+                    AiCallHandoffModel.handoff_id == handoff_id,
+                    AiCallHandoffModel.call_id == call_id,
+                    AiCallHandoffModel.status.in_({"expired", "failed", "canceled"}),
+                    or_(
+                        AiCallHandoffModel.exception_close_token.is_(None),
+                        AiCallHandoffModel.exception_close_expires_at.is_(None),
+                        AiCallHandoffModel.exception_close_expires_at <= now,
+                    ),
+                    select(AiCallRecordModel.id).where(
+                        AiCallRecordModel.call_id == call_id,
+                        AiCallRecordModel.status.notin_({"completed", "failed"}),
+                        AiCallRecordModel.ended_at.is_(None),
+                    ).exists(),
+                )
+                .values(
+                    exception_close_token=token,
+                    exception_close_expires_at=now + timedelta(seconds=EXCEPTION_CLOSE_LEASE_SECONDS),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claim.rowcount != 1:
+                return
+            handoff = await AiCallRecordRepository(db).get_handoff_by_id(handoff_id)
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                renewal = tasks.create_task(self._renew_close_claim(handoff_id, token))
+                try:
+                    await self._execute_exception_close(handoff, token, call_end_reason)
+                finally:
+                    renewal.cancel()
+        finally:
+            async with self.session_factory.begin() as db:
+                await db.execute(
+                    update(AiCallHandoffModel)
+                    .where(
+                        AiCallHandoffModel.handoff_id == handoff_id,
+                        AiCallHandoffModel.exception_close_token == token,
+                    )
+                    .values(exception_close_token=None, exception_close_expires_at=None)
+                )
+
+    async def _update_close_claim(
+        self,
+        db: AsyncSession,
+        handoff_id: str,
+        token: str,
+        *,
+        prompt_completed: bool = False,
+    ) -> None:
+        now = self._ensure_utc(await db.scalar(select(func.current_timestamp())))
+        values = {
+            "exception_close_expires_at": now + timedelta(seconds=EXCEPTION_CLOSE_LEASE_SECONDS),
+        }
+        if prompt_completed:
+            values["exception_prompt_completed_at"] = now
+        renewed = await db.execute(
+            update(AiCallHandoffModel)
+            .where(
+                AiCallHandoffModel.handoff_id == handoff_id,
+                AiCallHandoffModel.exception_close_token == token,
+                AiCallHandoffModel.exception_close_expires_at > now,
+            )
+            .values(**values)
         )
+        if renewed.rowcount != 1:
+            raise RuntimeError(f"handoff exception close lease lost: {handoff_id}")
+
+    async def _renew_close_claim(self, handoff_id: str, token: str) -> None:
+        while True:
+            await asyncio.sleep(EXCEPTION_CLOSE_RENEW_SECONDS)
+            async with self.session_factory.begin() as db:
+                await self._update_close_claim(db, handoff_id, token)
+
+    async def _execute_exception_close(
+        self,
+        handoff: AiCallHandoffModel,
+        token: str,
+        call_end_reason: str,
+    ) -> None:
+        handoff_id, call_id = handoff.handoff_id, handoff.call_id
+        room_name, handoff_status = handoff.room_name, handoff.status
+        if handoff.exception_prompt_completed_at is None:
+            if handoff_status == "expired":
+                self._record_handoff_event(
+                    call_id=call_id,
+                    event_type="handoff_expired",
+                    handoff_id=handoff_id,
+                    handoff_status=handoff_status,
+                    payload={"reason": handoff.end_reason},
+                )
+            self._record_handoff_event(
+                call_id=call_id,
+                event_type="handoff_auto_end_scheduled",
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                payload={"reason": call_end_reason},
+            )
+            prompt_completed = await self._play_unavailable_prompt(
+                call_id=call_id,
+                room_name=room_name,
+                handoff_id=handoff_id,
+                handoff_status=handoff_status,
+                call_end_reason=call_end_reason,
+            )
+            async with self.session_factory.begin() as db:
+                await self._update_close_claim(
+                    db, handoff_id, token, prompt_completed=prompt_completed,
+                )
         async with self.session_factory() as db:
             async with db.begin():
                 repository = AiCallRecordRepository(db)
@@ -560,17 +727,28 @@ class AiCallHandoffExceptionManager:
                         tenant_id=tenant_id,
                         call_id=call_id,
                     )
-                runtime_close_mode = await self._close_runtime_after_exception(
-                    call_id=call_id,
-                    room_name=room_name,
-                    handoff_id=handoff_id,
-                    handoff_status=handoff_status,
-                    call_end_reason=call_end_reason,
-                )
-                if runtime_close_mode is None:
-                    return
-                record_service = AiCallRecordService(repository)
-                await record_service.complete_session(call_id, end_reason=call_end_reason)
+        async with self.session_factory.begin() as db:
+            await self._update_close_claim(db, handoff_id, token)
+        runtime_close_mode = await self._close_runtime_after_exception(
+            call_id=call_id,
+            room_name=room_name,
+            handoff_id=handoff_id,
+            handoff_status=handoff_status,
+            call_end_reason=call_end_reason,
+        )
+        if runtime_close_mode is None:
+            raise RuntimeError(f"handoff exception runtime close failed: {handoff_id}")
+        async with self.session_factory.begin() as db:
+            # 与控制面一致，按 record -> handoff 的顺序在短事务内确认执行权。
+            await db.scalar(
+                select(AiCallRecordModel)
+                .where(AiCallRecordModel.call_id == call_id)
+                .with_for_update()
+            )
+            await self._update_close_claim(db, handoff_id, token)
+            await AiCallRecordService(AiCallRecordRepository(db)).complete_session(
+                call_id, end_reason=call_end_reason,
+            )
 
         payload = {"reason": call_end_reason}
         if runtime_close_mode != "orchestrator":
@@ -600,9 +778,17 @@ class AiCallHandoffExceptionManager:
         call_end_reason: str,
     ) -> str | None:
         try:
-            await self.orchestrator.end_session(
+            session = await self.orchestrator.get_session(call_id)
+            if session.room_name != room_name:
+                raise AiCallError(
+                    error_id="handoff_room_mismatch",
+                    msg="转人工房间与运行态会话不一致，无法自动关闭",
+                )
+            await self.orchestrator.abort_session(
                 call_id,
                 end_reason=call_end_reason,
+                strict_agent_stop=False,
+                ensure_room_deleted=True,
             )
             return "orchestrator"
         except AiCallError as exc:
@@ -723,14 +909,14 @@ class AiCallHandoffExceptionManager:
         handoff_id: str,
         handoff_status: str,
         call_end_reason: str = "default",
-    ) -> None:
+    ) -> bool:
         prompt = self.exception_prompts.get(
             call_end_reason,
             self.exception_prompts["default"],
         )
         if prompt.audio_path is None:
-            return
-        await self._play_prompt_audio(
+            return True
+        return await self._play_prompt_audio(
             call_id=call_id,
             room_name=room_name,
             handoff_id=handoff_id,
@@ -750,9 +936,9 @@ class AiCallHandoffExceptionManager:
         audio_path: Path,
         event_prefix: str,
         event_payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         if self.system_prompt_player is None:
-            return
+            return True
         base_payload = {"audioFile": audio_path.name}
         if event_payload:
             base_payload.update(event_payload)
@@ -785,7 +971,7 @@ class AiCallHandoffExceptionManager:
                 },
                 source="system",
             )
-            return
+            return False
         self._record_handoff_event(
             call_id=call_id,
             event_type=f"{event_prefix}_done",
@@ -794,6 +980,7 @@ class AiCallHandoffExceptionManager:
             payload=base_payload,
             source="system",
         )
+        return True
 
     @staticmethod
     def _prompt_event_payload(prompt: HandoffPrompt) -> dict[str, Any]:
@@ -847,8 +1034,9 @@ class AiCallHandoffExceptionManager:
             registry.pop(key, None)
         if done_task.cancelled():
             return
-        with log.catch(reraise=False):
-            _ = done_task.exception()
+        error = done_task.exception()
+        if error is not None:
+            log.opt(exception=error).warning("转人工后台任务执行失败: handoffId={}", key)
 
     @staticmethod
     def _ensure_utc(value: datetime) -> datetime:

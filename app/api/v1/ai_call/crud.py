@@ -2853,7 +2853,7 @@ class AiCallRecordRepository:
         tenant_id: str,
         handoff_id: str,
     ) -> AiCallHandoffModel | None:
-        stmt = select(AiCallHandoffModel).where(
+        stmt = select(AiCallHandoffModel).execution_options(populate_existing=True).where(
             AiCallHandoffModel.tenant_id == tenant_id,
             AiCallHandoffModel.handoff_id == handoff_id,
         )

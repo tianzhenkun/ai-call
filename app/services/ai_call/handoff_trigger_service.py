@@ -677,6 +677,8 @@ class AiCallHandoffTriggerService:
             {
                 "handoffId": triggered.handoff.get("handoffId"),
                 "status": triggered.handoff.get("status"),
+                "failureStage": triggered.handoff.get("failureStage"),
+                "failureMessage": triggered.handoff.get("failureMessage"),
                 "source": "customer",
                 "reason": result.reason or "customer_request",
                 "confidence": result.confidence,
@@ -695,6 +697,7 @@ class AiCallHandoffTriggerService:
     ) -> None:
         reason = self._tool_request_reason(event)
         request_message = self._tool_request_message(event)
+        tool_call_id = event.payload.get("toolCallId")
         if not self.enabled or not self.customer_intent_enabled:
             self._append_ignored(
                 event_store,
@@ -702,6 +705,7 @@ class AiCallHandoffTriggerService:
                 reason="disabled",
                 transcript=request_message,
                 classifier_source="realtime_tool",
+                tool_call_id=tool_call_id,
             )
             return
         if self._has_recent_auto_trigger(event_store, event.call_id):
@@ -711,6 +715,7 @@ class AiCallHandoffTriggerService:
                 reason="duplicate_trigger",
                 transcript=request_message,
                 classifier_source="realtime_tool",
+                tool_call_id=tool_call_id,
             )
             return
         if await self._has_active_handoff(event.call_id):
@@ -722,6 +727,7 @@ class AiCallHandoffTriggerService:
                 reason="active_handoff_exists",
                 transcript=request_message,
                 classifier_source="realtime_tool",
+                tool_call_id=tool_call_id,
             )
             return
 
@@ -730,7 +736,6 @@ class AiCallHandoffTriggerService:
             or event.payload.get("confirmationRequired") is True
         )
         if confirmation_required:
-            tool_call_id = event.payload.get("toolCallId")
             confirmation = PendingHandoffConfirmation(
                 reason=reason,
                 request_message=(
@@ -793,6 +798,7 @@ class AiCallHandoffTriggerService:
                 message=str(exc),
                 error_type=type(exc).__name__,
                 transcript=request_message,
+                tool_call_id=tool_call_id,
             )
             return
 
@@ -803,6 +809,8 @@ class AiCallHandoffTriggerService:
             {
                 "handoffId": triggered.handoff.get("handoffId"),
                 "status": triggered.handoff.get("status"),
+                "failureStage": triggered.handoff.get("failureStage"),
+                "failureMessage": triggered.handoff.get("failureMessage"),
                 "source": "customer",
                 "reason": reason,
                 "confidence": 1.0,
@@ -849,6 +857,7 @@ class AiCallHandoffTriggerService:
                 transcript=transcript,
                 confidence=1.0,
                 classifier_source="confirmation_gate",
+                tool_call_id=confirmation.tool_call_id,
             )
             return
 
@@ -910,6 +919,7 @@ class AiCallHandoffTriggerService:
                 message=str(exc),
                 error_type=type(exc).__name__,
                 transcript=transcript,
+                tool_call_id=confirmation.tool_call_id,
             )
             return
 
@@ -920,6 +930,8 @@ class AiCallHandoffTriggerService:
             {
                 "handoffId": triggered.handoff.get("handoffId"),
                 "status": triggered.handoff.get("status"),
+                "failureStage": triggered.handoff.get("failureStage"),
+                "failureMessage": triggered.handoff.get("failureMessage"),
                 "source": "customer",
                 "reason": confirmation.reason,
                 "confidence": 1.0,
@@ -1045,6 +1057,7 @@ class AiCallHandoffTriggerService:
         transcript: str,
         confidence: float | None = None,
         classifier_source: str | None = None,
+        tool_call_id: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "reason": reason,
@@ -1054,6 +1067,8 @@ class AiCallHandoffTriggerService:
             payload["confidence"] = confidence
         if classifier_source:
             payload["classifierSource"] = classifier_source
+        if tool_call_id is not None:
+            payload["toolCallId"] = tool_call_id
         event_store.append(call_id, "handoff_intent_ignored", "handoff", payload)
 
     def _append_failed(
@@ -1065,17 +1080,21 @@ class AiCallHandoffTriggerService:
         message: str,
         error_type: str,
         transcript: str,
+        tool_call_id: str | None = None,
     ) -> None:
+        payload: dict[str, Any] = {
+            "stage": stage,
+            "errorType": error_type,
+            "message": self._truncate(message, 300),
+            "transcriptPreview": self._truncate(transcript, 120),
+        }
+        if tool_call_id is not None:
+            payload["toolCallId"] = tool_call_id
         event_store.append(
             call_id,
             "handoff_auto_trigger_failed",
             "handoff",
-            {
-                "stage": stage,
-                "errorType": error_type,
-                "message": self._truncate(message, 300),
-                "transcriptPreview": self._truncate(transcript, 120),
-            },
+            payload,
         )
 
     @staticmethod
@@ -1255,6 +1274,15 @@ class AiCallHandoffTriggerWorker:
             self.queue.put_nowait(QueuedHandoffTriggerEvent(event=event, event_store=event_store))
         except asyncio.QueueFull:
             self.dropped_count += 1
+            self.trigger_service._append_failed(
+                event_store,
+                event.call_id,
+                stage="enqueue",
+                message="转人工触发队列已满",
+                error_type="QueueFull",
+                transcript=self.trigger_service._transcript_text(event),
+                tool_call_id=event.payload.get("toolCallId"),
+            )
             log.warning(
                 "AI Call 转人工触发队列已满，丢弃事件: callId={}, eventId={}",
                 event.call_id,
@@ -1285,12 +1313,21 @@ class AiCallHandoffTriggerWorker:
                     type(exc).__name__,
                     str(exc),
                 )
-                await self._retry(item)
+                await self._retry(item, exc)
             finally:
                 self.queue.task_done()
 
-    async def _retry(self, item: QueuedHandoffTriggerEvent) -> None:
+    async def _retry(self, item: QueuedHandoffTriggerEvent, error: Exception) -> None:
         if item.attempts >= self.max_retries:
+            self.trigger_service._append_failed(
+                item.event_store,
+                item.event.call_id,
+                stage="retry_exhausted",
+                message=str(error),
+                error_type=type(error).__name__,
+                transcript=self.trigger_service._transcript_text(item.event),
+                tool_call_id=item.event.payload.get("toolCallId"),
+            )
             return
         try:
             self.queue.put_nowait(
@@ -1302,3 +1339,12 @@ class AiCallHandoffTriggerWorker:
             )
         except asyncio.QueueFull:
             self.dropped_count += 1
+            self.trigger_service._append_failed(
+                item.event_store,
+                item.event.call_id,
+                stage="retry_enqueue",
+                message=f"转人工触发重试队列已满；原错误：{type(error).__name__}: {error}",
+                error_type="QueueFull",
+                transcript=self.trigger_service._transcript_text(item.event),
+                tool_call_id=item.event.payload.get("toolCallId"),
+            )

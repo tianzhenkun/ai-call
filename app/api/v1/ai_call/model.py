@@ -1154,7 +1154,7 @@ class AiCallHandoffModel(MappedBase):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
-        comment="等待或连接超时时间",
+        comment="等待坐席认领的排队截止时间",
     )
     claim_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, comment="首次媒体接入截止时间"
@@ -1190,6 +1190,15 @@ class AiCallHandoffModel(MappedBase):
     last_media_event_key: Mapped[str | None] = mapped_column(
         String(160), nullable=True, comment="最近媒体事件去重键"
     )
+    exception_close_token: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, comment="异常收尾执行令牌"
+    )
+    exception_close_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="异常收尾执行租约截止时间"
+    )
+    exception_prompt_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="异常提示已完成时间"
+    )
     end_reason: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
@@ -1205,6 +1214,18 @@ class AiCallHandoffModel(MappedBase):
         nullable=True,
         comment="失败摘要",
     )
+
+    @property
+    def pending_deadline_at(self) -> datetime | None:
+        """每个待处理阶段只使用自己的期限，不用排队期限截断已认领的连接。"""
+        if self.status == "requested":
+            return self.expires_at
+        if self.status == "accepted":
+            # 旧入口未保存认领期限的记录仍沿用其原有等待期限。
+            return self.claim_expires_at or self.expires_at
+        if self.status == "reconnecting":
+            return self.reconnect_expires_at
+        return None
 
 
 class AiCallHandoffAgentModel(MappedBase):

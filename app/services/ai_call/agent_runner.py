@@ -105,6 +105,11 @@ CALL_POLICY_FINAL_INPUT = (
     "请只说：感谢您的时间，今天先沟通到这里，祝您生活愉快，再见。"
     "不要添加其他内容，不要再提出问题。"
 )
+CALL_POLICY_TURN_LIMIT_INPUT = (
+    "本次对话已达到有效轮次上限。请先简短回答客户的当前问题；需要知识证据时正常调用知识工具，"
+    "不得编造答案。回答后礼貌收尾，不再开启新问题。客户明确要求转人工时，仍按转人工流程处理，"
+    "不得把回答问题或口头承诺当作已完成转接。"
+)
 CALL_POLICY_SILENCE_INPUTS = (
     "客户暂未回应，请简短询问一次是否还在听，不要重复之前的长内容。",
     "客户仍未回应，请最后确认一次是否方便继续沟通，保持一句话。",
@@ -126,6 +131,7 @@ CALL_END_REASON_MAPPING = {
 }
 
 HANDOFF_REASON_VALUES = {"customer_request", "business_escalation"}
+HANDOFF_TOOL_RESULT_TIMEOUT_SECONDS = 10
 BUSINESS_HANDOFF_CONFIRMATION_TOOL_RESULT = (
     "系统尚未开始转人工。请先询问用户是否确认需要转人工，不得说正在转接、马上接入或已经接通。"
 )
@@ -694,6 +700,7 @@ class PendingUserTurn:
     no_barge_unstarted_response_deferred: bool = False
     current_speech_semantic_rejected: bool = False
     response_requested: bool = False
+    customer_turn_counted: bool = False
     interrupt_candidate: bool = False
     interrupt_confirmed: bool = False
     interrupt_ignored: bool = False
@@ -967,6 +974,8 @@ class RealtimeCallAgentRunner:
         self._pending_call_end_intents: dict[str, PendingCallEndIntent] = {}
         self._pending_call_end_defer_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_knowledge_audit_ids: dict[str, list[int]] = {}
+        self._handoff_tool_results: dict[str, tuple[str, asyncio.Future[AiCallEvent]]] = {}
+        self._handoff_tool_tasks: dict[str, asyncio.Task[None]] = {}
         self._call_policy_tasks: dict[str, asyncio.Task[None]] = {}
         self._silence_watchdog_tasks: dict[str, asyncio.Task[None]] = {}
         self._silence_prompt_counts: dict[str, int] = {}
@@ -1011,6 +1020,20 @@ class RealtimeCallAgentRunner:
             )
 
     async def stop(self, call_id: str) -> None:
+        pending_result = self._handoff_tool_results.pop(call_id, None)
+        if pending_result is not None:
+            pending_result[1].cancel()
+        if not self._handoff_tool_results:
+            self.event_store.remove_listener(self._receive_handoff_tool_result)
+        handoff_task = self._handoff_tool_tasks.pop(call_id, None)
+        if (
+            handoff_task is not None
+            and not handoff_task.done()
+            and handoff_task is not asyncio.current_task()
+        ):
+            handoff_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await handoff_task
         await self._cancel_call_policy_task(call_id)
         await self._cancel_silence_watchdog(call_id)
         await self._cancel_playout_task(call_id)
@@ -1209,19 +1232,22 @@ class RealtimeCallAgentRunner:
             pending = self._pending_call_ends.get(call_id)
             if (
                 not self._call_policy_is_running(call_id)
-                or pending is None
-                or pending.scheduled
+                or (pending is not None and pending.scheduled)
                 or self.call_end_scheduler is None
             ):
                 return
-            pending.scheduled = True
+            if pending is not None:
+                pending.scheduled = True
             self._append_event(
                 call_id,
                 "call_policy_safety_end",
                 "agent",
                 {"elapsedSeconds": CALL_POLICY_SAFETY_END_SECONDS},
             )
-            self.call_end_scheduler(call_id, pending.end_reason)
+            self.call_end_scheduler(
+                call_id,
+                pending.end_reason if pending is not None else "policy_duration_limit",
+            )
         except asyncio.CancelledError:
             raise
         finally:
@@ -1246,6 +1272,16 @@ class RealtimeCallAgentRunner:
         *,
         end_reason: str,
     ) -> bool:
+        if not self._prepare_policy_call_end(call_id, end_reason=end_reason):
+            return False
+        await self._request_response(
+            call_id,
+            provider,
+            input_text=CALL_POLICY_FINAL_INPUT,
+        )
+        return True
+
+    def _prepare_policy_call_end(self, call_id: str, *, end_reason: str) -> bool:
         if call_id in self._pending_call_ends or not self._call_policy_is_running(call_id):
             return False
         self._pending_call_ends[call_id] = PendingCallEnd(
@@ -1259,11 +1295,6 @@ class RealtimeCallAgentRunner:
             "call_policy_end_requested",
             "agent",
             {"endReason": end_reason},
-        )
-        await self._request_response(
-            call_id,
-            provider,
-            input_text=CALL_POLICY_FINAL_INPUT,
         )
         return True
 
@@ -5808,6 +5839,14 @@ class RealtimeCallAgentRunner:
         session = self.registry.get(call_id)
         if session.status == CallSessionStatus.READY:
             session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+        previous_turn = self._pending_user_turns.get(call_id)
+        guard = self._playback_guard(call_id)
+        guard.user_speech_active = True
+        turn = self._pending_turn(call_id, reset_if_finished=True)
+        self._cancel_turn_response_task_nowait(call_id)
+        if turn.stopped_at is not None and not turn.response_requested:
+            turn.stopped_at = None
+        turn.started_at = timestamp
         if not self._is_barge_in_enabled_for_session(session):
             await self._apply_provider_event(
                 call_id,
@@ -5817,14 +5856,6 @@ class RealtimeCallAgentRunner:
                 {},
             )
             return
-        previous_turn = self._pending_user_turns.get(call_id)
-        guard = self._playback_guard(call_id)
-        guard.user_speech_active = True
-        turn = self._pending_turn(call_id, reset_if_finished=True)
-        self._cancel_turn_response_task_nowait(call_id)
-        if turn.stopped_at is not None and not turn.response_requested:
-            turn.stopped_at = None
-        turn.started_at = timestamp
         if self._should_confirm_recent_rejected_sip_pre_stop_from_provider(
             session,
             previous_turn,
@@ -6145,12 +6176,19 @@ class RealtimeCallAgentRunner:
             return
         if self._ignore_no_barge_call_end_tail_transcript(call_id, text):
             return
+        turn = self._pending_turn(call_id)
         if call_end_decision is not None and call_end_decision.action == "explicit_end":
             self._record_call_end_intent(call_id, text, call_end_decision)
         else:
             self._pending_call_end_intents.pop(call_id, None)
-            self._interrupt_pending_call_end(call_id, "user_transcript_after_call_end_tool")
-        turn = self._pending_turn(call_id)
+            pending_call_end = self._pending_call_ends.get(call_id)
+            # 已计数轮次的迟到转写不撤销收尾；新一轮客户发言仍可以打断告别。
+            if (
+                not turn.customer_turn_counted
+                or pending_call_end is None
+                or pending_call_end.end_reason != "policy_turn_limit"
+            ):
+                self._interrupt_pending_call_end(call_id, "user_transcript_after_call_end_tool")
         if provider_event.type == "user_transcript_done":
             turn.customer_transcript_event_id = customer_transcript_event_id
         should_queue_no_barge_followup = (
@@ -6167,16 +6205,6 @@ class RealtimeCallAgentRunner:
         if should_queue_no_barge_followup:
             self._queue_no_barge_followup_response(call_id, text)
         await self._maybe_confirm_interrupt_from_turn(call_id, provider, timestamp)
-        if (
-            provider_event.type == "user_transcript_done"
-            and self._record_customer_turn(call_id) >= CALL_POLICY_MAX_CUSTOMER_TURNS
-        ):
-            await self._begin_policy_call_end(
-                call_id,
-                provider,
-                end_reason="policy_turn_limit",
-            )
-            return
         await self._maybe_schedule_response_from_turn(call_id, provider, timestamp)
 
     def _record_customer_turn(self, call_id: str) -> int:
@@ -6795,6 +6823,34 @@ class RealtimeCallAgentRunner:
                     )
                 return
 
+        if reason == "customer_request":
+            pending_result = self._handoff_tool_results.get(call_id)
+            if pending_result is not None:
+                if pending_result[0] != tool_call_id:
+                    await provider.submit_tool_result(
+                        tool_call_id,
+                        "已有转人工请求处理中，请等待系统确认，不得宣告已接通。",
+                    )
+                return
+            self._interrupt_pending_call_end(call_id, "handoff_tool_requested")
+            self._cancel_silence_watchdog_nowait(call_id)
+            guard = self._playback_guard(call_id)
+            guard.generation += 1
+            if guard.current_response_id:
+                guard.cancelled_response_ids.add(guard.current_response_id)
+            cleanup_errors = await self._stop_audio_playout_queue(
+                call_id, source="agent", reason="handoff_tool_requested"
+            )
+            for cleanup_error in cleanup_errors:
+                self._append_event(call_id, "handoff_prompt_cleanup_failed", "agent", cleanup_error)
+            result = asyncio.get_running_loop().create_future()
+            self._handoff_tool_results[call_id] = (tool_call_id, result)
+            self.event_store.add_listener(self._receive_handoff_tool_result)
+            self._handoff_tool_tasks[call_id] = asyncio.create_task(
+                self._deliver_handoff_tool_result(call_id, provider, tool_call_id, result),
+                name=f"ai-call-handoff-result-{call_id}",
+            )
+
         self._append_event(
             call_id,
             "handoff_tool_requested",
@@ -6823,6 +6879,76 @@ class RealtimeCallAgentRunner:
                     "toolCallId": tool_call_id,
                 },
             )
+
+    def _receive_handoff_tool_result(self, event: AiCallEvent) -> None:
+        if event.source != "handoff" or event.type not in {
+            "handoff_auto_triggered", "handoff_auto_trigger_failed", "handoff_intent_ignored"
+        }:
+            return
+        pending = self._handoff_tool_results.get(event.call_id)
+        if pending is None or event.payload.get("toolCallId") != pending[0]:
+            return
+        if not pending[1].done():
+            pending[1].set_result(event)
+
+    async def _deliver_handoff_tool_result(
+        self,
+        call_id: str,
+        provider: RealtimeProviderProtocol,
+        tool_call_id: str,
+        result: asyncio.Future[AiCallEvent],
+    ) -> None:
+        try:
+            try:
+                event = await asyncio.wait_for(result, timeout=HANDOFF_TOOL_RESULT_TIMEOUT_SECONDS)
+            except TimeoutError:
+                self._append_event(
+                    call_id, "handoff_tool_result_timeout", "agent", {"toolCallId": tool_call_id}
+                )
+                output = (
+                    "转人工的执行结果尚未确认。请明确说明暂时无法确认转接状态，"
+                    "不得声称正在转接、已经接通、坐席繁忙或确定已失败。"
+                )
+            else:
+                if event.type == "handoff_auto_triggered" and event.payload.get("status") in {
+                    "requested", "accepted", "connected"
+                }:
+                    # 成功交接后由系统提示音接管，不向已关闭的模型补发成功口播。
+                    return
+                if event.type == "handoff_intent_ignored" and event.payload.get("reason") in {
+                    "duplicate_trigger", "active_handoff_exists"
+                }:
+                    output = (
+                        "系统已有转人工请求，本次未重复创建。是否接通仍以系统状态为准，"
+                        "不得宣告已经接通或本次转接失败，也不要再次重复申请。"
+                    )
+                else:
+                    output = (
+                        "系统未完成转人工。请如实告知本次转接未成功，并继续帮助客户；"
+                        "不得声称正在转接、已经接通，也不要编造失败原因。"
+                    )
+            if self._providers.get(call_id) is not provider or not self._call_policy_is_running(call_id):
+                return
+            self._handoff_tool_results.pop(call_id, None)
+            await provider.submit_tool_result(tool_call_id, output)
+            await self._request_response(call_id, provider)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_running_session(
+                call_id,
+                end_reason="model_error",
+                failure_stage="handoff_tool_result",
+                failure_message=f"提交转人工执行结果失败: {exc}",
+            )
+        finally:
+            pending = self._handoff_tool_results.get(call_id)
+            if pending is not None and pending[1] is result:
+                self._handoff_tool_results.pop(call_id, None)
+            if self._handoff_tool_tasks.get(call_id) is asyncio.current_task():
+                self._handoff_tool_tasks.pop(call_id, None)
+            if not self._handoff_tool_results:
+                self.event_store.remove_listener(self._receive_handoff_tool_result)
 
     @staticmethod
     def _payload_string(payload: dict[str, Any], *keys: str) -> str | None:
@@ -8694,6 +8820,8 @@ class RealtimeCallAgentRunner:
         response_id: str | None,
         response_generation: int,
     ) -> str | None:
+        if call_id in self._handoff_tool_results:
+            return "handoff_pending"
         guard = self._playback_guard(call_id)
         if (response_id, response_generation) in guard.overflowed_responses:
             return "audio_playout_queue_overflow"
@@ -9201,6 +9329,8 @@ class RealtimeCallAgentRunner:
         input_text: str | None = None,
         opening_response: bool = False,
     ) -> bool:
+        if call_id in self._handoff_tool_results:
+            return False
         lifecycle = self._response_lifecycle(call_id)
         if self.registry.get(call_id).status in {
             CallSessionStatus.ENDING,
@@ -9218,6 +9348,28 @@ class RealtimeCallAgentRunner:
             if opening_response:
                 lifecycle.pending_response_is_opening = True
             return False
+        turn = self._pending_user_turns.get(call_id)
+        count_customer_turn = (
+            not opening_response
+            and input_text is None
+            and turn is not None
+            and turn.stopped_at is not None
+            and bool(turn.transcript)
+            and not turn.current_speech_semantic_rejected
+            and not turn.customer_turn_counted
+        )
+        if (
+            count_customer_turn
+            and self._customer_turn_counts.get(call_id, 0) + 1 >= CALL_POLICY_MAX_CUSTOMER_TURNS
+        ):
+            self._prepare_policy_call_end(call_id, end_reason="policy_turn_limit")
+        pending_call_end = self._pending_call_ends.get(call_id)
+        if (
+            input_text is None
+            and pending_call_end is not None
+            and pending_call_end.end_reason == "policy_turn_limit"
+        ):
+            input_text = CALL_POLICY_TURN_LIMIT_INPUT
         try:
             await provider.create_response(input_text)
         except Exception as exc:
@@ -9235,6 +9387,10 @@ class RealtimeCallAgentRunner:
         }:
             self._clear_response_lifecycle(call_id)
             return False
+        # 在真正提交有效回复时计数；ASR 分片、重复最终稿和工具续答不是新一轮。
+        if count_customer_turn and turn is not None and not turn.customer_turn_counted:
+            turn.customer_turn_counted = True
+            self._record_customer_turn(call_id)
         lifecycle.active = True
         lifecycle.active_started_at = datetime.now(timezone.utc)
         lifecycle.cancel_pending = False

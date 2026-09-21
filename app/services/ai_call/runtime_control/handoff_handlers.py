@@ -193,6 +193,17 @@ class _HandoffStateRepository:
             )
             await self._session.flush()
             return HandoffHandlerResult(completed, False)
+        deadline = handoff.pending_deadline_at
+        if deadline is not None and _ensure_utc(deadline) <= now:
+            completed = self._complete_command(
+                record,
+                command,
+                CommandStatus.SUPERSEDED,
+                now,
+                result={"reason": "handoff_deadline_expired"},
+            )
+            await self._session.flush()
+            return HandoffHandlerResult(completed, False)
         if not self._observation_matches(target, observation):
             completed = self._complete_command(
                 record,

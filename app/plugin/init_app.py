@@ -35,6 +35,7 @@ class AiCallRoleWorkerHandles:
     offline_asr_worker: Any = None
     recording_reconcile_worker: Any = None
     handoff_trigger_worker: Any = None
+    handoff_exception_manager: Any = None
     runtime_webhook_worker: Any = None
     knowledge_worker: Any = None
     outbound_task_worker: Any = None
@@ -163,6 +164,7 @@ async def _start_ai_call_role_workers(
             handles.offline_asr_worker = await _start_ai_call_offline_asr_worker()
             handles.recording_reconcile_worker = await _start_ai_call_recording_reconcile_worker()
             handles.handoff_trigger_worker = await _start_ai_call_handoff_trigger_worker()
+            handles.handoff_exception_manager = await _start_ai_call_handoff_exception_manager()
             handles.runtime_webhook_worker = await _start_ai_call_runtime_webhook_worker()
             handles.knowledge_worker = await _start_ai_call_knowledge_worker()
             if start_voice:
@@ -195,6 +197,8 @@ async def _stop_ai_call_role_workers(
         await handles.credit_usage_worker.stop()
     if handles.handoff_trigger_worker is not None:
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
+    if handles.handoff_exception_manager is not None:
+        await handles.handoff_exception_manager.shutdown()
     if handles.runtime_webhook_worker is not None:
         await _stop_ai_call_runtime_webhook_worker(handles.runtime_webhook_worker)
     if handles.knowledge_worker is not None:
@@ -828,6 +832,18 @@ async def _stop_ai_call_dialogue_worker(worker) -> None:
     worker.detach_all()
     await worker.stop()
     log.info("✅ AI Call 对话文本后台持久化 worker 已关闭")
+
+
+async def _start_ai_call_handoff_exception_manager():
+    if not settings.SQL_DB_ENABLE or not settings.AI_CALL_HANDOFF_EXCEPTION_CLOSE_ENABLED:
+        return None
+    from app.api.v1.ai_call.service import get_default_ai_call_service
+    from app.core.database import async_db_session
+
+    async with async_db_session() as db:
+        manager = get_default_ai_call_service(db).handoff_exception_manager
+    await manager.start()
+    return manager
 
 
 async def _start_ai_call_handoff_trigger_worker():

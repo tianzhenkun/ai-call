@@ -813,6 +813,7 @@ def _patch_existing_workers(monkeypatch: pytest.MonkeyPatch) -> None:
         "_start_ai_call_offline_asr_worker",
         "_start_ai_call_recording_reconcile_worker",
         "_start_ai_call_handoff_trigger_worker",
+        "_start_ai_call_handoff_exception_manager",
         "_start_ai_call_outbound_task_worker",
         "_start_ai_call_linphone_test_worker",
     ]

@@ -1896,34 +1896,82 @@ class AiCallService:
             refreshed = await self.handoff_service.get_current(call_id)
             if refreshed is not None:
                 handoff = refreshed
-        if waiting_prompt_kind != "none":
-            self._schedule_handoff_timeout(
-                handoff,
-                waiting_prompt_kind=waiting_prompt_kind,
-            )
-        if created:
+        if created or waiting_prompt_kind != "none":
             from app.services.ai_call.agent_console_reconciler import (
                 publish_agent_console_event,
             )
 
-            payload = {
-                "handoff_id": handoff.handoff_id,
-                "call_id": handoff.call_id,
-                "scene_code": handoff.scene_code,
-                "status": handoff.status,
-            }
-            event.listen(
-                self.handoff_service.repository.db.sync_session,
-                "after_commit",
-                lambda _session: asyncio.create_task(
-                    publish_agent_console_event(
-                        handoff.tenant_id,
-                        "handoff.requested",
-                        payload,
+            sync_session = self.handoff_service.repository.db.sync_session
+            transaction = sync_session.get_transaction()
+            attempted_handoff_id = handoff.handoff_id
+            committed = False
+
+            def after_commit(committed_session):
+                nonlocal committed
+                # SAVEPOINT 回滚会移出新对象，外层提交不代表该转接请求已持久化。
+                if (
+                    committed_session.in_nested_transaction()
+                    or handoff not in committed_session
+                ):
+                    return
+                committed = True
+                if handoff.status not in {"requested", "accepted"}:
+                    return
+                if waiting_prompt_kind != "none":
+                    self._schedule_handoff_timeout(
+                        handoff,
+                        waiting_prompt_kind=waiting_prompt_kind,
                     )
-                ),
-                once=True,
-            )
+                if created:
+                    asyncio.create_task(
+                        publish_agent_console_event(
+                            handoff.tenant_id,
+                            "handoff.requested",
+                            {
+                                "handoff_id": handoff.handoff_id,
+                                "call_id": handoff.call_id,
+                                "scene_code": handoff.scene_code,
+                                "status": handoff.status,
+                            },
+                        )
+                    )
+
+            def after_transaction_end(ended_session, ended_transaction):
+                if ended_transaction is not transaction:
+                    return
+                event.remove(ended_session, "after_commit", after_commit)
+                # 当前事件遍历结束后移除自身；回滚或关闭后复用 Session 不保留旧请求。
+                asyncio.get_running_loop().call_soon(
+                    event.remove, ended_session, "after_transaction_end", after_transaction_end,
+                )
+                if committed or not created:
+                    return
+                try:
+                    runtime_session = self.orchestrator.registry.get(call_id)
+                except AiCallError:
+                    return
+                if runtime_session.status != CallSessionStatus.WAITING:
+                    return
+                # 模型已经挂起，但请求未提交；通过 owner-control 收尾，避免电话永久静默。
+                self.orchestrator.event_store.append(
+                    call_id,
+                    "handoff_auto_trigger_failed",
+                    "handoff",
+                    {
+                        "stage": "transaction_commit",
+                        "errorType": "TransactionNotCommitted",
+                        "message": "人工转接请求未提交，结束已挂起的通话",
+                        "attemptedHandoffId": attempted_handoff_id,
+                        "endReason": "handoff_service_unavailable",
+                    },
+                )
+                self.orchestrator._schedule_auto_end_session(
+                    call_id,
+                    "handoff_service_unavailable",
+                )
+
+            event.listen(sync_session, "after_commit", after_commit)
+            event.listen(sync_session, "after_transaction_end", after_transaction_end)
         return self.handoff_service.handoff_to_dict(handoff)
 
     async def get_current_handoff(self, call_id: str) -> dict | None:
@@ -2892,13 +2940,17 @@ class AiCallService:
         if self.handoff_service is None:
             return
         for handoff in self.handoff_service.consume_expired_handoffs():
-            self._record_handoff_event_best_effort(
-                call_id=handoff.call_id,
-                event_type="handoff_expired",
-                handoff_id=handoff.handoff_id,
-                handoff_status=handoff.status,
-                payload={"reason": handoff.end_reason},
-            )
+            if (
+                self.handoff_exception_manager is None
+                or not self.handoff_exception_manager.exception_close_enabled
+            ):
+                self._record_handoff_event_best_effort(
+                    call_id=handoff.call_id,
+                    event_type="handoff_expired",
+                    handoff_id=handoff.handoff_id,
+                    handoff_status=handoff.status,
+                    payload={"reason": handoff.end_reason},
+                )
             self._trigger_handoff_exception_close(
                 handoff,
                 call_end_reason="handoff_timeout",

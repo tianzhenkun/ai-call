@@ -914,9 +914,10 @@ async def test_owner_handoff_claim_uses_authenticated_agent_and_appends_command(
     monkeypatch.setattr(
         agent_console_service,
         "RuntimeHandoffRepository",
-        lambda session: RuntimeHandoffRepository(
+        lambda session, **options: RuntimeHandoffRepository(
             session,
             database_clock=database_clock,
+            **options,
         ),
     )
     async with session_factory() as db, db.begin():
@@ -1075,6 +1076,82 @@ async def test_same_agent_claiming_two_handoffs_only_one_succeeds(session_factor
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("queue_seconds_left", [8, 3.5])
+async def test_late_claim_keeps_full_connection_window(
+    session_factory, queue_seconds_left: float
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory, user_id=20, agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(
+        session_factory, row_id=1, handoff_id="handoff-1",
+        expires_delta=timedelta(seconds=queue_seconds_left),
+    )
+
+    claimed = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+
+    assert isinstance(claimed, AiCallHandoffModel)
+    assert claimed.claim_expires_at - claimed.accepted_at == timedelta(seconds=15)
+    assert claimed.expires_at.replace(tzinfo=timezone.utc) < claimed.claim_expires_at
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["reconcile", "media_ready", "retry_claim"])
+async def test_claimed_call_survives_queue_deadline_until_connection_deadline(
+    session_factory, operation: str
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory, user_id=20, agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    await _claim(
+        session_factory, user_id=20, handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        handoff = await db.get(AiCallHandoffModel, 1)
+        handoff.expires_at = now - timedelta(seconds=1)
+        handoff.claim_expires_at = now + timedelta(seconds=10)
+        db.add(AiCallRecordModel(
+            id=1001, tenant_id="tenant-a", call_id="call-handoff-1",
+            entry_type="web", room_name="room-handoff-1",
+            participant_identity="customer-handoff-1", status="running", started_at=now,
+        ))
+
+    async def microphone_ready(_room: str, _identity: str) -> bool:
+        return True
+
+    async with session_factory() as db, db.begin():
+        service = AiCallAgentConsoleService(db, participant_verifier=microphone_ready)
+        if operation == "reconcile":
+            handoff = await service.reconcile_handoff_timeout("tenant-a", "handoff-1", now=now)
+            assert handoff.status == "accepted"
+        elif operation == "media_ready":
+            handoff = await service.media_ready(
+                _auth(db, user_id=20), handoff_id="handoff-1",
+                console_session_id=console_session_id,
+                participant_identity="human-agent-handoff-1",
+            )
+            assert handoff.status == "connected"
+        else:
+            handoff = await service.claim_handoff(
+                _auth(db, user_id=20), handoff_id="handoff-1",
+                console_session_id=console_session_id,
+            )
+            assert handoff.claim_expires_at.replace(tzinfo=timezone.utc) == now + timedelta(seconds=10)
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.active_handoff_id == "handoff-1"
+
+
+@pytest.mark.anyio
 async def test_same_agent_session_claim_retry_returns_same_result(session_factory) -> None:
     console_session_id = str(uuid4())
     await _seed_agent(
@@ -1175,7 +1252,8 @@ async def test_media_ready_requires_livekit_microphone_before_connected(session_
 
 
 @pytest.mark.anyio
-async def test_claim_timeout_requeues_before_total_wait_deadline(session_factory) -> None:
+@pytest.mark.parametrize("entrypoint", ["reconcile", "lazy_read"])
+async def test_claim_timeout_requeues_before_queue_deadline(session_factory, entrypoint: str) -> None:
     console_session_id = str(uuid4())
     await _seed_agent(
         session_factory,
@@ -1199,11 +1277,14 @@ async def test_claim_timeout_requeues_before_total_wait_deadline(session_factory
         handoff.expires_at = now + timedelta(seconds=30)
 
     async with session_factory() as db, db.begin():
-        reconciled = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
-            "tenant-a",
-            "handoff-1",
-            now=now,
-        )
+        if entrypoint == "reconcile":
+            reconciled = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+                "tenant-a", "handoff-1", now=now,
+            )
+        else:
+            reconciled = await AiCallHandoffService(AiCallRecordRepository(db)).get_current(
+                "call-handoff-1",
+            )
     assert reconciled.status == "requested"
     assert reconciled.human_agent_identity is None
 
@@ -1216,7 +1297,123 @@ async def test_claim_timeout_requeues_before_total_wait_deadline(session_factory
 
 
 @pytest.mark.anyio
-async def test_total_wait_timeout_does_not_create_follow_up_task(session_factory) -> None:
+@pytest.mark.parametrize("expires_during_verification", [False, True])
+async def test_media_ready_cannot_connect_after_claim_deadline(
+    session_factory, expires_during_verification: bool
+) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(session_factory, user_id=20, agent_identity="agent-20",
+                      console_session_id=console_session_id)
+    await _seed_handoff(session_factory, row_id=1, handoff_id="handoff-1")
+    await _claim(session_factory, user_id=20, handoff_id="handoff-1",
+                 console_session_id=console_session_id)
+    async with session_factory() as db, db.begin():
+        handoff = await db.scalar(select(AiCallHandoffModel).where(AiCallHandoffModel.id == 1))
+        expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+        if not expires_during_verification:
+            handoff.claim_expires_at = expired
+
+        async def verify(_room: str, _identity: str) -> bool:
+            if expires_during_verification:
+                handoff.claim_expires_at = expired
+            return True
+
+        with pytest.raises(CustomException) as error:
+            await AiCallAgentConsoleService(db, participant_verifier=verify).media_ready(
+                _auth(db, user_id=20), handoff_id="handoff-1",
+                console_session_id=console_session_id,
+                participant_identity="human-agent-handoff-1",
+            )
+        assert _error_code(error.value) == "HANDOFF_CLAIM_EXPIRED"
+        assert handoff.status == "accepted"
+        assert handoff.connected_at is None
+
+
+@pytest.mark.anyio
+async def test_batch_next_claim_is_available_after_timeout_or_customer_hangup(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory, user_id=20, agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    for index in range(1, 4):
+        await _seed_handoff(session_factory, row_id=index, handoff_id=f"handoff-{index}")
+    first = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(first, AiCallHandoffModel)
+
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db, db.begin():
+        handoff = await db.get(AiCallHandoffModel, 1)
+        handoff.expires_at = now - timedelta(seconds=10)
+        handoff.claim_expires_at = now - timedelta(seconds=1)
+        expired = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+            "tenant-a", "handoff-1", now=now,
+        )
+        assert expired.status == "expired"
+
+    second = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-2",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(second, AiCallHandoffModel)
+    blocked = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-3",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(blocked, CustomException)
+    assert _error_code(blocked) == "AGENT_ALREADY_IN_CALL"
+
+    async with session_factory() as db, db.begin():
+        db.add(AiCallRecordModel(
+            id=1002, tenant_id="tenant-a", call_id="call-handoff-2",
+            entry_type="web", room_name="room-handoff-2",
+            participant_identity="customer-handoff-2", status="ending", started_at=now,
+        ))
+        canceled = await AiCallAgentConsoleService(db).reconcile_handoff_timeout(
+            "tenant-a", "handoff-2", now=now,
+        )
+        assert canceled.status == "canceled"
+        assert canceled.end_reason == "customer_disconnected"
+
+    third = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-3",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(third, AiCallHandoffModel)
+    assert third.status == "accepted"
+    async with session_factory() as db:
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.active_handoff_id == "handoff-3"
+
+
+@pytest.mark.anyio
+async def test_expired_queue_cannot_start_a_new_connection_window(session_factory) -> None:
+    console_session_id = str(uuid4())
+    await _seed_agent(
+        session_factory, user_id=20, agent_identity="agent-20",
+        console_session_id=console_session_id,
+    )
+    await _seed_handoff(
+        session_factory, row_id=1, handoff_id="handoff-1",
+        expires_delta=timedelta(seconds=-1),
+    )
+    result = await _claim(
+        session_factory, user_id=20, handoff_id="handoff-1",
+        console_session_id=console_session_id,
+    )
+    assert isinstance(result, CustomException)
+    assert _error_code(result) == "HANDOFF_EXPIRED"
+    async with session_factory() as db:
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        assert presence.status == "available"
+        assert presence.active_handoff_id is None
+
+
+@pytest.mark.anyio
+async def test_queue_timeout_does_not_create_follow_up_task(session_factory) -> None:
     await _seed_handoff(
         session_factory,
         row_id=1,

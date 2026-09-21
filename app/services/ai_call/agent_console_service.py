@@ -228,7 +228,10 @@ class AiCallAgentConsoleService:
                     data={"errorCode": "IDEMPOTENCY_KEY_REQUIRED"},
                 )
             try:
-                command = await RuntimeHandoffRepository(self.db).accept(
+                command = await RuntimeHandoffRepository(
+                    self.db,
+                    claim_ttl=timedelta(seconds=settings.AI_CALL_AGENT_CLAIM_CONNECT_TIMEOUT_SECONDS),
+                ).accept(
                     HandoffAcceptIntent(
                         tenant_id=profile.tenant_id,
                         handoff_id=handoff.handoff_id,
@@ -288,9 +291,6 @@ class AiCallAgentConsoleService:
         claim_expires_at = now + timedelta(
             seconds=settings.AI_CALL_AGENT_CLAIM_CONNECT_TIMEOUT_SECONDS
         )
-        if handoff.expires_at is not None:
-            claim_expires_at = min(claim_expires_at, self._ensure_utc(handoff.expires_at))
-
         handoff_claimed = await self.repository.claim_console_handoff_if_requested(
             tenant_id=profile.tenant_id,
             handoff_id=handoff.handoff_id,
@@ -365,8 +365,10 @@ class AiCallAgentConsoleService:
             self._raise_conflict("客户通话已经结束", "CUSTOMER_NOT_CONNECTED")
         if self.participant_verifier is None:
             raise CustomException(msg="LiveKit Participant 核验器未配置", status_code=503)
+        self._ensure_media_deadline(handoff)
         if not await self.participant_verifier(handoff.room_name, participant_identity):
             self._raise_conflict("坐席麦克风尚未就绪", "MEDIA_NOT_READY")
+        self._ensure_media_deadline(handoff)
         now = datetime.now(timezone.utc)
         handoff.status = "connected"
         handoff.connected_at = handoff.connected_at or now
@@ -378,6 +380,16 @@ class AiCallAgentConsoleService:
         presence.status_updated_at = now
         await self.db.flush()
         return handoff
+
+    def _ensure_media_deadline(self, handoff: AiCallHandoffModel) -> None:
+        now = datetime.now(timezone.utc)
+        if handoff.status == "reconnecting":
+            code, message = "AGENT_RECONNECT_TIMEOUT", "坐席重连期限已到"
+        else:
+            code, message = "HANDOFF_CLAIM_EXPIRED", "本次认领接入期限已到，请等待坐席状态同步"
+        deadline = handoff.pending_deadline_at
+        if deadline is not None and self._ensure_utc(deadline) <= now:
+            self._raise_conflict(message, code)
 
     async def begin_reconnect(
         self,
@@ -495,11 +507,23 @@ class AiCallAgentConsoleService:
             return None
         if handoff.status in {"completed", "expired", "canceled", "failed"}:
             return handoff
-        if (
-            handoff.status == "reconnecting"
-            and handoff.reconnect_expires_at is not None
-            and self._ensure_utc(handoff.reconnect_expires_at) <= current
-        ):
+        if handoff.status in {"requested", "accepted"}:
+            record = await self.repository.get_record(handoff.call_id)
+            if record is not None and (
+                record.status in {"ending", "completed", "failed"}
+                or record.terminal_requested_at is not None
+            ):
+                handoff.status = "canceled"
+                handoff.ended_at = current
+                handoff.end_reason = "customer_disconnected"
+                await self._set_claimed_presence(handoff, status_value="available", release=True)
+                await self.db.flush()
+                await self._publish_handoff_state(handoff)
+                return handoff
+        deadline = handoff.pending_deadline_at
+        if deadline is None or self._ensure_utc(deadline) > current:
+            return handoff
+        if handoff.status == "reconnecting":
             handoff.status = "failed"
             handoff.ended_at = current
             handoff.end_reason = "reconnect_timeout"
@@ -507,11 +531,11 @@ class AiCallAgentConsoleService:
             await self.db.flush()
             await self._publish_handoff_state(handoff)
             return handoff
-        if (
-            handoff.status in {"requested", "accepted"}
-            and handoff.expires_at is not None
+        queue_expired = (
+            handoff.expires_at is not None
             and self._ensure_utc(handoff.expires_at) <= current
-        ):
+        )
+        if queue_expired:
             handoff.status = "expired"
             handoff.ended_at = current
             handoff.end_reason = "handoff_unanswered"
@@ -525,20 +549,8 @@ class AiCallAgentConsoleService:
             await self.db.flush()
             await self._publish_handoff_state(handoff)
             return handoff
-        if (
-            handoff.status == "accepted"
-            and handoff.claim_expires_at is not None
-            and self._ensure_utc(handoff.claim_expires_at) <= current
-        ):
-            record = await self.repository.get_record(handoff.call_id)
+        if handoff.status == "accepted":
             await self._set_claimed_presence(handoff, status_value="available", release=True)
-            if record is not None and record.status in {"completed", "failed"}:
-                handoff.status = "canceled"
-                handoff.ended_at = current
-                handoff.end_reason = "customer_disconnected"
-                await self.db.flush()
-                await self._publish_handoff_state(handoff)
-                return handoff
             handoff.status = "requested"
             handoff.human_agent_identity = None
             handoff.accepted_console_session_id = None

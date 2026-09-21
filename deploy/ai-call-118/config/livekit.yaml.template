@@ -8,6 +8,15 @@ rtc:
   port_range_end: 50100
   use_external_ip: true
 
+turn:
+  enabled: true
+  domain: __LIVEKIT_TURN_DOMAIN__
+  tls_port: 443
+  udp_port: 0
+  external_tls: false
+  cert_file: /etc/livekit/turn/fullchain.pem
+  key_file: /etc/livekit/turn/privkey.pem
+
 redis:
   address: redis:6379
   password: "__REDIS_PASSWORD__"

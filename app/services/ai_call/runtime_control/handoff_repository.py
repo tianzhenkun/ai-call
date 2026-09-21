@@ -134,8 +134,6 @@ class RuntimeHandoffRepository:
         now = await self._database_clock(self._session)
         self._validate_new_claim(handoff, presence, request, now)
         claim_expires_at = now + self._claim_ttl
-        if handoff.expires_at is not None:
-            claim_expires_at = min(claim_expires_at, _ensure_utc(handoff.expires_at))
         command = self._new_command(
             record=record,
             command_type=HANDOFF_ACCEPTED,

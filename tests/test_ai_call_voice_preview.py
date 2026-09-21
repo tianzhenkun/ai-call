@@ -1576,6 +1576,7 @@ async def test_app_lifespan_starts_and_stops_preview_service(
         "_start_ai_call_offline_asr_worker",
         "_start_ai_call_recording_reconcile_worker",
         "_start_ai_call_handoff_trigger_worker",
+        "_start_ai_call_handoff_exception_manager",
         "_start_ai_call_outbound_task_worker",
         "_start_ai_call_linphone_test_worker",
         "_start_ai_call_voice_worker",

@@ -81,8 +81,10 @@ services:
     command: ["--config", "/etc/livekit.yaml"]
     volumes:
       - ./runtime/livekit.yaml:/etc/livekit.yaml:ro
+      - ./runtime/turn:/etc/livekit/turn:ro
     ports:
       - "10.77.0.2:7880:7880/tcp"
+      - "443:443/tcp"
       - "7881:7881/tcp"
       - "50000-50100:50000-50100/udp"
     logging: *default-logging

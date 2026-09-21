@@ -165,7 +165,8 @@ class LiveKitRoomManager:
                 track
                 for track in tracks
                 if isinstance(track, dict)
-                and track.get("type") in {0, "AUDIO"}
+                # ProtoJSON 会省略默认枚举值，TrackType 的 0 表示 AUDIO。
+                and track.get("type", 0) in {0, "AUDIO"}
                 and track.get("source") in {2, "MICROPHONE"}
                 and not bool(track.get("muted"))
             ),
