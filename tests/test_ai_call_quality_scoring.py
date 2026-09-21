@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import Text, UniqueConstraint
@@ -24,6 +25,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 )
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
+from app.core.exceptions import CustomException
 from app.services.ai_call.quality_scoring import (
     AiCallQualityScoringService,
     AiCallQualityScoringWorker,
@@ -105,8 +107,10 @@ async def test_quality_scoring_waits_for_recording_and_dialogue(session_maker) -
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("voicemail", [None, "before", "during"])
 async def test_quality_scoring_scores_after_recording_and_dialogue_ready(
     session_maker,
+    voicemail,
 ) -> None:
     async with session_maker() as db:
         repository = AiCallRecordRepository(db)
@@ -133,7 +137,38 @@ async def test_quality_scoring_scores_after_recording_and_dialogue_ready(
             ended_at=now,
             duration_ms=1000,
         )
-        service = AiCallQualityScoringService(repository, scorer=FakeQualityScorer())
+
+        async def mark_voicemail():
+            await repository.ensure_semantic_analysis_record(
+                call_id="call-quality-ready", scene_code="intro_geo"
+            )
+            await repository.update_semantic_analysis_success(
+                call_id="call-quality-ready",
+                analysis_result={"valid_dialogue": False, "tags": ["语音留言"]},
+                transcript_snapshot_json="{}",
+                transcript_hash="voicemail",
+            )
+
+        if voicemail == "before":
+            await repository.ensure_quality_score(tenant_id="000000", call_id="call-quality-ready")
+            await mark_voicemail()
+            assert await repository.list_recoverable_quality_score_call_ids(limit=10) == []
+            assert (
+                await repository.claim_quality_score(
+                    tenant_id="000000", call_id="call-quality-ready"
+                )
+                is None
+            )
+        scorer = FakeQualityScorer()
+        original_score = scorer.score
+
+        async def score_with_analysis(**kwargs):
+            if voicemail == "during":
+                await mark_voicemail()
+            return await original_score(**kwargs)
+
+        scorer.score = AsyncMock(side_effect=score_with_analysis)
+        service = AiCallQualityScoringService(repository, scorer=scorer)
 
         result = await service.score_call_once(
             tenant_id="000000",
@@ -141,9 +176,48 @@ async def test_quality_scoring_scores_after_recording_and_dialogue_ready(
             model_version="quality-v1",
         )
 
-        assert result.status == QUALITY_SCORE_STATUS_COMPLETED
-        assert result.score == 86
-    assert result.reason == "客户问题回应完整，转人工时机合理。"
+        if voicemail:
+            assert result.status == "not_applicable"
+            assert result.score is None
+            if voicemail == "before":
+                scorer.score.assert_not_awaited()
+            else:
+                scorer.score.assert_awaited_once()
+            assert await repository.list_recoverable_quality_score_call_ids(limit=10) == []
+            records, _ = await repository.list_records(tenant_id="000000")
+            assert records[0]._quality_context["qualityScoreStatus"] == "not_applicable"
+            assert records[0]._quality_context["qualityScore"] is None
+            api_service = AiCallService(object(), record_service=AiCallRecordService(repository))
+            assert await api_service.get_record_quality(
+                tenant_id="000000", call_id="call-quality-ready"
+            ) == {
+                "score": None,
+                "review": None,
+            }
+            with pytest.raises(CustomException, match="未接通通话不适用质检"):
+                await api_service.save_record_quality_review(
+                    tenant_id="000000",
+                    call_id="call-quality-ready",
+                    quality_result="pass",
+                    quality_reason=None,
+                    reviewed_by="1",
+                    reviewed_by_name="管理员",
+                )
+            await repository.update_semantic_analysis_success(
+                call_id="call-quality-ready",
+                analysis_result={"valid_dialogue": True, "summary": "客户咨询服务收费"},
+                transcript_snapshot_json="{}", transcript_hash="corrected-human",
+            )
+            assert await repository.list_recoverable_quality_score_call_ids(limit=10) == ["call-quality-ready"]
+            recovered = await AiCallQualityScoringService(
+                repository, scorer=FakeQualityScorer()
+            ).score_call_once(tenant_id="000000", call_id="call-quality-ready", model_version="quality-v1")
+            assert recovered.status == QUALITY_SCORE_STATUS_COMPLETED
+            assert recovered.score == 86
+        else:
+            assert result.status == QUALITY_SCORE_STATUS_COMPLETED
+            assert result.score == 86
+            assert result.reason == "客户问题回应完整，转人工时机合理。"
 
 
 @pytest.mark.anyio

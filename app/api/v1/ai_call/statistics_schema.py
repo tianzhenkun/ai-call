@@ -11,8 +11,6 @@ class StatisticsGranularity(StrEnum):
 
 class CallResultGroup(StrEnum):
     CONNECTED = "connected"
-    VOICEMAIL = "voicemail"
-    TRANSPORT_CONNECTED = "transport_connected"
     NO_ANSWER = "no_answer"
     REJECTED = "rejected"
     EARLY_HANGUP = "early_hangup"

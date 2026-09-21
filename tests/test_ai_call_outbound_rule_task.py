@@ -1884,6 +1884,14 @@ async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
         assert attempt is not None
         attempt.status = "COMPLETED"
         attempt.call_result = "connected"
+        target = await session.get(AiCallOutboundTargetModel, attempt.target_id)
+        assert target is not None
+        target.latest_result = "connected"
+        target.status = "COMPLETED"
+        task = await session.get(AiCallOutboundTaskModel, task_id)
+        task.completed_targets = 1
+        task.connected_targets = 1
+        task.failed_targets = 0
         session.add(
             AiCallSemanticAnalysisModel(
                 id=generate_snowflake_id(),
@@ -1915,6 +1923,28 @@ async def test_task_and_target_outputs_expose_attempt_summary(database) -> None:
             target_status=None,
         )
     assert targets[0].answer_type == "voicemail"
+    assert targets[0].latest_result == "no_answer"
+    async with database() as session:
+        task_out = await service.get_task(session, "tenant-a", task_id)
+        assert task_out.connected_targets == 0
+        assert task_out.failed_targets == 1
+        # 历史任务的展示按业务结果计算，读取接口不触发重拨或改写原计数。
+        stored = await session.get(AiCallOutboundTaskModel, task_id)
+        assert stored.connected_targets == 1
+        analysis = await session.scalar(select(AiCallSemanticAnalysisModel).where(
+            AiCallSemanticAnalysisModel.call_id == "attempt-provenance-call"
+        ))
+        analysis.analysis_result = json.dumps({"valid_dialogue": True})
+        target = await session.get(AiCallOutboundTargetModel, target.id)
+        target.exception_category = "no_answer"
+        target.exception_source_result = "no_answer"
+        target.exception_original_attempt_count = 1
+        target.attempt_count = 2
+        # 原通话分析更正后，原任务统计读取该次线路事实，不误用后续补呼或旧分类。
+        task_out = await service.get_task(session, "tenant-a", task_id)
+        assert task_out.connected_targets == 1
+        assert task_out.failed_targets == 0
+        assert target.exception_source_result == "no_answer"
 
 
 @pytest.mark.anyio

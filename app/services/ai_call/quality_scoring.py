@@ -148,6 +148,8 @@ class AiCallQualityScoringService:
             call_id=call_id,
             model_version=model_version,
         )
+        if await self.repository.skip_voicemail_quality_score(score):
+            return score
         if not await self._has_ready_evidence(tenant_id=tenant_id, call_id=call_id):
             return score
         claimed = await self.repository.claim_quality_score(

@@ -1690,6 +1690,8 @@ class AiCallService:
         if record is None:
             raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
         repository = self.record_service.repository
+        if await repository.is_voicemail_call(call_id):
+            return {"score": None, "review": None}
         score = await repository.get_quality_score(
             tenant_id=tenant_id,
             call_id=call_id,
@@ -1699,7 +1701,7 @@ class AiCallService:
             call_id=call_id,
         )
         return {
-            "score": self._quality_score_to_dict(score) if score else None,
+            "score": self._quality_score_to_dict(score) if score and score.status != "not_applicable" else None,
             "review": self._quality_review_to_dict(review) if review else None,
         }
 
@@ -1740,6 +1742,8 @@ class AiCallService:
         )
         if record is None:
             raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+        if await self.record_service.repository.is_voicemail_call(call_id):
+            raise CustomException(msg="未接通通话不适用质检", status_code=409)
         try:
             review = await self.record_service.repository.upsert_quality_review(
                 tenant_id=tenant_id,

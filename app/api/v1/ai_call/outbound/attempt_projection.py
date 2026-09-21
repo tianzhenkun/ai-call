@@ -3,17 +3,23 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.ai_call.model import AiCallRecordModel
+from app.api.v1.ai_call.call_outcome_query import business_call_result_expression
+from app.api.v1.ai_call.model import (
+    AiCallEventModel,
+    AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
+)
 from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 
 from .rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundExceptionBatchModel,
+    AiCallOutboundExceptionPolicyModel,
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
@@ -133,7 +139,8 @@ def terminal_attempt_decision(
     )
 
 
-def apply_terminal_projection(
+async def apply_terminal_projection(
+    db: AsyncSession,
     *,
     task: AiCallOutboundTaskModel,
     target: AiCallOutboundTargetModel,
@@ -141,6 +148,7 @@ def apply_terminal_projection(
     record: AiCallRecordModel,
     decision: AttemptTerminalDecision,
     now: datetime,
+    retry_allowed: bool = True,
 ) -> None:
     attempt.status = decision.attempt_status
     attempt.call_result = decision.call_result
@@ -152,25 +160,28 @@ def apply_terminal_projection(
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
 
-    target.latest_result = decision.call_result
+    target_result = await target_business_result(db, attempt)
+    if decision.call_result == "connected" and target_result == "no_answer":
+        retry_allowed = retry_allowed and await voicemail_retry_allowed(db, attempt.call_id)
+    target.latest_result = target_result
     target.updated_at = now
     task.next_dispatch_at = None
-    if decision.call_result == "connected":
+    if target_result == "connected":
         target.status = "COMPLETED"
         target.next_attempt_at = None
         return
 
     retry_interval = (
         None
-        if task.status in {"STOPPING", "STOPPED", "CANCELLED"}
-        else outbound_retry_interval(task, attempt.attempt_no, decision.call_result)
+        if not retry_allowed or task.status in {"STOPPING", "STOPPED", "CANCELLED", "FAILED"}
+        else outbound_retry_interval(task, attempt.attempt_no, target_result)
     )
     if retry_interval is None:
         target.status = "COMPLETED"
         target.next_attempt_at = None
     else:
         target.status = "RETRY_WAIT"
-        target.next_attempt_at = now + timedelta(minutes=retry_interval)
+        target.next_attempt_at = attempt.ended_at + timedelta(minutes=retry_interval)
 
 
 async def enroll_terminal_exception(
@@ -199,7 +210,8 @@ async def enroll_terminal_exception(
     )
     if active_attempt_count:
         return None
-    category = exception_category_for(attempt.call_result)
+    call_result = target.latest_result or attempt.call_result
+    category = exception_category_for(call_result)
     if category is None and await _is_customer_early_hangup(
         db,
         tenant_id=target.tenant_id,
@@ -211,7 +223,7 @@ async def enroll_terminal_exception(
         return None
     target.exception_category = category
     target.exception_source_result = (
-        "early_hangup" if category == "early_hangup" else attempt.call_result
+        "early_hangup" if category == "early_hangup" else call_result
     )
     target.exception_original_attempt_count = target.attempt_count
     target.exception_batch_id = None
@@ -243,7 +255,10 @@ async def apply_exception_terminal_projection(
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
 
-    category = exception_category_for(decision.call_result)
+    call_result = await target_business_result(db, attempt)
+    if decision.call_result == "connected" and call_result == "no_answer":
+        retry_allowed = retry_allowed and await voicemail_retry_allowed(db, attempt.call_id)
+    category = exception_category_for(call_result)
     if category is None and await _is_customer_early_hangup(
         db,
         tenant_id=target.tenant_id,
@@ -251,9 +266,7 @@ async def apply_exception_terminal_projection(
         record=record,
     ):
         category = "early_hangup"
-    target.latest_result = (
-        "early_hangup" if category == "early_hangup" else decision.call_result
-    )
+    target.latest_result = "early_hangup" if category == "early_hangup" else call_result
     target.updated_at = now
     target.next_attempt_at = None
 
@@ -267,23 +280,193 @@ async def apply_exception_terminal_projection(
     )
     original_count = target.exception_original_attempt_count or target.attempt_count
     retry_count = max(0, target.attempt_count - original_count)
-    if task.status in {"STOPPING", "STOPPED", "CANCELLED"}:
+    if task.status in {"STOPPING", "STOPPED", "CANCELLED", "FAILED"}:
         target.status = "CANCELLED"
-    elif (
-        not retry_allowed
-        or category is None
-        or category == "invalid_number"
-        or batch is None
-    ):
+    elif not retry_allowed or category is None or category == "invalid_number" or batch is None:
         target.status = "COMPLETED"
     elif retry_count >= batch.max_retry_count:
         target.status = "COMPLETED"
     else:
         target.status = "RETRY_WAIT"
-        target.next_attempt_at = now + timedelta(days=batch.interval_days)
+        target.next_attempt_at = attempt.ended_at + timedelta(days=batch.interval_days)
+        if batch.status == "COMPLETED":
+            # 迟到的分析可能恢复本批剩余重试；与新批次启动共用类别锁。
+            await db.scalar(
+                select(AiCallOutboundExceptionPolicyModel)
+                .where(
+                    AiCallOutboundExceptionPolicyModel.tenant_id == batch.tenant_id,
+                    AiCallOutboundExceptionPolicyModel.category == batch.category,
+                )
+                .with_for_update()
+            )
+            active_batch = await db.scalar(
+                select(AiCallOutboundExceptionBatchModel.id).where(
+                    AiCallOutboundExceptionBatchModel.tenant_id == batch.tenant_id,
+                    AiCallOutboundExceptionBatchModel.active_slot == batch.category,
+                    AiCallOutboundExceptionBatchModel.id != batch.id,
+                )
+            )
+            if active_batch is None:
+                batch.status = "RUNNING"
+                batch.active_slot = batch.category
+                batch.ended_at = None
+                batch.updated_at = now
+            else:
+                # 已有新批次时重新入池，不能抢占其名额或追加未授权的号码。
+                target.status = "COMPLETED"
+                target.next_attempt_at = None
+                target.exception_batch_id = None
+                target.exception_entered_at = now
     await db.flush()
     if batch is not None:
         await complete_exception_batch_if_done(db, batch, now)
+
+
+async def target_business_result(
+    db: AsyncSession,
+    attempt: AiCallOutboundAttemptModel,
+) -> str:
+    if attempt.call_result != "connected":
+        return attempt.call_result
+    return await db.scalar(
+        select(
+            business_call_result_expression(
+                literal(attempt.call_result),
+                literal(attempt.call_id),
+            )
+        )
+    )
+
+
+async def voicemail_retry_allowed(db: AsyncSession, call_id: str) -> bool:
+    """仅首次自动分析可产生补拨；人工分析及其失败恢复只能纠正结果。"""
+    reanalyzed = (
+        select(AiCallSemanticAnalysisModel.id)
+        .where(
+            AiCallSemanticAnalysisModel.call_id == call_id,
+            AiCallSemanticAnalysisModel.analysis_scene_code == "ai_call_semantic_analysis",
+            AiCallSemanticAnalysisModel.analysis_version > 1,
+        )
+        .exists()
+    )
+    manual = (
+        select(AiCallEventModel.id)
+        .where(
+            AiCallEventModel.call_id == call_id,
+            AiCallEventModel.event_type == "semantic_reanalysis_requested",
+        )
+        .exists()
+    )
+    return not bool(await db.scalar(select(or_(reanalyzed, manual))))
+
+
+async def reconcile_analyzed_call(
+    db: AsyncSession,
+    call_id: str,
+    *,
+    now: datetime | None = None,
+    retry_allowed: bool = True,
+) -> None:
+    """将话后分析应用于当前通话，原始线路结果和计量事实保持不变。"""
+    context = await db.scalar(
+        select(AiCallOutboundAttemptModel).where(
+            AiCallOutboundAttemptModel.call_id == call_id,
+        )
+    )
+    if context is None:
+        return
+    task = await db.scalar(
+        select(AiCallOutboundTaskModel)
+        .where(
+            AiCallOutboundTaskModel.tenant_id == context.tenant_id,
+            AiCallOutboundTaskModel.id == context.task_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    target = await db.scalar(
+        select(AiCallOutboundTargetModel)
+        .where(
+            AiCallOutboundTargetModel.tenant_id == context.tenant_id,
+            AiCallOutboundTargetModel.task_id == context.task_id,
+            AiCallOutboundTargetModel.id == context.target_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    attempt = await db.scalar(
+        select(AiCallOutboundAttemptModel)
+        .where(
+            AiCallOutboundAttemptModel.id == context.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result = await target_business_result(db, attempt) if attempt is not None else None
+    if (
+        task is None
+        or target is None
+        or attempt is None
+        or attempt.status != "COMPLETED"
+        or attempt.call_result != "connected"
+        or target.attempt_count != attempt.attempt_no
+        or target.status not in {"COMPLETED", "RETRY_WAIT"}
+        or (target.latest_result, result)
+        not in {
+            ("connected", "no_answer"),
+            ("early_hangup", "no_answer"),
+            ("no_answer", "connected"),
+        }
+    ):
+        return
+    now = now or datetime.now(timezone.utc)
+    record = await db.scalar(select(AiCallRecordModel).where(AiCallRecordModel.call_id == call_id))
+    if record is None:
+        return
+    decision = AttemptTerminalDecision(
+        attempt_status=attempt.status,
+        call_result=attempt.call_result,
+        error_message=attempt.error_message,
+        provider_status_code=attempt.provider_status_code,
+        provider_reason=attempt.provider_reason,
+        hangup_cause=attempt.hangup_cause,
+    )
+    if target.exception_batch_id is not None:
+        if target.exception_original_attempt_count == attempt.attempt_no:
+            target.exception_source_result = result
+        await apply_exception_terminal_projection(
+            db,
+            task=task,
+            target=target,
+            attempt=attempt,
+            record=record,
+            decision=decision,
+            now=now,
+            retry_allowed=retry_allowed,
+        )
+    else:
+        # 短时信箱可能先被归为早挂；以已完成的分析纠正业务分类。
+        target.exception_category = None
+        target.exception_source_result = None
+        target.exception_original_attempt_count = None
+        target.exception_entered_at = None
+        await apply_terminal_projection(
+            db,
+            task=task,
+            target=target,
+            attempt=attempt,
+            record=record,
+            decision=decision,
+            now=now,
+            retry_allowed=retry_allowed,
+        )
+        if target.status == "RETRY_WAIT" and task.status == "COMPLETED":
+            task.status = "RUNNING"
+            task.ended_at = None
+        await db.flush()
+        await enroll_terminal_exception(db, target=target, attempt=attempt, record=record, now=now)
+    await db.flush()
+    await refresh_task_counters(db, task, now)
 
 
 async def complete_exception_batch_if_done(

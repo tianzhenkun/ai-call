@@ -41,6 +41,7 @@ from app.services.ai_call.sip_vad_shadow import (
     SipVadShadowDetectorProtocol,
     UnavailableSipVadShadowDetector,
 )
+from app.services.ai_call.transcript_trust import CustomerSpeechClassifier
 from app.utils.id_util import generate_snowflake_id
 
 END_CLEANUP_TIMEOUT_SECONDS = 1.0
@@ -135,6 +136,9 @@ class AiCallRuntimeConfig:
     sip_vad_shadow_fsmn_timeout_seconds: float = 0.2
     sip_vad_shadow_queue_size: int = 50
     browser_livekit_url: str = ""
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    llm_api_key: str = field(default="", repr=False)
+    llm_model: str = "qwen-plus"
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -156,6 +160,9 @@ class AiCallRuntimeConfig:
             vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
             vad_threshold=settings.QWEN_REALTIME_VAD_THRESHOLD,
             vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
+            llm_base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
+            llm_api_key=settings.EFFECTIVE_LLM_API_KEY,
+            llm_model=settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus",
             user_turn_stability_delay_seconds=(settings.AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS),
             handoff_prompt_constraint_enabled=(settings.AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED),
             barge_in_enabled=settings.AI_CALL_BARGE_IN_ENABLED,
@@ -403,6 +410,11 @@ class AiCallOrchestrator:
             sip_vad_shadow_enabled=self.config.sip_vad_shadow_enabled,
             sip_vad_shadow_detector=self._build_sip_vad_shadow_detector(),
             call_end_scheduler=self._schedule_auto_end_session,
+            customer_speech_classifier=CustomerSpeechClassifier(
+                base_url=self.config.llm_base_url,
+                api_key=self.config.llm_api_key or self.config.dashscope_api_key,
+                model=self.config.llm_model,
+            ),
             knowledge_search_service=KnowledgeRealtimeSearchService(
                 async_db_session,
                 model_name=self.config.qwen_realtime_model,

@@ -238,7 +238,8 @@ class OutboundAttemptReconciler:
                         now=now,
                     )
                 else:
-                    apply_terminal_projection(
+                    await apply_terminal_projection(
+                        self._session,
                         task=task,
                         target=target,
                         attempt=attempt,

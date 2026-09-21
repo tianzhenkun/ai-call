@@ -47,6 +47,7 @@ from app.config.setting import Settings
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
 from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
+from app.services.ai_call.semantic_analysis import AiCallSemanticAnalysisService
 from app.utils.id_util import generate_snowflake_id
 
 
@@ -787,7 +788,8 @@ async def test_executor_persists_provider_diagnostics(database) -> None:
     assert attempt.hangup_cause == "NORMAL_UNSPECIFIED"
 
 
-def test_terminal_projection_persists_sip_480_diagnostics() -> None:
+@pytest.mark.anyio
+async def test_terminal_projection_persists_sip_480_diagnostics(database) -> None:
     now = datetime(2026, 8, 27, 2, 30, tzinfo=timezone.utc)
     record = SimpleNamespace(
         status="completed",
@@ -827,14 +829,16 @@ def test_terminal_projection_persists_sip_480_diagnostics() -> None:
         ended_at=None,
         updated_at=None,
     )
-    apply_terminal_projection(
-        task=task,
-        target=target,
-        attempt=attempt,
-        record=record,
-        decision=decision,
-        now=now,
-    )
+    async with database() as db:
+        await apply_terminal_projection(
+            db,
+            task=task,
+            target=target,
+            attempt=attempt,
+            record=record,
+            decision=decision,
+            now=now,
+        )
 
     assert attempt.call_result == "no_answer"
     assert attempt.provider_status_code == "480"
@@ -2073,6 +2077,352 @@ async def test_executor_waits_for_retry_time_then_uses_next_attempt(database) ->
     assert [item.attempt_no for item in attempts] == [1, 2]
     assert [item.call_result for item in attempts] == ["no_answer", "connected"]
     assert record_count == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("retry_count,stopped,analysis_first", [
+    (0, False, False), (1, False, False), (1, True, False), (1, False, True),
+])
+async def test_voicemail_analysis_updates_retry_and_task_counters(
+    database, retry_count, stopped, analysis_first
+):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(
+        database,
+        now=now,
+        snapshot=_snapshot(
+            retry_count=retry_count,
+            retry_intervals_minutes=[30],
+            retryable_results=["no_answer"],
+        ),
+    )
+
+    class AnalyzedDialer(SequenceDialer):
+        async def dial(self, request, *, call_id, on_connected):
+            result = await super().dial(request, call_id=call_id, on_connected=on_connected)
+            if analysis_first:
+                async with database() as db:
+                    await _analyze_voicemail(db, call_id, now)
+                    await db.commit()
+            return result
+
+    dialer = AnalyzedDialer([DialResult(call_result="connected", duration_ms=10_000)])
+    assert await OutboundTaskExecutor(database, dialer, now_provider=lambda: now).run_once() == 1
+    call_id = dialer.call_ids[0]
+
+    async with database() as db:
+        if stopped:
+            task = await db.get(AiCallOutboundTaskModel, task_id)
+            task.status = "STOPPED"
+        await _analyze_voicemail(db, call_id, now + timedelta(minutes=1))
+        await _analyze_voicemail(db, call_id, now + timedelta(minutes=2), force=True)
+        await db.commit()
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        attempt = await db.scalar(
+            select(AiCallOutboundAttemptModel).where(
+                AiCallOutboundAttemptModel.call_id == call_id,
+            )
+        )
+        assert target.latest_result == "no_answer"
+        assert attempt.call_result == "connected"
+        assert target.attempt_count == 1
+        assert task.connected_targets == 0
+        if retry_count and not stopped:
+            assert target.status == "RETRY_WAIT"
+            assert target.next_attempt_at == _sqlite_time(now + timedelta(minutes=30))
+            assert task.status == "RUNNING"
+            assert target.exception_category is None
+        else:
+            assert target.status == "COMPLETED"
+            assert target.next_attempt_at is None
+            assert target.exception_category == "no_answer"
+            assert task.failed_targets == 1
+            assert task.status == ("STOPPED" if stopped else "COMPLETED")
+    assert len(dialer.call_ids) == 1
+    if retry_count and not stopped:
+        next_dialer = SequenceDialer([DialResult(call_result="connected", duration_ms=20_000)])
+        assert (
+            await OutboundTaskExecutor(
+                database,
+                next_dialer,
+                now_provider=lambda: now + timedelta(minutes=30),
+            ).run_once()
+            == 1
+        )
+        async with database() as db:
+            await _analyze_voicemail(db, call_id, now + timedelta(minutes=31), force=True)
+            target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+            assert target.latest_result == "connected"
+            assert target.attempt_count == 2
+            assert target.next_attempt_at is None
+
+
+async def _analyze_voicemail(db, call_id, now, *, force=False, voicemail=True):
+    class VoicemailAnalyzer:
+        async def analyze(self, **kwargs):
+            return (
+                {"valid_dialogue": False, "summary": "进入语音信箱", "tags": ["语音留言"]}
+                if voicemail
+                else {"valid_dialogue": True, "summary": "客户咨询服务和费用", "tags": []}
+            )
+
+    repository = AiCallRecordRepository(db)
+    await repository.upsert_dialogue_segment(
+        call_id=call_id,
+        segment_no=1,
+        speaker_type="customer",
+        speaker_identity="sip-customer",
+        source="offline_asr",
+        source_segment_id="voicemail-1",
+        segment_text="您好，请在提示音后录制留言，录音完成后挂断。"
+        if voicemail
+        else "我想了解你们的服务内容和具体费用。",
+        segment_status="final",
+        started_at=now,
+        ended_at=now + timedelta(seconds=10),
+        duration_ms=10_000,
+    )
+    return await AiCallSemanticAnalysisService(
+        repository, analyzer=VoicemailAnalyzer()
+    ).analyze_call_once(
+        call_id=call_id,
+        now=now,
+        force=force,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("manual", [False, True])
+async def test_reanalysis_cannot_leave_an_obsolete_or_new_retry(database, manual):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(
+        database,
+        now=now,
+        snapshot=_snapshot(
+            retry_count=1,
+            retry_intervals_minutes=[30],
+            retryable_results=["no_answer"],
+        ),
+    )
+    dialer = SequenceDialer([DialResult(call_result="connected", duration_ms=10_000)])
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+    assert await executor.run_once() == 1
+    async with database() as db:
+        await _analyze_voicemail(db, dialer.call_ids[0], now, force=manual)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        if manual:
+            assert target.latest_result == "no_answer"
+            assert target.status == "COMPLETED"
+            assert target.next_attempt_at is None
+        else:
+            assert target.status == "RETRY_WAIT"
+            await _analyze_voicemail(
+                db, dialer.call_ids[0], now + timedelta(minutes=1), force=True, voicemail=False
+            )
+            task = await db.get(AiCallOutboundTaskModel, task_id)
+            assert target.latest_result == "connected"
+            assert target.status == "COMPLETED"
+            assert target.next_attempt_at is None
+            assert task.connected_targets == 1
+            assert task.failed_targets == 0
+        await db.commit()
+    assert await executor.run_once() == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("already_analyzed", [False, True])
+async def test_failed_manual_reanalysis_recovery_does_not_redial(database, already_analyzed):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(
+        database,
+        now=now,
+        snapshot=_snapshot(
+            retry_count=1, retry_intervals_minutes=[30], retryable_results=["no_answer"]
+        ),
+    )
+    dialer = SequenceDialer([DialResult(call_result="connected", duration_ms=10_000)])
+    assert await OutboundTaskExecutor(database, dialer, now_provider=lambda: now).run_once() == 1
+    async with database() as db:
+        call_id = dialer.call_ids[0]
+        if already_analyzed:
+            await _analyze_voicemail(db, call_id, now, voicemail=False)
+        else:
+            await AiCallRecordRepository(db).upsert_dialogue_segment(
+                call_id=call_id,
+                segment_no=1,
+                speaker_type="customer",
+                speaker_identity="sip-customer",
+                source="offline_asr",
+                source_segment_id="human-1",
+                segment_text="我想了解你们的服务内容和具体费用。",
+                segment_status="final",
+                started_at=now,
+                ended_at=now + timedelta(seconds=10),
+                duration_ms=10_000,
+            )
+
+        class FailedAnalyzer:
+            async def analyze(self, **kwargs):
+                raise RuntimeError("临时模型错误")
+
+        failed = await AiCallSemanticAnalysisService(
+            AiCallRecordRepository(db), analyzer=FailedAnalyzer()
+        ).reanalyze_call_once(call_id=call_id, now=now + timedelta(minutes=1))
+        assert failed.analysis_status == "3"
+        assert failed.analysis_version == int(already_analyzed)
+        recovered = await _analyze_voicemail(db, call_id, now + timedelta(minutes=12))
+        assert recovered.analysis_status == "2"
+        assert recovered.analysis_version == 1 + int(already_analyzed)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target.latest_result == "no_answer"
+        assert target.status == "COMPLETED"
+        assert target.next_attempt_at is None
+        await db.commit()
+    next_dialer = SequenceDialer([])
+    assert (
+        await OutboundTaskExecutor(
+            database, next_dialer, now_provider=lambda: now + timedelta(hours=1)
+        ).run_once()
+        == 0
+    )
+    assert next_dialer.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("already_analyzed", [False, True])
+async def test_manual_analysis_before_terminal_does_not_redial(database, already_analyzed):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    _, target_ids = await _seed_task(
+        database,
+        now=now,
+        snapshot=_snapshot(
+            retry_count=1, retry_intervals_minutes=[30], retryable_results=["no_answer"]
+        ),
+    )
+
+    class AnalyzedDialer(SequenceDialer):
+        async def dial(self, request, *, call_id, on_connected):
+            result = await super().dial(request, call_id=call_id, on_connected=on_connected)
+            async with database() as db:
+                if already_analyzed:
+                    await _analyze_voicemail(db, call_id, now, voicemail=False)
+                await _analyze_voicemail(db, call_id, now, force=True)
+                await db.commit()
+            return result
+
+    dialer = AnalyzedDialer([DialResult(call_result="connected", duration_ms=10_000)])
+    assert await OutboundTaskExecutor(database, dialer, now_provider=lambda: now).run_once() == 1
+    async with database() as db:
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target.latest_result == "no_answer"
+        assert target.status == "COMPLETED"
+        assert target.next_attempt_at is None
+    assert (
+        await OutboundTaskExecutor(
+            database, dialer, now_provider=lambda: now + timedelta(hours=1)
+        ).run_once()
+        == 0
+    )
+    assert len(dialer.call_ids) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("new_batch", [False, True])
+@pytest.mark.parametrize("original_result", ["busy", "early_hangup"])
+async def test_voicemail_in_exception_batch_respects_retry_limit_and_new_batch(
+    database, new_batch, original_result
+):
+    now = datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    assert (
+        await OutboundTaskExecutor(
+            database,
+            SequenceDialer([
+                DialResult(call_result="connected" if original_result == "early_hangup" else "busy")
+            ]),
+            now_provider=lambda: now,
+        ).run_once()
+        == 1
+    )
+    service = OutboundExceptionService()
+    category = "early_hangup" if original_result == "early_hangup" else "no_answer"
+    async with database() as db:
+        await service.update_policy(
+            db, "tenant-a", 1, category, ExceptionPolicyIn(interval_days=1, max_retry_count=2)
+        )
+        if original_result == "early_hangup":
+            target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+            target.latest_result = target.exception_source_result = "early_hangup"
+            target.exception_category = "early_hangup"
+            target.exception_original_attempt_count = 1
+            target.exception_entered_at = now
+        batch_out = await service.start_batch(db, "tenant-a", 1, None, category, "voicemail-batch")
+        await db.commit()
+    clock = [now + timedelta(days=1)]
+    dialer = SequenceDialer([DialResult(call_result="connected", duration_ms=10_000)] * 2)
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: clock[0])
+    assert await executor.run_once() == 1
+    async with database() as db:
+        batch = await db.get(AiCallOutboundExceptionBatchModel, int(batch_out.batch_id))
+        assert batch.status == "COMPLETED"
+        if new_batch:
+            db.add(
+                AiCallOutboundExceptionBatchModel(
+                    id=generate_snowflake_id(),
+                    tenant_id="tenant-a",
+                    category=category,
+                    status="RUNNING",
+                    interval_days=1,
+                    max_retry_count=2,
+                    cutoff_at=clock[0],
+                    target_count=1,
+                    idempotency_key="another-voicemail-batch",
+                    request_fingerprint="new-batch",
+                    active_slot=category,
+                    created_by=1,
+                    started_at=clock[0],
+                    created_at=clock[0],
+                    updated_at=clock[0],
+                )
+            )
+        await _analyze_voicemail(db, dialer.call_ids[0], clock[0] + timedelta(minutes=1))
+        await _analyze_voicemail(
+            db, dialer.call_ids[0], clock[0] + timedelta(minutes=2), force=True
+        )
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        assert target.latest_result == "no_answer"
+        assert target.attempt_count == 2
+        assert target.exception_source_result == original_result
+        assert target.exception_original_attempt_count == 1
+        task_out = await OutboundRuleTaskService(database).get_task(db, "tenant-a", task_id)
+        assert task_out.connected_targets == int(original_result == "early_hangup")
+        assert task_out.failed_targets == int(original_result != "early_hangup")
+        if new_batch:
+            assert target.exception_batch_id is None
+            assert target.status == "COMPLETED"
+            assert target.next_attempt_at is None
+            assert batch.status == "COMPLETED"
+        else:
+            assert batch.status == "RUNNING"
+            assert target.status == "RETRY_WAIT"
+            assert target.next_attempt_at == _sqlite_time(now + timedelta(days=2))
+        await db.commit()
+    if not new_batch:
+        clock[0] += timedelta(days=1)
+        assert await executor.run_once() == 1
+        async with database() as db:
+            await _analyze_voicemail(db, dialer.call_ids[1], clock[0] + timedelta(minutes=1))
+            target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+            batch = await db.get(AiCallOutboundExceptionBatchModel, int(batch_out.batch_id))
+            assert target.latest_result == "no_answer"
+            assert target.status == "COMPLETED"
+            assert target.next_attempt_at is None
+            assert target.attempt_count == 3
+            assert batch.status == "COMPLETED"
+            await db.commit()
+        assert await executor.run_once() == 0
 
 
 @pytest.mark.anyio

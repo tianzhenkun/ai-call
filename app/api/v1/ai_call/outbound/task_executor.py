@@ -29,8 +29,8 @@ from .attempt_projection import (
     REJECTED_END_REASONS,
     AttemptTerminalDecision,
     apply_exception_terminal_projection,
+    apply_terminal_projection,
     enroll_terminal_exception,
-    outbound_retry_interval,
     refresh_task_counters,
 )
 from .call_window import task_allows_call_at
@@ -1206,31 +1206,23 @@ class OutboundTaskExecutor:
                     retry_allowed=result.retry_allowed,
                 )
             else:
-                target.latest_result = result.call_result
-                target.updated_at = now
-                task.next_dispatch_at = None
-                if connected:
-                    target.status = "COMPLETED"
-                    target.next_attempt_at = None
-                else:
-                    retry_interval = (
-                        None
-                        if (
-                            not result.retry_allowed
-                            or task.status in {"STOPPING", "STOPPED", "CANCELLED"}
-                        )
-                        else self._retry_interval(
-                            task,
-                            request.attempt_no,
-                            result.call_result,
-                        )
-                    )
-                    if retry_interval is None:
-                        target.status = "COMPLETED"
-                        target.next_attempt_at = None
-                    else:
-                        target.status = "RETRY_WAIT"
-                        target.next_attempt_at = now + timedelta(minutes=retry_interval)
+                await apply_terminal_projection(
+                    db,
+                    task=task,
+                    target=target,
+                    attempt=attempt,
+                    record=record,
+                    decision=AttemptTerminalDecision(
+                        attempt_status=attempt.status,
+                        call_result=result.call_result,
+                        error_message=result.error_message,
+                        provider_status_code=result.provider_status_code,
+                        provider_reason=result.provider_reason,
+                        hangup_cause=result.hangup_cause,
+                    ),
+                    now=now,
+                    retry_allowed=result.retry_allowed,
+                )
                 await db.flush()
                 await enroll_terminal_exception(
                     db,
@@ -1312,14 +1304,6 @@ class OutboundTaskExecutor:
         now: datetime,
     ) -> None:
         await refresh_task_counters(db, task, now)
-
-    @staticmethod
-    def _retry_interval(
-        task: AiCallOutboundTaskModel,
-        attempt_no: int,
-        call_result: str,
-    ) -> int | None:
-        return outbound_retry_interval(task, attempt_no, call_result)
 
     def _within_call_window(
         self,

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
+from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
@@ -36,6 +37,7 @@ from app.api.v1.ai_call.statistics_service import (
 )
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_ai_call_statistics_viewer
+from app.services.ai_call.record_service import AiCallRecordService
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -532,7 +534,8 @@ async def test_repository_counts_only_current_tenant_formal_outbound_calls() -> 
 
 
 @pytest.mark.anyio
-async def test_repository_splits_human_voicemail_and_transport_connections() -> None:
+@pytest.mark.parametrize("low_value_analysis", [None, {"valid_dialogue": False, "classification": "low_value"}])
+async def test_voicemail_is_unanswered_in_statistics_records_and_filters(low_value_analysis) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
@@ -575,6 +578,8 @@ async def test_repository_splits_human_voicemail_and_transport_connections() -> 
                 now=begin,
             ),
         ])
+        if low_value_analysis is not None:
+            session.add(_analysis(row_id=3, result=low_value_analysis, now=begin))
         await session.commit()
 
         repository = OutboundStatisticsRepository(session)
@@ -589,12 +594,28 @@ async def test_repository_splits_human_voicemail_and_transport_connections() -> 
             started_at=begin,
             ended_at=begin + timedelta(days=1),
         )
+        trend = await repository.aggregate_trend(
+            tenant_id="tenant-a", buckets=[(begin, begin + timedelta(days=1))],
+        )
+        records = AiCallRecordRepository(session)
+        connected_rows, connected_total = await records.list_records(
+            tenant_id="tenant-a", call_result="connected",
+        )
+        unanswered_rows, unanswered_total = await records.list_records(
+            tenant_id="tenant-a", call_result="no_answer",
+        )
+        assert connected_total == 2
+        assert {row.call_id for row in connected_rows} == {"call-1", "call-3"}
+        assert unanswered_total == 1
+        assert unanswered_rows[0].call_id == "call-2"
+        assert AiCallRecordService(records).record_to_dict(unanswered_rows[0])["callResult"] == "no_answer"
 
     await engine.dispose()
 
-    assert overview.connected_calls == 1
-    assert overview.total_duration_ms == 10_000
-    assert counts == {"connected": 1, "voicemail": 1, "transport_connected": 1}
+    assert overview.connected_calls == 2
+    assert overview.total_duration_ms == 40_000
+    assert counts == {"connected": 2, "no_answer": 1}
+    assert trend[0].connected_calls == 2
 
 
 @pytest.mark.anyio
@@ -819,8 +840,6 @@ class _StatisticsRepositoryStub:
         del tenant_id, started_at, ended_at, scene_code, task_id
         return {
             "connected": 2,
-            "voicemail": 0,
-            "transport_connected": 0,
             "no_answer": 2,
             "rejected": 1,
             "early_hangup": 1,
@@ -876,8 +895,6 @@ async def test_service_builds_comparison_buckets_and_ordered_results() -> None:
     assert repository.buckets[-1][1] == NOW
     assert [item.result for item in result.results] == [
         "connected",
-        "voicemail",
-        "transport_connected",
         "no_answer",
         "rejected",
         "early_hangup",

@@ -5976,7 +5976,11 @@ async def test_realtime_agent_runner_accepts_task_completed_with_online_meeting_
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_records_handoff_tool_request() -> None:
+@pytest.mark.parametrize("transcript", [
+    "帮我转人工",
+    "呃，主要是获客，呃，要不你帮我转一下人工。",
+])
+async def test_realtime_agent_runner_records_handoff_tool_request(transcript) -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -6000,7 +6004,7 @@ async def test_realtime_agent_runner_records_handoff_tool_request() -> None:
         registry=registry,
         event_store=store,
     )
-    runner._pending_turn("call_handoff_tool").transcript_parts = ["帮我转人工"]
+    runner._pending_turn("call_handoff_tool").transcript_parts = [transcript]
 
     await runner.start(session)
     await provider.emit(
@@ -6043,7 +6047,8 @@ async def test_realtime_agent_runner_records_handoff_tool_request() -> None:
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_explicit_intent() -> None:
+@pytest.mark.parametrize("transcript", ["干什么？", "不用转人工，你继续说。"])
+async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_explicit_intent(transcript) -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -6068,7 +6073,7 @@ async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_expli
         registry=registry,
         event_store=store,
     )
-    runner._pending_turn(call_id).transcript_parts = ["干什么？"]
+    runner._pending_turn(call_id).transcript_parts = [transcript]
 
     await runner._handle_handoff_tool_done(
         call_id,
@@ -6090,7 +6095,7 @@ async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_expli
         event for event in store.list(call_id) if event.type == "handoff_tool_ignored"
     )
     assert ignored.payload["reason"] == "customer_request_without_explicit_intent"
-    assert ignored.payload["transcriptPreview"] == "干什么？"
+    assert ignored.payload["transcriptPreview"] == transcript
     assert provider.submitted_tool_results == [
         (
             "handoff_tool_false_positive",

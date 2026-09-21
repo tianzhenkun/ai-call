@@ -257,6 +257,31 @@ class SlowHandoffIntentClassifier:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "transcript,matched",
+    [
+        ("呃，主要是获客，呃，要不你帮我转一下人工。", True),
+        ("麻烦转接一下人工客服。", True),
+        ("帮我找个真人。", True),
+        ("接一下客服吧。", True),
+        ("要不转人工吧。", True),
+        ("不用转人工，你继续说。", False),
+        ("不转人工。", False),
+        ("不要帮我转一下人工。", False),
+        ("我不想找个真人。", False),
+        ("你是人工还是机器？", False),
+        ("人工智能是什么意思？", False),
+        ("转入。", False),
+    ],
+)
+async def test_handoff_rule_handles_natural_requests_and_refusals(transcript, matched) -> None:
+    result = await RuleBasedHandoffIntentClassifier().classify(transcript=transcript)
+    assert result.matched is matched
+    if matched:
+        assert result.reason == "customer_request"
+
+
+@pytest.mark.anyio
 async def test_rule_based_handoff_classifier_matches_customer_manager_request() -> None:
     classifier = RuleBasedHandoffIntentClassifier()
 
@@ -309,7 +334,11 @@ async def test_rule_based_handoff_classifier_matches_product_follow_up_intent() 
 
 
 @pytest.mark.anyio
-async def test_composite_handoff_classifier_uses_strong_rule_before_primary() -> None:
+@pytest.mark.parametrize("transcript", [
+    "麻烦给我找你们客户经理。",
+    "呃，主要是获客，呃，要不你帮我转一下人工。",
+])
+async def test_composite_handoff_classifier_uses_strong_rule_before_primary(transcript) -> None:
     primary = FakeHandoffIntentClassifier(
         HandoffIntentResult(
             matched=False,
@@ -324,7 +353,7 @@ async def test_composite_handoff_classifier_uses_strong_rule_before_primary() ->
         fallback=RuleBasedHandoffIntentClassifier(),
     )
 
-    result = await classifier.classify(transcript="麻烦给我找你们客户经理。")
+    result = await classifier.classify(transcript=transcript)
 
     assert result.matched is True
     assert result.source == "rule_fallback"

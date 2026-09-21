@@ -4,13 +4,17 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Select, String, and_, asc, cast, desc, func, or_, select, update
+from sqlalchemy import Select, String, and_, asc, cast, desc, func, literal, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from app.api.v1.ai_call.call_outcome_query import (
+    business_call_result_expression,
+    voicemail_expression,
+)
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
     AiCallAsrJobModel,
@@ -690,8 +694,8 @@ class AiCallRecordRepository:
         )
         rows = (await self.db.execute(stmt)).scalars().all()
         await self.attach_outbound_context(rows, tenant_id=tenant_id)
-        await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_semantic_analysis(rows)
+        await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_follow_up_context(rows, tenant_id=tenant_id)
         await self.attach_after_call_result_context(rows, tenant_id=tenant_id)
         return list(rows), total
@@ -774,6 +778,12 @@ class AiCallRecordRepository:
         for record in records:
             score = scores.get(record.call_id)
             review = reviews.get(record.call_id)
+            if getattr(record, "_semantic_analysis_context", {}).get("answerType") == "voicemail":
+                record._quality_context = {
+                    "qualityScoreStatus": "not_applicable", "qualityScore": None,
+                    "qualityReviewResult": None, "qualityReviewReason": None,
+                }
+                continue
             score_status = (
                 score.status
                 if score is not None
@@ -1968,6 +1978,20 @@ class AiCallRecordRepository:
         await self.db.refresh(analysis)
         return analysis
 
+    async def is_voicemail_call(self, call_id: str) -> bool:
+        return bool(await self.db.scalar(select(voicemail_expression(literal(call_id)))))
+
+    async def skip_voicemail_quality_score(self, score: AiCallQualityScoreModel) -> bool:
+        if not await self.is_voicemail_call(score.call_id):
+            return False
+        score.status = "not_applicable"
+        score.score = None
+        score.reason = None
+        score.error_message = None
+        score.finished_at = score.updated_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        return True
+
     async def ensure_quality_score(
         self,
         *,
@@ -2056,8 +2080,9 @@ class AiCallRecordRepository:
                 AiCallQualityScoreModel.tenant_id == tenant_id,
                 AiCallQualityScoreModel.call_id == call_id,
                 AiCallQualityScoreModel.model_version == model_version,
+                ~voicemail_expression(AiCallQualityScoreModel.call_id),
                 or_(
-                    AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_PENDING,
+                    AiCallQualityScoreModel.status.in_({QUALITY_SCORE_STATUS_PENDING, "not_applicable"}),
                     and_(
                         AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_FAILED,
                         AiCallQualityScoreModel.retry_count < QUALITY_SCORE_MAX_RETRY_COUNT,
@@ -2100,8 +2125,9 @@ class AiCallRecordRepository:
         result = await self.db.execute(
             select(AiCallQualityScoreModel.call_id)
             .where(
+                ~voicemail_expression(AiCallQualityScoreModel.call_id),
                 or_(
-                    AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_PENDING,
+                    AiCallQualityScoreModel.status.in_({QUALITY_SCORE_STATUS_PENDING, "not_applicable"}),
                     and_(
                         AiCallQualityScoreModel.status == QUALITY_SCORE_STATUS_FAILED,
                         AiCallQualityScoreModel.retry_count < QUALITY_SCORE_MAX_RETRY_COUNT,
@@ -2139,6 +2165,8 @@ class AiCallRecordRepository:
                 call_id=call_id,
                 model_version=model_version,
             )
+        if await self.skip_voicemail_quality_score(row):
+            return row
         now = now or datetime.now(timezone.utc)
         row.status = QUALITY_SCORE_STATUS_COMPLETED
         row.score = max(0, min(100, int(score)))
@@ -2170,6 +2198,8 @@ class AiCallRecordRepository:
                 call_id=call_id,
                 model_version=model_version,
             )
+        if await self.skip_voicemail_quality_score(row):
+            return row
         now = now or datetime.now(timezone.utc)
         row.status = QUALITY_SCORE_STATUS_FAILED
         row.retry_count = int(row.retry_count or 0) + 1
@@ -3205,7 +3235,9 @@ class AiCallRecordRepository:
             )
         if call_result:
             stmt = stmt.where(
-                AiCallOutboundAttemptModel.call_result == call_result,
+                business_call_result_expression(
+                    AiCallOutboundAttemptModel.call_result, AiCallRecordModel.call_id,
+                ) == call_result,
             )
         if filters.get("business_type"):
             stmt = stmt.where(AiCallRecordModel.business_type == filters["business_type"])

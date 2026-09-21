@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import status
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.v1.ai_call.call_outcome_query import business_call_result_expression
 from app.api.v1.ai_call.model import (
     AiCallPromptProfileModel,
     AiCallPromptProfileVersionModel,
@@ -19,7 +20,7 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.config.setting import settings
 from app.core.exceptions import CustomException
-from app.services.ai_call.call_outcome import detect_answer_type
+from app.services.ai_call.call_outcome import business_call_result, detect_answer_type
 from app.services.ai_call.credit_metering import (
     CreditMeteringClient,
     require_credit_eligible_for_request,
@@ -101,7 +102,7 @@ class OutboundRuleTaskService:
         return CallRuleMetadataOut(
             max_retry_count=MAX_RETRY_COUNT,
             retryable_results=[
-                RetryableResultMeta(value="no_answer", label="无人接听"),
+                RetryableResultMeta(value="no_answer", label="未接通"),
                 RetryableResultMeta(value="busy", label="忙线"),
                 RetryableResultMeta(value="rejected", label="拒接"),
             ],
@@ -729,11 +730,13 @@ class OutboundRuleTaskService:
             tenant_id,
             [task.id for task in tasks],
         )
+        outcome_counts = await self._business_result_counts_by_task(db, tenant_id, [task.id for task in tasks])
         return [
             self.task_out(
                 task,
                 attempt_dialer_types=dialer_types_by_task.get(task.id, []),
                 failed_attempts=failed_attempts_by_task.get(task.id, 0),
+                outcome_counts=outcome_counts.get(task.id),
             )
             for task in tasks
         ], total
@@ -755,10 +758,12 @@ class OutboundRuleTaskService:
             tenant_id,
             [task.id],
         )
+        outcome_counts = await self._business_result_counts_by_task(db, tenant_id, [task.id])
         return self.task_out(
             task,
             attempt_dialer_types=dialer_types_by_task.get(task.id, []),
             failed_attempts=failed_attempts_by_task.get(task.id, 0),
+            outcome_counts=outcome_counts.get(task.id),
         )
 
     async def update_schedule(
@@ -1139,6 +1144,7 @@ class OutboundRuleTaskService:
         *,
         attempt_dialer_types: list[str] | None = None,
         failed_attempts: int = 0,
+        outcome_counts: tuple[int, int] | None = None,
     ) -> OutboundTaskOut:
         return OutboundTaskOut(
             task_id=str(task.id),
@@ -1148,8 +1154,8 @@ class OutboundRuleTaskService:
             status=task.status,
             total_targets=task.total_targets,
             completed_targets=task.completed_targets,
-            connected_targets=task.connected_targets,
-            failed_targets=task.failed_targets,
+            connected_targets=outcome_counts[0] if outcome_counts is not None else task.connected_targets,
+            failed_targets=outcome_counts[1] if outcome_counts is not None else task.failed_targets,
             failed_attempts=failed_attempts,
             attempt_dialer_types=attempt_dialer_types or [],
             execution_mode=task.execution_mode,
@@ -1214,7 +1220,7 @@ class OutboundRuleTaskService:
             phone_number=_mask_phone_number(target.phone_number),
             status=target.status,
             attempt_count=target.attempt_count,
-            latest_result=target.latest_result,
+            latest_result=business_call_result(target.latest_result, answer_type),
             answer_type=answer_type,
             latest_dialer_type=latest_dialer_type,
             provider_status_code=provider_status_code,
@@ -1276,6 +1282,55 @@ class OutboundRuleTaskService:
             )
         ).all()
         return {task_id: int(count) for task_id, count in rows}
+
+    @staticmethod
+    async def _business_result_counts_by_task(
+        db: AsyncSession,
+        tenant_id: str,
+        task_ids: list[int],
+    ) -> dict[int, tuple[int, int]]:
+        if not task_ids:
+            return {}
+        target = AiCallOutboundTargetModel
+        attempt = AiCallOutboundAttemptModel
+        # 异常补呼保留原任务结果；历史记录在读取时按新口径统计，不触发重拨。
+        in_exception = target.exception_category.is_not(None)
+        result = business_call_result_expression(
+            func.coalesce(
+                attempt.call_result,
+                case((in_exception, target.exception_source_result), else_=target.latest_result),
+            ),
+            attempt.call_id,
+        )
+        connected = result.in_({"connected", "early_hangup"})
+        rows = (
+            await db.execute(
+                select(
+                    target.task_id,
+                    func.sum(case((connected, 1), else_=0)),
+                    func.sum(case((connected, 0), else_=1)),
+                )
+                .outerjoin(
+                    attempt,
+                    and_(
+                        attempt.tenant_id == target.tenant_id,
+                        attempt.target_id == target.id,
+                        attempt.attempt_no
+                        == case(
+                            (in_exception, target.exception_original_attempt_count),
+                            else_=target.attempt_count,
+                        ),
+                    ),
+                )
+                .where(
+                    target.tenant_id == tenant_id,
+                    target.task_id.in_(task_ids),
+                    or_(in_exception, target.status == "COMPLETED"),
+                )
+                .group_by(target.task_id)
+            )
+        ).all()
+        return {task_id: (int(connected), int(failed)) for task_id, connected, failed in rows}
 
     @staticmethod
     async def _latest_attempts_by_target(

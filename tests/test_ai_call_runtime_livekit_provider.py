@@ -264,7 +264,7 @@ def test_livekit_owner_provider_routes_final_customer_speech_to_handoff_worker()
     )
 
     runtime_settings = settings.model_copy(
-        update={"AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED": True}
+        update={"AI_CALL_HANDOFF_AUTO_TRIGGER_ENABLED": True, "LLM_API_KEY": "test-only-key"}
     )
     provider = build_livekit_runtime_provider(
         settings=runtime_settings,
@@ -307,7 +307,7 @@ def test_livekit_owner_provider_attaches_event_persistence_worker() -> None:
     configure_ai_call_event_persistence(worker)
     try:
         provider = build_livekit_runtime_provider(
-            settings=settings,
+            settings=settings.model_copy(update={"LLM_API_KEY": "test-only-key"}),
             session_factory=object(),
             registry=RuntimeRegistry(),
         )
@@ -361,7 +361,7 @@ async def test_livekit_owner_provider_requests_end_before_local_cleanup(
         FakeCommandRepository,
     )
     provider = build_livekit_runtime_provider(
-        settings=settings,
+        settings=settings.model_copy(update={"LLM_API_KEY": "test-only-key"}),
         session_factory=SessionFactory(),
         registry=RuntimeRegistry(),
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,13 @@ class HandoffIntentClassifierProtocol(Protocol):
 class RuleBasedHandoffIntentClassifier:
     """只做高置信兜底，避免散落在通话链路里的关键词判断。"""
 
+    DECLINED_REQUEST_PATTERN = re.compile(
+        r"(?:不用|不要|不需要|不想|不必|无需|别|暂不|(?<!要)不)"
+        r"(?:再|先|现在|帮我|给我|替我)*"
+        r"(?:转接|转|接|找|换|联系|安排|叫)"
+        r"(?:给|到|一下|下|你们的|你们|一个|一位|个)*"
+        r"(?:人工|真人|客服|客户经理|客户顾问|销售顾问|业务经理|负责人|专人)"
+    )
     NEGATIVE_HINTS = (
         "人工智能",
         "人工审核",
@@ -134,6 +142,9 @@ class RuleBasedHandoffIntentClassifier:
         "收费",
     )
     HUMAN_ROLE_TERMS = (
+        "人工",
+        "真人",
+        "客服",
         "客户经理",
         "客户顾问",
         "人工顾问",
@@ -170,6 +181,15 @@ class RuleBasedHandoffIntentClassifier:
                 confidence=0.0,
                 reason="empty_transcript",
                 summary="用户文本为空",
+                source="rule_fallback",
+            )
+        # 明确拒绝必须先于正向子串匹配，避免把“不用转人工”当作授权。
+        if self.DECLINED_REQUEST_PATTERN.search(normalized):
+            return HandoffIntentResult(
+                matched=False,
+                confidence=0.95,
+                reason="not_handoff",
+                summary="用户明确拒绝转人工",
                 source="rule_fallback",
             )
         if any(hint in normalized for hint in self.NEGATIVE_HINTS):

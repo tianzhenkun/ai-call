@@ -5,13 +5,11 @@ from sqlalchemy import Select, and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Selectable
 
-from app.services.ai_call.call_outcome import VOICEMAIL_MARKERS
-
+from .call_outcome_query import business_call_result_expression
 from .model import (
     AiCallFollowUpDataModel,
     AiCallFollowUpTaskModel,
     AiCallRecordModel,
-    AiCallSemanticAnalysisModel,
 )
 from .outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
@@ -43,47 +41,9 @@ class OutboundStatisticsRepository:
         self.db = db
 
     @staticmethod
-    def _connected_outcomes():
-        raw_connected = AiCallOutboundAttemptModel.call_result == "connected"
-        valid_dialogue = (
-            select(AiCallSemanticAnalysisModel.id)
-            .where(
-                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
-                AiCallSemanticAnalysisModel.analysis_scene_code
-                == "ai_call_semantic_analysis",
-                AiCallSemanticAnalysisModel.analysis_status == "2",
-                or_(
-                    AiCallSemanticAnalysisModel.analysis_result.contains(
-                        '"valid_dialogue": true'
-                    ),
-                    AiCallSemanticAnalysisModel.analysis_result.contains(
-                        '"valid_dialogue":true'
-                    ),
-                ),
-            )
-            .exists()
-        )
-        voicemail_marker = (
-            select(AiCallSemanticAnalysisModel.id)
-            .where(
-                AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id,
-                AiCallSemanticAnalysisModel.analysis_scene_code
-                == "ai_call_semantic_analysis",
-                AiCallSemanticAnalysisModel.analysis_status == "2",
-                or_(
-                    *(
-                        AiCallSemanticAnalysisModel.analysis_result.contains(marker)
-                        for marker in VOICEMAIL_MARKERS
-                    )
-                ),
-            )
-            .exists()
-        )
-        voicemail = and_(~valid_dialogue, voicemail_marker)
-        return (
-            and_(raw_connected, valid_dialogue),
-            and_(raw_connected, voicemail),
-            and_(raw_connected, ~valid_dialogue, ~voicemail),
+    def _call_result():
+        return business_call_result_expression(
+            AiCallOutboundAttemptModel.call_result, AiCallRecordModel.call_id,
         )
 
     @staticmethod
@@ -180,7 +140,7 @@ class OutboundStatisticsRepository:
             )
             .scalar_subquery()
         )
-        connected, _, _ = self._connected_outcomes()
+        connected = self._call_result() == "connected"
         statement = select(
             func.count(AiCallRecordModel.id),
             func.coalesce(
@@ -225,7 +185,8 @@ class OutboundStatisticsRepository:
         scene_code: str | None = None,
         task_id: int | None = None,
     ) -> dict[str, int]:
-        connected, voicemail, transport_connected = self._connected_outcomes()
+        call_result = self._call_result()
+        connected = call_result == "connected"
         early_hangup = and_(
             connected,
             AiCallRecordModel.answered_at.is_not(None),
@@ -248,10 +209,8 @@ class OutboundStatisticsRepository:
         )
         result_group = case(
             (early_hangup, "early_hangup"),
-            (voicemail, "voicemail"),
             (connected, "connected"),
-            (transport_connected, "transport_connected"),
-            (AiCallOutboundAttemptModel.call_result == "no_answer", "no_answer"),
+            (call_result == "no_answer", "no_answer"),
             (rejected, "rejected"),
             (invalid_number, "invalid_number"),
             else_="other",
@@ -284,7 +243,7 @@ class OutboundStatisticsRepository:
             return []
 
         statements = []
-        connected, _, _ = self._connected_outcomes()
+        connected = self._call_result() == "connected"
         for bucket_index, (bucket_start, bucket_end) in enumerate(buckets):
             statement = select(
                 literal(bucket_index).label("bucket_index"),

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Protocol
+from uuid import uuid4
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -27,6 +28,7 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffModel,
     AiCallSemanticAnalysisModel,
 )
+from app.api.v1.ai_call.outbound.attempt_projection import reconcile_analyzed_call
 from app.core.logger import log
 from app.services.ai_call.classification_review import requires_classification_review
 from app.services.ai_call.dialogue_merge import (
@@ -1765,6 +1767,16 @@ class AiCallSemanticAnalysisService:
         )
         if claimed is None:
             return analysis
+        if force:
+            # 保存人工触发事实，失败恢复或迟到结算都不能将重分析变成新呼叫。
+            await self.repository.append_event(
+                event_id=str(uuid4()),
+                call_id=call_id,
+                event_type="semantic_reanalysis_requested",
+                source="manual",
+                event_time=now or datetime.now(timezone.utc),
+                payload_json=None,
+            )
 
         rows = await self.repository.list_dialogue_segments(call_id)
         tenant_id = str(record.tenant_id or "").strip() if record is not None else ""
@@ -1840,6 +1852,7 @@ class AiCallSemanticAnalysisService:
             now=now,
         )
         if succeeded is not None:
+            await reconcile_analyzed_call(self.repository.db, call_id, now=now)
             await AiCallFollowUpDataService(self.repository).apply_ai_analysis(succeeded)
             return succeeded
         return claimed

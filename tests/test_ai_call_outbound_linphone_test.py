@@ -1484,6 +1484,7 @@ async def test_lifespan_starts_and_stops_linphone_recovery_worker(
         raising=False,
     )
     monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", False, raising=False)
+    monkeypatch.setattr(init_app.settings, "LLM_API_KEY", "test-only-key")
     monkeypatch.setattr(
         init_app.settings,
         "AI_CALL_RECORDING_ENABLED",

@@ -50,6 +50,8 @@ from app.services.ai_call.sip_vad_shadow import (
     SipVadShadowObservation,
 )
 from app.services.ai_call.transcript_trust import (
+    CustomerSpeechClassifier,
+    CustomerSpeechDecision,
     decide_realtime_transcript_trust,
     is_realtime_transcript_semantically_rejected,
 )
@@ -696,6 +698,10 @@ class PendingUserTurn:
     transcript_parts: list[str] = field(default_factory=list)
     transcript_merge_start_index: int | None = None
     customer_transcript_event_id: str | None = None
+    transcript_candidates: dict[str, str] = field(default_factory=dict)
+    transcript_review_pending: bool = False
+    speech_decision: CustomerSpeechDecision | None = None
+    speech_item_id: str | None = None
     no_barge_overlap_stopped_during_ai_response: bool = False
     no_barge_unstarted_response_deferred: bool = False
     current_speech_semantic_rejected: bool = False
@@ -899,6 +905,7 @@ class RealtimeCallAgentRunner:
         call_end_decision_service: RuleBasedCallEndDecisionService | None = None,
         call_end_scheduler: CallEndScheduler | None = None,
         knowledge_search_service: Any | None = None,
+        customer_speech_classifier: CustomerSpeechClassifier | None = None,
     ) -> None:
         self.provider_factory = provider_factory
         self.registry = registry
@@ -940,6 +947,7 @@ class RealtimeCallAgentRunner:
         )
         self.call_end_scheduler = call_end_scheduler
         self.knowledge_search_service = knowledge_search_service
+        self.customer_speech_classifier = customer_speech_classifier
         self._interrupt_policy = InterruptDecisionPolicy()
         self._sip_barge_in_vad = sip_barge_in_vad or (
             WebRtcVadAdapter()
@@ -963,6 +971,8 @@ class RealtimeCallAgentRunner:
         self._audio_playout_overflow_tasks: dict[str, asyncio.Task[None]] = {}
         self._playout_tasks: dict[str, asyncio.Task[None]] = {}
         self._turn_response_tasks: dict[str, asyncio.Task[None]] = {}
+        self._transcript_review_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reviewed_transcript_item_ids: dict[str, set[str]] = {}
         self._last_ai_audio_published_at: dict[str, datetime] = {}
         self._last_ai_audio_rms_dbfs: dict[str, float] = {}
         self._last_sip_local_speech_active_at: dict[str, datetime] = {}
@@ -980,6 +990,7 @@ class RealtimeCallAgentRunner:
         self._silence_watchdog_tasks: dict[str, asyncio.Task[None]] = {}
         self._silence_prompt_counts: dict[str, int] = {}
         self._customer_turn_counts: dict[str, int] = {}
+        self._off_topic_turn_event_ids: dict[str, list[str]] = {}
         self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
         self._sip_barge_in_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1038,6 +1049,11 @@ class RealtimeCallAgentRunner:
         await self._cancel_silence_watchdog(call_id)
         await self._cancel_playout_task(call_id)
         await self._cancel_turn_response_task(call_id)
+        review_task = self._transcript_review_tasks.pop(call_id, None)
+        if review_task is not None and review_task is not asyncio.current_task():
+            review_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await review_task
         await self._cancel_pending_call_end_defer_task(call_id)
         await self._cancel_browser_audio_hold_task(call_id)
         await self._cancel_browser_pre_stop_task(call_id)
@@ -1102,6 +1118,7 @@ class RealtimeCallAgentRunner:
         self._last_sip_provider_speech_stopped_at.pop(call_id, None)
         self._sip_vad_shadow_failed_call_ids.discard(call_id)
         self._pending_user_turns.pop(call_id, None)
+        self._reviewed_transcript_item_ids.pop(call_id, None)
         self._response_lifecycles.pop(call_id, None)
         self._playback_guards.pop(call_id, None)
         self._pending_call_ends.pop(call_id, None)
@@ -1109,6 +1126,7 @@ class RealtimeCallAgentRunner:
         self._pending_knowledge_audit_ids.pop(call_id, None)
         self._silence_prompt_counts.pop(call_id, None)
         self._customer_turn_counts.pop(call_id, None)
+        self._off_topic_turn_event_ids.pop(call_id, None)
         self._provider_transport_diagnostics.pop(call_id, None)
         self._last_ai_question_completed_at.pop(call_id, None)
         self._audio_playout_queues.pop(call_id, None)
@@ -1148,6 +1166,9 @@ class RealtimeCallAgentRunner:
             if task is None:
                 continue
             await task
+        review_task = self._transcript_review_tasks.get(call_id)
+        if review_task is not None:
+            await review_task
         turn_response_task = self._turn_response_tasks.get(call_id)
         if turn_response_task is not None:
             await turn_response_task
@@ -1294,7 +1315,11 @@ class RealtimeCallAgentRunner:
             call_id,
             "call_policy_end_requested",
             "agent",
-            {"endReason": end_reason},
+            {
+                "endReason": end_reason,
+                "customerTurnCount": self._customer_turn_counts.get(call_id, 0),
+                "offTopicEvidenceEventIds": list(self._off_topic_turn_event_ids.get(call_id, [])),
+            },
         )
         return True
 
@@ -5542,6 +5567,187 @@ class RealtimeCallAgentRunner:
             payload.update(self._sip_barge_in_detector.latest_observation_payload(call_id))
         return payload
 
+    def _queue_transcript_review(
+        self, call_id: str, provider: RealtimeProviderProtocol, event: ProviderEvent,
+    ) -> None:
+        candidate = self._append_event_record(
+            call_id, "user_transcript_failed" if event.type == "user_transcript_failed" else "user_transcript_candidate", "provider",
+            {**event.payload, "providerEventType": event.type},
+        )
+        self._record_provider_event(call_id, event.type, candidate.timestamp)
+        if event.type == "user_transcript_delta":
+            return
+        text = self._transcript_text(event)
+        if not text and event.type != "user_transcript_failed":
+            return
+        turn = self._pending_turn(call_id)
+        item_id = str(event.payload.get("item_id") or "latest")
+        if item_id != "latest" and item_id in self._reviewed_transcript_item_ids.get(call_id, set()):
+            return
+        if event.type == "user_transcript_done" and turn.transcript_candidates.get(item_id) == text:
+            return
+        if text:
+            turn.transcript_candidates[item_id] = text
+        if turn.speech_item_id and item_id != "latest" and item_id != turn.speech_item_id:
+            return
+        turn.transcript_review_pending = True
+        self._cancel_turn_response_task_nowait(call_id)
+        previous = self._transcript_review_tasks.pop(call_id, None)
+        if previous is not None and previous is not asyncio.current_task():
+            previous.cancel()
+        self._transcript_review_tasks[call_id] = asyncio.create_task(
+            self._review_customer_transcript(
+                call_id, provider, turn, candidate, event, speech_started_at=turn.started_at,
+            ),
+            name=f"ai-call-transcript-review-{call_id}",
+        )
+
+    async def _await_final_transcript(
+        self, call_id: str, provider: RealtimeProviderProtocol, turn: PendingUserTurn,
+    ) -> None:
+        try:
+            await asyncio.sleep(CustomerSpeechClassifier.TIMEOUT_SECONDS)
+            if self._pending_user_turns.get(call_id) is turn and self._providers.get(call_id) is provider:
+                self._queue_transcript_review(call_id, provider, ProviderEvent(
+                    type="user_transcript_failed", payload={"reason": "final_transcript_timeout"},
+                ))
+        finally:
+            if self._transcript_review_tasks.get(call_id) is asyncio.current_task():
+                self._transcript_review_tasks.pop(call_id, None)
+
+    async def _review_customer_transcript(
+        self, call_id: str, provider: RealtimeProviderProtocol, turn: PendingUserTurn,
+        candidate: AiCallEvent, event: ProviderEvent, *, speech_started_at: datetime | None,
+    ) -> None:
+        started = asyncio.get_running_loop().time()
+        transcript = " ".join(turn.transcript_candidates.values())
+        classifier = self.customer_speech_classifier
+        assert classifier is not None
+        # 使用开始审核时的观测，不能用网络返回时的播放状态倒推原发言。
+        audio_evidence = {
+            "during_ai_audio": self._has_recent_ai_audio(call_id, candidate.timestamp),
+            "interrupt_candidate": turn.interrupt_candidate,
+        }
+        if self._has_reliable_short_transcript_audio_evidence(turn):
+            audio_evidence["reliable_user_audio"] = True
+        history = [
+            {
+                "role": "assistant" if row.type == "ai_transcript_done" else (
+                    str(row.payload.get("speechSource") or "uncertain")
+                    if is_realtime_transcript_semantically_rejected(row.payload) else "user"
+                ),
+                "text": str(row.payload.get("transcript") or row.payload.get("text") or ""),
+                "background_text": str(row.payload.get("backgroundText") or ""),
+            }
+            for row in self.event_store.list_all(call_id)
+            if row.type in {"ai_transcript_done", "user_transcript_done"}
+        ][-6:]
+        basic_trust = self._decide_realtime_transcript_trust(call_id, ProviderEvent(
+            type="user_transcript_done", payload={**event.payload, "transcript": transcript},
+        ))
+        classification_error: dict[str, Any] | None = None
+        try:
+            try:
+                if event.type == "user_transcript_failed":
+                    decision = CustomerSpeechDecision(
+                        speech="uncertain", reason=str(event.payload.get("reason") or "transcription_failed"),
+                    )
+                elif not basic_trust.accepted:
+                    decision = CustomerSpeechDecision(
+                        speech="background", reason=basic_trust.reason,
+                    )
+                else:
+                    async with asyncio.timeout(CustomerSpeechClassifier.TIMEOUT_SECONDS):
+                        decision = await classifier.classify(
+                            transcript=transcript,
+                            business_prompt=str(self._config_value(
+                                self.registry.get(call_id).effective_config, "prompt", "",
+                            )),
+                            recent_dialogue=history,
+                            audio_evidence=audio_evidence,
+                        )
+            except Exception as exc:
+                # 审核失败只允许澄清，不能默认放行计数或结束通话。
+                classification_error = {
+                    "type": type(exc).__name__,
+                    "statusCode": getattr(getattr(exc, "response", None), "status_code", None),
+                    "validationMessage": str(exc) if isinstance(exc, ValueError) else None,
+                }
+                decision = CustomerSpeechDecision(
+                    speech="uncertain", reason=f"classification_failed:{type(exc).__name__}",
+                )
+            if (
+                self._providers.get(call_id) is not provider
+                or self._pending_user_turns.get(call_id) is not turn
+                or turn.started_at != speech_started_at
+                or self._transcript_review_tasks.get(call_id) is not asyncio.current_task()
+                or self.registry.get(call_id).status in {
+                    CallSessionStatus.ENDING, CallSessionStatus.COMPLETED, CallSessionStatus.FAILED,
+                }
+            ):
+                return
+            turn.transcript_review_pending = False
+            turn.speech_decision = decision
+            self._reviewed_transcript_item_ids.setdefault(call_id, set()).update(
+                item_id for item_id in turn.transcript_candidates if item_id != "latest"
+            )
+            payload = {
+                **event.payload, **decision.as_payload(),
+                "transcript": decision.customer_text if decision.accepted else transcript,
+                "originalTranscript": transcript,
+                "candidateEventId": candidate.event_id,
+                "observedAt": candidate.timestamp.isoformat(),
+                "classificationMs": round((asyncio.get_running_loop().time() - started) * 1000),
+                "audioEvidence": audio_evidence,
+                **({"classificationError": classification_error} if classification_error else {}),
+            }
+            reviewed = self.event_store.append(
+                call_id=call_id, type="user_transcript_done", source="provider",
+                payload=payload, timestamp=candidate.timestamp,
+            )
+            self._append_event(call_id, "customer_speech_classified", "agent", {
+                **payload, "customerTranscriptEventId": reviewed.event_id,
+                "customerTurnCount": self._customer_turn_counts.get(call_id, 0),
+            })
+            if decision.accepted:
+                self._silence_prompt_counts[call_id] = 0
+                await self._handle_user_transcript(
+                    call_id, provider, ProviderEvent(type="user_transcript_done", payload=payload),
+                    candidate.timestamp, customer_transcript_event_id=reviewed.event_id,
+                )
+                return
+            self._off_topic_turn_event_ids.pop(call_id, None)
+            turn.transcript_parts.clear()
+            turn.transcript_merge_start_index = None
+            self._ignore_empty_turn(call_id, turn, decision.reason)
+            # 仍在讲话时等待话尾；否则不确定输入只做一次简短澄清。
+            if not self._playback_guard(call_id).user_speech_active:
+                await self._respond_to_unreviewable_speech(call_id, provider, turn)
+        except Exception as exc:
+            self._fail_running_session(
+                call_id, end_reason="agent_error", failure_stage="customer_speech_review",
+                failure_message=f"处理客户发言审核结果失败: {type(exc).__name__}",
+            )
+        finally:
+            if self._transcript_review_tasks.get(call_id) is asyncio.current_task():
+                self._transcript_review_tasks.pop(call_id, None)
+
+    async def _respond_to_unreviewable_speech(
+        self, call_id: str, provider: RealtimeProviderProtocol, turn: PendingUserTurn,
+    ) -> None:
+        if turn.response_requested or turn.speech_decision is None:
+            return
+        guard = self._playback_guard(call_id)
+        if turn.speech_decision.speech == "uncertain":
+            instruction = "刚才未能确认客户说了什么，请只简短询问能否再说一遍，不要结束通话或调用工具。"
+        elif guard.cancel_requested or guard.audio_stop_requested:
+            instruction = "刚才检测到的是背景声音，请接着被打断的内容简短继续，不要回应背景声或调用工具。"
+        else:
+            self._arm_silence_watchdog(call_id)
+            return
+        turn.response_requested = True
+        await self._request_response(call_id, provider, input_text=instruction)
+
     async def _consume_provider_events(
         self,
         call_id: str,
@@ -5549,6 +5755,12 @@ class RealtimeCallAgentRunner:
     ) -> None:
         try:
             async for provider_event in provider.receive_events():
+                if self.customer_speech_classifier is not None and provider_event.type in {
+                    "user_transcript_delta", "user_transcript_done", "user_transcript_failed",
+                }:
+                    # 审核在独立任务中进行，不能阻塞模型音频、取消和工具结果的接收。
+                    self._queue_transcript_review(call_id, provider, provider_event)
+                    continue
                 event_payload = self._event_payload(provider_event.type, provider_event.payload)
                 handler_event = provider_event
                 if provider_event.type == "user_transcript_done":
@@ -5571,7 +5783,10 @@ class RealtimeCallAgentRunner:
                 event_timestamp = runtime_event.timestamp
                 self._record_provider_event(call_id, provider_event.type, event_timestamp)
                 if handler_event.type == "user_speech_started":
-                    await self._handle_user_speech_started(call_id, provider, event_timestamp)
+                    await self._handle_user_speech_started(
+                        call_id, provider, event_timestamp,
+                        speech_item_id=self._payload_str(handler_event.payload, "item_id"),
+                    )
                 elif handler_event.type == "user_speech_stopped":
                     await self._handle_user_speech_stopped(call_id, provider, event_timestamp)
                 elif handler_event.type in {"user_transcript_delta", "user_transcript_done"}:
@@ -5833,9 +6048,11 @@ class RealtimeCallAgentRunner:
         call_id: str,
         provider: RealtimeProviderProtocol,
         timestamp: datetime,
+        *, speech_item_id: str | None = None,
     ) -> None:
         self._cancel_silence_watchdog_nowait(call_id)
-        self._silence_prompt_counts[call_id] = 0
+        if self.customer_speech_classifier is None:
+            self._silence_prompt_counts[call_id] = 0
         session = self.registry.get(call_id)
         if session.status == CallSessionStatus.READY:
             session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
@@ -5847,6 +6064,13 @@ class RealtimeCallAgentRunner:
         if turn.stopped_at is not None and not turn.response_requested:
             turn.stopped_at = None
         turn.started_at = timestamp
+        if self.customer_speech_classifier is not None:
+            previous_review = self._transcript_review_tasks.pop(call_id, None)
+            if previous_review is not None:
+                previous_review.cancel()
+            turn.transcript_review_pending = True
+            turn.speech_decision = None
+            turn.speech_item_id = speech_item_id
         if not self._is_barge_in_enabled_for_session(session):
             await self._apply_provider_event(
                 call_id,
@@ -6133,6 +6357,17 @@ class RealtimeCallAgentRunner:
             and self._has_active_model_response(call_id)
         ):
             turn.no_barge_overlap_stopped_during_ai_response = True
+        if turn.transcript_review_pending:
+            task = self._transcript_review_tasks.get(call_id)
+            if task is None or task.done():
+                self._transcript_review_tasks[call_id] = asyncio.create_task(
+                    self._await_final_transcript(call_id, provider, turn),
+                    name=f"ai-call-await-transcript-{call_id}",
+                )
+            return
+        if turn.speech_decision is not None and not turn.speech_decision.accepted:
+            await self._respond_to_unreviewable_speech(call_id, provider, turn)
+            return
         if turn.call_end_acknowledged:
             self._complete_acknowledged_call_end_turn(call_id)
             return
@@ -6210,11 +6445,28 @@ class RealtimeCallAgentRunner:
     def _record_customer_turn(self, call_id: str) -> int:
         count = self._customer_turn_counts.get(call_id, 0) + 1
         self._customer_turn_counts[call_id] = count
+        turn = self._pending_user_turns.get(call_id)
+        decision = turn.speech_decision if turn is not None else None
+        off_topic_ids = self._off_topic_turn_event_ids.setdefault(call_id, [])
+        if (
+            decision is not None and decision.accepted and decision.topic == "off_topic"
+            and turn is not None and turn.customer_transcript_event_id is not None
+        ):
+            off_topic_ids.append(turn.customer_transcript_event_id)
+            del off_topic_ids[:-3]
+        else:
+            off_topic_ids.clear()
         self._append_event(
             call_id,
             "call_policy_customer_turn",
             "agent",
-            {"count": count, "limit": CALL_POLICY_MAX_CUSTOMER_TURNS},
+            {
+                "count": count, "limit": CALL_POLICY_MAX_CUSTOMER_TURNS,
+                "customerTranscriptEventId": turn.customer_transcript_event_id if turn else None,
+                "topicRelation": decision.topic if decision else "uncertain",
+                "consecutiveOffTopicTurns": len(off_topic_ids),
+                "offTopicEvidenceEventIds": list(off_topic_ids),
+            },
         )
         return count
 
@@ -6575,6 +6827,7 @@ class RealtimeCallAgentRunner:
                     "endReason": end_reason,
                     "finalAudioAlreadySpoken": final_audio_already_spoken,
                     "localExplicitIntent": has_local_customer_end_intent,
+                    "offTopicEvidenceEventIds": list(self._off_topic_turn_event_ids.get(call_id, [])),
                 },
             )
         pending_call_end = self._pending_call_ends[call_id]
@@ -6610,8 +6863,18 @@ class RealtimeCallAgentRunner:
         )
 
     def _accepts_call_end_tool(self, call_id: str, tool_reason: str) -> bool:
+        turn = self._pending_user_turns.get(call_id)
+        if self.customer_speech_classifier is not None and (
+            turn is None or turn.transcript_review_pending
+            or turn.speech_decision is None or not turn.speech_decision.accepted
+        ):
+            return False
         if tool_reason == "policy_limit":
-            return self._customer_turn_counts.get(call_id, 0) >= 3
+            evidence = self._off_topic_turn_event_ids.get(call_id, [])
+            return bool(
+                len(evidence) >= 3 and turn is not None and turn.customer_turn_counted
+                and turn.customer_transcript_event_id == evidence[-1]
+            )
         if tool_reason == "task_completed":
             return self._accepts_task_completed_tool(call_id)
         if tool_reason != "customer_end":
@@ -6623,7 +6886,7 @@ class RealtimeCallAgentRunner:
     @staticmethod
     def _call_end_tool_rejection_reason(tool_reason: str) -> str:
         if tool_reason == "policy_limit":
-            return "policy_limit_before_three_customer_turns"
+            return "policy_limit_without_three_consecutive_off_topic_turns"
         if tool_reason == "task_completed":
             return "task_completed_without_next_step_signal"
         return "customer_end_without_terminal_user_signal"
@@ -6637,7 +6900,7 @@ class RealtimeCallAgentRunner:
         if tool_reason == "task_completed":
             return TASK_COMPLETED_REJECTED_TOOL_RESULT
         if tool_reason == "policy_limit":
-            return "尚未达到连续三轮沟通策略上限，请继续回应当前话题。"
+            return "没有连续三轮有效客户发言离题的证据。背景声、未确认发言和累计轮数不能作为挂断依据，请继续当前沟通。"
         if rejection_reason == "customer_end_without_terminal_user_signal":
             return CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT
         return CALL_END_REJECTED_TOOL_RESULT
@@ -6989,7 +7252,10 @@ class RealtimeCallAgentRunner:
         turn = self._pending_user_turns.get(call_id)
         if turn is None or (
             reset_if_finished
-            and (turn.response_requested or (turn.stopped_at is not None and not turn.transcript))
+            and (
+                turn.response_requested
+                or (turn.stopped_at is not None and not turn.transcript and not turn.transcript_review_pending)
+            )
         ):
             turn = PendingUserTurn()
             self._pending_user_turns[call_id] = turn
@@ -7886,7 +8152,7 @@ class RealtimeCallAgentRunner:
                     not turn.interrupt_confirmed
                     and self._is_stale_browser_interrupt_candidate(turn, timestamp)
                 ),
-                has_valid_transcript=bool(turn.transcript),
+                has_valid_transcript=bool(turn.transcript) and not turn.transcript_review_pending,
             )
         )
         if decision.action == "ignore" and decision.reason == "browser_candidate_expired":
@@ -7961,6 +8227,7 @@ class RealtimeCallAgentRunner:
         turn = self._pending_turn(call_id)
         if (
             turn.response_requested
+            or turn.transcript_review_pending
             or turn.stopped_at is None
             or not turn.transcript
             or turn.transcript_merge_start_index is not None
@@ -8018,6 +8285,7 @@ class RealtimeCallAgentRunner:
             if (
                 turn.stopped_at != stopped_at
                 or turn.response_requested
+                or turn.transcript_review_pending
                 or not turn.transcript
                 or turn.transcript_merge_start_index is not None
             ):
@@ -8110,6 +8378,7 @@ class RealtimeCallAgentRunner:
     ) -> None:
         if (
             turn.response_requested
+            or turn.transcript_review_pending
             or turn.stopped_at is None
             or not turn.transcript
             or turn.transcript_merge_start_index is not None
@@ -9341,6 +9610,14 @@ class RealtimeCallAgentRunner:
             lifecycle.pending_input_text = None
             lifecycle.pending_response_is_opening = False
             return False
+        turn = self._pending_user_turns.get(call_id)
+        if input_text is None and not opening_response and turn is not None and (
+            turn.transcript_review_pending
+            or (self.customer_speech_classifier is not None and (
+                turn.speech_decision is None or not turn.speech_decision.accepted
+            ))
+        ):
+            return False
         if lifecycle.active or lifecycle.cancel_pending:
             lifecycle.pending_create = True
             if input_text:
@@ -9348,7 +9625,6 @@ class RealtimeCallAgentRunner:
             if opening_response:
                 lifecycle.pending_response_is_opening = True
             return False
-        turn = self._pending_user_turns.get(call_id)
         count_customer_turn = (
             not opening_response
             and input_text is None
@@ -9370,6 +9646,17 @@ class RealtimeCallAgentRunner:
             and pending_call_end.end_reason == "policy_turn_limit"
         ):
             input_text = CALL_POLICY_TURN_LIMIT_INPUT
+        elif (
+            input_text is None and turn is not None and turn.speech_decision is not None
+            and turn.speech_decision.accepted
+            and normalize_dialogue_text(" ".join(turn.transcript_candidates.values()))
+            != normalize_dialogue_text(turn.speech_decision.customer_text)
+        ):
+            # 原始音频已进入实时模型上下文；混合转写必须明确限定本轮回应的客户原话。
+            input_text = (
+                "本轮背景声音已排除。只回应以下 JSON 中的客户原话，不要向客户提及审核："
+                + json.dumps({"customer_text": turn.speech_decision.customer_text}, ensure_ascii=False)
+            )
         try:
             await provider.create_response(input_text)
         except Exception as exc:
@@ -9586,6 +9873,7 @@ class RealtimeCallAgentRunner:
             return False
         if (
             not turn.sip_barge_in_confirmed
+            or turn.transcript_review_pending
             or turn.sip_barge_in_confirmed_by != "sip_clean_window"
             or turn.transcript
             or turn.response_requested
@@ -9671,6 +9959,9 @@ class RealtimeCallAgentRunner:
         return True
 
     def _promote_missing_call_end_tool(self, call_id: str) -> bool:
+        turn = self._pending_user_turns.get(call_id)
+        if turn is not None and turn.transcript_review_pending:
+            return False
         if call_id in self._pending_call_ends:
             return False
         intent = self._pending_call_end_intents.get(call_id)
@@ -9766,6 +10057,9 @@ class RealtimeCallAgentRunner:
             )
 
     def _call_end_user_turn_deferral_reason(self, call_id: str) -> str | None:
+        turn = self._pending_user_turns.get(call_id)
+        if turn is not None and turn.transcript_review_pending:
+            return "customer_speech_review_pending"
         session = self.registry.get(call_id)
         if self._is_barge_in_enabled_for_session(session):
             return None

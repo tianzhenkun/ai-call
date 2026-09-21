@@ -25,6 +25,11 @@ def detect_answer_type(
     return "human" if analysis_result.get("valid_dialogue") is True else "transport"
 
 
+def business_call_result(call_result: str | None, answer_type: str | None) -> str | None:
+    """业务接通不包含语音信箱，保留底层呼叫结果用于信令排查。"""
+    return "no_answer" if call_result in {"connected", "early_hangup"} and answer_type == "voicemail" else call_result
+
+
 def is_voicemail_analysis(analysis_result: dict[str, Any]) -> bool:
     if analysis_result.get("valid_dialogue") is True:
         return False

@@ -6,7 +6,7 @@ from typing import Any
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
-from app.services.ai_call.call_outcome import detect_answer_type
+from app.services.ai_call.call_outcome import business_call_result, detect_answer_type
 from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.runtime_control.customer_media_repository import (
     OwnerCustomerMediaRepository,
@@ -66,6 +66,9 @@ PERSISTED_EVENT_TYPES = frozenset({
     "call_end_tool_missing",
     "call_end_tool_ignored",
     "call_end_tool_requested",
+    "call_policy_customer_turn",
+    "call_policy_end_requested",
+    "customer_speech_classified",
     "agent_suspended_for_handoff",
     "handoff_accepted",
     "handoff_canceled",
@@ -520,7 +523,7 @@ class AiCallRecordService:
             "customerName": outbound_context.get("customerName"),
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
-            "callResult": call_result,
+            "callResult": business_call_result(call_result, answer_type),
             "answerType": answer_type if call_result == "connected" else None,
             "summary": semantic_summary,
             "analysisStatus": semantic_context.get("analysisStatus"),
