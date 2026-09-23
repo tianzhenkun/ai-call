@@ -3671,8 +3671,8 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
     assert session_update.voice == "Tina"
     assert "你是一个电话外呼助手，回答要简短自然。" in session_update.instructions
     assert "电话单轮回复约束" in session_update.instructions
-    assert "10-15 秒" in session_update.instructions
-    assert "不超过 2 句话" in session_update.instructions
+    assert "不超过 60 字" in session_update.instructions
+    assert "1 到 2 句话" in session_update.instructions
     assert "schedule_call_end" in session_update.instructions
     assert session_update.vad_type == "server_vad"
     assert session_update.vad_threshold == 0.5
