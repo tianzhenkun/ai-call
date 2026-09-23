@@ -71,7 +71,10 @@ def test_runtime_dialogue_instructions_answer_repeated_questions_naturally() -> 
     assert "第一句先正面回答" in DEFAULT_COMMON_BUSINESS_PROMPT
     assert "客户重复追问时" in DEFAULT_COMMON_BUSINESS_PROMPT
     assert "第一句先正面回答" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
-    assert "相邻两轮连续用问题收尾" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
+    for instructions in (DEFAULT_COMMON_BUSINESS_PROMPT, PHONE_RESPONSE_BREVITY_INSTRUCTIONS):
+        assert "60 字" in instructions
+        assert "相邻两轮连续用问题收尾" not in instructions
+        assert "明白，您问的是" not in instructions
     assert "客户重复追问时" in PHONE_RESPONSE_BREVITY_INSTRUCTIONS
     assert "先回答可确认部分" in KNOWLEDGE_TOOL_INSTRUCTIONS
     assert "资料、知识库、检索、证据" in KNOWLEDGE_TOOL_INSTRUCTIONS

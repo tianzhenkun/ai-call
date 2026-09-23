@@ -221,7 +221,10 @@ class AiCallHandoffService:
         reason: str | None,
     ) -> AiCallHandoffModel:
         handoff = await self._get_required(handoff_id)
-        if handoff.status != HANDOFF_STATUS_CONNECTED:
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=handoff.tenant_id, handoff_id=handoff_id,
+        )
+        if handoff is None or handoff.status != HANDOFF_STATUS_CONNECTED:
             self._raise_invalid_status("当前转人工状态不允许完成")
         return await self._finish(
             handoff,

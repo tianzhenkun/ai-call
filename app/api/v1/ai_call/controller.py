@@ -651,6 +651,7 @@ async def preview_prompt_profile_controller(
         prompt=None,
         prompt_text=request.prompt_text,
         opening_message=request.opening_message,
+        opening_barge_in_enabled=request.opening_barge_in_enabled,
         product_info=request.product_info,
     )
     return SuccessResponse(data=PromptProfilePreviewOut.model_validate(result), msg="预览成功")

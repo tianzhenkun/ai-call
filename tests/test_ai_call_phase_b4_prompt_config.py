@@ -687,6 +687,93 @@ async def create_static_profile(service: AiCallService) -> dict:
 
 
 @pytest.mark.anyio
+async def test_opening_barge_in_setting_survives_save_preview_runtime_and_version_restore(b4_service):
+    service, repository, _room_manager, _agent_runner = b4_service
+    values = {
+        "scene_code": "intro_geo", "name": "GEO 产品介绍", "prompt_text": "介绍产品",
+        "opening_message": "您好，现在方便吗？", "opening_barge_in_enabled": False,
+    }
+    created = await service.create_prompt_profile(tenant_id=TEST_TENANT_ID, values=values)
+    assert created["openingBargeInEnabled"] is False
+    profile = await repository.get_prompt_profile(int(created["id"]), tenant_id=TEST_TENANT_ID)
+    assert profile.opening_barge_in_enabled is False
+
+    preview = await service.preview_prompt_profile(
+        tenant_id=TEST_TENANT_ID, business_id=None, scene_code="intro_geo",
+        business_params={}, prompt=None,
+    )
+    assert preview["openingBargeInEnabled"] is False
+    effective = await service._resolve_prompt_effective_config(
+        tenant_id=TEST_TENANT_ID, business_id=None, scene_code="intro_geo",
+        business_params={}, debug_prompt=None, call_id="test-opening",
+    )
+    runtime = service.orchestrator._build_effective_config(
+        voice=None, prompt=None, prompt_effective_config=effective,
+    )
+    assert runtime.opening_barge_in_enabled is False
+    assert runtime.barge_in_enabled is True
+
+    await service.update_prompt_profile(
+        tenant_id=TEST_TENANT_ID, profile_id=int(created["id"]),
+        values={**values, "opening_barge_in_enabled": True},
+    )
+    versions = await service.list_prompt_profile_versions(
+        tenant_id=TEST_TENANT_ID, profile_id=int(created["id"]),
+    )
+    restored = await service.apply_prompt_profile_version(
+        tenant_id=TEST_TENANT_ID, profile_id=int(created["id"]),
+        version_id=int(versions["rows"][-1]["id"]),
+    )
+    assert restored["openingBargeInEnabled"] is False
+
+
+def test_opening_barge_in_snapshot_defaults_on_and_preserves_false():
+    from app.services.ai_call.prompt_config import (
+        PromptResolveContext,
+        resolve_static_prompt_snapshot,
+    )
+
+    snapshot = {"providerKey": "static_profile", "sceneCode": "intro_geo", "name": "GEO",
+                "promptText": "介绍产品", "openingMessage": "您好"}
+    context = PromptResolveContext(call_id="test", tenant_id=TEST_TENANT_ID,
+                                   business_id=None, scene_code="intro_geo")
+    assert resolve_static_prompt_snapshot(snapshot, context).opening_barge_in_enabled is True
+    snapshot["openingBargeInEnabled"] = False
+    assert resolve_static_prompt_snapshot(snapshot, context).opening_barge_in_enabled is False
+    assert AiCallService._profile_values_from_snapshot(snapshot)["opening_barge_in_enabled"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("snapshot_value, expected", [(False, False), (None, True)])
+async def test_business_query_task_freezes_opening_policy(b4_service, snapshot_value, expected):
+    service, _repository, _room_manager, _agent_runner = b4_service
+    await service.create_prompt_profile(tenant_id=TEST_TENANT_ID, values={
+        "scene_code": "intro_collection", "name": "催收产品介绍",
+        "provider_key": PROMPT_PROVIDER_BUSINESS_QUERY,
+        "opening_barge_in_enabled": not expected,
+    })
+    snapshot = {"providerKey": PROMPT_PROVIDER_BUSINESS_QUERY, "sceneCode": "intro_collection"}
+    if snapshot_value is not None:
+        snapshot["openingBargeInEnabled"] = snapshot_value
+    effective = await service._resolve_prompt_effective_config(
+        call_id="frozen-opening", tenant_id=TEST_TENANT_ID,
+        business_id="2064663837392551940", scene_code="intro_collection",
+        business_params={"identityName": "项目员工"}, debug_prompt=None,
+        prompt_snapshot=snapshot,
+    )
+    assert effective.opening_barge_in_enabled is expected
+    assert "债务记录：2064663837392551940" in effective.instructions
+
+
+def test_opening_barge_in_api_rejects_non_boolean_values():
+    values = {"sceneCode": "intro_geo"}
+    for value in ["false", 0, "true"]:
+        with pytest.raises(ValidationError):
+            PromptProfilePreviewRequest.model_validate({**values, "openingBargeInEnabled": value})
+    assert PromptProfilePreviewRequest.model_validate({**values, "openingBargeInEnabled": False}).opening_barge_in_enabled is False
+
+
+@pytest.mark.anyio
 async def test_prompt_components_include_runtime_common_constraints(b4_service) -> None:
     service, _repository, _room_manager, _agent_runner = b4_service
 

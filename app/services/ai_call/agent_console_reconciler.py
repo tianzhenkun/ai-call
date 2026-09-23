@@ -521,7 +521,9 @@ class AiCallAgentConsoleReconciler:
     ) -> dict:
         self._require_confirmation(confirmed)
         user, tenant_id = self._identity(auth)
-        handoff = await self._handoff_by_id(tenant_id, handoff_id)
+        handoff = await self.repository.get_console_handoff_for_claim(
+            tenant_id=tenant_id, handoff_id=handoff_id,
+        )
         if handoff is None:
             raise CustomException(msg="转人工记录不存在", status_code=404)
         current = now or datetime.now(timezone.utc)
@@ -580,6 +582,7 @@ class AiCallAgentConsoleReconciler:
         source_type: str | None = None,
         scene_code: str | None = None,
         task_id: int | None = None,
+        follow_up_id: int | None = None,
         formal_outbound_only: bool = False,
         source_started_at_begin: datetime | None = None,
         source_started_at_end: datetime | None = None,
@@ -618,6 +621,10 @@ class AiCallAgentConsoleReconciler:
         if normalized_scene_code:
             filtered_stmt = filtered_stmt.where(
                 AiCallFollowUpTaskModel.scene_code == normalized_scene_code
+            )
+        if follow_up_id is not None:
+            filtered_stmt = filtered_stmt.where(
+                AiCallFollowUpTaskModel.id == follow_up_id
             )
         if (
             formal_outbound_only

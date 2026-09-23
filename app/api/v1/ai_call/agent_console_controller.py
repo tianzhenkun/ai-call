@@ -1070,6 +1070,7 @@ async def list_admin_follow_ups_controller(
     source_type: Annotated[str | None, Query(alias="sourceType")] = None,
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     task_id: Annotated[int | None, Query(alias="taskId", ge=1)] = None,
+    follow_up_id: Annotated[int | None, Query(alias="followUpId", ge=1)] = None,
     formal_outbound_only: Annotated[
         bool,
         Query(alias="formalOutboundOnly"),
@@ -1092,6 +1093,7 @@ async def list_admin_follow_ups_controller(
             source_type=source_type,
             scene_code=scene_code,
             task_id=task_id,
+            follow_up_id=follow_up_id,
             formal_outbound_only=formal_outbound_only,
             source_started_at_begin=source_started_at_begin,
             source_started_at_end=source_started_at_end,

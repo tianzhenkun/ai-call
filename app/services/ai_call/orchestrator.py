@@ -239,6 +239,7 @@ class EffectiveConfig:
     vad_threshold: float
     vad_silence_duration_ms: int
     barge_in_enabled: bool = False
+    opening_barge_in_enabled: bool = True
     instructions: str | None = field(default=None, repr=False)
 
 
@@ -1547,6 +1548,7 @@ class AiCallOrchestrator:
                 vad_threshold=self.config.vad_threshold,
                 vad_silence_duration_ms=self.config.vad_silence_duration_ms,
                 barge_in_enabled=self.config.barge_in_enabled,
+                opening_barge_in_enabled=prompt_effective_config.opening_barge_in_enabled,
                 instructions=prompt_effective_config.instructions,
             )
 

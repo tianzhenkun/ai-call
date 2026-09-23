@@ -7,6 +7,7 @@ from typing import Any
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
 from app.services.ai_call.call_outcome import business_call_result, detect_answer_type
+from app.services.ai_call.call_termination import call_end_category
 from app.services.ai_call.event_store import AiCallEvent
 from app.services.ai_call.runtime_control.customer_media_repository import (
     OwnerCustomerMediaRepository,
@@ -575,6 +576,7 @@ class AiCallRecordService:
             "participantIdentity": record.participant_identity,
             "status": record.status,
             "endReason": record.end_reason,
+            "endCategory": getattr(record, "_end_category", call_end_category(record)),
             "failureStage": record.failure_stage,
             "failureMessage": record.failure_message,
             "startedAt": record.started_at,

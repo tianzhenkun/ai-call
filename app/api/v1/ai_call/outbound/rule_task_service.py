@@ -459,6 +459,7 @@ class OutboundRuleTaskService:
                 "providerKey": prompt.provider_key,
                 "promptText": prompt.prompt_text,
                 "openingMessage": prompt.opening_message,
+                "openingBargeInEnabled": prompt.opening_barge_in_enabled,
                 "productInfo": prompt.product_info,
                 "variables": self._load_list(prompt.variables_json),
                 "versionId": str(prompt_version.id) if prompt_version is not None else None,
@@ -473,6 +474,9 @@ class OutboundRuleTaskService:
                 "voiceName": voice.display_name,
                 "voiceType": voice.voice_type,
                 "targetModel": voice.target_model,
+                "speakingStyle": (
+                    voice.speaking_style if isinstance(voice, AiCallTenantVoiceProfileModel) else "natural"
+                ),
             },
             "rule": self.rule_out(rule).model_dump(mode="json", by_alias=True),
             "knowledge": knowledge_snapshot,

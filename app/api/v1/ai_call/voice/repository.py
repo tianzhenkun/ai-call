@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from typing import cast
 
 from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +11,7 @@ from app.api.v1.ai_call.model import AiCallVoiceProfileModel
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.schema import VoiceProfileOut, VoiceStatus
+from app.services.ai_call.voice_profile import VOICE_SPEAKING_STYLE_INSTRUCTIONS, VoiceSpeakingStyle
 
 BLOCKING_TASK_STATUSES = ("SCHEDULED", "RUNNING", "PAUSING", "PAUSED", "STOPPING")
 HISTORICAL_TASK_STATUSES = ("STOPPED", "COMPLETED", "FAILED", "CANCELLED")
@@ -160,6 +163,61 @@ class VoiceRepository:
             statement = statement.with_for_update()
         return await self.db.scalar(statement)
 
+    async def resolve_call_speaking_style(
+        self,
+        *,
+        tenant_id: str | None,
+        voice: str | None,
+        target_model: str,
+        business_type: str | None = None,
+        business_id: str | None = None,
+    ) -> VoiceSpeakingStyle:
+        if not tenant_id:
+            return "natural"
+        if business_type in {"outbound_task", "outbound_attempt"}:
+            from app.api.v1.ai_call.crud import AiCallRecordRepository
+
+            repository = AiCallRecordRepository(self.db)
+            if not business_id or not business_id.isdecimal():
+                raise ValueError("外呼表达风格缺少任务或拨打标识")
+            if business_type == "outbound_task":
+                snapshot_json = await repository.get_outbound_task_config_snapshot(
+                    int(business_id), tenant_id=tenant_id,
+                )
+            else:
+                snapshot = await repository.get_outbound_attempt_task_snapshot(
+                    int(business_id), tenant_id=tenant_id,
+                )
+                snapshot_json = snapshot[1] if snapshot is not None else None
+            if snapshot_json is None:
+                raise ValueError("外呼表达风格缺少任务快照")
+            voice_snapshot = json.loads(snapshot_json).get("voice", {})
+            if voice_snapshot.get("voice", voice) != voice:
+                raise ValueError("外呼音色与任务快照不一致")
+            # 旧任务没有风格配置时沿用自然表达，不读取后续修改的音色档案。
+            style = voice_snapshot.get("speakingStyle", "natural")
+        else:
+            builtin = await self.db.scalar(
+                select(AiCallVoiceProfileModel.id).where(
+                    AiCallVoiceProfileModel.voice == voice,
+                    AiCallVoiceProfileModel.target_model == target_model,
+                    AiCallVoiceProfileModel.voice_type == "内置",
+                )
+            )
+            if builtin is not None:
+                return "natural"
+            style = await self.db.scalar(
+                select(AiCallTenantVoiceProfileModel.speaking_style).where(
+                    AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                    AiCallTenantVoiceProfileModel.voice == voice,
+                    AiCallTenantVoiceProfileModel.target_model == target_model,
+                    AiCallTenantVoiceProfileModel.status == "ENABLED",
+                )
+            ) or "natural"
+        if style not in VOICE_SPEAKING_STYLE_INSTRUCTIONS:
+            raise ValueError("音色表达风格不合法")
+        return cast(VoiceSpeakingStyle, style)
+
     async def task_reference_summary(
         self,
         *,
@@ -237,6 +295,7 @@ class VoiceRepository:
             scope="TENANT",
             voice=profile.voice,
             display_name=profile.display_name,
+            speaking_style=profile.speaking_style,
             voice_type=profile.voice_type,
             gender=profile.gender,
             language=profile.language,

@@ -7,6 +7,7 @@ import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import UploadFile
@@ -992,6 +993,42 @@ async def test_tenant_voice_availability_can_be_disabled_and_reenabled(
 
 
 @pytest.mark.anyio
+async def test_speaking_style_persists_and_is_tenant_scoped(voice_database, monkeypatch) -> None:
+    _engine, factory = voice_database
+    await _seed(factory, _tenant_voice(profile_id=7021, voice="vc-style"))
+    service = _deletion_service(factory)
+    async with factory() as db:
+        result = await service.set_speaking_style(db, tenant_id="tenant-a", profile_id=7021, speaking_style="gentle")
+        assert result.model_dump(by_alias=True)["speakingStyle"] == "gentle"
+    async with factory() as db:
+        repository = VoiceRepository(db)
+        assert await repository.resolve_call_speaking_style(tenant_id="tenant-a", voice="vc-style", target_model=TARGET_MODEL) == "gentle"
+        assert await repository.resolve_call_speaking_style(tenant_id="tenant-b", voice="vc-style", target_model=TARGET_MODEL) == "natural"
+        with pytest.raises(CustomException) as caught:
+            await service.set_speaking_style(db, tenant_id="tenant-b", profile_id=7021, speaking_style="lively")
+        assert caught.value.status_code == 404
+    async with factory() as db:
+        monkeypatch.setattr(db, "commit", AsyncMock(side_effect=RuntimeError("test persistence failure")))
+        with pytest.raises(CustomException) as caught:
+            await service.set_speaking_style(db, tenant_id="tenant-a", profile_id=7021, speaking_style="lively")
+        assert caught.value.status_code == 500
+    async with factory() as db:
+        profile = await db.get(AiCallTenantVoiceProfileModel, 7021)
+        assert profile.speaking_style == "gentle"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("voice_status,expected_status", [("CREATING", 409), ("DELETING", 409), ("CREATE_FAILED", 409), ("DELETED", 404)])
+async def test_speaking_style_rejects_unavailable_asset(voice_database, voice_status, expected_status) -> None:
+    _engine, factory = voice_database
+    await _seed(factory, _tenant_voice(profile_id=7021, voice="vc-style", status=voice_status))
+    async with factory() as db:
+        with pytest.raises(CustomException) as caught:
+            await _deletion_service(factory).set_speaking_style(db, tenant_id="tenant-a", profile_id=7021, speaking_style="gentle")
+        assert caught.value.status_code == expected_status
+
+
+@pytest.mark.anyio
 async def test_tenant_voice_availability_rejects_transient_status(
     deletion_database,
 ) -> None:
@@ -1338,6 +1375,7 @@ def test_enrollment_request_normalizes_fields_and_forbids_server_owned_values() 
     assert request.transcript is None
     assert request.model_dump(by_alias=True) == {
         "displayName": "客服小林",
+        "speakingStyle": "natural",
         "gender": "女声",
         "language": "zh",
         "transcript": None,
@@ -1365,6 +1403,7 @@ def test_enrollment_request_normalizes_fields_and_forbids_server_owned_values() 
         {"language": "en"},
         {"transcript": "a" * 2001},
         {"consent_confirmed": "true"},
+        {"speaking_style": "任意指令"},
     ],
 )
 def test_enrollment_request_rejects_invalid_business_fields(payload: dict[str, object]) -> None:
@@ -1403,7 +1442,7 @@ async def test_create_persists_normalized_profile_and_enrollment(enrollment_data
             tenant_id="tenant-a",
             user_id=7,
             idempotency_key=" key-1 ",
-            request=_enrollment_request(),
+            request=_enrollment_request(speaking_style="gentle"),
             sample=sample,
         )
 
@@ -1423,6 +1462,7 @@ async def test_create_persists_normalized_profile_and_enrollment(enrollment_data
     assert profile.display_name == "客服小林"
     assert profile.voice is None
     assert profile.voice_type == "自定义复刻"
+    assert profile.speaking_style == "gentle"
     assert profile.provider == "aliyun_qwen"
     assert profile.target_model == TARGET_MODEL
     assert profile.status == "CREATING"

@@ -2,6 +2,7 @@ create table if not exists ai_call_tenant_voice_profile (
     id bigint primary key,
     tenant_id varchar(64) not null,
     display_name varchar(100) not null,
+    speaking_style varchar(32) not null default 'natural' constraint ck_tenant_voice_speaking_style check (speaking_style in ('natural','gentle','professional','lively','serious')),
     voice varchar(128) null,
     voice_type varchar(32) not null,
     gender varchar(16) not null,

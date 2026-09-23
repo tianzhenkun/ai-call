@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -1263,7 +1264,9 @@ async def test_resource_resolver_uses_effect_generation_and_source_reference() -
 @pytest.mark.anyio
 async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypatch) -> None:
     from app.api.v1.ai_call import service as ai_call_service
+    from app.api.v1.ai_call.crud import AiCallRecordRepository
     from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.services.ai_call.prompt_config import PromptEffectiveConfig
     from app.services.ai_call.runtime_control.livekit_provider import (
         DatabaseRuntimeProviderResourceResolver,
     )
@@ -1273,7 +1276,12 @@ async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypat
     )
 
     contexts = []
-    prompt_config = SimpleNamespace(opening_message="您好刘先生，想介绍一下 GEO。")
+    prompt_config = PromptEffectiveConfig(
+        instructions="业务话术", prompt_hash="original", opening_message="您好刘先生，想介绍一下 GEO。",
+        opening_message_hash="opening", prompt_source_key="intro_geo",
+    )
+    snapshot_lookup = AsyncMock(return_value=(10, '{"voice":{"voice":"Cherry","speakingStyle":"gentle"}}'))
+    monkeypatch.setattr(AiCallRecordRepository, "get_outbound_attempt_task_snapshot", snapshot_lookup)
 
     class PromptResolver:
         async def resolve(self, context):
@@ -1297,7 +1305,8 @@ async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypat
             room_name="ai-call-call-1",
             participant_identity="browser-call-1",
             callee_phone_number=None,
-            business_id="attempt-1",
+            business_id="11",
+            business_type="outbound_attempt",
             scene_code="intro_geo",
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(
@@ -1331,10 +1340,15 @@ async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypat
 
     resource = await DatabaseRuntimeProviderResourceResolver(
         lambda: SessionContext(),
-        orchestrator=object(),
+        orchestrator=SimpleNamespace(config=SimpleNamespace(qwen_realtime_model="qwen3.5-omni-plus-realtime")),
     ).resolve(_effect("ATTACH_AGENT_PARTICIPANT"))
 
-    assert resource.prompt_effective_config is prompt_config
+    assert "温和" in resource.prompt_effective_config.instructions
+    assert "业务话术" in resource.prompt_effective_config.instructions
+    assert resource.prompt_effective_config.opening_message == prompt_config.opening_message
+    assert resource.prompt_effective_config.prompt_hash != "original"
+    # 表达风格与知识库分别从同一租户的任务快照解析。
+    assert snapshot_lookup.await_args_list == [call(11, tenant_id="tenant-a")] * 2
     assert contexts[0].scene_code == "intro_geo"
     assert contexts[0].business_params == {"customerName": "刘先生"}
 

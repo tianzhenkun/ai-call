@@ -240,6 +240,12 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
             page_num=1,
             page_size=10,
         )
+        single_follow_up_page = await service.list_follow_ups(
+            _auth(session),
+            follow_up_id=4,
+            page_num=1,
+            page_size=10,
+        )
 
     await engine.dispose()
 
@@ -250,6 +256,8 @@ async def test_admin_follow_ups_filter_by_status_source_period_and_page() -> Non
     assert {row["id"] for row in formal_page["rows"]} == {"1", "2", "3"}
     assert task_page["total"] == 3
     assert {row["id"] for row in task_page["rows"]} == {"1", "2", "3"}
+    assert single_follow_up_page["total"] == 1
+    assert [row["id"] for row in single_follow_up_page["rows"]] == ["4"]
     assert {row["id"] for row in first_page["rows"] + second_page["rows"]} == {
         str(row_id) for row_id in range(1, 8)
     }
@@ -275,6 +283,7 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
         source_type="after_call_work",
         scene_code="intro_geo",
         task_id=100,
+        follow_up_id=4,
         formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,
@@ -288,6 +297,7 @@ async def test_admin_follow_up_controller_forwards_deep_link_filters() -> None:
         source_type="after_call_work",
         scene_code="intro_geo",
         task_id=100,
+        follow_up_id=4,
         formal_outbound_only=True,
         source_started_at_begin=begin,
         source_started_at_end=end,

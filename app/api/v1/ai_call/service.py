@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +20,7 @@ from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.exceptions import CustomException
 from app.core.logger import log
+from app.services.ai_call.call_termination import sip_disconnect_end_reason
 from app.services.ai_call.dialogue_service import (
     AiCallDialoguePersistenceWorker,
     AiCallDialogueRuntimeStore,
@@ -190,6 +191,7 @@ class AiCallService:
                 scene_code=scene_code,
                 business_params=business_params or {},
                 debug_prompt=None,
+                voice=resolved_voice,
             )
             await self.record_service.update_prompt_context(
                 call_id,
@@ -286,6 +288,8 @@ class AiCallService:
                 business_params=business_params or {},
                 debug_prompt=None,
                 prompt_snapshot=prompt_snapshot,
+                voice=resolved_voice,
+                business_type=business_type,
             )
             await self.record_service.update_prompt_context(
                 resolved_call_id,
@@ -656,6 +660,7 @@ class AiCallService:
         prompt: str | None,
         prompt_text: str | None = None,
         opening_message: str | None = None,
+        opening_barge_in_enabled: bool | None = None,
         product_info: str | None = None,
     ) -> dict:
         scene_code = self._require_scene_code(scene_code)
@@ -682,6 +687,9 @@ class AiCallService:
                 result = BusinessPromptResult(
                     prompt=draft_prompt,
                     opening_message=draft_opening,
+                    opening_barge_in_enabled=(
+                        opening_barge_in_enabled if opening_barge_in_enabled is not None else True
+                    ),
                     product_info=render_prompt_template(product_info or "", params).strip(),
                     source_key=scene_code,
                 )
@@ -708,6 +716,10 @@ class AiCallService:
         return {
             "instructions": effective_config.instructions,
             "openingMessage": effective_config.opening_message,
+            "openingBargeInEnabled": (
+                opening_barge_in_enabled if opening_barge_in_enabled is not None
+                else effective_config.opening_barge_in_enabled
+            ),
             "promptHash": effective_config.prompt_hash,
             "openingMessageHash": effective_config.opening_message_hash,
             "promptSourceKey": effective_config.prompt_source_key,
@@ -1133,16 +1145,19 @@ class AiCallService:
                 payload=payload,
             ),
         )
+        end_reason = sip_disconnect_end_reason(payload)
+        if end_reason == "sip_participant_left":
+            end_reason = "remote_hangup"
         await self.end_session(
             call_id,
-            end_reason="remote_hangup",
+            end_reason=end_reason,
             ended_at=hangup_event.timestamp if hangup_event is not None else None,
         )
         return {
             "handled": True,
             "action": "end_session",
             "callId": call_id,
-            "endReason": "remote_hangup",
+            "endReason": end_reason,
         }
 
     async def _end_persisted_sip_session_after_remote_hangup(
@@ -1155,6 +1170,9 @@ class AiCallService:
         payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
         assert self.record_service is not None
+        end_reason = sip_disconnect_end_reason(payload)
+        if end_reason == "sip_participant_left":
+            end_reason = "remote_hangup"
         hangup_event = self.orchestrator.event_store.append(
             call_id=call_id,
             type="sip_hangup",
@@ -1173,18 +1191,18 @@ class AiCallService:
         )
         await self.record_service.complete_session(
             call_id,
-            end_reason="remote_hangup",
+            end_reason=end_reason,
             ended_at=hangup_event.timestamp,
         )
         await self._finalize_handoffs_for_call(
             call_id,
-            end_reason="remote_hangup",
+            end_reason=end_reason,
         )
         completed_event = self.orchestrator.event_store.append(
             call_id=call_id,
             type="session_completed",
             source="orchestrator",
-            payload={"endReason": "remote_hangup"},
+            payload={"endReason": end_reason},
         )
         await self.record_service.mirror_runtime_events([completed_event])
         await self._enqueue_offline_asr_if_recordings_closed(call_id)
@@ -1192,7 +1210,7 @@ class AiCallService:
             "handled": True,
             "action": "end_persisted_session",
             "callId": call_id,
-            "endReason": "remote_hangup",
+            "endReason": end_reason,
         }
 
     async def terminate_sip_session(
@@ -1379,6 +1397,9 @@ class AiCallService:
         await self.record_service.repository.attach_after_call_result_context(
             [record], tenant_id=record.tenant_id
         )
+        await self.record_service.repository.attach_end_context(
+            [record], tenant_id=record.tenant_id
+        )
         last_event = await self.record_service.get_last_event(call_id)
         execution_config = await self.record_service.get_execution_config(record)
         exception_handling = (
@@ -1402,6 +1423,10 @@ class AiCallService:
                 )
             )
             if task is not None:
+                await self.record_service.repository.attach_end_context(
+                    ([source_record] if source_record is not None else []) + callback_records,
+                    tenant_id=record.tenant_id,
+                )
                 follow_up = {
                     "id": str(task.id),
                     "status": task.status,
@@ -2343,6 +2368,8 @@ class AiCallService:
         payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
         source_payload = payload or {}
+        participant = source_payload.get("participant")
+        participant = participant if isinstance(participant, dict) else {}
         result: dict[str, Any] = {
             "roomName": room_name,
             "participantIdentity": participant_identity,
@@ -2356,6 +2383,8 @@ class AiCallService:
             ("created_at", "createdAt"),
         ):
             value = source_payload.get(source_key)
+            if source_key in {"disconnectReason", "disconnect_reason"}:
+                value = participant.get(source_key) or value
             if value not in (None, ""):
                 result[target_key] = value
         return result
@@ -2501,6 +2530,8 @@ class AiCallService:
         business_params: dict,
         debug_prompt: str | None,
         prompt_snapshot: dict | None = None,
+        voice: str | None = None,
+        business_type: str | None = None,
     ) -> PromptEffectiveConfig | None:
         if self.prompt_resolver is None or self.prompt_composer is None:
             return None
@@ -2515,7 +2546,28 @@ class AiCallService:
         prompt_result = resolve_static_prompt_snapshot(prompt_snapshot, context)
         if prompt_result is None:
             prompt_result = await self.prompt_resolver.resolve(context)
-        return self.prompt_composer.compose(prompt_result)
+            # 动态业务内容实时解析，但任务的开场白策略仍使用创建时的快照。
+            if prompt_snapshot and normalize_scene_code(
+                str(prompt_snapshot.get("sceneCode") or "")
+            ) == normalize_scene_code(scene_code):
+                prompt_result = replace(
+                    prompt_result,
+                    opening_barge_in_enabled=prompt_snapshot.get("openingBargeInEnabled", True),
+                )
+        # 未选择音色的独立调用可以只注入提示词解析器，不依赖音色数据库。
+        if not tenant_id or (voice is None and self.prompt_repository is None):
+            return self.prompt_composer.compose(prompt_result)
+        from app.api.v1.ai_call.voice.repository import VoiceRepository
+        from app.services.ai_call.voice_profile import apply_voice_style
+
+        style = await VoiceRepository(self._ensure_prompt_repository().db).resolve_call_speaking_style(
+            tenant_id=tenant_id,
+            voice=voice or self.orchestrator.config.qwen_realtime_voice,
+            target_model=self.orchestrator.config.qwen_realtime_model,
+            business_type=business_type,
+            business_id=business_id,
+        )
+        return apply_voice_style(self.prompt_composer.compose(prompt_result), style)
 
     async def _resolve_legacy_knowledge_context(
         self,
@@ -2556,6 +2608,7 @@ class AiCallService:
             ).strip(),
             "prompt_text": _strip_or_none(values.get("prompt_text")),
             "opening_message": _strip_or_none(values.get("opening_message")),
+            "opening_barge_in_enabled": values.get("opening_barge_in_enabled", True),
             "product_info": str(values.get("product_info") or "").strip(),
             "variables_json": json.dumps(
                 values.get("variables") or [],
@@ -2607,6 +2660,7 @@ class AiCallService:
             "providerKey": profile.provider_key,
             "promptText": profile.prompt_text,
             "openingMessage": profile.opening_message,
+            "openingBargeInEnabled": profile.opening_barge_in_enabled,
             "productInfo": profile.product_info,
             "variables": json.loads(profile.variables_json or "[]"),
             "versionNo": version_no,
@@ -2648,6 +2702,7 @@ class AiCallService:
             "providerKey": profile.provider_key,
             "promptText": profile.prompt_text,
             "openingMessage": profile.opening_message,
+            "openingBargeInEnabled": profile.opening_barge_in_enabled,
             "productInfo": profile.product_info,
             "variables": json.loads(profile.variables_json or "[]"),
         }
@@ -2660,6 +2715,7 @@ class AiCallService:
             "provider_key": snapshot.get("providerKey"),
             "prompt_text": snapshot.get("promptText"),
             "opening_message": snapshot.get("openingMessage"),
+            "opening_barge_in_enabled": snapshot.get("openingBargeInEnabled", True),
             "product_info": snapshot.get("productInfo"),
             "variables": snapshot.get("variables"),
         })

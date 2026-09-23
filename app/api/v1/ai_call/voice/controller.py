@@ -36,6 +36,7 @@ from .schema import (
     VoiceAvailabilityRequest,
     VoiceEnrollmentAcceptedOut,
     VoiceEnrollmentRequest,
+    VoiceSpeakingStyleRequest,
     VoiceStatus,
 )
 from .service import (
@@ -49,6 +50,8 @@ VoiceRouter = APIRouter(tags=["租户音色管理"])
 
 
 class VoiceLifecycleService(Protocol):
+    async def set_speaking_style(self, *, tenant_id: str, profile_id: int, speaking_style: str) -> Any: ...
+
     async def get_enrollment(
         self,
         *,
@@ -138,6 +141,9 @@ class _UnavailableVoiceEnrollmentService:
 
 
 class _UnavailableVoiceLifecycleService:
+    async def set_speaking_style(self, **kwargs):
+        self._raise_unavailable()
+
     async def get_enrollment(self, **kwargs):
         self._raise_unavailable()
 
@@ -222,6 +228,11 @@ class _DefaultVoiceLifecycleService(_UnavailableVoiceLifecycleService):
         if self.deletion_service is None:
             self._raise_unavailable()
         return await self.deletion_service.set_availability(self.db, **kwargs)
+
+    async def set_speaking_style(self, **kwargs):
+        if self.deletion_service is None:
+            self._raise_unavailable()
+        return await self.deletion_service.set_speaking_style(self.db, **kwargs)
 
 
 _unavailable_enrollment_service = _UnavailableVoiceEnrollmentService()
@@ -444,6 +455,25 @@ async def create_voice_preview_audio_controller(
         voice=request.voice,
     )
     return SuccessResponse(data=result, msg="试听音频生成成功")
+
+
+@VoiceRouter.patch(
+    "/tenant-voice-profiles/{id}/speaking-style",
+    summary="设置自定义音色表达风格",
+)
+async def set_voice_speaking_style_controller(
+    request: VoiceSpeakingStyleRequest,
+    profile_id: Annotated[int, Path(alias="id", gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_voice_manager)],
+    service: Annotated[VoiceLifecycleService, Depends(get_voice_deletion_lifecycle_service)],
+) -> JSONResponse:
+    tenant_id, _user_id = _identity(auth)
+    result = await service.set_speaking_style(
+        tenant_id=tenant_id,
+        profile_id=profile_id,
+        speaking_style=request.speaking_style,
+    )
+    return SuccessResponse(data=result, msg="表达风格已保存")
 
 
 @VoiceRouter.post(

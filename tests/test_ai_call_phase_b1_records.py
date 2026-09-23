@@ -87,6 +87,7 @@ from app.services.ai_call.recording_service import (
     AiCallRecordingReconcileWorker,
     AiCallRecordingService,
 )
+from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 from app.services.ai_call.session_registry import (
     CallSession,
     CallSessionStatus,
@@ -1384,6 +1385,96 @@ async def test_record_query_outputs_bigint_ids_as_strings(b1_service) -> None:
     assert events["total"] == 6
     assert isinstance(events["rows"][0]["id"], str)
     assert events["rows"][0]["eventType"] == "session_created"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("end_reason", "disconnect_reason", "expected"),
+    [
+        ("agent_completed", "CLIENT_INITIATED", "agent"),
+        ("callback_ended_by_agent", None, "agent"),
+        ("remote_hangup", None, "unknown"),
+        ("sip_client_initiated", None, "customer"),
+        ("sip_participant_left", "CLIENT_INITIATED", "customer"),
+        ("sip_participant_left", "MEDIA_FAILURE", "system_error"),
+        ("sip_participant_left", "ROOM_DELETED", "unknown"),
+        ("sip_participant_left", None, "unknown"),
+        ("customer_end", "CLIENT_INITIATED", "system_normal"),
+        ("policy_turn_limit", None, "system_normal"),
+        ("normal_completed", None, "system_normal"),
+        ("model_error", "CLIENT_INITIATED", "system_error"),
+        ("owner_lost", None, "system_error"),
+        ("callback_completed", None, "unknown"),
+        ("new_unrecognized_reason", None, "unknown"),
+    ],
+)
+async def test_record_end_category_is_shared_by_list_and_detail(
+    b1_service, end_reason, disconnect_reason, expected,
+) -> None:
+    service, record_service = b1_service
+    db = record_service.repository.db
+    now = datetime(2026, 9, 21, 9, 13, 39, tzinfo=timezone.utc)
+    record = AiCallRecordModel(
+        id=987001, tenant_id="000000", call_id="call-end-category",
+        entry_type="direct_sip", room_name="ai-call-call-end-category",
+        participant_identity="caller-call-end-category", status="completed",
+        started_at=now - timedelta(minutes=4), answered_at=now - timedelta(minutes=4),
+        ended_at=now, end_reason=end_reason, runtime_control_mode="owner_command_v1",
+    )
+    db.add(record)
+    if disconnect_reason:
+        db.add(AiCallEndEvidenceModel(
+            id=987002, tenant_id="000000", call_id=record.call_id,
+            source="livekit_webhook", end_reason="sip_participant_left",
+            dedupe_key="end-category-webhook", received_at=now,
+            evidence_json=json.dumps({
+                "event": "participant_left", "createdAt": "1789982018",
+                "room": {"name": record.room_name},
+                "participant": {
+                    "identity": record.participant_identity, "kind": "SIP",
+                    "disconnectReason": disconnect_reason,
+                },
+            }),
+        ))
+    await db.flush()
+    detail = await service.get_record_detail(record.call_id)
+    assert detail["record"].get("endCategory") == expected
+    assert RecordDetailOut.model_validate(detail).record.end_category == expected
+    rows = await service.list_records(tenant_id="000000")
+    assert rows["rows"][0].get("endCategory") == expected
+    assert record.end_reason == end_reason
+
+
+@pytest.mark.anyio
+async def test_end_category_does_not_use_other_tenant_or_later_cleanup_evidence(b1_service) -> None:
+    service, record_service = b1_service
+    db = record_service.repository.db
+    now = datetime(2026, 9, 21, 9, 13, 39, tzinfo=timezone.utc)
+    record = AiCallRecordModel(
+        id=987011, tenant_id="000000", call_id="call-end-evidence-order",
+        entry_type="direct_sip", room_name="ai-call-end-evidence-order",
+        participant_identity="caller-end-evidence-order", status="completed",
+        started_at=now - timedelta(minutes=4), answered_at=now - timedelta(minutes=4),
+        ended_at=now, end_reason="sip_participant_left",
+    )
+    db.add(record)
+    for index, tenant_id, reason in [(0, "other", "CLIENT_INITIATED"),
+                                    (1, "000000", "ROOM_DELETED"),
+                                    (2, "000000", "CLIENT_INITIATED")]:
+        db.add(AiCallEndEvidenceModel(
+            id=987012 + index, tenant_id=tenant_id, call_id=record.call_id,
+            source="livekit_webhook", end_reason=record.end_reason,
+            dedupe_key=f"end-evidence-{index}", received_at=now + timedelta(seconds=index),
+            evidence_json=json.dumps({
+                "event": "participant_left", "room": {"name": record.room_name},
+                "participant": {"identity": record.participant_identity, "kind": "SIP",
+                                "disconnectReason": reason},
+            }),
+        ))
+    await db.flush()
+    detail = await service.get_record_detail(record.call_id)
+    assert detail["record"]["endCategory"] == "unknown"
+    assert record.end_reason == "sip_participant_left"
 
 
 @pytest.mark.anyio

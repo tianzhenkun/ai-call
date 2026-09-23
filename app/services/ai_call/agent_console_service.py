@@ -27,6 +27,10 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.handoff_unanswered_service import (
     AiCallHandoffUnansweredService,
 )
+from app.services.ai_call.runtime_control.command_repository import (
+    EndCallIntent,
+    RuntimeCommandRepository,
+)
 from app.services.ai_call.runtime_control.handoff_repository import (
     HandoffAcceptIntent,
     HandoffClaimConflictError,
@@ -478,6 +482,23 @@ class AiCallAgentConsoleService:
 
         now = datetime.now(timezone.utc)
         if handoff.status in {"connected", "reconnecting"}:
+            record = await self.repository.get_record_for_tenant(
+                tenant_id=profile.tenant_id, call_id=handoff.call_id,
+            )
+            if record is not None and record.runtime_control_mode == "owner_command_v1":
+                # 在响应和媒体清理之前登记已鉴权的坐席动作，后续 Webhook 只追加证据。
+                await RuntimeCommandRepository(self.db).request_end(EndCallIntent(
+                    tenant_id=profile.tenant_id,
+                    call_id=handoff.call_id,
+                    source="agent_console",
+                    end_reason="agent_completed",
+                    dedupe_key=f"agent_handoff_complete:{handoff.call_id}",
+                    event_at=now,
+                    evidence={
+                        "agentIdentity": profile.agent_identity,
+                        "handoffId": handoff.handoff_id,
+                    },
+                ))
             handoff.status = "completed"
             handoff.ended_at = now
             handoff.end_reason = "agent_completed"

@@ -556,6 +556,10 @@ async def test_preview_allows_builtin_and_enabled_tenant_voice_with_fixed_config
     )
 
     async with preview_database() as db:
+        if voice == "tenant-a-enabled":
+            profile = await db.get(AiCallTenantVoiceProfileModel, 2)
+            profile.speaking_style = "gentle"
+            await db.commit()
         result = await service.create_preview_session(
             db,
             tenant_id="tenant-a",
@@ -568,6 +572,7 @@ async def test_preview_allows_builtin_and_enabled_tenant_voice_with_fixed_config
     assert result.effective_config.voice == voice
     assert result.effective_config.opening_message == VOICE_PREVIEW_OPENING_MESSAGE
     assert result.effective_config.prompt_source_key == "voice_preview"
+    assert ("温和" in result.effective_config.prompt) is (voice == "tenant-a-enabled")
 
     await service.close_preview_session(
         tenant_id="tenant-a",
@@ -589,6 +594,9 @@ async def test_preview_audio_generates_direct_wav_data_url_without_livekit(
     )
 
     async with preview_database() as db:
+        profile = await db.get(AiCallTenantVoiceProfileModel, 2)
+        profile.speaking_style = "gentle"
+        await db.commit()
         result = await service.create_preview_audio(
             db,
             tenant_id="tenant-a",
@@ -599,6 +607,7 @@ async def test_preview_audio_generates_direct_wav_data_url_without_livekit(
     assert provider.connected is True
     assert provider.closed is True
     assert provider.session_configs[0].voice == "tenant-a-enabled"
+    assert "温和" in provider.session_configs[0].instructions
     assert provider.response_inputs == [VOICE_PREVIEW_OPENING_MESSAGE]
     assert result["text"] == VOICE_PREVIEW_OPENING_MESSAGE
     assert result["audioUrl"].startswith("data:audio/wav;base64,")

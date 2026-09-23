@@ -50,6 +50,7 @@ from app.common.constant import RET
 from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.call_termination import sip_disconnect_end_reason
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.livekit_sip import HumanOnlySipSessionFactory
 from app.utils.id_util import generate_snowflake_id
@@ -1711,6 +1712,8 @@ class AiCallFollowUpService:
     ) -> AiCallRecordModel:
         if self.callback_factory is None:
             raise CustomException(msg="人工回拨服务未配置", status_code=503)
+        # 与客户断开入口串行，并刷新已被其他事务结束的旧 ORM 对象。
+        await self.db.refresh(record, with_for_update=True)
         if record.status in {"completed", "failed"}:
             return record
         await self._callback_presence(
@@ -1722,13 +1725,14 @@ class AiCallFollowUpService:
         if record.status not in {"ringing", "running"}:
             self._raise_conflict("当前回拨通话已经结束", "FOLLOW_UP_STATE_CONFLICT")
 
+        record.end_reason = record.end_reason or "callback_ended_by_agent"
+        await self.db.flush()
         await self._stop_callback_recording(record)
         await self.callback_factory.end(call_id=record.call_id)
         now = datetime.now(timezone.utc)
         record.status = "completed"
         record.ended_at = now
         record.duration_ms = self._callback_duration_ms(record, now)
-        record.end_reason = "callback_ended_by_agent"
         if follow_up_task is not None:
             follow_up_task.status = "processing"
             follow_up_task.updated_at = now
@@ -2045,6 +2049,9 @@ class AiCallFollowUpService:
                 return {"handled": False, "reason": "sip_not_connected"}
             attempt_result = "connected"
         elif event_type == "participant_left":
+            await self.db.refresh(record, with_for_update=True)
+            if record.status in {"completed", "failed"}:
+                return {"handled": True, "action": "record_terminal", "callId": call_id}
             existing_attempt = await self._attempt_by_call_id(call_id)
             connected = (
                 existing_attempt is not None
@@ -2069,13 +2076,18 @@ class AiCallFollowUpService:
                     if record.follow_up_id is not None
                     else None
                 )
+                disconnect_reason = sip_disconnect_end_reason(payload)
+                record.end_reason = record.end_reason or (
+                    "callback_completed" if disconnect_reason == "sip_participant_left"
+                    else disconnect_reason
+                )
+                await self.db.flush()
                 await self._stop_callback_recording(record)
                 now = datetime.now(timezone.utc)
                 record.status = "completed"
                 ended_at = record.ended_at or now
                 record.ended_at = ended_at
                 record.duration_ms = self._callback_duration_ms(record, ended_at)
-                record.end_reason = record.end_reason or "callback_completed"
                 if task is not None:
                     task.updated_at = now
                 await self._settle_callback_presence(

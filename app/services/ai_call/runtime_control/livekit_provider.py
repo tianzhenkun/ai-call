@@ -234,6 +234,8 @@ class DatabaseRuntimeProviderResourceResolver:
             _build_prompt_composer,
             _build_prompt_resolver,
         )
+        from app.api.v1.ai_call.voice.repository import VoiceRepository
+        from app.services.ai_call.voice_profile import apply_voice_style
 
         payload = self._payload(getattr(command, "payload_json", None))
         business_params = payload.get("business_params")
@@ -260,7 +262,14 @@ class DatabaseRuntimeProviderResourceResolver:
                 AiCallRecordRepository(session),
                 self._orchestrator,
             ).resolve(context)
-        return _build_prompt_composer(self._orchestrator).compose(result)
+        style = await VoiceRepository(session).resolve_call_speaking_style(
+            tenant_id=context.tenant_id,
+            voice=payload.get("voice") or self._orchestrator.config.qwen_realtime_voice,
+            target_model=self._orchestrator.config.qwen_realtime_model,
+            business_type=record.business_type,
+            business_id=context.business_id,
+        )
+        return apply_voice_style(_build_prompt_composer(self._orchestrator).compose(result), style)
 
     @staticmethod
     async def _resolve_knowledge_context(

@@ -163,7 +163,8 @@ def test_answer_mode_rejects_invalid_task_combinations(payload: dict) -> None:
 
 
 @pytest.mark.anyio
-async def test_web_single_validation_and_task_creation_skip_sip_line(database) -> None:
+@pytest.mark.parametrize("opening_barge_in_enabled", [True, False])
+async def test_web_single_validation_and_task_creation_skip_sip_line(database, opening_barge_in_enabled) -> None:
     prompt_id, _ = await _seed_references(database)
     credit_metering_client = AsyncMock()
     service = OutboundRuleTaskService(
@@ -171,6 +172,8 @@ async def test_web_single_validation_and_task_creation_skip_sip_line(database) -
         credit_metering_client=credit_metering_client,
     )
     async with database() as session:
+        profile = await session.get(AiCallPromptProfileModel, prompt_id)
+        profile.opening_barge_in_enabled = opening_barge_in_enabled
         rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
         await session.commit()
 
@@ -231,6 +234,7 @@ async def test_web_single_validation_and_task_creation_skip_sip_line(database) -
     task_snapshot = json.loads(task.config_snapshot_json)
     assert "sipLine" not in task_snapshot
     assert task_snapshot["prompt"]["versionId"] == str(current_version_id)
+    assert task_snapshot["prompt"]["openingBargeInEnabled"] is opening_barge_in_enabled
     assert total == 1
     assert targets[0].phone_number is None
     credit_metering_client.require_eligible.assert_not_awaited()
@@ -431,6 +435,7 @@ async def _seed_tenant_voice(
     tenant_id: str = "tenant-a",
     voice: str = "qwen-omni-vc-tenant",
     status: str = "ENABLED",
+    speaking_style: str = "natural",
     target_model: str = QWEN_OMNI_REALTIME_TARGET_MODEL,
 ) -> int:
     profile_id = generate_snowflake_id()
@@ -441,6 +446,7 @@ async def _seed_tenant_voice(
                 id=profile_id,
                 tenant_id=tenant_id,
                 display_name="租户客服音色",
+                speaking_style=speaking_style,
                 voice=voice,
                 voice_type="自定义复刻",
                 gender="女声",
@@ -569,7 +575,7 @@ async def test_formal_task_tenant_voice_lookup_uses_profile_row_lock() -> None:
 @pytest.mark.anyio
 async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
     prompt_id, _ = await _seed_references(database)
-    profile_id = await _seed_tenant_voice(database)
+    profile_id = await _seed_tenant_voice(database, speaking_style="gentle")
     service = OutboundRuleTaskService(database)
     async with database() as session:
         rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())
@@ -605,6 +611,7 @@ async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
         "scope": "TENANT",
         "profileId": str(profile_id),
         "voice": "qwen-omni-vc-tenant",
+        "speakingStyle": "gentle",
         "voiceName": "租户客服音色",
         "voiceType": "自定义复刻",
         "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
@@ -613,6 +620,32 @@ async def test_formal_task_uses_enabled_tenant_voice_snapshot(database) -> None:
     assert task.voice_name == "租户客服音色"
     assert task.voice_type == "自定义复刻"
     assert task.voice_target_model == QWEN_OMNI_REALTIME_TARGET_MODEL
+
+    async with database() as session:
+        await VoiceDeletionService(session_factory=database).set_speaking_style(
+            session, tenant_id="tenant-a", profile_id=profile_id, speaking_style="lively",
+        )
+        repository = VoiceRepository(session)
+        assert await repository.resolve_call_speaking_style(
+            tenant_id="tenant-a", voice=task.voice, target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+            business_type="outbound_task", business_id=str(task.id),
+        ) == "gentle"
+        assert await repository.resolve_call_speaking_style(
+            tenant_id="tenant-a", voice=task.voice, target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+        ) == "lively"
+        with pytest.raises(ValueError, match="缺少任务快照"):
+            await repository.resolve_call_speaking_style(
+                tenant_id="tenant-b", voice=task.voice, target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+                business_type="outbound_task", business_id=str(task.id),
+            )
+        persisted_task = await session.get(AiCallOutboundTaskModel, task.id)
+        del snapshot["voice"]["speakingStyle"]
+        persisted_task.config_snapshot_json = json.dumps(snapshot)
+        await session.commit()
+        assert await repository.resolve_call_speaking_style(
+            tenant_id="tenant-a", voice=task.voice, target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
+            business_type="outbound_task", business_id=str(task.id),
+        ) == "natural"
 
     task_out = service.task_out(task)
     task_payload = task_out.model_dump(mode="json", by_alias=True)
@@ -735,6 +768,7 @@ async def test_task_history_keeps_voice_snapshot_after_tenant_voice_deleted(
         "scope": "TENANT",
         "profileId": str(profile_id),
         "voice": "qwen-omni-vc-history",
+        "speakingStyle": "natural",
         "voiceName": "租户客服音色",
         "voiceType": "自定义复刻",
         "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,
@@ -840,6 +874,7 @@ async def test_formal_task_builtin_voice_is_scoped_by_target_model(database) -> 
         "scope": "BUILTIN",
         "profileId": str(builtin_voice_id),
         "voice": "Tina",
+        "speakingStyle": "natural",
         "voiceName": "甜甜 Tina",
         "voiceType": "内置",
         "targetModel": QWEN_OMNI_REALTIME_TARGET_MODEL,

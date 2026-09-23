@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints, field_validator
 from pydantic.alias_generators import to_camel
 
+from app.services.ai_call.voice_profile import VoiceSpeakingStyle
+
 VoiceStatus = Literal[
     "CREATING",
     "ENABLED",
@@ -45,6 +47,7 @@ class VoiceEnrollmentRequest(BaseModel):
         StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
     ]
     gender: Literal["未知", "女声", "男声"]
+    speaking_style: VoiceSpeakingStyle = "natural"
     language: Literal["zh"]
     transcript: (
         Annotated[
@@ -68,6 +71,12 @@ class VoiceAvailabilityRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: VoiceAvailabilityStatus
+
+
+class VoiceSpeakingStyleRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    speaking_style: VoiceSpeakingStyle
 
 
 class VoiceEnrollmentAcceptedOut(BaseModel):
@@ -100,6 +109,7 @@ class VoiceProfileOut(BaseModel):
     voice: str | None
     display_name: str
     voice_type: str
+    speaking_style: VoiceSpeakingStyle = "natural"
     gender: str
     language: str | None
     target_model: str

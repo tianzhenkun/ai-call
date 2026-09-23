@@ -929,6 +929,7 @@ async def test_create_sip_session_accepts_enabled_tenant_voice() -> None:
                     id=1,
                     tenant_id="tenant-a",
                     display_name="租户音色",
+                    speaking_style="gentle",
                     voice="tenant-voice",
                     voice_type="自定义复刻",
                     gender="女声",
@@ -971,6 +972,7 @@ async def test_create_sip_session_accepts_enabled_tenant_voice() -> None:
 
             assert result.effective_config.voice == "tenant-voice"
             assert agent_runner.started_sessions[0].effective_config.voice == "tenant-voice"
+            assert "温和" in agent_runner.started_sessions[0].effective_config.prompt
     finally:
         async with engine.begin() as conn:
             await conn.run_sync(MappedBase.metadata.drop_all)
@@ -1221,7 +1223,14 @@ async def test_create_sip_session_starts_customer_and_ai_participant_recordings(
 
 
 @pytest.mark.anyio
-async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recording() -> None:
+@pytest.mark.parametrize(("disconnect_reason", "end_reason"), [
+    ("CLIENT_INITIATED", "sip_client_initiated"),
+    ("MEDIA_FAILURE", "sip_transport_error"),
+    ("ROOM_DELETED", "remote_hangup"),
+])
+async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recording(
+    disconnect_reason, end_reason,
+) -> None:
     (
         service,
         room_manager,
@@ -1246,14 +1255,14 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
         event_type="participant_left",
         room_name=result.room_name,
         participant_identity=result.participant_identity,
-        payload={"disconnectReason": "CLIENT_INITIATED"},
+        payload={"participant": {"disconnectReason": disconnect_reason}},
     )
 
     assert handled == {
         "handled": True,
         "action": "end_session",
         "callId": result.call_id,
-        "endReason": "remote_hangup",
+        "endReason": end_reason,
     }
     status = await service.get_session(result.call_id)
     assert status.status == CallSessionStatus.COMPLETED
@@ -1263,7 +1272,7 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
     assert record_service.completed_sessions == [
         {
             "call_id": result.call_id,
-            "end_reason": "remote_hangup",
+            "end_reason": end_reason,
             "ended_at": next(
                 event.timestamp
                 for event in service.orchestrator.event_store.list_all(result.call_id)
@@ -1279,7 +1288,14 @@ async def test_livekit_sip_participant_left_auto_ends_session_and_stops_recordin
 
 
 @pytest.mark.anyio
-async def test_livekit_sip_participant_left_ends_persisted_session_without_local_runtime() -> None:
+@pytest.mark.parametrize(("disconnect_reason", "end_reason"), [
+    ("CLIENT_INITIATED", "sip_client_initiated"),
+    ("SERVER_SHUTDOWN", "sip_transport_error"),
+    ("ROOM_DELETED", "remote_hangup"),
+])
+async def test_livekit_sip_participant_left_ends_persisted_session_without_local_runtime(
+    disconnect_reason, end_reason,
+) -> None:
     (
         service,
         room_manager,
@@ -1305,14 +1321,14 @@ async def test_livekit_sip_participant_left_ends_persisted_session_without_local
         event_type="participant_left",
         room_name=result.room_name,
         participant_identity=result.participant_identity,
-        payload={"disconnectReason": "CLIENT_INITIATED"},
+        payload={"disconnectReason": disconnect_reason},
     )
 
     assert handled == {
         "handled": True,
         "action": "end_persisted_session",
         "callId": result.call_id,
-        "endReason": "remote_hangup",
+        "endReason": end_reason,
     }
     assert room_manager.deleted_rooms == [result.room_name]
     assert agent_runner.stopped_call_ids == [result.call_id]
@@ -1320,7 +1336,7 @@ async def test_livekit_sip_participant_left_ends_persisted_session_without_local
     assert record_service.completed_sessions == [
         {
             "call_id": result.call_id,
-            "end_reason": "remote_hangup",
+            "end_reason": end_reason,
             "ended_at": next(
                 event.timestamp
                 for event in service.orchestrator.event_store.list_all(result.call_id)

@@ -1,6 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
+from typing import Literal
+
+from app.services.ai_call.prompt_config import PromptEffectiveConfig
+
+VoiceSpeakingStyle = Literal["natural", "gentle", "professional", "lively", "serious"]
+
+VOICE_SPEAKING_STYLE_INSTRUCTIONS: dict[VoiceSpeakingStyle, str] = {
+    "natural": "",
+    "gentle": "使用温和、耐心、亲切的语气，表达舒缓，不刻意撒娇。",
+    "professional": "使用专业、沉稳、自信的语气，表达清晰克制，避免机械播报。",
+    "lively": "使用活泼、明快、有活力的语气，适度增加语气起伏，不夸张表演。",
+    "serious": "使用严肃、冷静、郑重的语气，表达克制，不生硬、不施压。",
+}
+
+
+def append_voice_style(instructions: str, style: VoiceSpeakingStyle) -> str:
+    direction = VOICE_SPEAKING_STYLE_INSTRUCTIONS[style]
+    if not direction:
+        return instructions
+    return (
+        f"{instructions}\n\n音色表达风格：{direction}"
+        "保持当前音色的身份特征，仅调整声音表达；不改变业务事实、原定话术和工具调用规则。"
+    )
+
+
+def apply_voice_style(config: PromptEffectiveConfig, style: VoiceSpeakingStyle) -> PromptEffectiveConfig:
+    instructions = append_voice_style(config.instructions, style)
+    if instructions == config.instructions:
+        return config
+    return replace(
+        config,
+        instructions=instructions,
+        prompt_hash=hashlib.sha256(instructions.encode()).hexdigest(),
+    )
+
 
 VOICE_TYPE_BUILTIN = "内置"
 VOICE_TYPE_CUSTOM_CLONE = "自定义复刻"

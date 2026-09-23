@@ -1096,7 +1096,12 @@ async def test_product_info_extractor_marks_knowledge_as_untrusted_json_input() 
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert payload["model"] == "qwen3.7-plus"
-        assert "不可信资料" in payload["messages"][0]["content"]
+        instructions = payload["messages"][0]["content"]
+        assert "不可信资料" in instructions
+        assert all(section in instructions for section in ("产品定位", "核心能力", "关键边界"))
+        assert "300～600" in instructions
+        assert "价格、政策、案例、周期和具体参数" in instructions
+        assert "合并时保留" in instructions
         assert json.loads(payload["messages"][1]["content"])["mode"] == "extract"
         return httpx.Response(
             200,

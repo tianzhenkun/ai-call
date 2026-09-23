@@ -96,6 +96,7 @@ class EffectiveConfigOut(AiCallBaseSchema):
     opening_message_hash: str
     prompt_source_key: str
     barge_in_enabled: bool = False
+    opening_barge_in_enabled: bool = True
     vad_type: str
     vad_threshold: float
     vad_silence_duration_ms: int
@@ -358,6 +359,7 @@ class RecordOut(AiCallBaseSchema):
     participant_identity: str | None = None
     status: str
     end_reason: str | None = None
+    end_category: Literal["agent", "customer", "system_normal", "system_error", "unknown"] | None = None
     failure_stage: str | None = None
     failure_message: str | None = None
     started_at: datetime
@@ -671,6 +673,7 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
     )
     prompt_text: str | None = Field(default=None, description="固定提示词")
     opening_message: str | None = Field(default=None, max_length=1000, description="固定开场白")
+    opening_barge_in_enabled: bool = Field(default=True, strict=True, description="开场白允许打断")
     product_info: str = Field(default="", max_length=20_000, description="产品或服务信息")
     variables: list[PromptVariableDefinition] = Field(default_factory=list, max_length=100)
 
@@ -731,6 +734,7 @@ class PromptProfileOut(AiCallBaseSchema):
     provider_key: str
     prompt_text: str | None = None
     opening_message: str | None = None
+    opening_barge_in_enabled: bool = True
     product_info: str = ""
     variables: list[PromptVariableDefinition] = Field(default_factory=list)
     version_no: int | None = None
@@ -837,6 +841,7 @@ class PromptProfilePreviewRequest(AiCallBaseSchema):
     business_params: dict[str, Any] = Field(default_factory=dict, description="业务侧上下文参数")
     prompt_text: str | None = Field(default=None, description="未保存的场景提示词")
     opening_message: str | None = Field(default=None, max_length=1000)
+    opening_barge_in_enabled: bool | None = Field(default=None, strict=True)
     product_info: str | None = Field(default=None, max_length=20_000)
 
 
@@ -847,6 +852,7 @@ class PromptProfilePreviewOut(AiCallBaseSchema):
     opening_message_hash: str
     prompt_source_key: str
     barge_in_enabled: bool = False
+    opening_barge_in_enabled: bool = True
 
 
 class PromptOptimizeSceneContext(AiCallBaseSchema):

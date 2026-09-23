@@ -35,6 +35,10 @@ class AiCallTenantVoiceProfileModel(MappedBase):
             "updated_at",
         ),
         Index("idx_tenant_voice_tenant_id", "tenant_id", "id"),
+        CheckConstraint(
+            "speaking_style in ('natural','gentle','professional','lively','serious')",
+            name="ck_tenant_voice_speaking_style",
+        ),
         {"comment": "AI Call 租户自定义复刻音色档案"},
     )
     __permission_strategy__ = None
@@ -42,6 +46,9 @@ class AiCallTenantVoiceProfileModel(MappedBase):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    speaking_style: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="natural", server_default=text("'natural'"),
+    )
     voice: Mapped[str | None] = mapped_column(String(128), nullable=True)
     voice_type: Mapped[str] = mapped_column(String(32), nullable=False)
     gender: Mapped[str] = mapped_column(String(16), nullable=False)

@@ -95,6 +95,10 @@ class FakeLifecycleService:
     def __init__(self) -> None:
         self.availability_calls: list[dict[str, object]] = []
 
+    async def set_speaking_style(self, **values):
+        self.availability_calls.append(values)
+        return {"id": str(values["profile_id"]), "speakingStyle": values["speaking_style"]}
+
     async def get_enrollment(self, *, tenant_id: str, enrollment_id: int):
         if enrollment_id == 9002:
             raise CustomException(
@@ -312,6 +316,7 @@ def test_voice_routes_replace_old_direct_registration_entry() -> None:
         ("/ai-call/voice-preview-sessions/{callId}", "DELETE"),
         ("/ai-call/tenant-voice-profiles/{id}/deletion-check", "GET"),
         ("/ai-call/tenant-voice-profiles/{id}/status", "PATCH"),
+        ("/ai-call/tenant-voice-profiles/{id}/speaking-style", "PATCH"),
         ("/ai-call/tenant-voice-profiles/{id}", "DELETE"),
     }
     registered = {
@@ -521,6 +526,22 @@ def test_cross_tenant_resource_operations_do_not_expose_resources(
     assert preview.status_code in {403, 404}
     assert deletion_check.status_code in {403, 404}
     assert delete.status_code in {403, 404}
+
+
+def test_speaking_style_route_validates_input_and_management_permission(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "JWT_ENABLE", True)
+    client, _, _, lifecycle = _client(monkeypatch, permissions=frozenset({"ai_call:voice:manage"}))
+    path = f"/ai-call/tenant-voice-profiles/{BIG_PROFILE_ID}/speaking-style"
+    response = client.patch(path, json={"speakingStyle": "gentle"})
+    assert response.status_code == 200
+    assert response.json()["data"] == {"id": str(BIG_PROFILE_ID), "speakingStyle": "gentle"}
+    assert lifecycle.availability_calls == [{"tenant_id": "tenant-a", "profile_id": BIG_PROFILE_ID, "speaking_style": "gentle"}]
+    for payload in ({"speakingStyle": "arbitrary instruction"}, {"speakingStyle": "gentle", "tenantId": "tenant-b"}, {}):
+        assert client.patch(path, json=payload).status_code == 422
+    assert len(lifecycle.availability_calls) == 1
+    denied_client, _, _, denied_service = _client(monkeypatch, permissions=frozenset())
+    assert denied_client.patch(path, json={"speakingStyle": "gentle"}).status_code == 403
+    assert denied_service.availability_calls == []
 
 
 def test_tenant_voice_availability_routes_to_tenant_lifecycle_service(

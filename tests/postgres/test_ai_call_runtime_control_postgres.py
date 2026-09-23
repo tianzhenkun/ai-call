@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import psycopg
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1.ai_call.model import (
     AiCallEventModel,
+    AiCallFollowUpAttemptModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallRecordingModel,
@@ -38,6 +40,10 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 )
 from app.api.v1.ai_call.outbound.sip_line_model import AiCallSipLineModel
 from app.api.v1.ai_call.outbound.task_executor import OutboundTaskExecutor
+from app.core.exceptions import CustomException
+from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.call_termination import call_end_category
+from app.services.ai_call.follow_up_service import AiCallFollowUpService
 from app.services.ai_call.runtime_control.bootstrap_service import (
     RuntimeBootstrapNotFoundError,
     RuntimeBootstrapService,
@@ -1042,6 +1048,175 @@ async def _seed_postgres_webhook_handoff(factory) -> None:
                 status_updated_at=await read_database_time(session),
             )
         )
+
+
+async def test_seat_end_races_customer_left_without_overwriting_first_cause(monkeypatch) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await _seed_postgres_webhook_handoff(factory)
+        async with factory.begin() as session:
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            handoff.status = "connected"
+            handoff.connected_at = await read_database_time(session)
+            record = await session.scalar(select(AiCallRecordModel))
+            record.entry_type = "direct_sip"
+            record.answered_at = handoff.connected_at
+            await RuntimeWebhookRepository(session).receive(WebhookReceiveIntent(
+                provider="livekit", provider_namespace="test", dedupe_key="EV_customer_left",
+                event_type="participant_left", room_name=record.room_name,
+                participant_identity=record.participant_identity,
+                payload={
+                    "event": "participant_left", "room": {"name": record.room_name},
+                    "participant": {"identity": record.participant_identity, "kind": "SIP",
+                                    "disconnectReason": "CLIENT_INITIATED"},
+                },
+            ))
+        async with factory.begin() as session:
+            claim = await RuntimeWebhookRepository(session).claim_inbox("test-webhook")
+
+        async def seat_end():
+            async with factory.begin() as session:
+                service = AiCallAgentConsoleService(session)
+                monkeypatch.setattr(service, "require_current_agent", AsyncMock(return_value=SimpleNamespace(
+                    tenant_id="tenant-a", agent_identity="agent-webhook",
+                )))
+                await service.complete_handoff(
+                    None, handoff_id="handoff-webhook",
+                    console_session_id="55555555-5555-4555-8555-555555555555",
+                )
+
+        async def customer_left():
+            async with factory.begin() as session:
+                await RuntimeWebhookRepository(session).apply_inbox_media(claim)
+
+        await asyncio.wait_for(asyncio.gather(seat_end(), customer_left()), timeout=10)
+        async with factory() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            evidence = list(await session.scalars(select(AiCallEndEvidenceModel).order_by(
+                AiCallEndEvidenceModel.received_at, AiCallEndEvidenceModel.id,
+            )))
+            assert len(evidence) == 2
+            assert record.end_reason == evidence[0].end_reason
+            assert call_end_category(record, evidence[0]) == (
+                "agent" if evidence[0].source == "agent_console" else "customer"
+            )
+            assert await session.scalar(select(func.count()).select_from(AiCallRuntimeCommandModel)) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(("first_actor", "answered"), [("agent", True), ("customer", True), ("agent", False)])
+async def test_callback_stale_record_cannot_overwrite_first_end(first_actor, answered, monkeypatch) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(AiCallFollowUpAttemptModel.__table__.create, checkfirst=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await _seed_postgres_webhook_handoff(factory)
+        async with factory.begin() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            record.entry_type = "sip_callback"
+            record.status = "running" if answered else "ringing"
+            record.answered_at = await read_database_time(session) if answered else None
+            record.room_name = f"ai-call-{record.call_id}"
+            record.participant_identity = f"sip-{record.call_id}"
+            record.operator_agent_identity = "agent-webhook"
+        cleanup_reasons = []
+
+        async def stop_recording(record):
+            cleanup_reasons.append(record.end_reason)
+
+        async def end(session, record, actor):
+            service = AiCallFollowUpService(session, callback_factory=SimpleNamespace(end=AsyncMock()))
+            monkeypatch.setattr(service, "_stop_callback_recording", stop_recording)
+            if actor == "agent":
+                await service._end_callback_record(
+                    profile=SimpleNamespace(tenant_id="tenant-a", agent_identity="agent-webhook"),
+                    record=record, console_session_id="55555555-5555-4555-8555-555555555555",
+                    follow_up_task=None,
+                )
+            else:
+                await service.handle_livekit_webhook_event(
+                    event_type="participant_left", room_name=record.room_name,
+                    participant_identity=record.participant_identity,
+                    payload={"participant": {"disconnectReason": "CLIENT_INITIATED"}},
+                )
+
+        async with factory.begin() as stale_session:
+            stale_record = await stale_session.scalar(select(AiCallRecordModel))
+            async with factory.begin() as first_session:
+                first_record = await first_session.scalar(select(AiCallRecordModel))
+                await end(first_session, first_record, first_actor)
+            await end(stale_session, stale_record, "customer" if first_actor == "agent" else "agent")
+        expected = "callback_ended_by_agent" if first_actor == "agent" else "sip_client_initiated"
+        async with factory() as session:
+            record = await session.scalar(select(AiCallRecordModel))
+            assert record.end_reason == expected
+            assert cleanup_reasons[0] == expected
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("operation", ["claim", "media_ready"])
+async def test_console_updates_lock_record_before_handoff(operation, monkeypatch) -> None:
+    engine = create_async_engine(_async_dsn(), isolation_level="READ COMMITTED")
+    await _reset_repository_schema(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    waiting = asyncio.Event()
+    pending = None
+    try:
+        await _seed_postgres_webhook_handoff(factory)
+        async with factory.begin() as session:
+            handoff = await session.scalar(select(AiCallHandoffModel))
+            handoff.status = "reconnecting" if operation == "media_ready" else "connected"
+            handoff.connected_at = await read_database_time(session)
+            handoff.reconnect_expires_at = handoff.connected_at + timedelta(minutes=1)
+
+        async def console_update():
+            async with factory.begin() as session:
+                service = AiCallAgentConsoleService(session, participant_verifier=AsyncMock(return_value=True))
+                monkeypatch.setattr(service, "require_current_agent", AsyncMock(return_value=SimpleNamespace(
+                    tenant_id="tenant-a", agent_identity="agent-webhook",
+                )))
+                monkeypatch.setattr(service, "_scene_codes", AsyncMock(return_value=["default"]))
+                try:
+                    if operation == "claim":
+                        await service.claim_handoff(
+                            None, handoff_id="handoff-webhook",
+                            console_session_id="55555555-5555-4555-8555-555555555555",
+                            idempotency_key="repeat-claim",
+                        )
+                    else:
+                        await service.media_ready(
+                            None, handoff_id="handoff-webhook",
+                            console_session_id="55555555-5555-4555-8555-555555555555",
+                            participant_identity="human-agent-handoff-webhook",
+                        )
+                except CustomException as exc:
+                    assert exc.status_code == 409
+
+        async with factory.begin() as ending_session:
+            await ending_session.scalar(select(AiCallRecordModel).with_for_update())
+
+            @event.listens_for(engine.sync_engine, "before_cursor_execute")
+            def before_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+                if "ai_call_record" in statement and ("FOR UPDATE" in statement or statement.startswith("UPDATE")):
+                    waiting.set()
+
+            pending = asyncio.create_task(console_update())
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            # 结束事务已经持有 record；另一入口此时不能先持有 handoff 锁。
+            assert await ending_session.scalar(select(AiCallHandoffModel).with_for_update(nowait=True))
+        await asyncio.wait_for(pending, timeout=5)
+    finally:
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await engine.dispose()
 
 
 async def test_two_webhook_workers_claim_once_and_expired_claim_is_fenced() -> None:

@@ -1461,6 +1461,160 @@ class ImmediatePlayoutAudioPublisher(FakeAudioPublisher):
         _ = call_id
 
 
+@pytest.fixture(params=["browser", "sip"])
+async def protected_opening(request):
+    provider = QueueRealtimeProvider()
+    publisher = WaitingAudioPublisher()
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    session = CallSession(
+        call_id="opening-protection", room_name="opening-protection",
+        participant_identity=f"{request.param}-opening-protection",
+        status=CallSessionStatus.READY,
+        effective_config={
+            "opening_message": "您好，请问方便介绍产品吗？",
+            "opening_barge_in_enabled": False, "barge_in_enabled": True,
+        },
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider, registry=registry, event_store=store,
+        audio_publisher=publisher, user_turn_stability_delay_seconds=0,
+        no_barge_user_turn_stability_delay_seconds=0, ai_speaking_tail_grace_seconds=0,
+    )
+    await runner.start(session)
+    registry.transition(session.call_id, CallSessionStatus.CONNECTED)
+    await runner.start_opening(session.call_id)
+    yield runner, provider, publisher, session, store
+    await runner.stop(session.call_id)
+
+
+async def _emit_opening_audio(runner, provider, call_id):
+    await provider.emit(ProviderEvent(
+        type="model_response_started", payload={"response_id": "opening"},
+    ))
+    await provider.emit(ProviderEvent(type="model_audio_delta", payload={
+        "response_id": "opening",
+        "delta": base64.b64encode(_pcm16_constant_frame(amplitude=1000).data).decode(),
+    }))
+    await _wait_until(lambda: bool(runner.audio_publisher.published))
+
+
+@pytest.mark.anyio
+async def test_protected_opening_keeps_listening_and_defers_reply_until_playout(protected_opening):
+    from unittest.mock import patch
+
+    runner, provider, publisher, session, _store = protected_opening
+    call_id = session.call_id
+    await _emit_opening_audio(runner, provider, call_id)
+    now = datetime.now(timezone.utc)
+    assert await runner.record_browser_speech_candidate(call_id, now) is False
+    with patch.object(runner._sip_barge_in_detector, "observe") as observe:
+        await runner.send_audio_frame(call_id, _pcm16_constant_frame(amplitude=3000))
+        observe.assert_not_called()
+    assert provider.sent_audio
+    await runner._handle_user_speech_started(call_id, provider, now)
+    await runner._handle_user_transcript(
+        call_id, provider, ProviderEvent(type="user_transcript_done", payload={
+            "transcript": "我想了解一下你们的产品价格", "semanticAction": "accept",
+        }), now,
+    )
+    await runner._handle_user_speech_stopped(call_id, provider, now)
+    assert provider.cancelled_response_count == 0
+    assert publisher.stopped_call_ids == []
+    assert len(provider.created_responses) == 1
+    await runner._apply_provider_event(call_id, provider, "model_response_done", now, {})
+    await asyncio.wait_for(publisher.playout_wait_started.wait(), 1)
+    assert await runner.record_browser_speech_candidate(call_id, now) is False
+    assert len(provider.created_responses) == 1
+    publisher.playout_release.set()
+    await _wait_until(lambda: len(provider.created_responses) == 2)
+    assert runner._pending_user_turns[call_id].transcript == "我想了解一下你们的产品价格"
+    assert runner._is_barge_in_enabled_for_session(session) is True
+
+
+@pytest.mark.anyio
+async def test_protected_opening_tail_can_receive_speech_without_stopping_audio(protected_opening):
+    runner, provider, publisher, session, _store = protected_opening
+    call_id = session.call_id
+    await _emit_opening_audio(runner, provider, call_id)
+    now = datetime.now(timezone.utc)
+    await runner._apply_provider_event(call_id, provider, "model_response_done", now, {})
+    await asyncio.wait_for(publisher.playout_wait_started.wait(), 1)
+    await runner._handle_user_speech_started(call_id, provider, now)
+    assert provider.cancelled_response_count == 0
+    assert publisher.stopped_call_ids == []
+    assert runner._audio_identity_drop_reason(
+        call_id, response_id="opening", response_generation=0,
+    ) is None
+    publisher.playout_release.set()
+    await _wait_until(lambda: runner._is_barge_in_enabled_for_session(session))
+    assert len(provider.created_responses) == 1
+
+
+@pytest.mark.anyio
+async def test_protected_opening_does_not_override_global_disable(protected_opening):
+    runner, provider, publisher, session, _store = protected_opening
+    await _emit_opening_audio(runner, provider, session.call_id)
+    session.effective_config["barge_in_enabled"] = False
+    await runner._apply_provider_event(
+        session.call_id, provider, "model_response_done", datetime.now(timezone.utc), {},
+    )
+    publisher.playout_release.set()
+    await _wait_until(lambda: session.status == CallSessionStatus.CONNECTED)
+    assert runner._is_barge_in_enabled_for_session(session) is False
+
+
+@pytest.mark.anyio
+async def test_protected_opening_keeps_early_customer_speech_for_after_opening(protected_opening):
+    runner, provider, publisher, session, _store = protected_opening
+    call_id = session.call_id
+    now = datetime.now(timezone.utc)
+    await runner._handle_user_speech_started(call_id, provider, now)
+    await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+        type="user_transcript_done", payload={"transcript": "请说一下产品价格", "semanticAction": "accept"},
+    ), now)
+    await runner._handle_user_speech_stopped(call_id, provider, now)
+    await _emit_opening_audio(runner, provider, call_id)
+    assert provider.cancelled_response_count == 0
+    assert publisher.stopped_call_ids == []
+    assert len(provider.created_responses) == 1
+    await runner._apply_provider_event(call_id, provider, "model_response_done", now, {})
+    publisher.playout_release.set()
+    await _wait_until(lambda: len(provider.created_responses) == 2)
+    assert runner._pending_user_turns[call_id].transcript == "请说一下产品价格"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ending", ["hangup", "model_error", "playout_error", "no_audio"])
+async def test_protected_opening_releases_on_end_or_playout_failure(protected_opening, ending):
+    from unittest.mock import AsyncMock
+
+    runner, provider, publisher, session, store = protected_opening
+    call_id = session.call_id
+    now = datetime.now(timezone.utc)
+    if ending != "no_audio":
+        await _emit_opening_audio(runner, provider, call_id)
+    if ending == "playout_error":
+        publisher.wait_for_playout = AsyncMock(side_effect=RuntimeError("playout failed"))
+    await runner._apply_provider_event(call_id, provider, "model_response_done", now, {})
+    if ending == "hangup":
+        runner.registry.transition(call_id, CallSessionStatus.ENDING)
+        await asyncio.wait_for(runner.stop(call_id), 1)
+    elif ending == "model_error":
+        await runner._apply_provider_event(call_id, provider, "model_error", now, {"message": "failed"})
+    publisher.playout_release.set()
+    await _wait_until(lambda: not runner._response_lifecycle(call_id).opening_playout_pending)
+    if ending in {"model_error", "playout_error"}:
+        assert session.status == CallSessionStatus.FAILED
+        assert any(event.type == "session_failed" for event in store.list(call_id))
+    elif ending == "hangup":
+        assert session.status == CallSessionStatus.ENDING
+    else:
+        assert session.status == CallSessionStatus.CONNECTED
+    assert len(provider.created_responses) == 1
+
+
 class BlockingAudioPublisher(FakeAudioPublisher):
     def __init__(self) -> None:
         super().__init__()

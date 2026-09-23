@@ -33,6 +33,11 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.livekit_room import LiveKitRoomManager
+from app.services.ai_call.runtime_control.command_repository import (
+    EndCallIntent,
+    RuntimeCommandRepository,
+)
+from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 
 
 def _auth(db, *, user_id: int, tenant_id: str = "tenant-a") -> AuthSchema:
@@ -148,6 +153,61 @@ async def _seed_handoff(
 
 def _error_code(exc: CustomException) -> str | None:
     return exc.data.get("errorCode") if isinstance(exc.data, dict) else None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("customer_ended_first", [False, True])
+async def test_complete_handoff_persists_end_intent_before_background_cleanup(
+    session_factory, monkeypatch, customer_ended_first,
+) -> None:
+    from app.services.ai_call import agent_console_service
+
+    console_id = str(uuid4())
+    await _seed_agent(session_factory, user_id=10, agent_identity="agent-10",
+                      console_session_id=console_id, status="in_call")
+    await _seed_handoff(session_factory, row_id=100, handoff_id="end-test", status="connected")
+    now = datetime.now(timezone.utc)
+
+    async def clock(_db):
+        return now
+
+    def repository(db):
+        return RuntimeCommandRepository(db, database_clock=clock)
+
+    monkeypatch.setattr(agent_console_service, "RuntimeCommandRepository", repository, raising=False)
+    async with session_factory() as db, db.begin():
+        handoff = await db.get(AiCallHandoffModel, 100)
+        handoff.human_agent_identity = "agent-10"
+        handoff.accepted_console_session_id = console_id
+        handoff.connected_at = now
+        presence = await db.get(AiCallHandoffAgentModel, 10)
+        presence.active_handoff_id = handoff.handoff_id
+        presence.active_call_id = handoff.call_id
+        record = AiCallRecordModel(
+            id=900, tenant_id="tenant-a", call_id=handoff.call_id, entry_type="direct_sip",
+            room_name=handoff.room_name, participant_identity=f"caller-{handoff.call_id}",
+            status="running", started_at=now, answered_at=now,
+            runtime_control_mode="owner_command_v1",
+        )
+        db.add(record)
+        await db.flush()
+        if customer_ended_first:
+            await repository(db).request_end(EndCallIntent(
+                tenant_id="tenant-a", call_id=record.call_id, source="livekit_webhook",
+                end_reason="sip_participant_left", dedupe_key="customer-first",
+            ))
+        await AiCallAgentConsoleService(db).complete_handoff(
+            _auth(db, user_id=10), handoff_id=handoff.handoff_id, console_session_id=console_id,
+        )
+        evidence = await db.scalar(select(AiCallEndEvidenceModel).where(
+            AiCallEndEvidenceModel.source == "agent_console",
+        ))
+        assert evidence is not None
+        assert evidence.end_reason == "agent_completed"
+        assert json.loads(evidence.evidence_json)["agentIdentity"] == "agent-10"
+        assert evidence.event_at is not None
+        assert record.end_reason == ("sip_participant_left" if customer_ended_first else "agent_completed")
+        assert record.terminal_requested_at is not None
 
 
 def test_agent_console_task3_routes_are_registered() -> None:

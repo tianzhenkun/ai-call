@@ -1890,6 +1890,10 @@ class AiCallPromptProfileModel(MappedBase):
         nullable=True,
         comment="固定开场白",
     )
+    opening_barge_in_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true"),
+        comment="开场白允许打断，仍受系统总开关限制",
+    )
     current_version_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,

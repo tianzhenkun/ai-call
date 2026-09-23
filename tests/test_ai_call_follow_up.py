@@ -2905,6 +2905,14 @@ async def test_callback_livekit_webhook_maps_no_answer_to_follow_up_outcome(
     ("webhook_payload", "expected_result", "expected_status", "expected_reason"),
     [
         (
+            {"participant": {"attributes": {"sip.callStatus": "active"}, "disconnectReason": "CLIENT_INITIATED"}},
+            "connected", "completed", "sip_client_initiated",
+        ),
+        (
+            {"participant": {"attributes": {"sip.callStatus": "active"}, "disconnectReason": "MEDIA_FAILURE"}},
+            "connected", "completed", "sip_transport_error",
+        ),
+        (
             {"participant": {"attributes": {"sip.callStatus": "active"}}},
             "connected",
             "completed",

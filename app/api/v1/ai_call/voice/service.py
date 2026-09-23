@@ -38,6 +38,11 @@ from app.services.ai_call.providers.aliyun_qwen_realtime import (
 from app.services.ai_call.providers.base import ProviderEvent
 from app.services.ai_call.session_registry import CallSessionStatus
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
+from app.services.ai_call.voice_profile import (
+    VoiceSpeakingStyle,
+    append_voice_style,
+    apply_voice_style,
+)
 from app.services.ai_call.voice_sample import (
     VoiceSampleMetadata,
     VoiceSampleStorage,
@@ -225,7 +230,7 @@ class VoicePreviewService:
                 msg="音色试听服务正在停止，请稍后重试",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        resolved_voice = await self._resolve_voice(
+        resolved_voice, resolved_style = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
             voice=voice,
@@ -249,7 +254,10 @@ class VoicePreviewService:
                     voice=resolved_voice,
                     prompt=None,
                     call_id=call_id,
-                    prompt_effective_config=preview_config,
+                    prompt_effective_config=apply_voice_style(
+                        preview_config,
+                        resolved_style,
+                    ),
                 ),
                 name=f"ai-call-voice-preview-create-{call_id}",
             )
@@ -307,14 +315,17 @@ class VoicePreviewService:
                 msg="音色试听服务正在停止，请稍后重试",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        resolved_voice = await self._resolve_voice(
+        resolved_voice, resolved_style = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
             voice=voice,
         )
         try:
             audio_url = await asyncio.wait_for(
-                self._generate_preview_audio(resolved_voice),
+                self._generate_preview_audio(
+                    resolved_voice,
+                    resolved_style,
+                ),
                 timeout=self.preview_audio_timeout_seconds,
             )
         except TimeoutError:
@@ -392,7 +403,9 @@ class VoicePreviewService:
         self._assert_owner(session, tenant_id=tenant_id, user_id=user_id)
         return await self._release(session, end_reason="voice_preview_user_end")
 
-    async def _generate_preview_audio(self, resolved_voice: str) -> str:
+    async def _generate_preview_audio(
+        self, resolved_voice: str, speaking_style: VoiceSpeakingStyle = "natural"
+    ) -> str:
         if self.preview_audio_provider_factory is None:
             raise CustomException(
                 msg="音色试听音频服务未启用",
@@ -405,7 +418,9 @@ class VoicePreviewService:
             await provider.update_session(
                 QwenRealtimeSessionConfig(
                     voice=resolved_voice,
-                    instructions=VOICE_PREVIEW_AUDIO_INSTRUCTIONS,
+                    instructions=append_voice_style(
+                        VOICE_PREVIEW_AUDIO_INSTRUCTIONS, speaking_style,
+                    ),
                     vad_type=self.vad_type,
                     vad_threshold=self.vad_threshold,
                     vad_silence_duration_ms=self.vad_silence_duration_ms,
@@ -434,7 +449,7 @@ class VoicePreviewService:
         *,
         tenant_id: str,
         voice: str,
-    ) -> str:
+    ) -> tuple[str, VoiceSpeakingStyle]:
         normalized_tenant_id = str(tenant_id or "").strip()
         normalized_voice = str(voice or "").strip()
         if not normalized_tenant_id or not normalized_voice:
@@ -450,9 +465,9 @@ class VoicePreviewService:
                 .limit(1)
             )
             if builtin_voice is not None:
-                return str(builtin_voice)
+                return str(builtin_voice), "natural"
             tenant_voice = await db.scalar(
-                select(AiCallTenantVoiceProfileModel.voice)
+                select(AiCallTenantVoiceProfileModel)
                 .where(
                     AiCallTenantVoiceProfileModel.tenant_id == normalized_tenant_id,
                     AiCallTenantVoiceProfileModel.voice == normalized_voice,
@@ -472,7 +487,7 @@ class VoicePreviewService:
             ) from None
         if tenant_voice is None:
             self._raise_not_found()
-        return str(tenant_voice)
+        return str(tenant_voice.voice), tenant_voice.speaking_style
 
     async def _release_after_timeout(
         self,
@@ -1038,6 +1053,33 @@ class VoiceDeletionService:
         except Exception:
             await self._safe_rollback(db)
             self._raise_persistence_failure()
+        return result
+
+    async def set_speaking_style(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        profile_id: int,
+        speaking_style: VoiceSpeakingStyle,
+    ) -> VoiceProfileOut:
+        repository = VoiceRepository(db)
+        profile = await repository.get_tenant_profile(
+            tenant_id=tenant_id, profile_id=profile_id, for_update=True
+        )
+        if profile is None or profile.status == "DELETED":
+            self._raise_not_found()
+        if profile.status not in {"ENABLED", "DISABLED", "DELETE_FAILED"}:
+            raise CustomException(msg="当前音色状态不允许设置表达风格", status_code=409)
+        profile.speaking_style = speaking_style
+        profile.updated_at = self.now()
+        result = repository._tenant_profile(profile)
+        try:
+            await db.commit()
+        except Exception:
+            await self._safe_rollback(db)
+            log.exception("表达风格保存失败 profile_id={}", profile_id)
+            raise CustomException(msg="表达风格保存失败，请稍后重试", status_code=500) from None
         return result
 
     async def request_deletion(
@@ -1686,6 +1728,7 @@ class VoiceEnrollmentService:
                 id=profile_id,
                 tenant_id=tenant_id,
                 display_name=request.display_name,
+                speaking_style=request.speaking_style,
                 voice=None,
                 voice_type="自定义复刻",
                 gender=request.gender,
@@ -1753,6 +1796,7 @@ class VoiceEnrollmentService:
             )
             .values(
                 display_name=request.display_name,
+                speaking_style=request.speaking_style,
                 gender=request.gender,
                 language=request.language,
                 status="CREATING",
@@ -1874,6 +1918,8 @@ class VoiceEnrollmentService:
                 "language": request.language,
                 "sampleSha256": sample_sha256,
                 "transcript": request.transcript,
+                # 默认风格沿用原有请求哈希，保证升级前的幂等重试仍可识别。
+                **({"speakingStyle": request.speaking_style} if request.speaking_style != "natural" else {}),
             },
             ensure_ascii=False,
             separators=(",", ":"),

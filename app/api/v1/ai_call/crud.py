@@ -47,7 +47,9 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 )
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.services.ai_call.call_outcome import detect_answer_type
+from app.services.ai_call.call_termination import call_end_category
 from app.services.ai_call.classification_review import requires_classification_review
+from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
 from app.utils.id_util import generate_snowflake_id
 
 DEFAULT_SEMANTIC_ANALYSIS_SCENE_CODE = "ai_call_semantic_analysis"
@@ -698,7 +700,40 @@ class AiCallRecordRepository:
         await self._attach_quality_context(rows, tenant_id=tenant_id)
         await self._attach_follow_up_context(rows, tenant_id=tenant_id)
         await self.attach_after_call_result_context(rows, tenant_id=tenant_id)
+        await self.attach_end_context(rows, tenant_id=tenant_id)
         return list(rows), total
+
+    async def attach_end_context(
+        self, records: list[AiCallRecordModel], *, tenant_id: str | None,
+    ) -> None:
+        for record in records:
+            record._end_category = call_end_category(record)
+        ambiguous = [
+            record for record in records
+            if record.tenant_id == tenant_id
+            and record.end_reason in {"sip_participant_left", "browser_disconnect"}
+        ]
+        if not tenant_id or not ambiguous:
+            return
+        # 与终态屏障的首次写入顺序一致，后续清理事件不能改写发起方。
+        ranked = select(
+            AiCallEndEvidenceModel.id,
+            func.row_number().over(
+                partition_by=AiCallEndEvidenceModel.call_id,
+                order_by=(AiCallEndEvidenceModel.received_at, AiCallEndEvidenceModel.id),
+            ).label("position"),
+        ).where(
+            AiCallEndEvidenceModel.tenant_id == tenant_id,
+            AiCallEndEvidenceModel.call_id.in_([record.call_id for record in ambiguous]),
+        ).subquery()
+        evidence = await self.db.scalars(
+            select(AiCallEndEvidenceModel).join(
+                ranked, ranked.c.id == AiCallEndEvidenceModel.id,
+            ).where(ranked.c.position == 1)
+        )
+        by_call_id = {row.call_id: row for row in evidence}
+        for record in ambiguous:
+            record._end_category = call_end_category(record, by_call_id.get(record.call_id))
 
     async def attach_after_call_result_context(
         self,
@@ -2883,6 +2918,16 @@ class AiCallRecordRepository:
         tenant_id: str,
         handoff_id: str,
     ) -> AiCallHandoffModel | None:
+        if self._dialect_name() == "postgresql":
+            # 所有坐席写入口与 Runtime 一致，先锁通话，再锁交接和在线状态。
+            call_id = select(AiCallHandoffModel.call_id).where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.handoff_id == handoff_id,
+            ).scalar_subquery()
+            await self.db.execute(select(AiCallRecordModel).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+            ).with_for_update().execution_options(populate_existing=True))
         stmt = select(AiCallHandoffModel).execution_options(populate_existing=True).where(
             AiCallHandoffModel.tenant_id == tenant_id,
             AiCallHandoffModel.handoff_id == handoff_id,
