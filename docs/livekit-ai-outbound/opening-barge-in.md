@@ -30,3 +30,5 @@ UV_NO_SYNC=1 bash tools/run_ai_call_runtime_postgres_tests.sh tests/postgres/tes
 第二条使用已安装的 `.venv`，由现有脚本创建并销毁独立 PostgreSQL 容器，不连接业务数据库。运行时回归使用合成 PCM 和隔离的 provider/publisher，覆盖首帧前插话、生成中插话、缓冲播放阶段插话、总开关关闭、无音频响应、挂断以及模型和播放异常，不能替代真实电话验收。
 
 本次浏览器检查验证了本地页面开关位置、开启和关闭状态；没有保存线上配置或发起真实通话。
+
+生产发布见 [发布记录](production-deployed-20260923-all.md)；真实通话打断效果仍需受控号码验收。

@@ -50,4 +50,4 @@ SIP `CLIENT_INITIATED` 还要求 SIP 类型和已接通事实；后续清理证�
 
 复放脚本和结果位于忽略目录 `build/record-comments-20260922/`：
 `verify_end_categories.py`、`end-categories-verified.json`。
-此验证没有发起新通话或修改线上数据；线上界面生效需要发布前后端。
+此复放验证没有发起新通话或修改线上数据。前后端生产发布见 [发布记录](production-deployed-20260923-all.md)；真实通话仍需单独验收。
