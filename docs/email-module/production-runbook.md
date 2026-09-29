@@ -10,6 +10,7 @@
 - [2026-09-19 Git 提交发布记录](production-deployed-20260919.md)
 - [2026-09-20 Git 提交发布记录](production-deployed-20260920.md)
 - [2026-09-20 任务编辑更新发布记录](production-deployed-20260920-task-edit.md)
+- [2026-09-29 全量业务改动发布与提示词迁移记录](../livekit-ai-outbound/production-deployed-20260929-all.md)
 - [菜单权限配置记录](production-permissions-20260918.md)
 - [邮件 Compose 模板](../../deploy/email-worker/compose.production.yml)
 - [计费 Compose 模板](../../deploy/email-worker/compose.credit.yml)
@@ -72,7 +73,7 @@ df -h /home
 
 ### 配置核对
 
-生产 API 需要主 Compose、平台覆盖、邮件覆盖、计费覆盖，按此顺序合并。API 与 worker 使用同一新镜像，数据库、邮件加密密钥、AI 和对象存储配置必须一致；worker 不开放业务端口，也不承担 Nacos API 注册。
+生产 API 需要主 Compose、平台覆盖、邮件覆盖、计费覆盖及后续 API 覆盖，保持现场查到的完整顺序。邮件代码或其共享依赖改动时，协调更新 API 与 worker；仅外呼或提示词改动时可只更新 API，明确保留 worker 原镜像。数据库、邮件加密密钥、AI 和对象存储配置必须一致；worker 不开放业务端口，也不承担 Nacos API 注册。
 
 | 配置 | 要求 |
 | --- | --- |
@@ -97,6 +98,7 @@ df -h /home
 - **比较新镜像全部相关模型与生产 schema，再生成迁移清单。**检查表、字段及改动涉及的约束、索引、默认值和数据兼容性；不能只检查邮件模块。
 - 邮件使用 `python -m app.services.reach_email.migrate --apply`。2026-09-18 还需要仓库已有 `docs/livekit-ai-outbound/sql/phase-k2-credit-metering-postgres.sql`，建立 `reach_credit_usage_outbox`；下次先查是否已存在及定义是否符合新版本。
 - 在隔离数据库验证适用迁移及重复执行。生产上只执行本次已审阅的迁移，不使用全量 `metadata.create_all` 代替差异分析。
+- 提示词编辑器迁移使用 `tools/migrate_prompt_editor.py`：默认完整事务演练后回滚，`--apply` 才提交；保留数据备份并审阅名称和版本指针报告。前后端更新合同包含修订令牌，须协调切换。
 - 核对外呼任务调度和 LiveKit 实际房间/参与者，安排无活跃通话的窗口；不能仅凭历史 `ending` 状态判断当前通话。切换前再次复核，防止检查后新任务启动。
 - 后续升级还需处理**邮件发送中的任务**：停止新增执行入口、等待当前 SMTP 操作收尾，再按既有租约规则切换 worker。`unknown` 邮件不能盲目重发，也不能删除租约抢占。
 
@@ -238,5 +240,7 @@ sha256sum current/index.html
 3. 若上一版含 worker，恢复 API 和 worker；若上一版没有邮件功能，只恢复 API，保持新 worker 停止。验证实际 image ID、健康和原业务接口。
 4. 前端用临时软链接加 `mv -Tf` 原子切回本次保存的 `previous-target.txt` 目标，核对公网资源。
 5. 默认保留新增表及生产密钥，不 DROP、不自动整库恢复。恢复整库可能丢弃发布后的业务写入，须另行评估。已经 SMTP 接受或结果不明的邮件不得重新排队。
+
+提示词编辑器回退旧应用前必须执行 `tools/migrate_prompt_editor.py --check-rollback`。存在草稿或软删除场景时禁止回退到无状态过滤的旧后端；保留新增列及兼容后端，不删除业务数据或清空标记来满足检查。2026-09-29 发布包的 `rollback.sh` 已包含此检查。
 
 回滚也要形成执行记录：恢复目标、时间、实际健康结果和仍需处理的数据，不将“已执行回滚命令”视为恢复成功。

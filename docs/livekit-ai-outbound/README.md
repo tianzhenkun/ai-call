@@ -36,7 +36,7 @@
 20. [sql/phase-b4-voice-profile-postgres.sql](sql/phase-b4-voice-profile-postgres.sql)：端到端音色配置表和 Qwen Omni Realtime 内置音色种子数据。
 21. [CALL_SCENARIOS.md](CALL_SCENARIOS.md)：通话中通用场景和验收清单。
 
-提示词编辑器设计稿（2026-09-24，未实施）：[模块保存、草稿、版本与场景删除设计](phases/phase-b4-prompt-editor-save-version-design-20260924.md)，覆盖配置页交互、保存与版本合同、草稿持久化、场景删除、知识库关联展示和外呼准入。
+提示词编辑器已于 2026-09-29 部署：[模块保存、草稿、版本与场景删除设计](phases/phase-b4-prompt-editor-save-version-design-20260924.md)，覆盖配置页交互、保存与版本合同、草稿持久化、场景删除、知识库关联展示和外呼准入。发布版本、验证和回退限制见 [2026-09-29 发布记录](production-deployed-20260929-all.md)。
 
 Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它已作为 Phase B1/B2/B2.5/B3 正式设计的输入，后续实现以对应阶段正式设计文档为准。
 
