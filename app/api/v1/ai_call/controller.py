@@ -495,6 +495,8 @@ async def list_prompt_profiles_controller(
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 20,
     include_drafts: Annotated[bool, Query(alias="includeDrafts")] = False,
+    name: Annotated[str | None, Query(max_length=100)] = None,
+    lifecycle_status: Annotated[Literal["DRAFT", "READY"] | None, Query(alias="lifecycleStatus")] = None,
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     result = await service.list_prompt_profiles(
@@ -503,6 +505,8 @@ async def list_prompt_profiles_controller(
         page_num=page_num,
         page_size=page_size,
         include_drafts=include_drafts,
+        name=name,
+        lifecycle_status=lifecycle_status,
     )
     return TableResponse(rows=result["rows"], total=result["total"], msg="查询成功")
 

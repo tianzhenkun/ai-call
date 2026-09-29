@@ -2414,18 +2414,24 @@ class AiCallRecordRepository:
         page_num: int = 1,
         page_size: int = 20,
         include_drafts: bool = False,
+        name: str | None = None,
+        lifecycle_status: str | None = None,
     ) -> tuple[list[AiCallPromptProfileModel], int]:
         stmt = self._prompt_profile_filters(
             select(AiCallPromptProfileModel),
             tenant_id=tenant_id,
             scene_code=scene_code,
             include_drafts=include_drafts,
+            name=name,
+            lifecycle_status=lifecycle_status,
         )
         count_stmt = self._prompt_profile_filters(
             select(func.count()).select_from(AiCallPromptProfileModel),
             tenant_id=tenant_id,
             scene_code=scene_code,
             include_drafts=include_drafts,
+            name=name,
+            lifecycle_status=lifecycle_status,
         )
         total = int((await self.db.execute(count_stmt)).scalar_one())
         safe_page_num = max(1, page_num)
@@ -3527,6 +3533,10 @@ class AiCallRecordRepository:
             )
         if filters.get("scene_code"):
             stmt = stmt.where(AiCallPromptProfileModel.scene_code == filters["scene_code"])
+        if filters.get("name"):
+            stmt = stmt.where(AiCallPromptProfileModel.name.contains(filters["name"], autoescape=True))
+        if filters.get("lifecycle_status"):
+            stmt = stmt.where(AiCallPromptProfileModel.lifecycle_status == filters["lifecycle_status"])
         return stmt
 
     @staticmethod

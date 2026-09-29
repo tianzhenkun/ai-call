@@ -26,6 +26,28 @@ pytestmark = pytest.mark.anyio
 b4_service = _b4_service
 
 
+async def test_prompt_list_filters_before_pagination_and_keeps_tenant_isolation(b4_service):
+    service, *_ = b4_service
+    for tenant, name in [
+        (TEST_TENANT_ID, "产品 A"),
+        (TEST_TENANT_ID, "产品 B"),
+        (TEST_TENANT_ID, "折扣 10%_"),
+        ("other_tenant", "产品 C"),
+    ]:
+        await service.create_prompt_profile_draft(
+            tenant_id=tenant,
+            values={"name": name, "creation_key": name, "module": "opening", "opening_message": "你好"},
+        )
+    query = {"tenant_id": TEST_TENANT_ID, "include_drafts": True, "name": " 产品 ", "lifecycle_status": "DRAFT", "page_size": 1}
+    first = await service.list_prompt_profiles(**query)
+    second = await service.list_prompt_profiles(**query, page_num=2)
+    assert first["total"] == second["total"] == 2
+    assert {first["rows"][0]["name"], second["rows"][0]["name"]} == {"产品 A", "产品 B"}
+    assert (await service.list_prompt_profiles(**{**query, "lifecycle_status": "READY"}))["total"] == 0
+    literal = await service.list_prompt_profiles(**{**query, "name": "%_"})
+    assert literal["total"] == 1 and literal["rows"][0]["name"] == "折扣 10%_"
+
+
 def test_migration_cli_starts_without_application_import_order():
     completed = subprocess.run(
         [sys.executable, "tools/migrate_prompt_editor.py", "--help"],

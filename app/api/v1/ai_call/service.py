@@ -488,6 +488,8 @@ class AiCallService:
         page_num: int = 1,
         page_size: int = 20,
         include_drafts: bool = False,
+        name: str | None = None,
+        lifecycle_status: str | None = None,
     ) -> dict:
         repository = self._ensure_prompt_repository()
         rows, total = await repository.list_prompt_profiles(
@@ -496,6 +498,8 @@ class AiCallService:
             page_num=page_num,
             page_size=page_size,
             include_drafts=include_drafts,
+            name=(name or "").strip(),
+            lifecycle_status=lifecycle_status,
         )
         summaries = await repository.get_prompt_profile_version_summaries(
             tenant_id=tenant_id,
