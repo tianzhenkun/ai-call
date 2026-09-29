@@ -337,6 +337,8 @@ class HandoffListOut(AiCallBaseSchema):
 
 
 class RecordOut(AiCallBaseSchema):
+    scene_deleted: bool = False
+    scene_name: str | None = None
     id: str
     call_id: str
     task_id: str | None = None
@@ -389,6 +391,10 @@ class RecordEventOut(AiCallBaseSchema):
 
 
 class RecordExecutionConfigOut(AiCallBaseSchema):
+    prompt_scene_deleted: bool = False
+    prompt_version_no: int | None = None
+    config_revision: int | None = None
+    content_hash: str | None = None
     prompt_profile_id: str | None = None
     prompt_name: str | None = None
     scene_code: str | None = None
@@ -659,11 +665,18 @@ class PromptVariableDefinition(AiCallBaseSchema):
     key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
     label: str = Field(min_length=1, max_length=100)
 
+    @model_validator(mode="after")
+    def normalize_label(self):
+        self.label = self.label.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not self.label:
+            raise ValueError("变量名称不能为空")
+        return self
+
 
 class PromptProfileBaseRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
-    scene_code: str = Field(min_length=1, max_length=64, description="业务场景编码")
+    scene_code: str = Field(default="", max_length=64, description="业务场景编码，新建自动生成")
     name: str = Field(min_length=1, max_length=100, description="配置名称")
     provider_key: str = Field(
         default=PROMPT_PROVIDER_STATIC_PROFILE,
@@ -671,7 +684,7 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
         max_length=64,
         description="提示词来源模式",
     )
-    prompt_text: str | None = Field(default=None, description="固定提示词")
+    prompt_text: str | None = Field(default=None, max_length=50_000, description="固定提示词")
     opening_message: str | None = Field(default=None, max_length=1000, description="固定开场白")
     opening_barge_in_enabled: bool = Field(default=True, strict=True, description="开场白允许打断")
     product_info: str = Field(default="", max_length=20_000, description="产品或服务信息")
@@ -679,16 +692,9 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
 
     @model_validator(mode="after")
     def validate_static_content(self) -> "PromptProfileBaseRequest":
-        if (
-            self.provider_key == PROMPT_PROVIDER_STATIC_PROFILE
-            and not (self.prompt_text or "").strip()
-        ):
-            raise ValueError("固定提示词不能为空")
-        if (
-            self.provider_key == PROMPT_PROVIDER_STATIC_PROFILE
-            and not (self.opening_message or "").strip()
-        ):
-            raise ValueError("固定开场白不能为空")
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("场景名称不能为空")
         keys = [item.key for item in self.variables]
         labels = [item.label.strip() for item in self.variables]
         if len(keys) != len(set(keys)):
@@ -714,10 +720,11 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
 
 
 class PromptProfileCreateRequest(PromptProfileBaseRequest):
-    pass
+    creation_key: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class PromptProfileUpdateRequest(PromptProfileBaseRequest):
+    expected_revision: int = Field(ge=1)
     knowledge_version_snapshot_hash: str | None = Field(
         default=None,
         min_length=64,
@@ -727,7 +734,31 @@ class PromptProfileUpdateRequest(PromptProfileBaseRequest):
     )
 
 
+class PromptProfileModuleRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+    module: Literal["opening", "productInfo", "scenePrompt"]
+    expected_revision: int = Field(ge=1)
+    opening_message: str | None = Field(default=None, max_length=1000)
+    opening_barge_in_enabled: bool | None = Field(default=None, strict=True)
+    prompt_text: str | None = Field(default=None, max_length=50_000)
+    product_info: str | None = Field(default=None, max_length=20_000)
+    variables: list[PromptVariableDefinition] = Field(default_factory=list, max_length=100)
+    knowledge_version_snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class PromptProfileDraftRequest(PromptProfileModuleRequest):
+    expected_revision: int | None = None
+    name: str = Field(min_length=1, max_length=100)
+    creation_key: str = Field(min_length=1, max_length=100)
+
+
+class PromptProfileRevisionRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1)
+
+
 class PromptProfileOut(AiCallBaseSchema):
+    saved_at: datetime | None = None
     id: str
     scene_code: str
     name: str
@@ -739,11 +770,18 @@ class PromptProfileOut(AiCallBaseSchema):
     variables: list[PromptVariableDefinition] = Field(default_factory=list)
     version_no: int | None = None
     version_count: int = 0
+    lifecycle_status: Literal["DRAFT", "READY"] = "READY"
+    edit_revision: int = 1
+    current_version_id: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    version_created: bool = False
+    save_outcome: str = "unchanged"
     created_at: datetime
     updated_at: datetime
 
 
 class PromptProfileVersionOut(AiCallBaseSchema):
+    scene_deleted: bool = False
     id: str
     profile_id: str
     version_no: int
@@ -760,6 +798,7 @@ class PromptProfileVersionDetailOut(PromptProfileVersionOut):
 
 
 class PromptProfileVersionApplicationOut(AiCallBaseSchema):
+    scene_deleted: bool = False
     id: str
     profile_id: str
     from_version_id: str | None = None
@@ -777,6 +816,7 @@ class PromptProfileVersionUpdateRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
     version_name: str = Field(min_length=1, max_length=100)
+    expected_revision: int = Field(ge=1)
 
     @model_validator(mode="after")
     def normalize_version_name(self):
@@ -837,7 +877,9 @@ class PromptProfilePreviewRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
     business_id: str | None = Field(default=None, description="业务ID")
-    scene_code: str = Field(description="业务场景编码")
+    scene_code: str = Field(default="", description="业务场景编码")
+    profile_id: str | None = None
+    variables: list[PromptVariableDefinition] | None = None
     business_params: dict[str, Any] = Field(default_factory=dict, description="业务侧上下文参数")
     prompt_text: str | None = Field(default=None, description="未保存的场景提示词")
     opening_message: str | None = Field(default=None, max_length=1000)
@@ -847,12 +889,15 @@ class PromptProfilePreviewRequest(AiCallBaseSchema):
 
 class PromptProfilePreviewOut(AiCallBaseSchema):
     instructions: str
+    product_info: str
+    prompt_text: str
     opening_message: str
     prompt_hash: str
     opening_message_hash: str
     prompt_source_key: str
     barge_in_enabled: bool = False
     opening_barge_in_enabled: bool = True
+    missing_fields: list[str] = Field(default_factory=list)
 
 
 class PromptOptimizeSceneContext(AiCallBaseSchema):
@@ -867,10 +912,12 @@ class PromptOptimizeSceneContext(AiCallBaseSchema):
 class PromptOptimizeRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
+    operation: Literal["generate", "optimize"] | None = None
     target_type: Literal["opening", "scenePrompt"]
     current_content: str = Field(default="", max_length=50_000)
     scene_context: PromptOptimizeSceneContext
     instruction: str | None = Field(default=None, max_length=2_000)
+    profile_id: str | None = None
 
 
 class PromptOptimizeOut(AiCallBaseSchema):

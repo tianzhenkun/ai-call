@@ -90,9 +90,12 @@ from .schema import (
     PromptOptimizeOut,
     PromptOptimizeRequest,
     PromptProfileCreateRequest,
+    PromptProfileDraftRequest,
+    PromptProfileModuleRequest,
     PromptProfileOut,
     PromptProfilePreviewOut,
     PromptProfilePreviewRequest,
+    PromptProfileRevisionRequest,
     PromptProfileUpdateRequest,
     PromptProfileVersionApplicationOut,
     PromptProfileVersionDetailOut,
@@ -491,6 +494,7 @@ async def list_prompt_profiles_controller(
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 20,
+    include_drafts: Annotated[bool, Query(alias="includeDrafts")] = False,
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     result = await service.list_prompt_profiles(
@@ -498,8 +502,83 @@ async def list_prompt_profiles_controller(
         scene_code=scene_code,
         page_num=page_num,
         page_size=page_size,
+        include_drafts=include_drafts,
     )
     return TableResponse(rows=result["rows"], total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.get("/prompt-profiles/check-name", summary="检查场景名称是否可用")
+async def check_prompt_name_controller(
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    name: Annotated[str, Query(min_length=1, max_length=100)],
+    exclude_profile_id: Annotated[int | None, Query(alias="excludeProfileId")] = None,
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(data=await service.check_prompt_profile_name(
+        tenant_id=tenant_id, name=name, exclude_profile_id=exclude_profile_id,
+    ))
+
+
+@AiCallRouter.get("/prompt-profiles/by-creation-key", summary="核对新建场景保存结果")
+async def get_prompt_by_creation_key_controller(
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    creation_key: Annotated[str, Query(alias="creationKey", min_length=1, max_length=100)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(data=PromptProfileOut.model_validate(await service.get_prompt_profile_by_creation_key(
+        tenant_id=tenant_id, creation_key=creation_key,
+    )))
+
+
+@AiCallRouter.post("/prompt-profiles/drafts", summary="首次模块保存创建草稿")
+async def create_prompt_draft_controller(
+    request: PromptProfileDraftRequest,
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(data=PromptProfileOut.model_validate(await service.create_prompt_profile_draft(
+        tenant_id=tenant_id, values=request.model_dump(exclude_unset=True),
+    )))
+
+
+@AiCallRouter.patch("/prompt-profiles/{profileId}", summary="保存指定场景模块")
+async def save_prompt_module_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    request: PromptProfileModuleRequest,
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(data=PromptProfileOut.model_validate(await service.save_prompt_profile_module(
+        tenant_id=tenant_id, profile_id=profile_id, values=request.model_dump(exclude_unset=True),
+    )))
+
+
+@AiCallRouter.get("/prompt-profiles/{profileId}/deletion-check", summary="检查场景删除占用")
+async def check_prompt_deletion_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(data=await service.check_prompt_profile_deletion(tenant_id=tenant_id, profile_id=profile_id))
+
+
+@AiCallRouter.delete("/prompt-profiles/{profileId}", summary="删除场景，保留历史")
+async def delete_prompt_profile_controller(
+    profile_id: Annotated[int, Path(alias="profileId")],
+    request: PromptProfileRevisionRequest,
+    auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
+    service: Annotated[AiCallService, Depends(get_ai_call_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    return SuccessResponse(data=await service.delete_prompt_profile(
+        tenant_id=tenant_id, profile_id=profile_id,
+        expected_revision=request.expected_revision, deleted_by=user_id,
+    ))
 
 
 @AiCallRouter.get(
@@ -653,6 +732,8 @@ async def preview_prompt_profile_controller(
         opening_message=request.opening_message,
         opening_barge_in_enabled=request.opening_barge_in_enabled,
         product_info=request.product_info,
+        variables=[item.model_dump() for item in request.variables] if request.variables is not None else None,
+        profile_id=request.profile_id,
     )
     return SuccessResponse(data=PromptProfilePreviewOut.model_validate(result), msg="预览成功")
 
@@ -729,6 +810,7 @@ async def apply_prompt_profile_version_controller(
     version_id: Annotated[int, Path(alias="versionId")],
     auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    request: PromptProfileRevisionRequest,
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
     user = auth.user
@@ -736,6 +818,7 @@ async def apply_prompt_profile_version_controller(
         tenant_id=tenant_id,
         profile_id=profile_id,
         version_id=version_id,
+        expected_revision=request.expected_revision,
         applied_by=user_id,
         applied_by_name=(
             getattr(user, "nick_name", None) or getattr(user, "user_name", None)
@@ -762,6 +845,7 @@ async def update_prompt_profile_version_controller(
         profile_id=profile_id,
         version_id=version_id,
         version_name=request.version_name,
+        expected_revision=request.expected_revision,
     )
     return SuccessResponse(
         data=PromptProfileVersionOut.model_validate(result),
@@ -778,12 +862,14 @@ async def delete_prompt_profile_version_controller(
     version_id: Annotated[int, Path(alias="versionId")],
     auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
+    expected_revision: Annotated[int, Query(alias="expectedRevision", ge=1)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     await service.delete_prompt_profile_version(
         tenant_id=tenant_id,
         profile_id=profile_id,
         version_id=version_id,
+        expected_revision=expected_revision,
     )
     return SuccessResponse(data=None, msg="删除成功")
 

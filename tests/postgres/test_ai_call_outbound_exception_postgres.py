@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.v1.ai_call.model import AiCallPromptProfileModel
 from app.api.v1.ai_call.outbound.exception_service import (
     EXCEPTION_DEFAULTS,
     OutboundExceptionService,
@@ -36,6 +37,7 @@ def _dsn() -> str:
 async def test_concurrent_same_category_starts_only_one_batch() -> None:
     engine = create_async_engine(_dsn(), isolation_level="READ COMMITTED")
     tables = [
+        AiCallPromptProfileModel.__table__,
         AiCallOutboundTaskModel.__table__,
         AiCallOutboundTargetModel.__table__,
         AiCallOutboundAttemptModel.__table__,
@@ -51,6 +53,9 @@ async def test_concurrent_same_category_starts_only_one_batch() -> None:
 
     try:
         async with factory.begin() as session:
+            session.add(AiCallPromptProfileModel(id=9001, tenant_id="tenant-a", scene_code="intro_contract",
+                name="测试提示词", provider_key="static_profile", prompt_text="介绍合同", opening_message="您好",
+                created_at=now, updated_at=now))
             session.add(
                 AiCallOutboundTaskModel(
                     id=task_id,
@@ -66,7 +71,7 @@ async def test_concurrent_same_category_starts_only_one_batch() -> None:
                     connected_targets=0,
                     failed_targets=1,
                     execution_mode="immediate",
-                    prompt_profile_id="prompt-1",
+                    prompt_profile_id="9001",
                     prompt_name="测试提示词",
                     scene_code="intro_contract",
                     voice="Tina",

@@ -243,7 +243,7 @@ class AiCallRecordService:
     async def get_execution_config(
         self,
         record: AiCallRecordModel,
-    ) -> dict[str, str | None] | None:
+    ) -> dict[str, Any] | None:
         if not record.business_id:
             return None
         try:
@@ -271,9 +271,16 @@ class AiCallRecordService:
         except (KeyError, TypeError, ValueError):
             return None
 
+        profile = None
+        if str(prompt.get("id") or "").isdigit():
+            profile = await self.repository.get_prompt_profile(int(prompt["id"]), tenant_id=record.tenant_id)
         result = {
             "promptProfileId": _optional_text(prompt.get("id")),
             "promptName": _optional_text(prompt.get("name")),
+            "promptSceneDeleted": profile is not None and profile.deleted_at is not None,
+            "promptVersionNo": prompt.get("versionNo"),
+            "configRevision": prompt.get("configRevision"),
+            "contentHash": prompt.get("contentHash"),
             "sceneCode": _optional_text(prompt.get("sceneCode")),
             "voice": _optional_text(voice.get("voice")),
             "voiceName": _optional_text(
@@ -507,7 +514,7 @@ class AiCallRecordService:
                 }:
                     call_result = candidate
         answer_type = semantic_context.get("answerType")
-        if call_result == "connected" and answer_type is None:
+        if call_result in {"connected", "early_hangup"} and answer_type is None:
             answer_type = detect_answer_type(
                 call_result=call_result,
                 analysis_status=semantic_context.get("analysisStatus"),
@@ -525,7 +532,7 @@ class AiCallRecordService:
             "phoneNumber": outbound_context.get("phoneNumber"),
             "attemptNo": outbound_context.get("attemptNo"),
             "callResult": business_call_result(call_result, answer_type),
-            "answerType": answer_type if call_result == "connected" else None,
+            "answerType": answer_type if call_result in {"connected", "early_hangup"} else None,
             "summary": semantic_summary,
             "analysisStatus": semantic_context.get("analysisStatus"),
             "customerIntent": semantic_context.get("customerIntent"),
@@ -570,6 +577,8 @@ class AiCallRecordService:
             "businessType": record.business_type,
             "businessId": record.business_id,
             "sceneCode": record.scene_code,
+            "sceneDeleted": getattr(record, "_deleted_scene_name", None) is not None,
+            "sceneName": getattr(record, "_deleted_scene_name", None),
             "promptSourceKey": record.prompt_source_key,
             "entryType": record.entry_type,
             "roomName": record.room_name,

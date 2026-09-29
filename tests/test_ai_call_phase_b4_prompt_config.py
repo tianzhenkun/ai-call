@@ -894,6 +894,7 @@ async def test_prompt_profiles_are_tenant_scoped_and_versioned(b4_service) -> No
     )
     assert applications["total"] == 1
     assert applications["rows"][0] == {
+        "sceneDeleted": False,
         "id": applications["rows"][0]["id"],
         "profileId": created["id"],
         "fromVersionId": versions["rows"][0]["id"],
@@ -1188,6 +1189,32 @@ def test_prompt_optimizer_rejects_unchanged_candidate() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("product_info", ["服务{{customerName}}。\n业务话术：这是产品原文。", ""])
+async def test_preview_returns_separate_rendered_sections(b4_service, product_info):
+    from app.api.v1.ai_call.schema import PromptProfilePreviewOut
+
+    service, *_ = b4_service
+    preview = await service.preview_prompt_profile(
+        tenant_id=TEST_TENANT_ID,
+        business_id=None,
+        scene_code="",
+        business_params={"customerName": "张总"},
+        prompt=None,
+        opening_message="您好{{customerName}}",
+        product_info=product_info,
+        prompt_text="先询问{{customerName}}的需求。",
+        variables=[{"key": "customerName", "label": "客户名称"}],
+    )
+    assert preview["productInfo"] == product_info.replace("{{customerName}}", "张总")
+    assert preview["promptText"] == "先询问张总的需求。"
+    serialized = PromptProfilePreviewOut.model_validate(preview).model_dump(by_alias=True)
+    assert serialized["productInfo"] == preview["productInfo"]
+    assert serialized["promptText"] == preview["promptText"]
+    assert serialized["openingMessage"] == "您好张总"
+    assert "平台关键约束" not in serialized["instructions"]
+
+
+@pytest.mark.anyio
 async def test_static_prompt_profile_composes_effective_instructions(b4_service) -> None:
     service, _repository, _room_manager, agent_runner = b4_service
     profile = await create_static_profile(service)
@@ -1210,14 +1237,16 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
 
     assert profile["sceneCode"] == "debt_promise_repay_reminder"
     assert "bargeInEnabled" not in profile
-    assert preview["promptSourceKey"] == "debt_promise_repay_reminder"
+    assert preview["promptSourceKey"] == "debt_promise_repay_reminder@r1"
     assert preview["bargeInEnabled"] is True
     assert "平台关键约束" not in preview["instructions"]
     assert "业务话术" in preview["instructions"]
     assert "你正在联系张总" in preview["instructions"]
     assert "{{customerName}}" not in preview["instructions"]
     assert preview["openingMessage"] == "您好张总，我是灵宸智能助手，想和您确认一下还款安排。"
-    assert result.effective_config.prompt_source_key == "debt_promise_repay_reminder"
+    assert preview["productInfo"] == ""
+    assert preview["promptText"] == "你正在联系张总，提醒客户按承诺时间还款，语气克制。"
+    assert result.effective_config.prompt_source_key == "debt_promise_repay_reminder@r1"
     assert result.effective_config.barge_in_enabled is True
     assert "平台关键约束" in result.effective_config.instructions
     assert "当前日期：" in result.effective_config.instructions
@@ -1229,7 +1258,7 @@ async def test_static_prompt_profile_composes_effective_instructions(b4_service)
     assert events.rows[0].payload == {
         "promptHash": result.effective_config.prompt_hash,
         "openingMessageHash": preview["openingMessageHash"],
-        "promptSourceKey": "debt_promise_repay_reminder",
+        "promptSourceKey": "debt_promise_repay_reminder@r1",
     }
     assert "提醒客户按承诺时间还款" not in str(events.rows[0].payload)
 
@@ -1386,9 +1415,9 @@ async def test_missing_prompt_profile_fails_before_livekit_room_created(b4_servi
     assert exc_info.value.msg == "业务场景提示词配置不存在"
     assert room_manager.created_rooms == []
     rows, total = await repository.list_records()
-    assert total == 1
-    assert rows[0].status == CallSessionStatus.FAILED.value
-    assert rows[0].end_reason == "prompt_profile_not_found"
+    # 场景准入先于创建通话记录，不为无效场景建立业务占用。
+    assert total == 0
+    assert rows == []
 
 
 @pytest.mark.anyio
@@ -1805,6 +1834,8 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
             _ = kwargs
             return {
                 "instructions": "最终提示词",
+                "productInfo": "产品事实",
+                "promptText": "业务话术",
                 "openingMessage": "您好",
                 "promptHash": "sha256:prompt",
                 "openingMessageHash": "sha256:opening",
@@ -1873,7 +1904,11 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
                 "businessParams": {},
             },
         ).json()
-        applied = client.post("/ai-call/prompt-profiles/1/versions/1/apply").json()
+        assert client.post("/ai-call/prompt-profiles/1/versions/1/apply").status_code == 422
+        assert client.put("/ai-call/prompt-profiles/1", json={"name": "场景"}).status_code == 422
+        assert client.patch("/ai-call/prompt-profiles/1/versions/1", json={"versionName": "新名称"}).status_code == 422
+        assert client.delete("/ai-call/prompt-profiles/1/versions/1").status_code == 422
+        applied = client.post("/ai-call/prompt-profiles/1/versions/1/apply", json={"expectedRevision": 1}).json()
         applications = client.get(
             "/ai-call/prompt-profiles/1/version-applications"
         ).json()
@@ -1884,8 +1919,11 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert common_config["data"]["content"] == "统一品牌语气"
     assert saved_common_config["data"]["content"] == "新的统一品牌语气"
     assert preview["data"]["promptSourceKey"] == "debt_promise_repay_reminder"
+    assert preview["data"]["productInfo"] == "产品事实"
+    assert preview["data"]["promptText"] == "业务话术"
     assert applied["data"]["id"] == "1"
     assert fake_service.applied_version == {
+        "expected_revision": 1,
         "tenant_id": TEST_TENANT_ID,
         "profile_id": 1,
         "version_id": 1,

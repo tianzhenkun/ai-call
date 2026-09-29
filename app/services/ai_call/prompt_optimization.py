@@ -48,6 +48,7 @@ class OpenAICompatiblePromptOptimizer:
             system_content=(
                 "你是 AI 外呼提示词编辑器。只输出 JSON 对象："
                 '{"candidateContent":"候选内容","warnings":[]}。'
+                "operation 为 generate 时依据可见业务资料生成本模块内容，为 optimize 时只按指令优化 currentContent；"
                 "只能使用 allowedVariables 中的变量，保留原内容已有变量；"
                 "currentContent 非空时必须产生实质改进，不得原样返回；"
                 "允许询问并记录微信等联系方式，也可以表达后续沟通意向；"

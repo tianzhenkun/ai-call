@@ -139,6 +139,7 @@ class OutboundExceptionService:
                     total_count=sum(category_counts.values()),
                     pending_count=pending_count,
                     maxed_out_count=category_counts.get("MAXED", 0),
+                    status_counts=category_counts,
                     policy=(
                         self._policy_out(policy)
                         if policy is not None and retryable
@@ -207,6 +208,22 @@ class OutboundExceptionService:
                 )
             return self._batch_out(existing)
 
+        # 先锁场景再锁策略及目标，删除与新重呼接纳使用相同顺序。
+        from app.services.ai_call.prompt_editor import require_available_profile
+        candidate_tasks = (await db.scalars(select(AiCallOutboundTaskModel).join(
+            AiCallOutboundTargetModel,
+            (AiCallOutboundTargetModel.task_id == AiCallOutboundTaskModel.id)
+            & (AiCallOutboundTargetModel.tenant_id == AiCallOutboundTaskModel.tenant_id),
+        ).where(AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.exception_category == category,
+                AiCallOutboundTargetModel.exception_batch_id.is_(None),
+                AiCallOutboundTargetModel.status == "COMPLETED").distinct())).all()
+        profiles = [await require_available_profile(db, tenant_id=tenant_id,
+                    profile_id=task.prompt_profile_id, scene_code=task.scene_code, for_update=False)
+                    for task in candidate_tasks]
+        for profile_id in sorted({profile.id for profile in profiles}):
+            await require_available_profile(db, tenant_id=tenant_id, profile_id=profile_id)
+
         await self._ensure_policies(db, tenant_id, user_id)
         policy = await db.scalar(
             select(AiCallOutboundExceptionPolicyModel)
@@ -255,6 +272,7 @@ class OutboundExceptionService:
                     AiCallOutboundTargetModel.exception_category == category,
                     AiCallOutboundTargetModel.exception_batch_id.is_(None),
                     AiCallOutboundTargetModel.status == "COMPLETED",
+                    AiCallOutboundTargetModel.task_id.in_([task.id for task in candidate_tasks]),
                     AiCallOutboundTargetModel.exception_entered_at <= cutoff_at,
                 )
                 .order_by(
@@ -335,7 +353,7 @@ class OutboundExceptionService:
             AiCallOutboundTargetModel.exception_category == category,
         ]
         if target_status:
-            conditions.append(display_status == target_status)
+            conditions.append(display_status.in_(target_status.split(",")))
         if keyword and keyword.strip():
             value = keyword.strip()
             conditions.append(

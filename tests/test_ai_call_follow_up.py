@@ -36,6 +36,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptProfileModel,
     AiCallRecordModel,
 )
 from app.api.v1.ai_call.outbound.rule_task_model import (
@@ -82,6 +83,14 @@ async def session_factory(tmp_path):
     async with engine.begin() as conn:
         await conn.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    # 回拨使用已存在的可用业务场景；删除/草稿用例再显式变更该状态。
+    async with factory() as db, db.begin():
+        db.add(AiCallPromptProfileModel(
+            id=9001, tenant_id="tenant-a", scene_code="intro_contract",
+            name="产品介绍", provider_key="static_profile", lifecycle_status="READY",
+            prompt_text="介绍产品", opening_message="您好",
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+        ))
     yield factory
     await engine.dispose()
 

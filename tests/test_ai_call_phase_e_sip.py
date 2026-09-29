@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from app.api.v1.ai_call import controller as ai_call_controller
 from app.api.v1.ai_call import service as ai_call_service_module
 from app.api.v1.ai_call.controller import AiCallRouter, get_ai_call_service
 from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.model import AiCallPromptProfileModel
 from app.api.v1.ai_call.schema import CreateSipSessionRequest
 from app.api.v1.ai_call.service import AiCallService
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
@@ -924,6 +926,11 @@ async def test_create_sip_session_accepts_enabled_tenant_voice() -> None:
     now = datetime.now(timezone.utc)
     try:
         async with session_maker() as db:
+            db.add(AiCallPromptProfileModel(
+                id=1, tenant_id="tenant-a", scene_code="intro_geo", name="测试 GEO",
+                provider_key="static_profile", prompt_text="介绍 GEO", opening_message="您好",
+                created_at=now, updated_at=now,
+            ))
             db.add(
                 AiCallTenantVoiceProfileModel(
                     id=1,
@@ -1647,6 +1654,13 @@ async def test_create_sip_session_controller_commits_failed_record_before_error_
 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
+        async with session_maker.begin() as db:
+            now = datetime.now(timezone.utc)
+            db.add(AiCallPromptProfileModel(
+                id=1, tenant_id="000000", scene_code="intro_geo", name="测试 GEO",
+                provider_key="static_profile", prompt_text="介绍 GEO", opening_message="您好",
+                created_at=now, updated_at=now,
+            ))
         async with session_maker() as db:
             with pytest.raises(CustomException):
                 async with db.begin():
@@ -1673,6 +1687,7 @@ async def test_create_sip_session_controller_commits_failed_record_before_error_
                         prompt_resolver=FakePromptResolver(),
                         prompt_composer=PromptComposer(handoff_component_enabled=True),
                     )
+                    service.create_sip_session = partial(service.create_sip_session, tenant_id="000000")
                     await ai_call_controller.create_sip_session_controller(
                         service=service,
                         request=CreateSipSessionRequest(

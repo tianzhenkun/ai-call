@@ -607,8 +607,8 @@ async def test_owner_runtime_start_failure_rolls_back_target_and_all_start_facts
     task_id, target_id, _phone_number = await _seed_due_task(database, now)
     original_create = RuntimeCommandRepository.create_start_call
 
-    async def create_then_fail(self, request):
-        await original_create(self, request)
+    async def create_then_fail(self, request, *, admitted_task=False):
+        await original_create(self, request, admitted_task=admitted_task)
         raise RuntimeError("forced failure after start facts flush")
 
     monkeypatch.setattr(

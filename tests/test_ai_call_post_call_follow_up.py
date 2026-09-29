@@ -19,6 +19,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptProfileModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
@@ -405,6 +406,10 @@ async def session_factory(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db, db.begin():
+        db.add(AiCallPromptProfileModel(id=9001, tenant_id="tenant-a", name="GEO介绍", scene_code="intro_geo",
+            provider_key="static_profile", prompt_text="介绍GEO", opening_message="您好",
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)))
     yield factory
     await engine.dispose()
 

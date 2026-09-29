@@ -375,6 +375,19 @@ async def reconcile_analyzed_call(
     )
     if context is None:
         return
+    # 话后纠正可以保留历史结论，但不得让已删除场景重新进入重呼队列。
+    from app.api.v1.ai_call.model import AiCallPromptProfileModel
+    task_context = await db.get(AiCallOutboundTaskModel, context.task_id)
+    if task_context is not None:
+        scene_stmt = select(AiCallPromptProfileModel).where(
+            AiCallPromptProfileModel.tenant_id == context.tenant_id,
+        )
+        scene_stmt = scene_stmt.where(AiCallPromptProfileModel.id == int(task_context.prompt_profile_id)) if task_context.prompt_profile_id else scene_stmt.where(
+            AiCallPromptProfileModel.scene_code == task_context.scene_code,
+        )
+        scene = await db.scalar(scene_stmt.with_for_update().execution_options(populate_existing=True))
+        if scene is None or scene.deleted_at is not None or scene.lifecycle_status != "READY":
+            retry_allowed = False
     task = await db.scalar(
         select(AiCallOutboundTaskModel)
         .where(

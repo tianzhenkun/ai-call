@@ -186,7 +186,8 @@ class StaticProfilePromptProvider:
                 profile.opening_message or "",
                 context.business_params,
             ).strip(),
-            source_key=normalize_scene_code(profile.scene_code) or profile.scene_code,
+            source_key=(normalize_scene_code(profile.scene_code) or profile.scene_code)
+            + (f"@r{profile.edit_revision}" if getattr(profile, "edit_revision", None) is not None else ""),
         )
 
 
@@ -288,6 +289,10 @@ class BusinessPromptResolver:
                 "业务场景提示词配置不存在",
                 404,
             )
+        if getattr(profile, "deleted_at", None) is not None:
+            raise _prompt_error("prompt_profile_deleted", "该场景已删除", 410)
+        if getattr(profile, "lifecycle_status", "READY") != "READY":
+            raise _prompt_error("prompt_profile_draft", "该场景仍为草稿，请先完成保存配置", 409)
 
         provider_key = profile.provider_key or PROMPT_PROVIDER_STATIC_PROFILE
         provider = self._provider_for_profile(provider_key, profile.scene_code)
@@ -504,7 +509,9 @@ def resolve_static_prompt_snapshot(
         product_info=render_prompt_template(
             str(snapshot.get("productInfo") or ""), context.business_params
         ).strip(),
-        source_key=f"{snapshot_scene}@v{snapshot.get('versionNo') or 1}",
+        source_key=(f"{snapshot_scene}@v{snapshot.get('versionNo')}@r{snapshot['configRevision']}"
+                    if snapshot.get("configRevision") is not None
+                    else f"{snapshot_scene}@v{snapshot.get('versionNo') or 1}"),
         opening_barge_in_enabled=snapshot.get("openingBargeInEnabled", True),
     )
     BusinessPromptResolver._validate_result(result)

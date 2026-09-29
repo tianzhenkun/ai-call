@@ -49,6 +49,7 @@ class ExceptionSummaryCardOut(OutboundSchema):
     total_count: int = 0
     pending_count: int = 0
     maxed_out_count: int = 0
+    status_counts: dict[ExceptionDisplayStatus, int] = Field(default_factory=dict)
     policy: ExceptionPolicyOut | None = None
     active_batch: ExceptionActiveBatchOut | None = None
     can_start: bool = False

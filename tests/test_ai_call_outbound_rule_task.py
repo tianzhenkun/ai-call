@@ -235,9 +235,25 @@ async def test_web_single_validation_and_task_creation_skip_sip_line(database, o
     assert "sipLine" not in task_snapshot
     assert task_snapshot["prompt"]["versionId"] == str(current_version_id)
     assert task_snapshot["prompt"]["openingBargeInEnabled"] is opening_barge_in_enabled
+    assert task_snapshot["prompt"]["configRevision"] == 1
+    assert len(task_snapshot["prompt"]["contentHash"]) == 64
     assert total == 1
     assert targets[0].phone_number is None
     credit_metering_client.require_eligible.assert_not_awaited()
+
+    from types import SimpleNamespace
+
+    from app.api.v1.ai_call.crud import AiCallRecordRepository
+    from app.api.v1.ai_call.service import AiCallService
+    async with database() as session:
+        prompt_service = AiCallService(SimpleNamespace(), prompt_repository=AiCallRecordRepository(session))
+        saved = await prompt_service.save_prompt_profile_module(tenant_id="tenant-a", profile_id=prompt_id,
+            values={"module": "opening", "opening_message": "新的开场白", "expected_revision": 1})
+        await session.commit()
+        assert saved["versionNo"] == 1 and saved["editRevision"] == 2
+    async with database() as session:
+        historical_task = await session.get(AiCallOutboundTaskModel, task.id)
+        assert json.loads(historical_task.config_snapshot_json) == task_snapshot
 
 
 @pytest.mark.anyio

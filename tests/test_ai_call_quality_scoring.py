@@ -144,7 +144,7 @@ async def test_quality_scoring_scores_after_recording_and_dialogue_ready(
             )
             await repository.update_semantic_analysis_success(
                 call_id="call-quality-ready",
-                analysis_result={"valid_dialogue": False, "tags": ["语音留言"]},
+                analysis_result={"valid_dialogue": False, "tags": ["录音留言提示"]},
                 transcript_snapshot_json="{}",
                 transcript_hash="voicemail",
             )

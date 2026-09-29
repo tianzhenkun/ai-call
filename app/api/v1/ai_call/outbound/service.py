@@ -742,14 +742,9 @@ class OutboundValidationService:
     ) -> str:
         labels = ["客户名称"]
         if prompt_profile_id is not None:
-            profile = await db.scalar(
-                select(AiCallPromptProfileModel).where(
-                    AiCallPromptProfileModel.tenant_id == tenant_id,
-                    AiCallPromptProfileModel.id == prompt_profile_id,
-                )
-            )
-            if profile is None:
-                raise CustomException(msg="提示词配置不存在", status_code=404)
+            from app.services.ai_call.prompt_editor import require_available_profile
+            profile = await require_available_profile(db, tenant_id=tenant_id,
+                                                      profile_id=prompt_profile_id, for_update=False)
             labels = list(
                 (await self._prompt_variable_columns(db, profile=profile)).keys()
             )
@@ -788,6 +783,8 @@ class OutboundValidationService:
         if profile is None:
             # 兼容尚未配置提示词的旧任务；新任务在创建阶段仍会校验所选配置。
             return {}
+        if profile.deleted_at is not None or profile.lifecycle_status != "READY":
+            raise CustomException(msg="场景已删除或尚未完成保存配置", status_code=409)
         try:
             variables = json.loads(profile.variables_json or "[]")
         except json.JSONDecodeError:

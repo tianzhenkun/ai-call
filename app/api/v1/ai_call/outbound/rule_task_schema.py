@@ -187,6 +187,10 @@ class OutboundTaskOut(OutboundSchema):
     ended_at: str | None = None
     prompt_profile_id: str | None = None
     prompt_name: str
+    prompt_scene_deleted: bool = False
+    prompt_version_no: int | None = None
+    prompt_config_revision: int | None = None
+    prompt_content_hash: str | None = None
     scene_code: str
     voice: str
     voice_name: str | None = None

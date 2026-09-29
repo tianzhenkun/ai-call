@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallEventModel,
+    AiCallPromptProfileModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
 )
@@ -114,6 +115,12 @@ async def database(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db, db.begin():
+        db.add(AiCallPromptProfileModel(
+            id=9001, tenant_id="tenant-a", scene_code="intro_contract", name="合同介绍",
+            provider_key="static_profile", lifecycle_status="READY", prompt_text="介绍合同",
+            opening_message="您好", created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+        ))
     yield factory
     await engine.dispose()
 
@@ -306,7 +313,7 @@ def _snapshot(
     return json.dumps(
         {
             "request": {"taskName": "执行器测试任务"},
-            "prompt": {"id": "prompt-1", "sceneCode": "intro_contract"},
+            "prompt": {"id": "9001", "sceneCode": "intro_contract"},
             "voice": {"voice": "Tina"},
             "rule": {
                 "retryCount": retry_count,
@@ -432,7 +439,7 @@ async def _seed_task(
                 scheduled_at=scheduled_at,
                 started_at=None,
                 ended_at=None,
-                prompt_profile_id="prompt-1",
+                prompt_profile_id="9001",
                 prompt_name="合同介绍",
                 scene_code="intro_contract",
                 voice="Tina",
@@ -537,6 +544,32 @@ async def test_exception_batch_claims_only_current_pending_targets(database) -> 
             "exception-batch-1",
         )
         assert replay.batch_id == batch.batch_id
+
+
+@pytest.mark.anyio
+async def test_completed_task_with_retry_target_still_blocks_scene_deletion(database):
+    from app.api.v1.ai_call.service import AiCallService
+    now = datetime.now(timezone.utc)
+    task_id, target_ids = await _seed_task(database, now=now)
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+        task.status = "COMPLETED"
+        target.status = "RETRY_WAIT"
+        service = AiCallService(SimpleNamespace(), prompt_repository=AiCallRecordRepository(db))
+        check = await service.check_prompt_profile_deletion(tenant_id="tenant-a", profile_id=9001)
+        assert check["blockers"][0]["id"] == str(task_id)
+        with pytest.raises(CustomException, match="未结束"):
+            await service.delete_prompt_profile(tenant_id="tenant-a", profile_id=9001, expected_revision=1)
+        target.status = "COMPLETED"
+        target.exception_category = "no_answer"
+        await db.flush()
+        await service.delete_prompt_profile(tenant_id="tenant-a", profile_id=9001, expected_revision=1)
+        await db.commit()
+        with pytest.raises(CustomException, match="已删除"):
+            await OutboundExceptionService().start_batch(db, "tenant-a", 1, None, "no_answer", "deleted-retry")
+        historical = await OutboundRuleTaskService(database).get_task(db, "tenant-a", task_id)
+        assert historical.prompt_scene_deleted and historical.prompt_name == "合同介绍"
 
 
 @pytest.mark.anyio
@@ -1045,7 +1078,7 @@ async def test_mock_dialer_preserves_result_without_connected_callback(
         customer_name="测试客户",
         scene_code="intro_contract",
         voice="Tina",
-        prompt_profile_id="prompt-1",
+        prompt_profile_id="9001",
     )
 
     result = await MockOutboundDialer(configured_result).dial(
@@ -1418,7 +1451,7 @@ async def test_real_managed_record_fields_are_not_overwritten(database) -> None:
                 business_type="outbound_task",
                 business_id=str(task_id),
                 scene_code="intro_contract",
-                prompt_source_key="prompt-1",
+                prompt_source_key="9001",
                 entry_type="sip",
                 room_name=f"ai-call-{claimed.call_id}",
                 participant_identity=f"sip-{claimed.call_id}",
@@ -1583,7 +1616,7 @@ async def test_stale_recovery_reconciles_terminal_sip_attempt_without_redial(
                 business_type="outbound_task",
                 business_id=str(task_id),
                 scene_code="intro_contract",
-                prompt_source_key="prompt-1",
+                prompt_source_key="9001",
                 entry_type="sip_outbound",
                 room_name=f"ai-call-{attempt.call_id}",
                 participant_identity=f"sip-{attempt.call_id}",
@@ -2163,7 +2196,7 @@ async def _analyze_voicemail(db, call_id, now, *, force=False, voicemail=True):
     class VoicemailAnalyzer:
         async def analyze(self, **kwargs):
             return (
-                {"valid_dialogue": False, "summary": "进入语音信箱", "tags": ["语音留言"]}
+                {"valid_dialogue": False, "summary": "客户未接听电话，系统播放了无法接听语音提示。", "tags": ["录音留言提示", "无有效对话"]}
                 if voicemail
                 else {"valid_dialogue": True, "summary": "客户咨询服务和费用", "tags": []}
             )
@@ -3075,6 +3108,18 @@ async def test_exception_batch_snapshots_policy_and_uses_last_attempt_end_time(
         assert batch is not None and target is not None
         assert (batch.interval_days, batch.max_retry_count) == (7, 2)
         assert target.next_attempt_at == _sqlite_time(now + timedelta(days=7))
+        rows, total = await service.list_targets(
+            session,
+            "tenant-a",
+            1,
+            category="no_answer",
+            target_status="WAITING,CALLING",
+            keyword=None,
+            page_num=1,
+            page_size=20,
+        )
+        assert total == 1
+        assert rows[0].status == "WAITING"
 
 
 @pytest.mark.anyio
@@ -3214,6 +3259,21 @@ async def test_exception_retry_stops_at_batch_limit_and_is_tenant_isolated(
         assert total == 1
         assert rows[0].status == "MAXED"
         assert rows[0].phone_number == "138****8001"
+        completed_rows, completed_total = await service.list_targets(
+            session,
+            "tenant-a",
+            1,
+            category="no_answer",
+            target_status="CONNECTED,MAXED,UNAVAILABLE,STOPPED",
+            keyword=None,
+            page_num=1,
+            page_size=20,
+        )
+        assert completed_total == 1
+        assert completed_rows[0].status == "MAXED"
+        summary = await service.get_summary(session, "tenant-a", 1)
+        no_answer = next(card for card in summary.cards if card.category == "no_answer")
+        assert no_answer.status_counts == {"MAXED": 1}
 
         other_rows, other_total = await service.list_targets(
             session,

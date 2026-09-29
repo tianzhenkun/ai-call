@@ -803,6 +803,11 @@ async def load_current_ready_knowledge_versions(
                 )
                 .where(
                     AiCallKnowledgeVersionModel.tenant_id == tenant_id,
+                    select(AiCallPromptProfileModel.id).where(
+                        AiCallPromptProfileModel.id == prompt_profile_id,
+                        AiCallPromptProfileModel.tenant_id == tenant_id,
+                        AiCallPromptProfileModel.deleted_at.is_(None),
+                    ).exists(),
                     AiCallKnowledgeVersionModel.status == "READY",
                     AiCallKnowledgeItemModel.tenant_id == tenant_id,
                     AiCallKnowledgeItemModel.deleted_at.is_(None),
@@ -867,6 +872,8 @@ class KnowledgeProductInfoService:
         )
         if profile is None:
             raise CustomException(msg="提示词配置不存在", status_code=404)
+        if profile.deleted_at is not None:
+            raise CustomException(msg="该场景已删除", status_code=410)
         versions = await load_current_ready_knowledge_versions(
             db,
             tenant_id=tenant_id,
@@ -1875,6 +1882,7 @@ class KnowledgeService:
                 .where(
                     AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
                     AiCallPromptKnowledgeBindingModel.knowledge_item_id.in_(item_ids),
+                    AiCallPromptProfileModel.deleted_at.is_(None),
                 )
                 .order_by(
                     AiCallPromptKnowledgeBindingModel.knowledge_item_id,
@@ -1959,7 +1967,6 @@ class KnowledgeService:
         prompt_profile_ids: list[int],
         user_id: int,
     ) -> list[dict[str, str]]:
-        await self._get_item_record(db, tenant_id, item_id, for_update=True)
         profile_ids = sorted({int(profile_id) for profile_id in prompt_profile_ids})
         if len(profile_ids) > 100 or any(profile_id <= 0 for profile_id in profile_ids):
             raise CustomException(msg="提示词配置 ID 不合法", status_code=400)
@@ -1970,7 +1977,8 @@ class KnowledgeService:
                         select(AiCallPromptProfileModel).where(
                             AiCallPromptProfileModel.tenant_id == tenant_id,
                             AiCallPromptProfileModel.id.in_(profile_ids),
-                        )
+                            AiCallPromptProfileModel.deleted_at.is_(None),
+                        ).order_by(AiCallPromptProfileModel.id).with_for_update().execution_options(populate_existing=True)
                     )
                 ).all()
             )
@@ -1979,6 +1987,7 @@ class KnowledgeService:
         )
         if {profile.id for profile in profiles} != set(profile_ids):
             raise CustomException(msg="提示词配置不存在或无权管理", status_code=400)
+        await self._get_item_record(db, tenant_id, item_id, for_update=True)
 
         await db.execute(
             delete(AiCallPromptKnowledgeBindingModel).where(
@@ -2099,6 +2108,7 @@ class KnowledgeService:
                 .where(
                     AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
                     AiCallPromptKnowledgeBindingModel.knowledge_item_id == item_id,
+                    AiCallPromptProfileModel.deleted_at.is_(None),
                 )
                 .order_by(AiCallPromptProfileModel.scene_code, AiCallPromptProfileModel.id)
             )

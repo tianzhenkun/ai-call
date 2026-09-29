@@ -5,6 +5,9 @@ from typing import Any
 VOICEMAIL_MARKERS = (
     "语音信箱",
     "语音留言",
+    "录音留言",
+    "无法接听，请留言",
+    "嘟声后留言",
     "提示音后录制留言",
     "录音完成后挂断",
 )
@@ -16,7 +19,7 @@ def detect_answer_type(
     analysis_status: str | None,
     analysis_result: dict[str, Any] | None,
 ) -> str | None:
-    if call_result != "connected":
+    if call_result not in {"connected", "early_hangup"}:
         return None
     if analysis_status != "2" or not isinstance(analysis_result, dict):
         return "transport"

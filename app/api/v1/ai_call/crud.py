@@ -695,13 +695,27 @@ class AiCallRecordRepository:
             .limit(safe_page_size)
         )
         rows = (await self.db.execute(stmt)).scalars().all()
-        await self.attach_outbound_context(rows, tenant_id=tenant_id)
-        await self._attach_semantic_analysis(rows)
-        await self._attach_quality_context(rows, tenant_id=tenant_id)
-        await self._attach_follow_up_context(rows, tenant_id=tenant_id)
-        await self.attach_after_call_result_context(rows, tenant_id=tenant_id)
-        await self.attach_end_context(rows, tenant_id=tenant_id)
+        await self.attach_record_read_context(rows, tenant_id=tenant_id)
         return list(rows), total
+
+    async def attach_record_read_context(
+        self, records: list[AiCallRecordModel], *, tenant_id: str | None,
+    ) -> None:
+        await self.attach_outbound_context(records, tenant_id=tenant_id)
+        await self._attach_semantic_analysis(records)
+        await self._attach_quality_context(records, tenant_id=tenant_id)
+        await self._attach_follow_up_context(records, tenant_id=tenant_id)
+        await self.attach_after_call_result_context(records, tenant_id=tenant_id)
+        await self.attach_end_context(records, tenant_id=tenant_id)
+        if tenant_id and records:
+            deleted_profiles = (await self.db.execute(select(AiCallPromptProfileModel.scene_code, AiCallPromptProfileModel.name).where(
+                AiCallPromptProfileModel.tenant_id == tenant_id,
+                AiCallPromptProfileModel.scene_code.in_([record.scene_code for record in records if record.scene_code]),
+                AiCallPromptProfileModel.deleted_at.is_not(None),
+            ))).all()
+            deleted_names = dict(deleted_profiles)
+            for record in records:
+                record._deleted_scene_name = deleted_names.get(record.scene_code)
 
     async def attach_end_context(
         self, records: list[AiCallRecordModel], *, tenant_id: str | None,
@@ -1875,6 +1889,7 @@ class AiCallRecordRepository:
                 == analysis_scene_code,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -2371,7 +2386,7 @@ class AiCallRecordRepository:
             AiCallPromptProfileModel.tenant_id == tenant_id,
         )
         if for_update:
-            stmt = stmt.with_for_update()
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -2380,11 +2395,14 @@ class AiCallRecordRepository:
         *,
         tenant_id: str,
         scene_code: str,
+        for_update: bool = False,
     ) -> AiCallPromptProfileModel | None:
         stmt = select(AiCallPromptProfileModel).where(
             AiCallPromptProfileModel.tenant_id == tenant_id,
             AiCallPromptProfileModel.scene_code == scene_code,
         )
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await self.db.execute(stmt.limit(1))
         return result.scalar_one_or_none()
 
@@ -2395,16 +2413,19 @@ class AiCallRecordRepository:
         scene_code: str | None = None,
         page_num: int = 1,
         page_size: int = 20,
+        include_drafts: bool = False,
     ) -> tuple[list[AiCallPromptProfileModel], int]:
         stmt = self._prompt_profile_filters(
             select(AiCallPromptProfileModel),
             tenant_id=tenant_id,
             scene_code=scene_code,
+            include_drafts=include_drafts,
         )
         count_stmt = self._prompt_profile_filters(
             select(func.count()).select_from(AiCallPromptProfileModel),
             tenant_id=tenant_id,
             scene_code=scene_code,
+            include_drafts=include_drafts,
         )
         total = int((await self.db.execute(count_stmt)).scalar_one())
         safe_page_num = max(1, page_num)
@@ -2603,10 +2624,7 @@ class AiCallRecordRepository:
             await self.db.execute(
                 select(
                     AiCallPromptProfileModel.id,
-                    func.coalesce(
-                        current_version.version_no,
-                        func.max(version.version_no),
-                    ),
+                    current_version.version_no,
                     func.count(version.id),
                 )
                 .join(
@@ -2634,7 +2652,7 @@ class AiCallRecordRepository:
             )
         ).all()
         return {
-            int(profile_id): (int(version_no), int(version_count))
+            int(profile_id): (int(version_no) if version_no is not None else None, int(version_count))
             for profile_id, version_no, version_count in rows
         }
 
@@ -3500,6 +3518,9 @@ class AiCallRecordRepository:
 
     @staticmethod
     def _prompt_profile_filters(stmt: Select, **filters) -> Select:
+        stmt = stmt.where(AiCallPromptProfileModel.deleted_at.is_(None))
+        if not filters.get("include_drafts"):
+            stmt = stmt.where(AiCallPromptProfileModel.lifecycle_status == "READY")
         if filters.get("tenant_id"):
             stmt = stmt.where(
                 AiCallPromptProfileModel.tenant_id == filters["tenant_id"]

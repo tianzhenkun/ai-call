@@ -1848,6 +1848,9 @@ class AiCallPromptProfileModel(MappedBase):
             name="uk_ai_call_prompt_profile_tenant_scene",
         ),
         Index("idx_ai_call_prompt_profile_tenant_updated", "tenant_id", "updated_at"),
+        UniqueConstraint("tenant_id", "creation_key", name="uk_ai_call_prompt_creation_key"),
+        Index("uk_ai_call_prompt_active_name", "tenant_id", "name", unique=True,
+              postgresql_where=text("deleted_at IS NULL"), sqlite_where=text("deleted_at IS NULL")),
         {"comment": "AI Call 业务提示词配置表"},
     )
     __permission_strategy__ = None
@@ -1865,6 +1868,11 @@ class AiCallPromptProfileModel(MappedBase):
         comment="场景编码",
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False, comment="配置名称")
+    lifecycle_status: Mapped[str] = mapped_column(String(16), nullable=False, default="READY", server_default="READY")
+    edit_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    creation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     provider_key: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
@@ -1932,7 +1940,7 @@ class AiCallPromptCommonConfigModel(MappedBase):
 
 
 class AiCallPromptProfileVersionModel(MappedBase):
-    """AI Call 场景提示词不可变版本快照。"""
+    """场景版本快照；当前版本随模块保存更新，任务冻结快照不变。"""
 
     __tablename__ = "ai_call_prompt_profile_version"
     __table_args__ = (

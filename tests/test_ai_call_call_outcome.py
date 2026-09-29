@@ -12,16 +12,20 @@ from app.services.ai_call.call_outcome import detect_answer_type, is_voicemail_a
 from app.services.ai_call.record_service import AiCallRecordService
 
 
-@pytest.mark.parametrize("analysis_result", [
-    {"valid_dialogue": False, "summary": "进入语音信箱"},
-    {"valid_dialogue": False, "reason": "提示音后录制留言"},
-    {"valid_dialogue": False, "tags": ["语音留言"]},
-    {"valid_dialogue": False, "key_points": ["录音完成后挂断"]},
-    {"valid_dialogue": True, "tags": ["语音留言"]},
-    {"valid_dialogue": False, "evidence": ["客户说：上次打到了我的语音信箱"]},
-    {"valid_dialogue": False, "summary": "未形成有效业务对话", "nested": {"summary": "语音信箱"}},
+@pytest.mark.parametrize("analysis_result,expected", [
+    ({"valid_dialogue": False, "summary": "进入语音信箱"}, True),
+    ({"valid_dialogue": False, "reason": "提示音后录制留言"}, True),
+    ({"valid_dialogue": False, "tags": ["语音留言"]}, True),
+    ({"valid_dialogue": False, "key_points": ["录音完成后挂断"]}, True),
+    ({"valid_dialogue": False, "summary": "客户未接听电话，系统播放了标准的‘无法接听’语音提示，客户侧无真实对话表达。", "tags": ["未接听", "录音留言提示", "无有效对话"]}, True),
+    ({"valid_dialogue": False, "summary": "暂时无法接听，请留言"}, True),
+    ({"valid_dialogue": False, "reason": "嘟声后留言"}, True),
+    ({"valid_dialogue": True, "tags": ["语音留言"]}, False),
+    ({"valid_dialogue": False, "summary": "客户本人说请留言给他"}, False),
+    ({"valid_dialogue": False, "evidence": ["客户说：上次打到了我的语音信箱"]}, False),
+    ({"valid_dialogue": False, "summary": "未形成有效业务对话", "nested": {"summary": "语音信箱"}}, False),
 ])
-def test_sql_and_record_voicemail_detection_use_same_fields(analysis_result):
+def test_sql_and_record_voicemail_detection_use_same_fields(analysis_result, expected):
     engine = create_engine("sqlite://")
     AiCallSemanticAnalysisModel.__table__.create(engine)
     try:
@@ -33,7 +37,8 @@ def test_sql_and_record_voicemail_detection_use_same_fields(analysis_result):
                 created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
             ))
             db.flush()
-            assert db.scalar(select(voicemail_expression(literal("call-voicemail-parity")))) == is_voicemail_analysis(analysis_result)
+            assert db.scalar(select(voicemail_expression(literal("call-voicemail-parity")))) == expected
+            assert is_voicemail_analysis(analysis_result) == expected
     finally:
         engine.dispose()
 
@@ -42,6 +47,7 @@ def test_sql_and_record_voicemail_detection_use_same_fields(analysis_result):
     ({"valid_dialogue": True}, "connected"),
     ({"valid_dialogue": False, "classification": "low_value"}, "connected"),
     ({"valid_dialogue": False, "tags": ["语音留言"]}, "no_answer"),
+    ({"valid_dialogue": False, "summary": "客户未接听电话，系统播放了标准的‘无法接听’语音提示，客户侧无真实对话表达。", "tags": ["未接听", "录音留言提示", "无有效对话"]}, "no_answer"),
 ])
 def test_record_business_result_separates_voicemail_from_connected(analysis_result, expected) -> None:
     record = AiCallRecordModel(
@@ -54,6 +60,23 @@ def test_record_business_result_separates_voicemail_from_connected(analysis_resu
     response = AiCallRecordService(None).record_to_dict(record)
     assert response["callResult"] == expected
     assert record._outbound_context["callResult"] == "connected"
+
+
+def test_early_hangup_voicemail_is_business_no_answer() -> None:
+    record = AiCallRecordModel(
+        id=2, tenant_id="000000", call_id="call-early-voicemail", entry_type="sip_outbound",
+        status="completed", started_at=datetime.now(timezone.utc),
+    )
+    record._outbound_context = {"callResult": "early_hangup"}
+    record._semantic_analysis_context = {"analysisStatus": "2"}
+    record._semantic_analysis_result = json.dumps(
+        {"valid_dialogue": False, "tags": ["录音留言提示"]}, ensure_ascii=False,
+    )
+
+    response = AiCallRecordService(None).record_to_dict(record)
+
+    assert response["answerType"] == "voicemail"
+    assert response["callResult"] == "no_answer"
 
 
 def test_detect_answer_type_requires_real_dialogue_and_separates_voicemail() -> None:

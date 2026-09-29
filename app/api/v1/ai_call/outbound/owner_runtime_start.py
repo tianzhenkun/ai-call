@@ -92,7 +92,8 @@ class OwnerRuntimeOutboundStart:
                 callee_phone_number=phone.plaintext if phone is not None else None,
                 callee_phone_number_masked=phone.masked if phone is not None else None,
                 callee_phone_number_hash=phone.fingerprint if phone is not None else None,
-            )
+            ),
+            admitted_task=True,
         )
         session.add(
             AiCallOutboundAttemptModel(

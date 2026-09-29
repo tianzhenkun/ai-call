@@ -433,17 +433,6 @@ class OutboundRuleTaskService:
                     AiCallPromptProfileVersionModel.deleted_at.is_(None),
                 )
             )
-        if prompt_version is None:
-            prompt_version = await db.scalar(
-                select(AiCallPromptProfileVersionModel)
-                .where(
-                    AiCallPromptProfileVersionModel.tenant_id == tenant_id,
-                    AiCallPromptProfileVersionModel.profile_id == prompt.id,
-                    AiCallPromptProfileVersionModel.deleted_at.is_(None),
-                )
-                .order_by(AiCallPromptProfileVersionModel.version_no.desc())
-                .limit(1)
-            )
         knowledge_snapshot = await self._freeze_knowledge(
             db,
             tenant_id=tenant_id,
@@ -463,7 +452,13 @@ class OutboundRuleTaskService:
                 "productInfo": prompt.product_info,
                 "variables": self._load_list(prompt.variables_json),
                 "versionId": str(prompt_version.id) if prompt_version is not None else None,
-                "versionNo": prompt_version.version_no if prompt_version is not None else 1,
+                "versionNo": prompt_version.version_no if prompt_version is not None else None,
+                "configRevision": prompt.edit_revision,
+                "contentHash": hashlib.sha256(json.dumps({
+                    "promptText": prompt.prompt_text, "openingMessage": prompt.opening_message,
+                    "openingBargeInEnabled": prompt.opening_barge_in_enabled,
+                    "productInfo": prompt.product_info, "variables": self._load_list(prompt.variables_json),
+                }, ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
             },
             "voice": {
                 "scope": (
@@ -735,9 +730,15 @@ class OutboundRuleTaskService:
             [task.id for task in tasks],
         )
         outcome_counts = await self._business_result_counts_by_task(db, tenant_id, [task.id for task in tasks])
+        deleted_scenes = set(await db.scalars(select(AiCallPromptProfileModel.scene_code).where(
+            AiCallPromptProfileModel.tenant_id == tenant_id,
+            AiCallPromptProfileModel.scene_code.in_([task.scene_code for task in tasks]),
+            AiCallPromptProfileModel.deleted_at.is_not(None),
+        )))
         return [
             self.task_out(
                 task,
+                prompt_scene_deleted=task.scene_code in deleted_scenes,
                 attempt_dialer_types=dialer_types_by_task.get(task.id, []),
                 failed_attempts=failed_attempts_by_task.get(task.id, 0),
                 outcome_counts=outcome_counts.get(task.id),
@@ -763,8 +764,14 @@ class OutboundRuleTaskService:
             [task.id],
         )
         outcome_counts = await self._business_result_counts_by_task(db, tenant_id, [task.id])
+        deleted_scene = await db.scalar(select(AiCallPromptProfileModel.id).where(
+            AiCallPromptProfileModel.tenant_id == tenant_id,
+            AiCallPromptProfileModel.scene_code == task.scene_code,
+            AiCallPromptProfileModel.deleted_at.is_not(None),
+        ))
         return self.task_out(
             task,
+            prompt_scene_deleted=deleted_scene is not None,
             attempt_dialer_types=dialer_types_by_task.get(task.id, []),
             failed_attempts=failed_attempts_by_task.get(task.id, 0),
             outcome_counts=outcome_counts.get(task.id),
@@ -1014,12 +1021,17 @@ class OutboundRuleTaskService:
                 AiCallPromptProfileModel.id
                 == self._business_id(request.prompt_profile_id, "promptProfileId")
             )
-        prompt = await db.scalar(select(AiCallPromptProfileModel).where(*prompt_conditions))
+        prompt_stmt = select(AiCallPromptProfileModel).where(*prompt_conditions)
+        if lock_tenant_voice:
+            prompt_stmt = prompt_stmt.with_for_update().execution_options(populate_existing=True)
+        prompt = await db.scalar(prompt_stmt)
         if prompt is None:
             raise CustomException(
                 msg="提示词不存在或与场景不匹配",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
+        if prompt.deleted_at is not None or prompt.lifecycle_status != "READY":
+            raise CustomException(msg="该场景已删除或仍为草稿，不能用于新任务", status_code=409)
         voice = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
@@ -1149,7 +1161,9 @@ class OutboundRuleTaskService:
         attempt_dialer_types: list[str] | None = None,
         failed_attempts: int = 0,
         outcome_counts: tuple[int, int] | None = None,
+        prompt_scene_deleted: bool = False,
     ) -> OutboundTaskOut:
+        prompt_snapshot = OutboundRuleTaskService._load_object(task.config_snapshot_json).get("prompt") or {}
         return OutboundTaskOut(
             task_id=str(task.id),
             task_name=task.task_name,
@@ -1171,6 +1185,10 @@ class OutboundRuleTaskService:
             ended_at=OutboundRuleTaskService._format_datetime(task.ended_at),
             prompt_profile_id=task.prompt_profile_id,
             prompt_name=task.prompt_name,
+            prompt_scene_deleted=prompt_scene_deleted,
+            prompt_version_no=prompt_snapshot.get("versionNo"),
+            prompt_config_revision=prompt_snapshot.get("configRevision"),
+            prompt_content_hash=prompt_snapshot.get("contentHash"),
             scene_code=task.scene_code,
             voice=task.voice,
             voice_name=task.voice_name,

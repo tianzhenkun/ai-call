@@ -21,6 +21,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpAttemptModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptProfileModel,
     AiCallRecordingModel,
     AiCallRecordModel,
 )
@@ -542,6 +543,7 @@ async def test_handoff_media_migration_is_idempotent_and_portable() -> None:
 
 async def _reset_repository_schema(engine) -> None:
     tables = (
+        AiCallPromptProfileModel.__table__,
         AiCallSipLineModel.__table__,
         AiCallWebhookQuarantineModel.__table__,
         AiCallWebhookInboxModel.__table__,
@@ -567,6 +569,14 @@ async def _reset_repository_schema(engine) -> None:
             await connection.run_sync(table.drop, checkfirst=True)
         for table in reversed(tables):
             await connection.run_sync(table.create)
+        now = datetime.now(timezone.utc)
+        await connection.execute(
+            AiCallPromptProfileModel.__table__.insert().values(
+                id=1, tenant_id="tenant-a", scene_code="collection", name="测试场景",
+                provider_key="static_profile", prompt_text="测试提示词", opening_message="您好",
+                lifecycle_status="READY", created_at=now, updated_at=now,
+            )
+        )
 
 
 async def _insert_sip_line(

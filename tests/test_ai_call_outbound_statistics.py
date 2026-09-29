@@ -23,6 +23,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTargetModel,
     AiCallOutboundTaskModel,
 )
+from app.api.v1.ai_call.service import AiCallService
 from app.api.v1.ai_call.statistics_controller import (
     get_outbound_statistics_service,
 )
@@ -545,6 +546,13 @@ async def test_voicemail_is_unanswered_in_statistics_records_and_filters(low_val
     async with session_maker() as session:
         session.add(_task(task_id=100, tenant_id="tenant-a", now=begin))
         for row_id in (1, 2, 3):
+            record = _record(
+                row_id=row_id,
+                started_at=begin,
+                answered_at=begin,
+                duration_ms={1: 10_000, 2: 2_000, 3: 30_000}[row_id],
+            )
+            record.tenant_id = "tenant-a"
             session.add_all([
                 _target(
                     target_id=row_id,
@@ -552,12 +560,7 @@ async def test_voicemail_is_unanswered_in_statistics_records_and_filters(low_val
                     task_id=100,
                     now=begin,
                 ),
-                _record(
-                    row_id=row_id,
-                    started_at=begin,
-                    answered_at=begin,
-                    duration_ms={1: 10_000, 2: 2_000, 3: 30_000}[row_id],
-                ),
+                record,
                 _attempt(
                     row_id=row_id,
                     tenant_id="tenant-a",
@@ -574,7 +577,7 @@ async def test_voicemail_is_unanswered_in_statistics_records_and_filters(low_val
             ),
             _analysis(
                 row_id=2,
-                result={"valid_dialogue": False, "tags": ["语音留言"]},
+                result={"valid_dialogue": False, "summary": "客户未接听电话，系统播放了无法接听语音提示。", "tags": ["录音留言提示", "无有效对话"]},
                 now=begin,
             ),
         ])
@@ -609,6 +612,13 @@ async def test_voicemail_is_unanswered_in_statistics_records_and_filters(low_val
         assert unanswered_total == 1
         assert unanswered_rows[0].call_id == "call-2"
         assert AiCallRecordService(records).record_to_dict(unanswered_rows[0])["callResult"] == "no_answer"
+        session.expunge_all()
+        detail = await AiCallService(
+            object(), record_service=AiCallRecordService(records),
+        ).get_record_detail("call-2")
+        assert detail["record"]["callResult"] == "no_answer"
+        assert detail["record"]["answerType"] == "voicemail"
+        assert detail["record"]["qualityScoreStatus"] == "not_applicable"
 
     await engine.dispose()
 

@@ -286,7 +286,7 @@ class RuntimeCommandRepository:
             return None
         return self._query_snapshot(command)
 
-    async def create_start_call(self, request: StartCallIntent) -> CommandSnapshot:
+    async def create_start_call(self, request: StartCallIntent, *, admitted_task: bool = False) -> CommandSnapshot:
         _validate_start_call_intent(request)
         fingerprint = start_call_request_fingerprint(request)
         existing = await self._find_by_idempotency(
@@ -295,6 +295,10 @@ class RuntimeCommandRepository:
         )
         if existing is not None:
             return self._matching_snapshot(existing, fingerprint)
+
+        if request.scene_code and request.entry_type in {"web", "direct_sip"} and not admitted_task:
+            from app.services.ai_call.prompt_editor import require_available_profile
+            await require_available_profile(self._session, tenant_id=request.tenant_id, scene_code=request.scene_code)
 
         now = await self._database_clock(self._session)
         allocation_deadline_at = request.allocation_deadline_at

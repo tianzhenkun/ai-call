@@ -149,6 +149,10 @@ class AiCallPostCallFollowUpService:
             await self.repository.db.flush()
             return None
 
+        # 与话后重分析保持 analysis → profile 顺序，避免互相等待。
+        from app.services.ai_call.prompt_editor import require_available_profile
+        await require_available_profile(self.repository.db, tenant_id=attempt.tenant_id,
+                                        scene_code=record.scene_code or analysis.scene_code)
         follow_up = await self._create_follow_up(
             analysis=analysis,
             record=record,

@@ -512,6 +512,13 @@ class AiCallFollowUpDataService:
         if existing is not None:
             return self._replay_schedule(existing, fingerprint)
 
+        context = await self._load_context(tenant_id=tenant_id, follow_up_data_id=follow_up_data_id)
+        if context is None:
+            raise CustomException(msg="跟进数据上下文不完整", status_code=409)
+        outbound_task = context[2]
+        from app.services.ai_call.prompt_editor import require_available_profile
+        await require_available_profile(self.db, tenant_id=tenant_id,
+            profile_id=outbound_task.prompt_profile_id, scene_code=outbound_task.scene_code)
         data = await self.db.scalar(
             select(AiCallFollowUpDataModel)
             .where(
@@ -519,6 +526,7 @@ class AiCallFollowUpDataService:
                 AiCallFollowUpDataModel.id == follow_up_data_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if data is None:
             raise CustomException(msg="跟进数据不存在", status_code=404)

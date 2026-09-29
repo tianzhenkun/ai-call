@@ -16,7 +16,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import httpx
 import pytest
 from fastapi import UploadFile
-from sqlalchemy import UniqueConstraint, inspect, select
+from sqlalchemy import UniqueConstraint, func, inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.datastructures import Headers
 
@@ -1076,6 +1076,17 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         with pytest.raises(CustomException) as hidden_tenant:
             await service.get_item(db, tenant_id="tenant-a", item_id=3)
         assert hidden_tenant.value.status_code == 404
+
+        # 删除场景保留资料与绑定原记录，但从正常关联展示中移除。
+        profile = await db.get(AiCallPromptProfileModel, 101)
+        profile.deleted_at = now
+        await db.commit()
+        remaining = await service.get_item(db, tenant_id="tenant-a", item_id=1)
+        assert remaining["sceneBindings"] == []
+        assert await db.scalar(select(func.count()).select_from(AiCallPromptKnowledgeBindingModel)) == 1
+        with pytest.raises(CustomException, match="不存在或无权管理"):
+            await service.replace_scene_bindings(db, tenant_id="tenant-a", item_id=1,
+                                                prompt_profile_ids=[101], user_id=7)
 
         await service.delete_item(db, tenant_id="tenant-a", item_id=1)
         rows, total = await service.list_items(

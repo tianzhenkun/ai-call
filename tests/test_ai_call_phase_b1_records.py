@@ -1690,6 +1690,10 @@ async def test_outbound_record_detail_uses_frozen_task_execution_config(
     )
 
     assert response["executionConfig"] == {
+        "promptSceneDeleted": False,
+        "promptVersionNo": None,
+        "configRevision": None,
+        "contentHash": None,
         "promptProfileId": "prompt-frozen",
         "promptName": "冻结提示词",
         "sceneCode": "intro_frozen",

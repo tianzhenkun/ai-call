@@ -22,6 +22,7 @@ from app.api.v1.ai_call.model import (
     AiCallFollowUpScheduleRequestModel,
     AiCallFollowUpTaskModel,
     AiCallHandoffModel,
+    AiCallPromptProfileModel,
     AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
@@ -45,6 +46,10 @@ async def session_factory(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(MappedBase.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db, db.begin():
+        db.add(AiCallPromptProfileModel(id=9001, tenant_id="tenant-a", name="产品介绍", scene_code="intro_product",
+            provider_key="static_profile", prompt_text="介绍产品", opening_message="您好",
+            created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)))
     yield factory
     await engine.dispose()
 
@@ -436,6 +441,25 @@ async def test_schedule_follow_up_rejects_past_time(session_factory) -> None:
                 changed_by_name="管理员",
             )
         assert rejected.value.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("lifecycle,deleted", [("DRAFT", False), ("READY", True)])
+async def test_unavailable_scene_cannot_schedule_new_follow_up(session_factory, lifecycle, deleted):
+    await _seed_follow_up_data(session_factory, with_active_task=False)
+    async with session_factory() as db:
+        profile = await db.get(AiCallPromptProfileModel, 9001)
+        profile.lifecycle_status = lifecycle
+        profile.deleted_at = datetime.now(timezone.utc) if deleted else None
+        await db.commit()
+        with pytest.raises(CustomException, match="已删除|草稿"):
+            await AiCallFollowUpDataService.from_session(db).schedule_follow_up(
+                tenant_id="tenant-a", follow_up_data_id=100,
+                payload=FollowUpDataScheduleIn(next_follow_up_at=datetime.now(timezone.utc) + timedelta(days=1),
+                                              follow_up_reason="客户希望后续沟通", expected_version=1),
+                idempotency_key="unavailable-scene", changed_by="admin", changed_by_name="管理员",
+            )
+        assert await db.scalar(select(func.count()).select_from(AiCallFollowUpTaskModel)) == 0
 
 
 @pytest.mark.anyio

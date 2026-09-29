@@ -157,6 +157,10 @@ class AiCallFollowUpService:
             follow_up = await self._follow_up_by_handoff(profile.tenant_id, handoff.handoff_id)
             return existing, follow_up
 
+        if payload.needs_follow_up or payload.schedule_follow_up:
+            from app.services.ai_call.prompt_editor import require_available_profile
+            await require_available_profile(self.db, tenant_id=profile.tenant_id, scene_code=handoff.scene_code)
+
         if payload.uses_classification_contract:
             assert fingerprint is not None
             return await self._submit_classification_after_call_work(
@@ -823,6 +827,13 @@ class AiCallFollowUpService:
             )
             return data, task, existing
 
+        if payload.schedule_follow_up:
+            context_data = await self._required_follow_up_data(profile.tenant_id, follow_up_data_id)
+            outbound_task = await self._callback_outbound_task(tenant_id=profile.tenant_id,
+                source_call_id=context_data.source_call_id, follow_up_data=context_data)
+            from app.services.ai_call.prompt_editor import require_available_profile
+            await require_available_profile(self.db, tenant_id=profile.tenant_id,
+                profile_id=outbound_task.prompt_profile_id, scene_code=outbound_task.scene_code)
         data = await self.db.scalar(
             select(AiCallFollowUpDataModel)
             .where(
@@ -830,6 +841,7 @@ class AiCallFollowUpService:
                 AiCallFollowUpDataModel.id == follow_up_data_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if data is None:
             raise CustomException(msg="跟进数据不存在", status_code=404)
@@ -1027,6 +1039,8 @@ class AiCallFollowUpService:
         if task.status not in {"pending", "processing"}:
             self._raise_conflict("当前跟进状态不允许回拨", "FOLLOW_UP_STATE_CONFLICT")
         await self.agent_service.require_scene_access(auth, task.scene_code)
+        from app.services.ai_call.prompt_editor import require_available_profile
+        await require_available_profile(self.db, tenant_id=profile.tenant_id, scene_code=task.scene_code)
         data = None
         if task.follow_up_data_id is not None:
             data = await self.db.scalar(
@@ -1099,6 +1113,20 @@ class AiCallFollowUpService:
         if existing_request is not None:
             return self._raise_replayed_call_request(existing_request, fingerprint)
 
+        data_context = await self.db.scalar(select(AiCallFollowUpDataModel).where(
+            AiCallFollowUpDataModel.tenant_id == profile.tenant_id,
+            AiCallFollowUpDataModel.id == follow_up_data_id,
+        ))
+        if data_context is None:
+            raise CustomException(msg="跟进数据不存在", status_code=404)
+        outbound_context = await self._callback_outbound_task(
+            tenant_id=profile.tenant_id, source_call_id=data_context.source_call_id,
+            follow_up_data=data_context,
+        )
+        from app.services.ai_call.prompt_editor import require_available_profile
+        await require_available_profile(self.db, tenant_id=profile.tenant_id,
+                                        profile_id=outbound_context.prompt_profile_id,
+                                        scene_code=outbound_context.scene_code)
         data = await self.db.scalar(
             select(AiCallFollowUpDataModel)
             .where(
@@ -1106,6 +1134,7 @@ class AiCallFollowUpService:
                 AiCallFollowUpDataModel.id == follow_up_data_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if data is None:
             raise CustomException(msg="跟进数据不存在", status_code=404)
