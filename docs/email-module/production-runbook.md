@@ -11,6 +11,7 @@
 - [2026-09-20 Git 提交发布记录](production-deployed-20260920.md)
 - [2026-09-20 任务编辑更新发布记录](production-deployed-20260920-task-edit.md)
 - [2026-09-29 全量业务改动发布与提示词迁移记录](../livekit-ai-outbound/production-deployed-20260929-all.md)
+- [2026-09-29 提示词列表发布与相邻版本回退记录](../livekit-ai-outbound/production-deployed-20260929-prompt-list.md)
 - [菜单权限配置记录](production-permissions-20260918.md)
 - [邮件 Compose 模板](../../deploy/email-worker/compose.production.yml)
 - [计费 Compose 模板](../../deploy/email-worker/compose.credit.yml)
@@ -241,6 +242,6 @@ sha256sum current/index.html
 4. 前端用临时软链接加 `mv -Tf` 原子切回本次保存的 `previous-target.txt` 目标，核对公网资源。
 5. 默认保留新增表及生产密钥，不 DROP、不自动整库恢复。恢复整库可能丢弃发布后的业务写入，须另行评估。已经 SMTP 接受或结果不明的邮件不得重新排队。
 
-提示词编辑器回退旧应用前必须执行 `tools/migrate_prompt_editor.py --check-rollback`。存在草稿或软删除场景时禁止回退到无状态过滤的旧后端；保留新增列及兼容后端，不删除业务数据或清空标记来满足检查。2026-09-29 发布包的 `rollback.sh` 已包含此检查。
+提示词编辑器回退到不支持草稿／软删除过滤的旧后端前，必须执行 `tools/migrate_prompt_editor.py --check-rollback`。存在任一状态时禁止回退；保留新增列及兼容后端，不删除业务数据或清空标记来满足检查。`reach-all-20260929T024955Z` 发布包的 `rollback.sh` 已包含此检查；当相邻版本已支持相同 schema、状态过滤和修订合同，按对应发布记录核对兼容性后回退。
 
 回滚也要形成执行记录：恢复目标、时间、实际健康结果和仍需处理的数据，不将“已执行回滚命令”视为恢复成功。

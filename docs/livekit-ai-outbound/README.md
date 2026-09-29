@@ -38,6 +38,8 @@
 
 提示词编辑器已于 2026-09-29 部署：[模块保存、草稿、版本与场景删除设计](phases/phase-b4-prompt-editor-save-version-design-20260924.md)，覆盖配置页交互、保存与版本合同、草稿持久化、场景删除、知识库关联展示和外呼准入。发布版本、验证和回退限制见 [2026-09-29 发布记录](production-deployed-20260929-all.md)。
 
+同日下午已部署提示词列表、名称／状态筛选与独立查看／编辑页面，最新版本及相邻版本回退方法见 [2026-09-29 提示词列表发布记录](production-deployed-20260929-prompt-list.md)。
+
 Phase B 预设计：[phases/phase-b-web-commercial-loop-pre-design.md](phases/phase-b-web-commercial-loop-pre-design.md)。它已作为 Phase B1/B2/B2.5/B3 正式设计的输入，后续实现以对应阶段正式设计文档为准。
 
 AI 智能体实现前必须先读 `OUTLINE.md`，再读当前阶段文档，最后用代码和测试核对真实进度。
