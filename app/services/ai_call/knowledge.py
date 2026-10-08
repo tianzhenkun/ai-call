@@ -2334,10 +2334,15 @@ def _validate_upload(
     extension = filename.rsplit(".", 1)[1].lower()
     text_extension = extension in {"txt", "md", "markdown"}
     binary_extension = extension in _BINARY_MIME_TYPES
-    if not text_extension and not (binary_extension and binary_parser_enabled):
+    if not text_extension and not binary_extension:
         raise CustomException(
-            msg="当前只支持 TXT、Markdown 和已启用的 PPTX、DOCX、文本型 PDF",
+            msg="当前只支持 TXT、Markdown、PPTX、DOCX 和文本型 PDF",
             status_code=400,
+        )
+    if binary_extension and not binary_parser_enabled:
+        raise CustomException(
+            msg="文档解析服务未启用，暂时无法上传 PPTX、DOCX 或 PDF，请联系管理员",
+            status_code=503,
         )
     mime_type = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
     supported_mime_types = (

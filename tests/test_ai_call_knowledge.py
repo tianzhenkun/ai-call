@@ -539,7 +539,8 @@ async def test_binary_upload_stays_closed_without_isolated_parser(
             note=None,
         )
 
-    assert error.value.status_code == 400
+    assert error.value.status_code == 503
+    assert error.value.msg == "文档解析服务未启用，暂时无法上传 PPTX、DOCX 或 PDF，请联系管理员"
 
 
 @pytest.mark.anyio

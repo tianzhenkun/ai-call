@@ -1909,7 +1909,11 @@ async def test_record_list_filters_and_projects_after_call_result_status(
 
 
 @pytest.mark.anyio
-async def test_callback_record_inherits_source_outbound_context(b1_service) -> None:
+@pytest.mark.parametrize("source", ["business_id", "follow_up_task", "follow_up_data"])
+@pytest.mark.parametrize("tenant_id", ["000000", "callback-tenant"])
+async def test_callback_record_inherits_source_outbound_context(
+    b1_service, source, tenant_id,
+) -> None:
     now = datetime.now(timezone.utc)
     task_id = 324800000000000301
     target_id = 324800000000000302
@@ -1920,9 +1924,9 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
             [
                 AiCallOutboundTaskModel(
                     id=task_id,
-                    tenant_id="000000",
                     validation_id=1,
                     idempotency_key="callback-record-context-task",
+                    tenant_id=tenant_id,
                     request_fingerprint="callback-record-context-fingerprint",
                     task_name="回拨来源任务",
                     task_mode="single",
@@ -1949,7 +1953,7 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
                 ),
                 AiCallOutboundTargetModel(
                     id=target_id,
-                    tenant_id="000000",
+                    tenant_id=tenant_id,
                     task_id=task_id,
                     validation_id=1,
                     source_validation_row_id=1,
@@ -1964,11 +1968,11 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
                 ),
                 AiCallOutboundAttemptModel(
                     id=attempt_id,
-                    tenant_id="000000",
                     task_id=task_id,
                     target_id=target_id,
                     attempt_no=1,
                     call_id="call-record-list-source",
+                    tenant_id=tenant_id,
                     status="COMPLETED",
                     call_result="connected",
                     started_at=now,
@@ -1978,11 +1982,12 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
                 ),
                 AiCallRecordModel(
                     id=324800000000000304,
-                    tenant_id="000000",
+                    tenant_id=tenant_id,
                     call_id=callback_call_id,
-                    follow_up_id=324800000000000305,
-                    business_type="outbound_attempt",
-                    business_id=str(attempt_id),
+                    follow_up_id=324800000000000305 if source == "follow_up_task" else None,
+                    follow_up_data_id=324800000000000306 if source == "follow_up_data" else None,
+                    business_type="outbound_attempt" if source == "business_id" else "outbound_task",
+                    business_id=str(attempt_id if source == "business_id" else task_id),
                     scene_code="intro_geo",
                     entry_type="sip_callback",
                     room_name="room-record-list-callback",
@@ -1996,12 +2001,32 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
             ]
         )
 
-    page = await b1_service.service.list_records(
-        tenant_id="000000",
-        task_id=task_id,
-        customer_name="刘先生",
-    )
+        if source == "follow_up_task":
+            db.add(AiCallFollowUpTaskModel(
+                id=324800000000000305, tenant_id=tenant_id,
+                source_type="manual", source_key="callback-context",
+                source_call_id="call-record-list-source", scene_code="intro_geo",
+                contact_ref="customer", masked_contact="199****1001",
+                status="processing", follow_up_reason="接着聊",
+                created_at=now, updated_at=now,
+            ))
+        elif source == "follow_up_data":
+            db.add(AiCallFollowUpDataModel(
+                id=324800000000000306, tenant_id=tenant_id,
+                task_id=task_id, target_id=target_id,
+                source_call_id="call-record-list-source",
+                created_at=now, updated_at=now,
+            ))
+        db.add(AiCallRecordModel(
+            id=324800000000000307, tenant_id="foreign-tenant",
+            call_id="foreign-callback", entry_type="sip_callback",
+            follow_up_id=324800000000000305,
+            follow_up_data_id=324800000000000306,
+            room_name="foreign-room", participant_identity="foreign-sip",
+            status="completed", started_at=now, ended_at=now,
+        ))
 
+    page = await b1_service.service.list_records(tenant_id=tenant_id)
     assert page["total"] == 1
     row = page["rows"][0]
     assert row["callId"] == callback_call_id
@@ -2012,10 +2037,26 @@ async def test_callback_record_inherits_source_outbound_context(b1_service) -> N
     assert row["phoneNumber"] == "19900001001"
     assert row["callResult"] == "no_answer"
 
+    filtered = await b1_service.service.list_records(
+        tenant_id=tenant_id, task_id=task_id, target_id=target_id,
+        customer_name="刘先生", phone_number="19900001001", call_result="no_answer",
+        page_size=1,
+    )
+    assert filtered["total"] == 1
+    assert filtered["rows"][0]["callId"] == callback_call_id
+    connected = await b1_service.service.list_records(
+        tenant_id=tenant_id, call_result="connected",
+    )
+    assert connected["total"] == 0
+    foreign = await b1_service.service.list_records(tenant_id="foreign-tenant")
+    assert not any(row["customerName"] or row["taskId"] for row in foreign["rows"])
+
     detail = RecordDetailOut.model_validate(
         await b1_service.service.get_record_detail(callback_call_id)
     ).model_dump(mode="json", by_alias=True)
     assert detail["record"]["callResult"] == "no_answer"
+    assert detail["record"]["customerName"] == "刘先生"
+    assert detail["record"]["taskName"] == "回拨来源任务"
 
 
 @pytest.mark.anyio
@@ -3441,7 +3482,7 @@ async def test_handoff_trigger_worker_auto_creates_customer_handoff(b1_service) 
 
 
 @pytest.mark.anyio
-async def test_handoff_trigger_worker_uses_explicit_transfer_delta_when_done_is_missing(
+async def test_handoff_trigger_worker_waits_for_complete_transfer_intent(
     b1_service,
 ) -> None:
     service, record_service = b1_service
@@ -3492,18 +3533,14 @@ async def test_handoff_trigger_worker_uses_explicit_transfer_delta_when_done_is_
 
         await worker.flush_pending()
         handoffs = await service.list_handoffs(result.call_id)
-        assert handoffs["total"] == 1
-        assert handoffs["rows"][0]["requestReason"] == "customer_request"
+        assert handoffs["total"] == 0
         assert classifier.transcripts == []
-
-        await b1_service.flush_events()
-        events = await record_service.list_events(result.call_id)
-        detected = next(
-            event for event in events if event.event_type == "handoff_intent_detected"
+        service.orchestrator.event_store.append(
+            result.call_id, "user_transcript_done", "provider", {"transcript": "转人工了吗？"},
         )
-        assert json.loads(detected.payload_json)["classifierSource"] == (
-            "realtime_delta_guard"
-        )
+        await worker.flush_pending()
+        assert classifier.transcripts == ["转人工了吗？"]
+        assert (await service.list_handoffs(result.call_id))["total"] == 0
     finally:
         worker.detach_all()
         await worker.stop()

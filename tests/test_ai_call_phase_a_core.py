@@ -4108,6 +4108,87 @@ async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_pl
 
 
 @pytest.mark.anyio
+async def test_outbound_missing_transcript_resumes_silence_policy_and_waits_for_farewell(monkeypatch) -> None:
+    from app.services.ai_call import agent_runner as agent_runner_module
+    from app.services.ai_call.transcript_trust import CustomerSpeechClassifier
+
+    monkeypatch.setattr(CustomerSpeechClassifier, "TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SILENCE_SECONDS", 0.01)
+
+    class NoTranscriptClassifier:
+        async def classify(self, **_kwargs):
+            raise AssertionError("缺少完整转写时不应调用分类器")
+
+    call_id = "call_outbound_silence"
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = QueueRealtimeProvider()
+    publisher = WaitingAudioPublisher()
+    scheduled = []
+    session = CallSession(
+        call_id=call_id,
+        room_name=f"ai-call-{call_id}",
+        participant_identity=f"caller-{call_id}",
+        entry_type="outbound",
+        status=CallSessionStatus.READY,
+        effective_config={"barge_in_enabled": True},
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _session: provider,
+        registry=registry,
+        event_store=store,
+        audio_publisher=publisher,
+        ai_speaking_tail_grace_seconds=0,
+        customer_speech_classifier=NoTranscriptClassifier(),
+        call_end_scheduler=lambda call, reason: scheduled.append((call, reason)),
+    )
+
+    async def play_response(response_id):
+        publisher.playout_wait_started.clear()
+        publisher.playout_release.clear()
+        await provider.emit(ProviderEvent(type="model_response_started", payload={"response_id": response_id}))
+        await provider.emit(ProviderEvent(type="model_audio_delta", payload={
+            "response_id": response_id,
+            "delta": base64.b64encode(b"\x01\x02" * 240).decode("ascii"),
+        }))
+        await provider.emit(ProviderEvent(type="model_response_done", payload={
+            "response": {"id": response_id, "status": "completed"},
+        }))
+        await asyncio.wait_for(publisher.playout_wait_started.wait(), timeout=1)
+        assert scheduled == []
+        publisher.playout_release.set()
+        await asyncio.wait_for(runner._playout_tasks[call_id], timeout=1)
+
+    try:
+        await runner.start(session)
+        registry.transition(call_id, CallSessionStatus.CONNECTED)
+        await runner.start_opening(call_id)
+        await play_response("opening")
+        now = datetime.now(timezone.utc)
+        await runner._handle_user_speech_started(call_id, provider, now, speech_item_id="voicemail")
+        await runner._handle_user_speech_stopped(call_id, provider, now)
+        await runner._transcript_review_tasks[call_id]
+        assert any(event.payload.get("semanticReason") == "final_transcript_timeout"
+                   for event in store.list_all(call_id))
+        assert not runner._customer_turn_counts
+
+        for count in range(1, 4):
+            await play_response(f"reply-{count}")
+            await asyncio.wait_for(runner._silence_watchdog_tasks[call_id], timeout=1)
+            assert runner._silence_prompt_counts[call_id] == count
+
+        assert runner._pending_call_ends[call_id].end_reason == "policy_no_response"
+        assert provider.created_responses[-1] == agent_runner_module.CALL_POLICY_FINAL_INPUT
+        await play_response("farewell")
+        assert scheduled == [(call_id, "policy_no_response")]
+        assert call_id not in runner._silence_watchdog_tasks
+    finally:
+        publisher.playout_release.set()
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_ignores_customer_end_tool_after_short_ack() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
@@ -6259,7 +6340,8 @@ async def test_realtime_agent_runner_rejects_customer_handoff_tool_without_expli
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_requests_confirmation_for_partial_handoff_intent() -> None:
+@pytest.mark.parametrize("transcript", ["转。", "小人工。", "打人工。"])
+async def test_realtime_agent_runner_requests_confirmation_for_partial_handoff_intent(transcript) -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -6284,7 +6366,7 @@ async def test_realtime_agent_runner_requests_confirmation_for_partial_handoff_i
         registry=registry,
         event_store=store,
     )
-    runner._pending_turn(call_id).transcript_parts = ["转。"]
+    runner._pending_turn(call_id).transcript_parts = [transcript]
 
     await runner._handle_handoff_tool_done(
         call_id,
@@ -6306,7 +6388,7 @@ async def test_realtime_agent_runner_requests_confirmation_for_partial_handoff_i
         "toolCallId": "handoff_tool_partial",
         "reason": "customer_request",
         "confirmationRequired": True,
-        "transcriptPreview": "转。",
+        "transcriptPreview": transcript,
     }
     assert provider.submitted_tool_results == [
         (

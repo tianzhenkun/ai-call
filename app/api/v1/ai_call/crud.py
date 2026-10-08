@@ -4,7 +4,20 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Select, String, and_, asc, cast, desc, func, literal, or_, select, update
+from sqlalchemy import (
+    Select,
+    String,
+    and_,
+    asc,
+    case,
+    cast,
+    desc,
+    func,
+    literal,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -13,6 +26,7 @@ from sqlalchemy.orm import aliased
 
 from app.api.v1.ai_call.call_outcome_query import (
     business_call_result_expression,
+    target_call_result_expression,
     voicemail_expression,
 )
 from app.api.v1.ai_call.model import (
@@ -174,6 +188,7 @@ class AiCallRecordRepository:
                 select(
                     AiCallOutboundTargetModel,
                     AiCallOutboundExceptionBatchModel,
+                    target_call_result_expression(),
                 )
                 .join(
                     AiCallOutboundAttemptModel,
@@ -207,7 +222,7 @@ class AiCallRecordRepository:
         ).first()
         if row is None:
             return None
-        target, batch = row
+        target, batch, last_result = row
         original_count = target.exception_original_attempt_count or target.attempt_count
         retry_count = max(0, target.attempt_count - original_count)
         max_retry_count = batch.max_retry_count if batch is not None else 0
@@ -236,7 +251,7 @@ class AiCallRecordRepository:
             display_status = "WAITING"
         elif target.status == "CANCELLED":
             display_status = "STOPPED"
-        elif target.latest_result == "connected":
+        elif last_result == "connected":
             display_status = "CONNECTED"
         elif retry_count >= max_retry_count:
             display_status = "MAXED"
@@ -248,7 +263,7 @@ class AiCallRecordRepository:
             "originalAttemptCount": original_count,
             "retryCount": retry_count,
             "maxRetryCount": max_retry_count,
-            "lastResult": target.latest_result,
+            "lastResult": last_result,
             "createdBy": str(batch.created_by) if batch is not None else None,
             "createdByName": batch.created_by_name if batch is not None else None,
             "startedAt": batch.started_at if batch is not None else None,
@@ -1018,53 +1033,26 @@ class AiCallRecordRepository:
         tenant_id: str | None,
     ) -> None:
         call_ids = [record.call_id for record in records]
-        attempt_ids = [
-            int(record.business_id)
-            for record in records
-            if record.business_type == "outbound_attempt"
-            and str(record.business_id or "").isdigit()
-        ]
         if not call_ids or not tenant_id:
             return
         context_rows = (
             await self.db.execute(
-                select(
-                    AiCallOutboundAttemptModel.id,
-                    AiCallOutboundAttemptModel.call_id,
-                    AiCallOutboundAttemptModel.task_id,
-                    AiCallOutboundAttemptModel.target_id,
-                    AiCallOutboundAttemptModel.attempt_no,
-                    AiCallOutboundAttemptModel.call_result,
-                    AiCallOutboundTaskModel.task_name,
-                    AiCallOutboundTargetModel.phone_number,
-                    AiCallOutboundTargetModel.customer_name,
-                )
-                .join(
-                    AiCallOutboundTargetModel,
-                    and_(
-                        AiCallOutboundTargetModel.tenant_id
-                        == AiCallOutboundAttemptModel.tenant_id,
-                        AiCallOutboundTargetModel.id
-                        == AiCallOutboundAttemptModel.target_id,
-                        AiCallOutboundTargetModel.task_id
-                        == AiCallOutboundAttemptModel.task_id,
-                    ),
-                )
-                .join(
-                    AiCallOutboundTaskModel,
-                    and_(
-                        AiCallOutboundTaskModel.tenant_id
-                        == AiCallOutboundAttemptModel.tenant_id,
-                        AiCallOutboundTaskModel.id
-                        == AiCallOutboundAttemptModel.task_id,
-                    ),
-                )
-                .where(
+                self._join_record_outbound_context(
+                    select(
+                        AiCallRecordModel.call_id,
+                        AiCallOutboundAttemptModel.task_id,
+                        AiCallOutboundAttemptModel.target_id,
+                        AiCallOutboundAttemptModel.attempt_no,
+                        AiCallOutboundAttemptModel.call_result,
+                        AiCallOutboundTaskModel.task_name,
+                        AiCallOutboundTargetModel.phone_number,
+                        AiCallOutboundTargetModel.customer_name,
+                    ).select_from(AiCallRecordModel)
+                ).where(
+                    AiCallRecordModel.call_id.in_(call_ids),
                     AiCallOutboundAttemptModel.tenant_id == tenant_id,
-                    or_(
-                        AiCallOutboundAttemptModel.call_id.in_(call_ids),
-                        AiCallOutboundAttemptModel.id.in_(attempt_ids),
-                    ),
+                    AiCallOutboundTargetModel.id.is_not(None),
+                    AiCallOutboundTaskModel.id.is_not(None),
                 )
             )
         ).all()
@@ -1080,18 +1068,8 @@ class AiCallRecordRepository:
             }
             for row in context_rows
         }
-        contexts_by_attempt_id = {
-            row.id: contexts_by_call_id[row.call_id] for row in context_rows
-        }
         for record in records:
-            context = contexts_by_call_id.get(record.call_id)
-            if (
-                context is None
-                and record.business_type == "outbound_attempt"
-                and str(record.business_id or "").isdigit()
-            ):
-                context = contexts_by_attempt_id.get(int(record.business_id))
-            record._outbound_context = context or {}
+            record._outbound_context = contexts_by_call_id.get(record.call_id, {})
 
     async def append_event(
         self,
@@ -3193,6 +3171,74 @@ class AiCallRecordRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    def _join_record_outbound_context(stmt: Select) -> Select:
+        follow_up_data = aliased(AiCallFollowUpDataModel)
+        follow_up_task = aliased(AiCallFollowUpTaskModel)
+        record_tenant = func.coalesce(AiCallRecordModel.tenant_id, DEFAULT_TENANT_ID)
+        source_call_id = func.coalesce(
+            follow_up_data.source_call_id,
+            follow_up_task.source_call_id,
+        )
+        # 人工回拨沿跟进资料或回访任务关联原始外呼，列表、详情和筛选使用同一规则。
+        return (
+            stmt.outerjoin(
+                follow_up_data,
+                and_(
+                    AiCallRecordModel.entry_type == "sip_callback",
+                    follow_up_data.id == AiCallRecordModel.follow_up_data_id,
+                    follow_up_data.tenant_id == record_tenant,
+                ),
+            )
+            .outerjoin(
+                follow_up_task,
+                and_(
+                    AiCallRecordModel.entry_type == "sip_callback",
+                    follow_up_task.id == AiCallRecordModel.follow_up_id,
+                    follow_up_task.tenant_id == record_tenant,
+                ),
+            )
+            .outerjoin(
+                AiCallOutboundAttemptModel,
+                and_(
+                    or_(
+                        AiCallRecordModel.tenant_id.is_(None),
+                        AiCallOutboundAttemptModel.tenant_id
+                        == AiCallRecordModel.tenant_id,
+                    ),
+                    or_(
+                        AiCallOutboundAttemptModel.call_id
+                        == func.coalesce(source_call_id, AiCallRecordModel.call_id),
+                        and_(
+                            source_call_id.is_(None),
+                            AiCallRecordModel.business_type == "outbound_attempt",
+                            AiCallRecordModel.business_id
+                            == cast(AiCallOutboundAttemptModel.id, String),
+                        ),
+                    ),
+                ),
+            )
+            .outerjoin(
+                AiCallOutboundTargetModel,
+                and_(
+                    AiCallOutboundTargetModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                    AiCallOutboundTargetModel.id
+                    == AiCallOutboundAttemptModel.target_id,
+                    AiCallOutboundTargetModel.task_id
+                    == AiCallOutboundAttemptModel.task_id,
+                ),
+            )
+            .outerjoin(
+                AiCallOutboundTaskModel,
+                and_(
+                    AiCallOutboundTaskModel.tenant_id
+                    == AiCallOutboundAttemptModel.tenant_id,
+                    AiCallOutboundTaskModel.id == AiCallOutboundAttemptModel.task_id,
+                ),
+            )
+        )
+
+    @staticmethod
     def _record_filters(stmt: Select, **filters) -> Select:
         tenant_id = str(filters.get("tenant_id") or "").strip() or None
         phone_number = str(filters.get("phone_number") or "").strip() or None
@@ -3226,38 +3272,7 @@ class AiCallRecordRepository:
             )
         )
         if tenant_id or has_outbound_filters:
-            stmt = (
-                stmt.outerjoin(
-                    AiCallOutboundAttemptModel,
-                    or_(
-                        AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
-                        and_(
-                            AiCallRecordModel.business_type == "outbound_attempt",
-                            AiCallRecordModel.business_id
-                            == cast(AiCallOutboundAttemptModel.id, String),
-                        ),
-                    ),
-                )
-                .outerjoin(
-                    AiCallOutboundTargetModel,
-                    and_(
-                        AiCallOutboundTargetModel.tenant_id
-                        == AiCallOutboundAttemptModel.tenant_id,
-                        AiCallOutboundTargetModel.id
-                        == AiCallOutboundAttemptModel.target_id,
-                        AiCallOutboundTargetModel.task_id
-                        == AiCallOutboundAttemptModel.task_id,
-                    ),
-                )
-                .outerjoin(
-                    AiCallOutboundTaskModel,
-                    and_(
-                        AiCallOutboundTaskModel.tenant_id
-                        == AiCallOutboundAttemptModel.tenant_id,
-                        AiCallOutboundTaskModel.id == AiCallOutboundAttemptModel.task_id,
-                    ),
-                )
-            )
+            stmt = AiCallRecordRepository._join_record_outbound_context(stmt)
         if tenant_id:
             tenant_conditions = [
                 and_(
@@ -3269,7 +3284,13 @@ class AiCallRecordRepository:
             if tenant_id == DEFAULT_TENANT_ID and not formal_outbound_only:
                 # 历史/Web 记录没有租户字段，只归属框架默认租户，禁止向其他租户开放。
                 tenant_conditions.append(AiCallOutboundAttemptModel.id.is_(None))
-            stmt = stmt.where(or_(*tenant_conditions))
+            stmt = stmt.where(
+                or_(
+                    AiCallRecordModel.tenant_id == tenant_id,
+                    AiCallRecordModel.tenant_id.is_(None),
+                ),
+                or_(*tenant_conditions),
+            )
         elif has_outbound_filters:
             stmt = stmt.where(
                 and_(
@@ -3303,9 +3324,26 @@ class AiCallRecordRepository:
                 AiCallOutboundTargetModel.customer_name.contains(customer_name)
             )
         if call_result:
+            callback_result = case(
+                (AiCallRecordModel.answered_at.is_not(None), "connected"),
+                *(
+                    (AiCallRecordModel.end_reason == f"callback_{result}", result)
+                    for result in (
+                        "no_answer", "busy", "rejected",
+                        "invalid_contact", "technical_failure",
+                    )
+                ),
+            )
             stmt = stmt.where(
                 business_call_result_expression(
-                    AiCallOutboundAttemptModel.call_result, AiCallRecordModel.call_id,
+                    case(
+                        (
+                            AiCallRecordModel.entry_type == "sip_callback",
+                            callback_result,
+                        ),
+                        else_=AiCallOutboundAttemptModel.call_result,
+                    ),
+                    AiCallRecordModel.call_id,
                 ) == call_result,
             )
         if filters.get("business_type"):

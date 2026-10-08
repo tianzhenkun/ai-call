@@ -57,6 +57,7 @@ class RuntimeProviderResource:
     prompt_effective_config: PromptEffectiveConfig | None = None
     knowledge_context: KnowledgeRuntimeContext | None = None
     sip_config: SipOutboundConfig | None = None
+    entry_type: str | None = None
 
 
 class RuntimeProviderResourceResolver(Protocol):
@@ -191,6 +192,7 @@ class DatabaseRuntimeProviderResourceResolver:
                 prompt_effective_config=prompt_effective_config,
                 knowledge_context=knowledge_context,
                 sip_config=sip_config,
+                entry_type=record.entry_type,
             )
 
     def _resolve_sip_config(
@@ -463,6 +465,7 @@ class OwnerRuntimeAgentManager:
             effective_config=effective_config,
             knowledge_context=resource.knowledge_context,
             local_participant_identity=resource.agent_participant_identity,
+            entry_type=resource.entry_type,
         )
         self._orchestrator.registry.add(session)
         handle = _OwnerAgentLocalHandle(self, resource.call_id)

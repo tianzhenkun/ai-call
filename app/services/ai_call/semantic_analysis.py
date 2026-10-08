@@ -189,6 +189,9 @@ semantic_evidence.low_confidence_source、source_conflict 或 unsupported_strong
 semantic_evidence.new_question_or_intent=true 的客户跳话题问题、conversation_control_intent=true 的继续/结束/稍后联系意图应保留为客户问题或关注点；semantic_evidence.weak_feedback=true 且 key_point_candidate=false 的弱反馈只能记录为弱反馈，不能扩写成强意向或业务事实。
 speaker_type=human_agent 且 transcript_quality.low_confidence_source=true 的人工坐席轮次只可作为低置信坐席上下文或音频污染风险，不能反推为客户事实，也不能作为客户诉求、异议或承诺。
 必须只返回以下 JSON 字段，不输出 Markdown、解释或额外字段。
+面向业务用户的 summary、reason、follow_up.reason、key_points 和 tags 必须使用简明中文，不得输出内部字段名、英文分类代码、轮次编号或布尔表达式。产品名称和客户原话保留原文；结构化字段的枚举值仍按下方定义返回。
+summary 用 2 至 4 句完整短句概括客户关注点、明确意向和本次结果，不堆砌逐句转写，不使用分号串联长句或括号嵌套分析。必要引用使用成对的中文双引号。事实依据不足时说明具体哪些信息未确认，不写 strong_fact 等内部术语。
+分类原因使用“有意向”“持续跟进”“低价值”等中文名称。跟进原因只写业务依据，例如“客户明确同意接收短信链接”，不要附加 seq、supports_follow_up_consent_fact 等内部证据参数。
 通话摘要字段：
 - summary: 字符串，本通电话摘要，重点描述客户侧表达。
 - feedback_type: 字符串，只能是 正向、负向、中性。
@@ -225,6 +228,14 @@ CUSTOMER_INTENT_BY_FEEDBACK = {
     "正向": "positive",
     "中性": "neutral",
     "负向": "negative",
+}
+ANALYSIS_BUSINESS_TERM_LABELS = {
+    "strong_fact": "明确的对话证据",
+    "interested": "有意向",
+    "nurturing": "持续跟进",
+    "low_value": "低价值",
+    "converted": "已转化",
+    "customer": "客户",
 }
 
 
@@ -2027,10 +2038,20 @@ def sanitize_analysis_result_for_response(
     )
     if original_reason and not cleaned_reason:
         cleaned_reason = "分类依据包含内部分析标记，建议人工复核。"
+    follow_up = result.get("follow_up")
+    cleaned_follow_up = follow_up
+    if isinstance(follow_up, dict):
+        cleaned_follow_up = {
+            **follow_up,
+            "reason": _strip_internal_evidence_annotations(
+                _string_value(follow_up.get("reason"))
+            ),
+        }
     if (
         cleaned_summary == result.get("summary")
         and cleaned_key_points == result.get("key_points")
         and cleaned_reason == original_reason
+        and cleaned_follow_up == follow_up
     ):
         return result
     return {
@@ -2038,13 +2059,19 @@ def sanitize_analysis_result_for_response(
         "summary": cleaned_summary,
         "key_points": cleaned_key_points,
         "reason": cleaned_reason,
+        **({"follow_up": cleaned_follow_up} if isinstance(follow_up, dict) else {}),
     }
 
 
 def _strip_internal_evidence_annotations(text: str) -> str:
     without_annotations = INTERNAL_EVIDENCE_PARENTHESES_PATTERN.sub("", text)
     without_internal_sentences = _remove_internal_evidence_sentences(without_annotations)
-    return re.sub(r"\s+", " ", without_internal_sentences).strip()
+    localized = re.sub(
+        r"\s*\b[a-z]+(?:_[a-z]+)*\b\s*",
+        lambda match: ANALYSIS_BUSINESS_TERM_LABELS.get(match.group().strip(), match.group()),
+        without_internal_sentences,
+    )
+    return re.sub(r"\s+", " ", localized).strip()
 
 
 def _remove_internal_evidence_sentences(text: str) -> str:

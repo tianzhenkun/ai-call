@@ -567,6 +567,7 @@ async def test_resource_resolver_builds_selected_line_config_for_outbound_sip() 
             participant_identity="sip-call-1",
             callee_phone_number="19900001001",
             business_type="outbound_attempt",
+            entry_type="outbound",
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(
             payload_json=json.dumps(command_payload)
@@ -606,6 +607,7 @@ async def test_resource_resolver_builds_selected_line_config_for_outbound_sip() 
     resource = await resolver.resolve(_effect("CREATE_SIP_PARTICIPANT"))
 
     assert resource.sip_config is not None
+    assert resource.entry_type == "outbound"
     assert resource.sip_config.trunk_hostname == "47.94.86.132:5089"
     assert resource.sip_config.caller_number == "037123124845"
     assert resource.sip_config.allowed_callee_prefixes == "199"
@@ -1214,6 +1216,7 @@ async def test_resource_resolver_uses_effect_generation_and_source_reference() -
             room_name="ai-call-call-1",
             participant_identity="sip-call-1",
             callee_phone_number="19900001001",
+            entry_type="direct_sip",
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(payload_json='{"voice":"Cherry"}'),
     }
@@ -1262,7 +1265,8 @@ async def test_resource_resolver_uses_effect_generation_and_source_reference() -
 
 
 @pytest.mark.anyio
-async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypatch) -> None:
+@pytest.mark.parametrize("entry_type", ["outbound", "direct_sip", "web"])
+async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypatch, entry_type) -> None:
     from app.api.v1.ai_call import service as ai_call_service
     from app.api.v1.ai_call.crud import AiCallRecordRepository
     from app.api.v1.ai_call.model import AiCallRecordModel
@@ -1303,11 +1307,12 @@ async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypat
             tenant_id="tenant-a",
             call_id="call-1",
             room_name="ai-call-call-1",
-            participant_identity="browser-call-1",
+            participant_identity="caller-call-1",
             callee_phone_number=None,
             business_id="11",
             business_type="outbound_attempt",
             scene_code="intro_geo",
+            entry_type=entry_type,
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(
             payload_json=(
@@ -1346,6 +1351,7 @@ async def test_resource_resolver_composes_task_prompt_for_agent_attach(monkeypat
     assert "温和" in resource.prompt_effective_config.instructions
     assert "业务话术" in resource.prompt_effective_config.instructions
     assert resource.prompt_effective_config.opening_message == prompt_config.opening_message
+    assert resource.entry_type == entry_type
     assert resource.prompt_effective_config.prompt_hash != "original"
     # 表达风格与知识库分别从同一租户的任务快照解析。
     assert snapshot_lookup.await_args_list == [call(11, tenant_id="tenant-a")] * 2
@@ -1372,6 +1378,7 @@ async def test_resource_resolver_validates_customer_track_scope_and_source_refer
             room_name="ai-call-call-1",
             participant_identity="sip-call-1",
             callee_phone_number="19900001001",
+            entry_type="direct_sip",
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(payload_json=None),
     }
@@ -1447,6 +1454,7 @@ async def test_resource_resolver_rejects_customer_track_key_mismatch() -> None:
             room_name="ai-call-call-1",
             participant_identity="sip-call-1",
             callee_phone_number="19900001001",
+            entry_type="direct_sip",
         ),
         AiCallRuntimeCommandModel: SimpleNamespace(payload_json=None),
     }
@@ -1487,7 +1495,8 @@ async def test_resource_resolver_rejects_customer_track_key_mismatch() -> None:
 
 
 @pytest.mark.anyio
-async def test_owner_agent_manager_registers_generation_identity_and_fail_closed_handle() -> None:
+@pytest.mark.parametrize("entry_type", ["outbound", "direct_sip", "web"])
+async def test_owner_agent_manager_registers_generation_identity_and_fail_closed_handle(entry_type) -> None:
     from app.services.ai_call.runtime_control.livekit_provider import (
         OwnerRuntimeAgentManager,
         RuntimeProviderResource,
@@ -1530,12 +1539,14 @@ async def test_owner_agent_manager_registers_generation_identity_and_fail_closed
         agent_participant_identity="agent-call-1-g7",
         voice="Cherry",
         prompt_effective_config=prompt_config,
+        entry_type=entry_type,
     )
 
     reference = await manager.start(resource)
 
     assert reference == "agent-call-1-g7"
     assert runner.started[0].local_participant_identity == "agent-call-1-g7"
+    assert runner.started[0].entry_type == entry_type
     assert runner.started[0].effective_config["prompt_effective_config"] is prompt_config
     assert "call-1" in runtime_registry.local_handles
 

@@ -10,6 +10,7 @@ from openpyxl import Workbook
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.call_outcome_query import target_call_result_expression
 from app.core.exceptions import CustomException
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.utils.id_util import generate_snowflake_id
@@ -390,6 +391,7 @@ class OutboundExceptionService:
                     AiCallOutboundTaskModel,
                     AiCallOutboundExceptionBatchModel,
                     display_status,
+                    target_call_result_expression(),
                 )
                 .join(
                     AiCallOutboundTaskModel,
@@ -406,7 +408,7 @@ class OutboundExceptionService:
                 .limit(page_size)
             )
         ).all()
-        target_ids = [target.id for target, _, _, _ in rows]
+        target_ids = [target.id for target, _, _, _, _ in rows]
         attempts = (
             await db.scalars(
                 select(AiCallOutboundAttemptModel)
@@ -425,7 +427,7 @@ class OutboundExceptionService:
             latest_attempts.setdefault(attempt.target_id, attempt)
 
         result = []
-        for target, task, batch, row_status in rows:
+        for target, task, batch, row_status, last_result in rows:
             original_count = target.exception_original_attempt_count or target.attempt_count
             retry_count = max(0, target.attempt_count - original_count)
             max_retry_count = (
@@ -449,7 +451,7 @@ class OutboundExceptionService:
                     status=row_status,
                     next_attempt_at=_format_datetime(target.next_attempt_at),
                     last_attempt_at=_format_datetime(attempt.ended_at if attempt else None),
-                    last_result=target.latest_result,
+                    last_result=last_result,
                     call_id=attempt.call_id if attempt else None,
                 )
             )
@@ -561,7 +563,7 @@ class OutboundExceptionService:
             ),
             (
                 (AiCallOutboundTargetModel.status == "COMPLETED")
-                & (AiCallOutboundTargetModel.latest_result == "connected"),
+                & (target_call_result_expression() == "connected"),
                 "CONNECTED",
             ),
             (

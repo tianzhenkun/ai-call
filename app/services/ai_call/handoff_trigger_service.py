@@ -34,6 +34,11 @@ class HandoffIntentClassifierProtocol(Protocol):
 class RuleBasedHandoffIntentClassifier:
     """只做高置信兜底，避免散落在通话链路里的关键词判断。"""
 
+    STATUS_QUERY_PATTERN = re.compile(
+        r"(?:转接?|接通|联系)(?:到|上|好|完)?(?:人工|真人|客服|顾问)(?:了|好|成功|完成)(?:吗|么|没|没有)"
+        r"|(?:人工|真人|客服|顾问)(?:转接?|接通|联系)(?:上|好|成功|完成|了)+(?:吗|么|没|没有)"
+    )
+
     DECLINED_REQUEST_PATTERN = re.compile(
         r"(?:不用|不要|不需要|不想|不必|无需|别|暂不|(?<!要)不)"
         r"(?:再|先|现在|帮我|给我|替我)*"
@@ -208,6 +213,14 @@ class RuleBasedHandoffIntentClassifier:
                 summary="用户只是询问人工角色概念",
                 source="rule_fallback",
             )
+        if self.STATUS_QUERY_PATTERN.search(normalized):
+            return HandoffIntentResult(
+                matched=False,
+                confidence=0.95,
+                reason="handoff_status_query",
+                summary="用户询问已有转接进展，未授权新建请求",
+                source="rule_fallback",
+            )
         if any(pattern in normalized for pattern in self.STRONG_PATTERNS):
             return HandoffIntentResult(
                 matched=True,
@@ -288,6 +301,7 @@ class OpenAICompatibleHandoffIntentClassifier:
         "找负责人、找销售顾问、找专人或不想继续和AI沟通。"
         "不要受业务话术影响。"
         "如果用户只是提到人工智能、人工审核、人工处理、询问你是否真人、询问客户经理职责，不算转人工。"
+        "询问转接是否完成、是否接通属于 handoff_status_query，不是新建转接请求。"
         "只返回JSON，字段为 matched(boolean), confidence(number 0-1), reason(string), summary(string)。"
     )
 
@@ -458,22 +472,6 @@ class TriggeredHandoff:
 class AiCallHandoffTriggerService:
     RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
     RECENT_TRIGGER_DEDUP_WINDOW_SECONDS = 5.0
-    EXPLICIT_TRANSFER_DELTA_COMMANDS = frozenset(
-        {
-            "转人工",
-            "转人工吧",
-            "请转人工",
-            "帮我转人工",
-            "请帮我转人工",
-            "给我转人工",
-            "我要转人工",
-            "我想转人工",
-            "找人工客服",
-            "我要找人工客服",
-            "找真人客服",
-            "我要找真人客服",
-        }
-    )
     CONFIRMATION_ACCEPT_PATTERNS = (
         "可以",
         "行",
@@ -564,8 +562,8 @@ class AiCallHandoffTriggerService:
         if event.type == "handoff_tool_requested":
             await self._handle_tool_request(event=event, event_store=event_store)
             return
-        is_explicit_delta = self._is_explicit_transfer_delta(event)
-        if event.type != "user_transcript_done" and not is_explicit_delta:
+        # 分片“转人工”可能继续成为“转人工了吗”，必须等待完整客户发言。
+        if event.type != "user_transcript_done":
             return
         if not self.enabled or not self.customer_intent_enabled:
             self._append_ignored(
@@ -616,38 +614,22 @@ class AiCallHandoffTriggerService:
             )
             return
         self._remember_confirmation_candidate(event, transcript)
-        if is_explicit_delta:
-            result = HandoffIntentResult(
-                matched=True,
-                confidence=0.95,
-                reason="customer_request",
-                summary="用户明确要求转人工",
-                source="realtime_delta_guard",
+        try:
+            result = await asyncio.wait_for(
+                self.classifier.classify(transcript=transcript),
+                timeout=self.timeout_seconds,
             )
-        else:
-            try:
-                result = await asyncio.wait_for(
-                    self.classifier.classify(transcript=transcript),
-                    timeout=self.timeout_seconds,
-                )
-            except TimeoutError:
-                self._append_ignored(
-                    event_store,
-                    event.call_id,
-                    reason="classifier_timeout",
-                    transcript=transcript,
-                )
-                return
-            except Exception as exc:
-                self._append_failed(
-                    event_store,
-                    event.call_id,
-                    stage="classify",
-                    message=str(exc),
-                    error_type=type(exc).__name__,
-                    transcript=transcript,
-                )
-                return
+        except TimeoutError:
+            self._append_ignored(
+                event_store, event.call_id, reason="classifier_timeout", transcript=transcript,
+            )
+            return
+        except Exception as exc:
+            self._append_failed(
+                event_store, event.call_id, stage="classify", message=str(exc),
+                error_type=type(exc).__name__, transcript=transcript,
+            )
+            return
 
         if not result.matched or result.confidence < self.threshold:
             self._append_ignored(
@@ -1126,14 +1108,6 @@ class AiCallHandoffTriggerService:
         value = event.payload.get("transcript") or event.payload.get("delta")
         return value.strip() if isinstance(value, str) else ""
 
-    @classmethod
-    def _is_explicit_transfer_delta(cls, event: AiCallEvent) -> bool:
-        if event.type != "user_transcript_delta":
-            return False
-        transcript = cls._transcript_text(event)
-        normalized = cls._normalize(transcript)
-        return normalized in cls.EXPLICIT_TRANSFER_DELTA_COMMANDS
-
     def _remember_confirmation_candidate(
         self,
         event: AiCallEvent,
@@ -1283,10 +1257,7 @@ class AiCallHandoffTriggerWorker:
     def enqueue(self, event: AiCallEvent, event_store: InMemoryEventStore) -> None:
         should_enqueue = event.type == "handoff_tool_requested" or (
             self.transcript_trigger_enabled
-            and (
-                event.type == "user_transcript_done"
-                or self.trigger_service._is_explicit_transfer_delta(event)
-            )
+            and event.type == "user_transcript_done"
         )
         if not should_enqueue:
             return

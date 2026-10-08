@@ -1871,6 +1871,9 @@ class RealtimeCallAgentRunner:
 
     @staticmethod
     def _is_sip_participant(session: CallSession) -> bool:
+        if session.entry_type is not None:
+            return session.entry_type in {"direct_sip", "outbound", "sip_outbound"}
+        # 兼容未携带入口类型的旧会话；Owner 的 caller- 标识也用于网页通话。
         return session.participant_identity.startswith("sip-")
 
     def _is_barge_in_enabled_for_session(self, session: CallSession) -> bool:
@@ -7032,6 +7035,9 @@ class RealtimeCallAgentRunner:
                 if (
                     self._normalize_handoff_intent_fragment(transcript)
                     in PARTIAL_HANDOFF_INTENT_VALUES
+                    or (decision.confidence < 0.8 and any(
+                        role in transcript for role in RuleBasedHandoffIntentClassifier.HUMAN_ROLE_TERMS
+                    ))
                 ):
                     self._append_event(
                         call_id,

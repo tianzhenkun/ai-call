@@ -477,8 +477,34 @@ def test_semantic_analysis_result_removes_internal_evidence_annotations() -> Non
         "人工接入后存在转写噪声",
         "客户承诺由秘书提供资料",
     ]
-    assert result["reason"] == "客户未实际接入；所有 customer 轮次均为系统提示。"
+    assert result["reason"] == "客户未实际接入；所有客户轮次均为系统提示。"
     assert result["summary"] == "客户确认当前方便沟通。客户结束通话。"
+
+
+def test_semantic_analysis_response_uses_business_chinese_without_changing_evidence() -> None:
+    module = _semantic_module()
+    original = {
+        "summary": "客户身份无 strong_fact 支持。",
+        "reason": "未达到 interested 标准，建议 nurturing。",
+        "classification": "nurturing",
+        "evidence_conflict": True,
+        "evidence": ["客户说 interested 是什么意思？"],
+        "follow_up": {
+            "required": True,
+            "consent": "explicit",
+            "confidence": "high",
+            "reason": "客户明确同意接收短信链接（seq=27，supports_follow_up_consent_fact=true）",
+        },
+    }
+    result = module.sanitize_analysis_result_for_response(original)
+    assert result["summary"] == "客户身份无明确的对话证据支持。"
+    assert result["reason"] == "未达到有意向标准，建议持续跟进。"
+    assert result["follow_up"]["reason"] == "客户明确同意接收短信链接"
+    assert result["classification"] == original["classification"]
+    assert result["evidence"] == original["evidence"]
+    assert result["evidence_conflict"] is True
+    assert original["follow_up"]["reason"].endswith("true）")
+    assert module.sanitize_analysis_result_for_response(result) == result
 
 
 def test_semantic_analysis_result_removes_record_only_time_hint() -> None:

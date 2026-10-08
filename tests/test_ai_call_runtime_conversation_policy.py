@@ -38,15 +38,16 @@ class FakeProvider:
         pass
 
 
-def _runner(classifier=None) -> tuple[RealtimeCallAgentRunner, FakeProvider, list[tuple[str, str]]]:
+def _runner(classifier=None, *, entry_type=None, participant_identity="sip-customer") -> tuple[RealtimeCallAgentRunner, FakeProvider, list[tuple[str, str]]]:
     registry = InMemorySessionRegistry()
     registry.add(
         CallSession(
             call_id="call-policy",
             room_name="room-policy",
-            participant_identity="sip-customer",
+            participant_identity=participant_identity,
             status=CallSessionStatus.CONNECTED,
             effective_config={"barge_in_enabled": True},
+            entry_type=entry_type,
         )
     )
     provider = FakeProvider()
@@ -583,9 +584,10 @@ async def test_duration_safety_limit_survives_interrupted_polite_closing(monkeyp
 
 
 @pytest.mark.anyio
-async def test_third_silence_timeout_starts_polite_end(monkeypatch) -> None:
+@pytest.mark.parametrize("entry_type,identity", [(None, "sip-customer"), ("direct_sip", "sip-customer"), ("sip_outbound", "sip-customer"), ("outbound", "caller-customer")])
+async def test_third_silence_timeout_starts_polite_end(monkeypatch, entry_type, identity) -> None:
     monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SILENCE_SECONDS", 0)
-    runner, provider, _scheduled = _runner()
+    runner, provider, _scheduled = _runner(entry_type=entry_type, participant_identity=identity)
     runner._silence_prompt_counts["call-policy"] = 2
 
     runner._arm_silence_watchdog("call-policy")
@@ -594,3 +596,33 @@ async def test_third_silence_timeout_starts_polite_end(monkeypatch) -> None:
 
     assert provider.created_responses == [CALL_POLICY_FINAL_INPUT]
     assert runner._pending_call_ends["call-policy"].end_reason == "policy_no_response"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entry_type,identity,telephone", [
+    ("outbound", "caller-customer", True),
+    ("direct_sip", "sip-customer", True),
+    ("sip_outbound", "sip-customer", True),
+    ("web", "caller-customer", False),
+    ("web", "sip-customer", False),
+    (None, "sip-customer", True),
+    (None, "browser-customer", False),
+])
+async def test_call_type_controls_duration_and_silence_protection(
+    monkeypatch, entry_type, identity, telephone,
+) -> None:
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_WRAP_UP_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_FINAL_RESPONSE_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SAFETY_END_SECONDS", 0)
+    runner, _provider, scheduled = _runner(entry_type=entry_type, participant_identity=identity)
+
+    try:
+        runner._arm_silence_watchdog("call-policy")
+        assert ("call-policy" in runner._silence_watchdog_tasks) is telephone
+        await runner.start_opening("call-policy")
+        assert ("call-policy" in runner._call_policy_tasks) is telephone
+        if telephone:
+            await runner._call_policy_tasks["call-policy"]
+        assert scheduled == ([("call-policy", "policy_duration_limit")] if telephone else [])
+    finally:
+        await runner.stop("call-policy")

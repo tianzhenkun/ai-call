@@ -37,6 +37,8 @@ QWEN_SERVER_EVENT_MAPPING = {
     "response.audio.done": "model_audio_done",
     "response.audio_transcript.delta": "ai_transcript_delta",
     "response.audio_transcript.done": "ai_transcript_done",
+    "response.text.delta": "model_text_delta",
+    "response.text.done": "model_text_done",
     "response.function_call_arguments.done": "tool_call_done",
     "response.done": "model_response_done",
     "error": "model_error",
@@ -133,11 +135,12 @@ class QwenRealtimeSessionConfig:
     vad_interrupt_response: bool = False
     temperature: float = 0.7
     tools: list[dict[str, Any]] = field(default_factory=list)
+    modalities: tuple[str, ...] = ("text", "audio")
 
 
 def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, Any]:
     session: dict[str, Any] = {
-        "modalities": ["text", "audio"],
+        "modalities": list(config.modalities),
         "voice": config.voice,
         "input_audio_format": "pcm",
         "output_audio_format": "pcm",

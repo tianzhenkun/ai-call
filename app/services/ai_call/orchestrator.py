@@ -488,6 +488,7 @@ class AiCallOrchestrator:
             participant_identity=participant_identity,
             status=CallSessionStatus.CREATED,
             effective_config=effective_config,
+            entry_type="web",
         )
         self.registry.add(session)
         self.metrics_by_call_id[call_id] = CallMetrics()
@@ -616,6 +617,7 @@ class AiCallOrchestrator:
             status=CallSessionStatus.CREATED,
             effective_config=effective_config,
             knowledge_context=knowledge_context,
+            entry_type="sip_outbound",
         )
         self.registry.add(session)
         self.metrics_by_call_id[call_id] = CallMetrics()

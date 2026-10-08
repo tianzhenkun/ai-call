@@ -342,6 +342,11 @@ class RecordOut(AiCallBaseSchema):
     id: str
     call_id: str
     task_id: str | None = None
+    target_id: str | None = None
+    task_name: str | None = None
+    customer_name: str | None = None
+    phone_number: str | None = None
+    attempt_no: int | None = None
     call_result: str | None = None
     answer_type: Literal["human", "voicemail", "transport"] | None = None
     follow_up_data_id: str | None = None

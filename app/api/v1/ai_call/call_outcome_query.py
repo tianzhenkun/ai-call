@@ -5,6 +5,7 @@ from sqlalchemy.sql.functions import FunctionElement
 from app.services.ai_call.call_outcome import VOICEMAIL_MARKERS
 
 from .model import AiCallSemanticAnalysisModel
+from .outbound.rule_task_model import AiCallOutboundAttemptModel, AiCallOutboundTargetModel
 
 
 class _AnalysisJson(FunctionElement):
@@ -59,3 +60,18 @@ def business_call_result_expression(call_result, call_id):
         ),
         else_=call_result,
     )
+
+
+def target_call_result_expression():
+    """历史目标可能尚未回写分析结果，读取时按最新通话统一业务口径。"""
+    target = AiCallOutboundTargetModel
+    attempt = AiCallOutboundAttemptModel
+    latest_call_id = (
+        select(attempt.call_id)
+        .where(attempt.tenant_id == target.tenant_id, attempt.target_id == target.id)
+        .order_by(attempt.attempt_no.desc())
+        .limit(1)
+        .correlate(target)
+        .scalar_subquery()
+    )
+    return business_call_result_expression(target.latest_result, latest_call_id)

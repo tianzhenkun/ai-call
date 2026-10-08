@@ -17,6 +17,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptProfileModel,
     AiCallRecordingTrackModel,
     AiCallRecordModel,
+    AiCallSemanticAnalysisModel,
 )
 from app.api.v1.ai_call.outbound.attempt_projection import (
     apply_terminal_projection,
@@ -737,6 +738,46 @@ async def test_exception_batch_executes_without_reopening_source_task(database) 
             "createdByName": None,
             "startedAt": batch.started_at,
         }
+
+        # 历史分析已确认信箱，但旧目标仍保留线路接通结果；读取时统一业务口径。
+        session.add(AiCallSemanticAnalysisModel(
+            id=generate_snowflake_id(), call_id=latest_attempt.call_id,
+            scene_code="intro_contract", analysis_scene_code="ai_call_semantic_analysis",
+            analysis_status="2", analysis_result=json.dumps({
+                "valid_dialogue": False, "summary": "客户未接听，进入语音信箱",
+            }), follow_up_suggested=False, analysis_retry_count=0,
+            created_at=now, updated_at=now,
+        ))
+        await session.flush()
+        context = await AiCallRecordRepository(session).get_exception_handling(
+            tenant_id="tenant-a", call_id=latest_attempt.call_id,
+        )
+        assert context["lastResult"] == "no_answer"
+        assert context["status"] == "STOPPED"
+        rows, total = await service.list_targets(
+            session, "tenant-a", 1, category="no_answer", target_status="STOPPED",
+            keyword=None, page_num=1, page_size=20,
+        )
+        assert total == 1
+        assert rows[0].last_result == "no_answer"
+        _, connected_total = await service.list_targets(
+            session, "tenant-a", 1, category="no_answer", target_status="CONNECTED",
+            keyword=None, page_num=1, page_size=20,
+        )
+        assert connected_total == 0
+        summary = await service.get_summary(session, "tenant-a", 1)
+        card = next(card for card in summary.cards if card.category == "no_answer")
+        assert card.status_counts == {"STOPPED": 1}
+        from openpyxl import load_workbook
+        export_path = await service.export_targets(session, "tenant-a", 1, "no_answer")
+        try:
+            workbook = load_workbook(export_path, read_only=True)
+            assert list(workbook.active.values)[1][-1] == "no_answer"
+            workbook.close()
+        finally:
+            export_path.unlink()
+        assert target.latest_result == latest_attempt.call_result == "connected"
+        assert target.next_attempt_at is None
 
 
 @pytest.mark.anyio
