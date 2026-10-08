@@ -98,7 +98,9 @@ AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS = 60_000
 AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT = 80
 CALL_POLICY_WRAP_UP_SECONDS = 240
 CALL_POLICY_FINAL_RESPONSE_SECONDS = 290
-CALL_POLICY_SAFETY_END_SECONDS = 300
+FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
+# 300 秒业务上限后最多留 15 秒播完收尾；供应商或播放卡住时仍有硬截止。
+CALL_POLICY_SAFETY_END_SECONDS = 315
 CALL_POLICY_MAX_CUSTOMER_TURNS = 15
 CALL_POLICY_SILENCE_SECONDS = 8
 CALL_POLICY_MAX_SILENCE_PROMPTS = 3
@@ -145,8 +147,8 @@ CUSTOMER_HANDOFF_CONFIRMATION_TOOL_RESULT = (
     "不得声称坐席繁忙、暂无人工接入或正在转接。"
 )
 PARTIAL_HANDOFF_INTENT_VALUES = frozenset({"转", "人工", "客服", "真人"})
-CALL_END_FINAL_RESPONSE_TOOL_RESULT = "已记录。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
-CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "已记录。系统将结束通话，不要再生成额外回复。"
+CALL_END_FINAL_RESPONSE_TOOL_RESULT = "结束请求已确认。请用一句简短礼貌的话结束通话，不要继续提出新问题。"
+CALL_END_NO_EXTRA_RESPONSE_TOOL_RESULT = "结束请求已确认。系统将结束通话，不要再生成额外回复。"
 CALL_END_REJECTED_TOOL_RESULT = "未确认用户要求结束通话。请继续按用户刚才的话推进对话，不要结束通话。"
 CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT = (
     "未确认客户要结束通话。请继续回应客户刚才的问题或做一个必要澄清。"
@@ -160,7 +162,7 @@ CALL_END_FINAL_RESPONSE_TOOL_RESULTS_BY_REASON = {
         "不要添加其他内容，不要再提出问题。"
     ),
     "task_completed": (
-        "请直接回复：“好的，相关信息我已经记录，感谢您的时间，再见。”"
+        "请直接回复：“好的，感谢您的时间，再见。”"
         "不要添加其他内容，不要再提出问题。"
     ),
     "policy_limit": CALL_POLICY_FINAL_INPUT,
@@ -179,6 +181,12 @@ CALL_END_ACKNOWLEDGEMENT_TEXTS = frozenset({
     "嗯好的",
     "行",
     "可以",
+    "再见",
+    "好再见",
+    "好的再见",
+    "谢谢",
+    "谢谢再见",
+    "拜拜",
 })
 TASK_COMPLETED_AMBIGUOUS_TEXTS = CALL_END_ACKNOWLEDGEMENT_TEXTS | frozenset({
     "方便",
@@ -700,6 +708,7 @@ class PendingUserTurn:
     customer_transcript_event_id: str | None = None
     transcript_candidates: dict[str, str] = field(default_factory=dict)
     transcript_review_pending: bool = False
+    stability_updated_at: float | None = None
     speech_decision: CustomerSpeechDecision | None = None
     speech_item_id: str | None = None
     no_barge_overlap_stopped_during_ai_response: bool = False
@@ -1001,7 +1010,11 @@ class RealtimeCallAgentRunner:
         self._last_ai_question_completed_at: dict[str, datetime] = {}
 
     def runtime_diagnostics(self) -> dict[str, object]:
-        return dict(AGENT_RUNNER_RUNTIME_DIAGNOSTICS)
+        return {
+            **AGENT_RUNNER_RUNTIME_DIAGNOSTICS,
+            "customerSpeechReviewModel": getattr(self.customer_speech_classifier, "model", None),
+            "customerSpeechReviewStabilityOverlap": self.customer_speech_classifier is not None,
+        }
 
     async def start(self, session: CallSession) -> None:
         provider = self.provider_factory(session)
@@ -5597,6 +5610,7 @@ class RealtimeCallAgentRunner:
         if turn.speech_item_id and item_id != "latest" and item_id != turn.speech_item_id:
             return
         turn.transcript_review_pending = True
+        turn.stability_updated_at = asyncio.get_running_loop().time()
         self._cancel_turn_response_task_nowait(call_id)
         previous = self._transcript_review_tasks.pop(call_id, None)
         if previous is not None and previous is not asyncio.current_task():
@@ -5612,7 +5626,7 @@ class RealtimeCallAgentRunner:
         self, call_id: str, provider: RealtimeProviderProtocol, turn: PendingUserTurn,
     ) -> None:
         try:
-            await asyncio.sleep(CustomerSpeechClassifier.TIMEOUT_SECONDS)
+            await asyncio.sleep(FINAL_TRANSCRIPT_TIMEOUT_SECONDS)
             if self._pending_user_turns.get(call_id) is turn and self._providers.get(call_id) is provider:
                 self._queue_transcript_review(call_id, provider, ProviderEvent(
                     type="user_transcript_failed", payload={"reason": "final_transcript_timeout"},
@@ -5704,6 +5718,7 @@ class RealtimeCallAgentRunner:
                 "candidateEventId": candidate.event_id,
                 "observedAt": candidate.timestamp.isoformat(),
                 "classificationMs": round((asyncio.get_running_loop().time() - started) * 1000),
+                "classificationModel": getattr(classifier, "model", None),
                 "audioEvidence": audio_evidence,
                 **({"classificationError": classification_error} if classification_error else {}),
             }
@@ -6002,6 +6017,12 @@ class RealtimeCallAgentRunner:
         session = self.registry.get(call_id)
         metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
 
+        if event_type == "model_response_done":
+            response_id = self._response_id_from_payload(payload)
+            current_response_id = self._playback_guard(call_id).current_response_id
+            if response_id and response_id != current_response_id:
+                return
+
         if event_type == "model_session_started" and session.status == CallSessionStatus.READY:
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         elif event_type == "model_response_started":
@@ -6072,6 +6093,7 @@ class RealtimeCallAgentRunner:
         if turn.stopped_at is not None and not turn.response_requested:
             turn.stopped_at = None
         turn.started_at = timestamp
+        turn.stability_updated_at = None
         if self.customer_speech_classifier is not None:
             previous_review = self._transcript_review_tasks.pop(call_id, None)
             if previous_review is not None:
@@ -6337,6 +6359,8 @@ class RealtimeCallAgentRunner:
             self._last_sip_provider_speech_stopped_at[call_id] = timestamp
         self._playback_guard(call_id).user_speech_active = False
         turn = self._pending_turn(call_id)
+        if self.customer_speech_classifier is not None:
+            turn.stability_updated_at = asyncio.get_running_loop().time()
         if turn.current_speech_semantic_rejected:
             turn.current_speech_semantic_rejected = False
             if (
@@ -6413,9 +6437,18 @@ class RealtimeCallAgentRunner:
             self._mark_current_no_barge_speech_semantically_rejected(call_id)
             return
         call_end_decision: CallEndDecision | None = None
+        # “好的”分片后面仍可能接新问题，只有完整发言才能确认告别应答。
+        if (
+            call_id in self._pending_call_ends
+            and provider_event.type != "user_transcript_done"
+            and self._normalize_call_end_acknowledgement(text) in CALL_END_ACKNOWLEDGEMENT_TEXTS
+        ):
+            return
         if provider_event.type == "user_transcript_done":
             call_end_decision = self.call_end_decision_service.decide(text)
         if self._acknowledge_pending_call_end_if_closing_ack(call_id, text):
+            if self._pending_turn(call_id).stopped_at is not None:
+                self._complete_acknowledged_call_end_turn(call_id)
             return
         if self._ignore_no_barge_call_end_tail_transcript(call_id, text):
             return
@@ -6839,6 +6872,13 @@ class RealtimeCallAgentRunner:
                 },
             )
         pending_call_end = self._pending_call_ends[call_id]
+        if final_audio_already_spoken:
+            pending_call_end.final_response_started = True
+            lifecycle = self._response_lifecycle(call_id)
+            if lifecycle.pending_input_text == CALL_POLICY_FINAL_INPUT:
+                # 有效结束工具已确认当前回复正在告别，无需再追加时限告别语。
+                lifecycle.pending_create = False
+                lifecycle.pending_input_text = None
         should_create_final_response = not pending_call_end.final_response_started
 
         try:
@@ -6961,6 +7001,12 @@ class RealtimeCallAgentRunner:
         self._cancel_pending_call_end_defer_task_nowait(call_id)
         if pending_call_end is None or pending_call_end.scheduled:
             return
+        self._pending_turn(call_id).call_end_acknowledged = False
+        lifecycle = self._response_lifecycle(call_id)
+        if lifecycle.pending_input_text == CALL_POLICY_FINAL_INPUT:
+            lifecycle.pending_create = False
+            lifecycle.pending_input_text = None
+            lifecycle.pending_response_is_opening = False
         self._append_event(
             call_id,
             "call_end_interrupted",
@@ -8290,6 +8336,10 @@ class RealtimeCallAgentRunner:
         stability_delay_seconds: float,
     ) -> None:
         try:
+            if turn.stability_updated_at is not None:
+                # 从最近的话尾或最终转写开始计时，审核耗时可覆盖稳定窗口。
+                elapsed = asyncio.get_running_loop().time() - turn.stability_updated_at
+                stability_delay_seconds = max(0.0, stability_delay_seconds - elapsed)
             await asyncio.sleep(stability_delay_seconds)
             if self._pending_user_turns.get(call_id) is not turn:
                 return
@@ -9629,7 +9679,7 @@ class RealtimeCallAgentRunner:
             ))
         ):
             return False
-        if lifecycle.active or lifecycle.cancel_pending or (
+        if lifecycle.active or lifecycle.cancel_pending or call_id in self._playout_tasks or (
             lifecycle.opening_playout_pending and not opening_response
         ):
             lifecycle.pending_create = True
@@ -9853,7 +9903,8 @@ class RealtimeCallAgentRunner:
             lifecycle.pending_input_text = None
             lifecycle.pending_response_is_opening = False
             return
-        if lifecycle.opening_playout_pending:
+        # 模型生成结束不等于客户已听完；下一回复会替换 response_id 并丢弃旧缓冲。
+        if lifecycle.opening_playout_pending or call_id in self._playout_tasks:
             return
         if not lifecycle.pending_create:
             if await self._maybe_recover_sip_confirmed_without_transcript(call_id, provider):
@@ -10025,6 +10076,12 @@ class RealtimeCallAgentRunner:
         if pending_call_end is None or pending_call_end.scheduled:
             return
         if not pending_call_end.final_response_started:
+            return
+        lifecycle = self._response_lifecycle(call_id)
+        if (
+            lifecycle.active or lifecycle.cancel_pending or lifecycle.pending_create
+            or call_id in self._playout_tasks
+        ):
             return
         if self.registry.get(call_id).status in {
             CallSessionStatus.ENDING,
@@ -10341,14 +10398,19 @@ class RealtimeCallAgentRunner:
             self._arm_silence_watchdog(call_id)
             return
         self._cancel_playout_task_nowait(call_id)
+        guard = self._playback_guard(call_id)
         self._playout_tasks[call_id] = asyncio.create_task(
-            self._wait_for_playout_and_mark_connected(call_id, wait_for_playout)
+            self._wait_for_playout_and_mark_connected(
+                call_id, wait_for_playout, guard.current_response_id, guard.generation,
+            )
         )
 
     async def _wait_for_playout_and_mark_connected(
         self,
         call_id: str,
         wait_for_playout: Any,
+        response_id: str | None,
+        generation: int,
     ) -> None:
         try:
             audio_playout_task = self._audio_playout_tasks.get(call_id)
@@ -10358,6 +10420,15 @@ class RealtimeCallAgentRunner:
                 await wait_for_playout(call_id)
             if self.ai_speaking_tail_grace_seconds > 0:
                 await asyncio.sleep(self.ai_speaking_tail_grace_seconds)
+            guard = self._playback_guard(call_id)
+            lifecycle = self._response_lifecycle(call_id)
+            if (
+                self._playout_tasks.get(call_id) is not asyncio.current_task()
+                or guard.current_response_id != response_id
+                or guard.generation != generation
+                or lifecycle.active
+            ):
+                return
             session = self.registry.get(call_id)
             if session.status in {
                 CallSessionStatus.ENDING, CallSessionStatus.COMPLETED, CallSessionStatus.FAILED,
@@ -10365,17 +10436,18 @@ class RealtimeCallAgentRunner:
                 return
             if session.status == CallSessionStatus.AI_SPEAKING:
                 self.registry.transition(call_id, CallSessionStatus.CONNECTED)
-            lifecycle = self._response_lifecycle(call_id)
-            if lifecycle.opening_playout_pending:
+            was_opening = lifecycle.opening_playout_pending
+            if was_opening:
                 lifecycle.opening_playout_pending = False
                 self._append_event(call_id, "opening_playout_completed", "agent", {})
-                provider = self._providers.get(call_id)
-                if provider is not None:
-                    await self._complete_response_and_flush_pending(call_id, provider)
-                    if not self._has_active_model_response(call_id):
-                        await self._maybe_schedule_response_from_turn(
-                            call_id, provider, datetime.now(timezone.utc),
-                        )
+            self._playout_tasks.pop(call_id, None)
+            provider = self._providers.get(call_id)
+            if provider is not None:
+                await self._complete_response_and_flush_pending(call_id, provider)
+                if was_opening and not self._has_active_model_response(call_id):
+                    await self._maybe_schedule_response_from_turn(
+                        call_id, provider, datetime.now(timezone.utc),
+                    )
             self._schedule_pending_call_end_nowait(call_id)
             self._arm_silence_watchdog(call_id)
         except asyncio.CancelledError:

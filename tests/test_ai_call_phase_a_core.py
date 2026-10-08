@@ -1899,6 +1899,65 @@ def test_ai_call_runtime_config_defaults_to_server_vad(monkeypatch: pytest.Monke
     assert runtime_config.vad_type == "server_vad"
 
 
+def test_customer_speech_model_is_independent_from_general_text_model() -> None:
+    config = AiCallRuntimeConfig.from_settings(Settings(
+        _env_file=None, LLM_MODEL="qwen-plus", AI_CALL_CUSTOMER_SPEECH_MODEL="qwen-flash",
+    ))
+    assert config.customer_speech_model == "qwen-flash"
+    assert config.llm_model == "qwen-plus"
+    inherited = AiCallRuntimeConfig.from_settings(Settings(
+        _env_file=None, LLM_MODEL="qwen-plus", AI_CALL_CUSTOMER_SPEECH_MODEL="",
+    ))
+    assert inherited.customer_speech_model == "qwen-plus"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("shutdown_path", ["direct", "api", "owner"])
+async def test_orchestrator_closes_shared_customer_review_client_on_shutdown(monkeypatch, shutdown_path) -> None:
+    template, livekit, _ = build_orchestrator()
+    orchestrator = AiCallOrchestrator(config=template.config, livekit_room_manager=livekit)
+    classifier = orchestrator.agent_runner.customer_speech_classifier
+    clients = []
+    client_class = httpx.AsyncClient
+
+    def respond(_request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "sources": ["customer"], "topic": "related", "confidence": .99,
+        })}}]})
+
+    def create_client(**kwargs):
+        client = client_class(**kwargs, transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", create_client)
+    try:
+        for _ in range(2):
+            await classifier.classify(transcript="你继续说。", business_prompt="产品咨询", recent_dialogue=[], audio_evidence={})
+        assert len(clients) == 1
+        assert not clients[0].is_closed
+    finally:
+        if shutdown_path == "api":
+            from fastapi import FastAPI
+
+            from app.api.v1.ai_call import service as service_module
+            from app.plugin import init_app
+
+            monkeypatch.setattr(service_module, "_default_orchestrator", orchestrator)
+            await init_app._stop_ai_call_role_workers(FastAPI(), init_app.AiCallRoleWorkerHandles())
+        elif shutdown_path == "owner":
+            from app.services.ai_call.runtime_control.livekit_provider import (
+                OwnerRuntimeAgentManager,
+            )
+            from app.services.ai_call.runtime_control.runtime_service import RuntimeRegistry
+
+            manager = OwnerRuntimeAgentManager(orchestrator=orchestrator, runtime_registry=RuntimeRegistry())
+            await manager.shutdown()
+        else:
+            await orchestrator.shutdown()
+    assert clients[0].is_closed
+
+
 def test_ai_call_runtime_config_reads_sip_barge_in_settings() -> None:
     runtime_config = AiCallRuntimeConfig.from_settings(
         Settings(
@@ -4110,9 +4169,8 @@ async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_pl
 @pytest.mark.anyio
 async def test_outbound_missing_transcript_resumes_silence_policy_and_waits_for_farewell(monkeypatch) -> None:
     from app.services.ai_call import agent_runner as agent_runner_module
-    from app.services.ai_call.transcript_trust import CustomerSpeechClassifier
 
-    monkeypatch.setattr(CustomerSpeechClassifier, "TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "FINAL_TRANSCRIPT_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SILENCE_SECONDS", 0.01)
 
     class NoTranscriptClassifier:
@@ -4766,7 +4824,7 @@ async def test_realtime_agent_runner_does_not_create_extra_call_end_response_aft
 
     assert provider.created_responses == []
     assert provider.submitted_tool_results == [
-        ("tool_after_audio", "已记录。系统将结束通话，不要再生成额外回复。")
+        ("tool_after_audio", "结束请求已确认。系统将结束通话，不要再生成额外回复。")
     ]
     assert [event.type for event in store.list("call_end_audio_already_spoken")] == [
         "model_session_started",
@@ -6074,7 +6132,7 @@ async def test_realtime_agent_runner_maps_task_completed_call_end_reason() -> No
 
     assert provider.submitted_tool_results[0][0] == "tool_2"
     assert provider.submitted_tool_results[0][1] == (
-        "请直接回复：“好的，相关信息我已经记录，感谢您的时间，再见。”"
+        "请直接回复：“好的，感谢您的时间，再见。”"
         "不要添加其他内容，不要再提出问题。"
     )
     assert "call_end_scheduled" in [event.type for event in store.list("call_task_completed")]

@@ -51,6 +51,7 @@ SCHEDULE_CALL_END_TOOL = {
         "name": "schedule_call_end",
         "description": (
             "仅当上下文明确表明通话已适合结束时，用于安排当前通话在最后一句回复播放完成后结束。"
+            "先调用并等待工具确认，再按工具结果告别；此工具不创建回访任务，也不安排顾问。"
         ),
         "parameters": {
             "type": "object",

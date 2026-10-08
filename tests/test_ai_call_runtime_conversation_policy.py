@@ -261,7 +261,8 @@ async def test_new_speech_waits_for_its_own_final_and_old_classification_cannot_
 
 @pytest.mark.anyio
 async def test_missing_final_transcript_clarifies_without_spending_budget(monkeypatch):
-    monkeypatch.setattr(CustomerSpeechClassifier, "TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(CustomerSpeechClassifier, "TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "FINAL_TRANSCRIPT_TIMEOUT_SECONDS", 0.01)
     classifier = SpeechClassifier()
     runner, provider, _ = _runner(classifier)
     now = datetime.now(timezone.utc)
@@ -345,6 +346,7 @@ async def test_unreviewed_transcript_delta_never_confirms_interrupt_or_end():
 @pytest.mark.anyio
 async def test_classifier_http_contract_keeps_context_and_uses_only_original_spans(monkeypatch):
     requests = []
+    clients = []
 
     def respond(request):
         requests.append(json.loads(request.content))
@@ -353,14 +355,24 @@ async def test_classifier_http_contract_keeps_context_and_uses_only_original_spa
         })}}]})
 
     client_class = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client_class(
-        **kw, transport=httpx.MockTransport(respond),
-    ))
+
+    def create_client(**kwargs):
+        client = client_class(**kwargs, transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", create_client)
     classifier = CustomerSpeechClassifier(base_url="https://model.example/v1", api_key="test-only", model="qwen-plus")
-    decision = await classifier.classify(
-        transcript="你继续说。", business_prompt="GEO 服务",
-        recent_dialogue=[{"role": "assistant", "text": "方便聊聊吗？"}], audio_evidence={},
-    )
+    for _ in range(2):
+        decision = await classifier.classify(
+            transcript="你继续说。", business_prompt="GEO 服务",
+            recent_dialogue=[{"role": "assistant", "text": "方便聊聊吗？"}], audio_evidence={},
+        )
+    assert len(clients) == 1
+    assert not clients[0].is_closed
+    await classifier.aclose()
+    assert clients[0].is_closed
+    assert requests[0] == requests[1]
     assert decision.customer_text == "你继续说。"
     assert requests[0]["enable_thinking"] is False
     assert requests[0]["response_format"] == {"type": "json_object"}
@@ -368,6 +380,73 @@ async def test_classifier_http_contract_keeps_context_and_uses_only_original_spa
     assert data["transcript"] == "你继续说。"
     assert data["clauses"] == ["你继续说。"]
     assert data["recent_dialogue"][0]["text"] == "方便聊聊吗？"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("review_elapsed", [.02, .30])
+async def test_review_overlaps_stability_without_releasing_unreviewed_reply(monkeypatch, review_elapsed):
+    entered, release = asyncio.Event(), asyncio.Event()
+    sleeps = []
+    original_sleep = asyncio.sleep
+
+    class GatedClassifier(SpeechClassifier):
+        async def classify(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return await super().classify(**kwargs)
+
+    async def observe_stability(seconds):
+        if asyncio.current_task().get_name().startswith("ai-call-turn-response-"):
+            sleeps.append(seconds)
+            await original_sleep(0)
+        else:
+            await original_sleep(seconds)
+
+    monkeypatch.setattr(agent_runner_module.asyncio, "sleep", observe_stability)
+    runner, provider, _ = _runner(GatedClassifier())
+    runner.user_turn_stability_delay_seconds = .15
+    now = datetime.now(timezone.utc)
+    try:
+        await runner._handle_user_speech_started("call-policy", provider, now, speech_item_id="turn")
+        await runner._handle_user_speech_stopped("call-policy", provider, now)
+        runner._queue_transcript_review("call-policy", provider, ProviderEvent(
+            type="user_transcript_done", payload={"transcript": "怎么收费？", "item_id": "turn"},
+        ))
+        await entered.wait()
+        turn = runner._pending_turn("call-policy")
+        assert turn.stability_updated_at is not None
+        assert provider.created_responses == []
+        # 只替换已流逝的审核时间，回复调度和所有权限检查仍走真实 runner。
+        turn.stability_updated_at = asyncio.get_running_loop().time() - review_elapsed
+        release.set()
+        await runner._transcript_review_tasks["call-policy"]
+        await runner.wait("call-policy")
+        assert len(provider.created_responses) == 1
+        assert sleeps == [pytest.approx(max(0, .15 - review_elapsed), abs=.03)]
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+async def test_new_speech_cancels_remaining_stability_wait():
+    runner, provider, _ = _runner(SpeechClassifier())
+    runner.user_turn_stability_delay_seconds = .20
+    now = datetime.now(timezone.utc)
+    try:
+        await runner._handle_user_speech_started("call-policy", provider, now, speech_item_id="old")
+        await runner._handle_user_speech_stopped("call-policy", provider, now)
+        runner._queue_transcript_review("call-policy", provider, ProviderEvent(
+            type="user_transcript_done", payload={"transcript": "介绍一下产品。", "item_id": "old"},
+        ))
+        await runner._transcript_review_tasks["call-policy"]
+        response = runner._turn_response_tasks["call-policy"]
+        await runner._handle_user_speech_started("call-policy", provider, datetime.now(timezone.utc), speech_item_id="new")
+        await asyncio.sleep(.22)
+        assert response.cancelled()
+        assert provider.created_responses == []
+        assert runner._pending_turn("call-policy").stability_updated_at is None
+    finally:
+        await runner.stop("call-policy")
 
 
 def test_mixed_source_decision_preserves_multiple_customer_spans_and_uncertain_corrections():
@@ -430,6 +509,97 @@ async def test_policy_end_speaks_before_scheduling_hangup() -> None:
     )
 
     assert scheduled == [("call-policy", "policy_duration_limit")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("text", ["好的。", "好的，再见。", "谢谢，再见。", "拜拜。"])
+async def test_final_closing_ack_does_not_create_another_response(text) -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner._prepare_policy_call_end(call_id, end_reason="policy_duration_limit")
+    runner._pending_call_ends[call_id].final_response_started = True
+    runner._response_lifecycle(call_id).active = True
+    now = datetime.now(timezone.utc)
+    await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+        type="user_transcript_done", payload={"transcript": text},
+    ), now)
+    await runner._handle_user_speech_stopped(call_id, provider, now)
+    await runner._complete_response_and_flush_pending(call_id, provider)
+
+    assert runner._pending_turn(call_id).call_end_acknowledged
+    assert provider.created_responses == []
+    assert scheduled == [(call_id, "policy_duration_limit")]
+    await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_reviewed_closing_ack_after_speech_stop_releases_pending_hangup() -> None:
+    runner, provider, scheduled = _runner(SpeechClassifier())
+    call_id = "call-policy"
+    runner._prepare_policy_call_end(call_id, end_reason="policy_duration_limit")
+    runner._pending_call_ends[call_id].final_response_started = True
+    runner.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
+    await _review_turn(runner, provider, "好的，再见。")
+    assert provider.created_responses == []
+    assert scheduled == [(call_id, "policy_duration_limit")]
+    await runner.stop(call_id)
+
+
+@pytest.mark.parametrize("prompt_key", ["prompt", "instructions"])
+def test_runtime_closing_constraints_apply_to_legacy_and_frozen_prompts(prompt_key) -> None:
+    runner, _, _ = _runner()
+    session = runner.registry.get("call-policy")
+    session.effective_config[prompt_key] = "客户同意后说稍后安排顾问联系。"
+    config = runner._session_config(session)
+    assert "先调用 schedule_call_end 并等待工具结果确认" in config.instructions
+    assert "当前通话没有创建回访任务或安排顾问的工具" in config.instructions
+    tool = next(item for item in config.tools if item["function"]["name"] == "schedule_call_end")
+    assert "此工具不创建回访任务" in tool["function"]["description"]
+
+
+@pytest.mark.anyio
+async def test_partial_ack_cannot_hide_the_question_in_final_transcript() -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner.user_turn_stability_delay_seconds = 0
+    runner._prepare_policy_call_end(call_id, end_reason="policy_duration_limit")
+    now = datetime.now(timezone.utc)
+    await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+        type="user_transcript_delta", payload={"text": "好的"},
+    ), now)
+    assert not runner._pending_turn(call_id).call_end_acknowledged
+    assert call_id in runner._pending_call_ends
+
+    await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+        type="user_transcript_done", payload={"transcript": "好的，再见之前还有个问题，多少钱？"},
+    ), now)
+    await runner._handle_user_speech_stopped(call_id, provider, now)
+    assert call_id not in runner._pending_call_ends
+    assert not runner._pending_turn(call_id).call_end_acknowledged
+    assert provider.created_responses == [None]
+    assert scheduled == []
+    await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_new_question_replaces_queued_policy_goodbye() -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner.user_turn_stability_delay_seconds = 0
+    runner._mark_response_started(call_id, {"response_id": "previous-answer"})
+    await runner._begin_policy_call_end(call_id, provider, end_reason="policy_duration_limit")
+    assert runner._response_lifecycle(call_id).pending_input_text == CALL_POLICY_FINAL_INPUT
+
+    now = datetime.now(timezone.utc)
+    await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+        type="user_transcript_done", payload={"transcript": "另外，你们有试用吗？"},
+    ), now)
+    await runner._handle_user_speech_stopped(call_id, provider, now)
+    await runner._complete_response_and_flush_pending(call_id, provider)
+    assert call_id not in runner._pending_call_ends
+    assert provider.created_responses == [None]
+    assert scheduled == []
+    await runner.stop(call_id)
 
 
 @pytest.mark.anyio
@@ -581,6 +751,183 @@ async def test_duration_safety_limit_survives_interrupted_polite_closing(monkeyp
     await runner._run_call_policy("call-policy")
 
     assert scheduled == [("call-policy", "policy_duration_limit")]
+
+
+class GatedPlayoutPublisher:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait_for_playout(self, _call_id: str) -> None:
+        self.started.set()
+        await self.release.wait()
+
+
+@pytest.mark.anyio
+async def test_duration_closing_waits_for_previous_and_final_playout() -> None:
+    runner, provider, scheduled = _runner()
+    publisher = GatedPlayoutPublisher()
+    runner.audio_publisher = publisher
+    runner.ai_speaking_tail_grace_seconds = 0
+    call_id = "call-policy"
+
+    async def emit(event_type, response_id):
+        await runner._apply_provider_event(
+            call_id, provider, event_type, datetime.now(timezone.utc),
+            {"response_id": response_id},
+        )
+
+    try:
+        await emit("model_response_started", "answer")
+        await emit("model_audio_delta", "answer")
+        await runner._begin_policy_call_end(call_id, provider, end_reason="policy_duration_limit")
+        await emit("model_response_done", "answer")
+        waiter = runner._playout_tasks[call_id]
+        await asyncio.wait_for(publisher.started.wait(), 1)
+        assert provider.created_responses == []
+        assert scheduled == []
+
+        publisher.release.set()
+        await asyncio.wait_for(waiter, 1)
+        assert provider.created_responses == [CALL_POLICY_FINAL_INPUT]
+        assert scheduled == []
+        # 新回复已请求但 response_started 尚未到达时，旧 done 也不能清掉新回复状态。
+        await emit("model_response_done", "answer")
+        assert runner._has_active_model_response(call_id)
+
+        publisher.started.clear()
+        publisher.release.clear()
+        await emit("model_response_started", "goodbye")
+        await emit("model_audio_delta", "goodbye")
+        await emit("model_response_done", "goodbye")
+        waiter = runner._playout_tasks[call_id]
+        await asyncio.wait_for(publisher.started.wait(), 1)
+        assert scheduled == []
+        publisher.release.set()
+        await asyncio.wait_for(waiter, 1)
+        runner._schedule_pending_call_end_nowait(call_id)
+        assert scheduled == [(call_id, "policy_duration_limit")]
+        assert provider.created_responses == [CALL_POLICY_FINAL_INPUT]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_stale_playout_and_done_cannot_end_new_goodbye() -> None:
+    runner, provider, scheduled = _runner()
+    publisher = GatedPlayoutPublisher()
+    runner.audio_publisher = publisher
+    runner.ai_speaking_tail_grace_seconds = 0
+    call_id = "call-policy"
+
+    async def emit(event_type, response_id):
+        await runner._apply_provider_event(
+            call_id, provider, event_type, datetime.now(timezone.utc),
+            {"response_id": response_id},
+        )
+
+    try:
+        await runner._begin_policy_call_end(call_id, provider, end_reason="policy_duration_limit")
+        await emit("model_response_started", "old-goodbye")
+        await emit("model_audio_delta", "old-goodbye")
+        await emit("model_response_done", "old-goodbye")
+        waiter = runner._playout_tasks[call_id]
+        await asyncio.wait_for(publisher.started.wait(), 1)
+        # 重现供应商新响应与旧播放完成回调交错到达。
+        await emit("model_response_started", "new-goodbye")
+        await emit("model_audio_delta", "new-goodbye")
+        publisher.release.set()
+        await asyncio.wait_for(waiter, 1)
+        assert runner.registry.get(call_id).status == CallSessionStatus.AI_SPEAKING
+        assert scheduled == []
+        await emit("model_response_done", "old-goodbye")
+        assert runner._has_active_model_response(call_id)
+        assert scheduled == []
+
+        await emit("model_response_done", "new-goodbye")
+        await asyncio.wait_for(runner._playout_tasks[call_id], 1)
+        assert scheduled == [(call_id, "policy_duration_limit")]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_pending_hangup_cannot_skip_final_generation_before_first_audio() -> None:
+    runner, provider, scheduled = _runner()
+    await runner._begin_policy_call_end("call-policy", provider, end_reason="policy_duration_limit")
+    runner._mark_response_started("call-policy", {"response_id": "goodbye"})
+    runner._schedule_pending_call_end_nowait("call-policy")
+    assert scheduled == []
+    await runner._apply_provider_event(
+        "call-policy", provider, "model_response_done", datetime.now(timezone.utc),
+        {"response_id": "goodbye"},
+    )
+    assert scheduled == [("call-policy", "policy_duration_limit")]
+
+
+@pytest.mark.anyio
+async def test_accepted_closing_does_not_repeat_queued_duration_goodbye() -> None:
+    runner, provider, scheduled = _runner()
+    publisher = GatedPlayoutPublisher()
+    runner.audio_publisher = publisher
+    runner.ai_speaking_tail_grace_seconds = 0
+    call_id = "call-policy"
+    runner._mark_response_started(call_id, {"response_id": "current-goodbye"})
+    runner.registry.transition(call_id, CallSessionStatus.AI_SPEAKING)
+    runner._playback_guard(call_id).current_response_audio_published = True
+    try:
+        await runner._begin_policy_call_end(call_id, provider, end_reason="policy_duration_limit")
+        await runner._handle_tool_call_done(call_id, provider, ProviderEvent(
+            type="tool_call_done", payload={
+                "call_id": "end-tool", "name": "schedule_call_end",
+                "arguments": json.dumps({"reason": "customer_end"}),
+            },
+        ))
+        await runner._apply_provider_event(
+            call_id, provider, "model_response_done", datetime.now(timezone.utc),
+            {"response_id": "current-goodbye"},
+        )
+        waiter = runner._playout_tasks[call_id]
+        await asyncio.wait_for(publisher.started.wait(), 1)
+        assert scheduled == []
+        publisher.release.set()
+        await asyncio.wait_for(waiter, 1)
+        assert provider.created_responses == []
+        assert scheduled == [(call_id, "policy_duration_limit")]
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stuck_stage", ["generation", "playout"])
+async def test_duration_safety_end_bounds_stuck_closing(monkeypatch, stuck_stage) -> None:
+    runner, provider, scheduled = _runner()
+    runner.audio_publisher = GatedPlayoutPublisher()
+    runner.ai_speaking_tail_grace_seconds = 0
+    sleep = asyncio.sleep
+    policy_sleeps = []
+
+    async def advance_policy_clock(seconds):
+        policy_sleeps.append(seconds)
+        if len(policy_sleeps) != 3:
+            return
+        if stuck_stage == "playout":
+            for event_type in ("model_response_started", "model_audio_delta", "model_response_done"):
+                await runner._apply_provider_event(
+                    "call-policy", provider, event_type, datetime.now(timezone.utc),
+                    {"response_id": "goodbye"},
+                )
+            await sleep(0)
+        assert scheduled == []
+
+    monkeypatch.setattr(agent_runner_module.asyncio, "sleep", advance_policy_clock)
+    try:
+        await runner._run_call_policy("call-policy")
+        # 业务上限为 300 秒，异常收尾最多再等 15 秒。
+        assert sum(policy_sleeps) == 315
+        assert scheduled == [("call-policy", "policy_duration_limit")]
+    finally:
+        await runner.stop("call-policy")
 
 
 @pytest.mark.anyio

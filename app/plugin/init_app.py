@@ -179,6 +179,8 @@ async def _stop_ai_call_role_workers(
     app: FastAPI,
     handles: AiCallRoleWorkerHandles,
 ) -> None:
+    from app.api.v1.ai_call.service import shutdown_default_ai_call_orchestrator
+
     if handles.recovery_control is not None:
         await _stop_ai_call_recovery_control(handles.recovery_control)
     if handles.dispatcher_control is not None:
@@ -199,6 +201,7 @@ async def _stop_ai_call_role_workers(
         await _stop_ai_call_handoff_trigger_worker(handles.handoff_trigger_worker)
     if handles.handoff_exception_manager is not None:
         await handles.handoff_exception_manager.shutdown()
+    await shutdown_default_ai_call_orchestrator()
     if handles.runtime_webhook_worker is not None:
         await _stop_ai_call_runtime_webhook_worker(handles.runtime_webhook_worker)
     if handles.knowledge_worker is not None:

@@ -139,6 +139,7 @@ class AiCallRuntimeConfig:
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = field(default="", repr=False)
     llm_model: str = "qwen-plus"
+    customer_speech_model: str = ""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -163,6 +164,10 @@ class AiCallRuntimeConfig:
             llm_base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
             llm_api_key=settings.EFFECTIVE_LLM_API_KEY,
             llm_model=settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus",
+            customer_speech_model=(
+                settings.AI_CALL_CUSTOMER_SPEECH_MODEL
+                or settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus"
+            ),
             user_turn_stability_delay_seconds=(settings.AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS),
             handoff_prompt_constraint_enabled=(settings.AI_CALL_HANDOFF_PROMPT_CONSTRAINT_ENABLED),
             barge_in_enabled=settings.AI_CALL_BARGE_IN_ENABLED,
@@ -362,6 +367,7 @@ class AiCallOrchestrator:
         self._agent_start_attempts: set[str] = set()
         self._resource_generations: dict[str, dict[str, int]] = {}
         self._cleanup_generations: dict[str, dict[str, int]] = {}
+        self._customer_speech_classifier: CustomerSpeechClassifier | None = None
         self.agent_runner = agent_runner or self._build_default_agent_runner()
 
     @classmethod
@@ -380,6 +386,12 @@ class AiCallOrchestrator:
         from app.core.database import async_db_session
         from app.services.ai_call.knowledge import KnowledgeRealtimeSearchService
 
+        if self._customer_speech_classifier is None:
+            self._customer_speech_classifier = CustomerSpeechClassifier(
+                base_url=self.config.llm_base_url,
+                api_key=self.config.llm_api_key or self.config.dashscope_api_key,
+                model=self.config.customer_speech_model or self.config.llm_model,
+            )
         audio_transport = LiveKitRoomAudioTransport(
             livekit_url=self.config.livekit_url,
             api_key=self.config.livekit_api_key,
@@ -411,11 +423,7 @@ class AiCallOrchestrator:
             sip_vad_shadow_enabled=self.config.sip_vad_shadow_enabled,
             sip_vad_shadow_detector=self._build_sip_vad_shadow_detector(),
             call_end_scheduler=self._schedule_auto_end_session,
-            customer_speech_classifier=CustomerSpeechClassifier(
-                base_url=self.config.llm_base_url,
-                api_key=self.config.llm_api_key or self.config.dashscope_api_key,
-                model=self.config.llm_model,
-            ),
+            customer_speech_classifier=self._customer_speech_classifier,
             knowledge_search_service=KnowledgeRealtimeSearchService(
                 async_db_session,
                 model_name=self.config.qwen_realtime_model,
@@ -1194,6 +1202,8 @@ class AiCallOrchestrator:
             except Exception:
                 continue
             self.dispose_session(call_id)
+        if self._customer_speech_classifier is not None:
+            await self._customer_speech_classifier.aclose()
 
     def _schedule_browser_ready_watchdog(self, call_id: str) -> None:
         self._cancel_browser_ready_watchdog(call_id)

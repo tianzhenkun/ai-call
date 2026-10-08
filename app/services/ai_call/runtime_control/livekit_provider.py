@@ -536,6 +536,7 @@ class OwnerRuntimeAgentManager:
         )
         for call_id in call_ids:
             await self.fail_closed(call_id)
+        await self._orchestrator.shutdown()
 
     async def _stop_agent(self, call_id: str) -> None:
         try:

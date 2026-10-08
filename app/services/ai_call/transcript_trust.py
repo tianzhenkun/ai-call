@@ -71,36 +71,46 @@ confidence 是对以上分类结论的信心，不是客户声音概率；明确
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self._client: httpx.AsyncClient | None = None
 
     async def classify(
         self, *, transcript: str, business_prompt: str,
         recent_dialogue: list[dict[str, str]], audio_evidence: dict[str, Any],
     ) -> CustomerSpeechDecision:
-        async with httpx.AsyncClient(timeout=self.TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps({
-                            "business_context": business_prompt,
-                            "recent_dialogue": recent_dialogue,
-                            "transcript": transcript,
-                            "clauses": self.split_clauses(transcript),
-                            "audio_observations": audio_evidence,
-                        }, ensure_ascii=False)},
-                    ],
-                    "temperature": 0,
-                    **({"enable_thinking": False} if self.model.startswith("qwen") else {}),
-                    "max_tokens": 256,
-                    "response_format": {"type": "json_object"},
-                },
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=self.TIMEOUT_SECONDS,
+                limits=httpx.Limits(keepalive_expiry=60),
             )
-            response.raise_for_status()
+        response = await self._client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps({
+                        "business_context": business_prompt,
+                        "recent_dialogue": recent_dialogue,
+                        "transcript": transcript,
+                        "clauses": self.split_clauses(transcript),
+                        "audio_observations": audio_evidence,
+                    }, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                **({"enable_thinking": False} if self.model.startswith("qwen") else {}),
+                "max_tokens": 256,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         return self.parse_decision(json.loads(content), transcript=transcript)
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     @staticmethod
     def split_clauses(transcript: str) -> list[str]:

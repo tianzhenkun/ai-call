@@ -3273,6 +3273,11 @@ _default_semantic_analysis_worker: AiCallSemanticAnalysisWorker | None = None
 _default_quality_scoring_worker: AiCallQualityScoringWorker | None = None
 
 
+async def shutdown_default_ai_call_orchestrator() -> None:
+    if _default_orchestrator is not None:
+        await _default_orchestrator.shutdown()
+
+
 def configure_ai_call_event_persistence(
     worker: AiCallEventPersistenceWorker | None,
 ) -> None:
