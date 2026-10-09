@@ -1012,6 +1012,7 @@ class RealtimeCallAgentRunner:
     def runtime_diagnostics(self) -> dict[str, object]:
         return {
             **AGENT_RUNNER_RUNTIME_DIAGNOSTICS,
+            "customerSpeechReviewEnabled": self.customer_speech_classifier is not None,
             "customerSpeechReviewModel": getattr(self.customer_speech_classifier, "model", None),
             "customerSpeechReviewStabilityOverlap": self.customer_speech_classifier is not None,
         }
@@ -8487,6 +8488,15 @@ class RealtimeCallAgentRunner:
             self.registry.transition(call_id, CallSessionStatus.WAITING)
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         self._schedule_pending_call_end_nowait(call_id)
+        if (
+            self.customer_speech_classifier is None
+            and session.status == CallSessionStatus.CONNECTED
+            and not self._playback_guard(call_id).user_speech_active
+            and not self._has_active_model_response(call_id)
+            and call_id not in self._playout_tasks
+        ):
+            # 无审核路径的空转写也要恢复无人回应计时，不能一直等到通话时限。
+            self._arm_silence_watchdog(call_id)
 
     def _complete_acknowledged_call_end_turn(self, call_id: str) -> None:
         session = self.registry.get(call_id)

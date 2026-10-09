@@ -295,6 +295,8 @@ class Settings(BaseSettings):
     AI_CALL_QUALITY_SCORING_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_QUALITY_SCORING_QUEUE_MAX_SIZE: int = 1000
     AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS: float = 0.15
+    # 默认关闭逐轮文本模型审核；保留实现，按需显式启用。
+    AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED: bool = False
     # 独立选择客户发言审核模型，留空时沿用通用文本模型。
     AI_CALL_CUSTOMER_SPEECH_MODEL: str = ""
     AI_CALL_HANDOFF_WAITING_PROMPT_AUDIO_PATH: str | None = str(

@@ -139,6 +139,7 @@ class AiCallRuntimeConfig:
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = field(default="", repr=False)
     llm_model: str = "qwen-plus"
+    customer_speech_review_enabled: bool = False
     customer_speech_model: str = ""
 
     @classmethod
@@ -164,6 +165,7 @@ class AiCallRuntimeConfig:
             llm_base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
             llm_api_key=settings.EFFECTIVE_LLM_API_KEY,
             llm_model=settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus",
+            customer_speech_review_enabled=settings.AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED,
             customer_speech_model=(
                 settings.AI_CALL_CUSTOMER_SPEECH_MODEL
                 or settings.LLM_MODEL or settings.POST_ANALYSIS_MODEL or "qwen-plus"
@@ -386,7 +388,7 @@ class AiCallOrchestrator:
         from app.core.database import async_db_session
         from app.services.ai_call.knowledge import KnowledgeRealtimeSearchService
 
-        if self._customer_speech_classifier is None:
+        if self.config.customer_speech_review_enabled and self._customer_speech_classifier is None:
             self._customer_speech_classifier = CustomerSpeechClassifier(
                 base_url=self.config.llm_base_url,
                 api_key=self.config.llm_api_key or self.config.dashscope_api_key,

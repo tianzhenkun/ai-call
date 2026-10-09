@@ -93,6 +93,26 @@ async def _review_turn(runner, provider, text, item_id="latest"):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("entry_type,active_response", [("outbound", False), ("web", False), ("outbound", True)])
+async def test_no_review_empty_turn_restores_outbound_silence_policy(monkeypatch, entry_type, active_response):
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SILENCE_SECONDS", .01)
+    runner, provider, _ = _runner(entry_type=entry_type, participant_identity="caller-test")
+    now = datetime.now(timezone.utc)
+    try:
+        runner._arm_silence_watchdog("call-policy")
+        await runner._handle_user_speech_started("call-policy", provider, now)
+        assert "call-policy" not in runner._silence_watchdog_tasks
+        runner._response_lifecycle("call-policy").active = active_response
+        await runner._handle_user_speech_stopped("call-policy", provider, now)
+        await asyncio.sleep(.03)
+        expected = [agent_runner_module.CALL_POLICY_SILENCE_INPUTS[0]] if entry_type == "outbound" and not active_response else []
+        assert provider.created_responses == expected
+        assert runner._customer_turn_counts.get("call-policy", 0) == 0
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("speech,error", [("background", None), ("uncertain", None), ("uncertain", TimeoutError())])
 async def test_background_and_uncertain_turns_cannot_spend_budget_or_authorize_end(speech, error):
     runner, provider, scheduled = _runner(SpeechClassifier(speech=speech, error=error))

@@ -1912,10 +1912,69 @@ def test_customer_speech_model_is_independent_from_general_text_model() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("enabled", [None, False, True])
+async def test_customer_speech_review_switch_controls_requests_and_reply(monkeypatch, enabled) -> None:
+    monkeypatch.delenv("AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED", raising=False)
+    options = {} if enabled is None else {"AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED": enabled}
+    config = AiCallRuntimeConfig.from_settings(Settings(
+        _env_file=None, LLM_API_KEY="review-test" if enabled else "", DASHSCOPE_API_KEY="",
+        AI_CALL_CUSTOMER_SPEECH_MODEL="qwen-flash", AI_CALL_USER_TURN_STABILITY_DELAY_SECONDS=0,
+        **options,
+    ))
+    assert config.customer_speech_review_enabled is bool(enabled)
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "sources": ["customer"], "topic": "related", "confidence": .99,
+        })}}]})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_class(
+        **kwargs, transport=httpx.MockTransport(respond),
+    ))
+    orchestrator = AiCallOrchestrator(config=config, livekit_room_manager=FakeLiveKitRoomManager())
+    runner = orchestrator.agent_runner
+    assert (runner.customer_speech_classifier is not None) is bool(enabled)
+    assert runner.runtime_diagnostics()["customerSpeechReviewEnabled"] is bool(enabled)
+    provider = FakeRealtimeProvider([
+        ProviderEvent(type="model_session_started", payload={}),
+        ProviderEvent(type="user_speech_started", payload={"item_id": "speech-1"}),
+        ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="user_transcript_done", payload={"item_id": "speech-1", "transcript": "介绍一下产品。"}),
+    ])
+    # 只隔离供应商和媒体，配置装配、事件处理与回复调度使用正式代码。
+    runner.provider_factory = lambda _session: provider
+    runner.audio_transport = None
+    runner.audio_publisher = FakeAudioPublisher()
+    session = CallSession(
+        call_id="review-switch", room_name="review-switch", participant_identity="browser-review-switch",
+        status=CallSessionStatus.READY, effective_config={"prompt": "产品咨询", "barge_in_enabled": True},
+    )
+    orchestrator.registry.add(session)
+    try:
+        await runner.start(session)
+        await runner.wait(session.call_id)
+        assert provider.created_responses == [None]
+        assert len(requests) == int(bool(enabled))
+        assert not runner._pending_turn(session.call_id).transcript_review_pending
+        reviews = [e for e in orchestrator.event_store.list_all(session.call_id) if e.type == "customer_speech_classified"]
+        assert len(reviews) == int(bool(enabled))
+        if enabled:
+            assert requests[0]["model"] == "qwen-flash"
+    finally:
+        await runner.stop(session.call_id)
+        await orchestrator.shutdown()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("shutdown_path", ["direct", "api", "owner"])
 async def test_orchestrator_closes_shared_customer_review_client_on_shutdown(monkeypatch, shutdown_path) -> None:
     template, livekit, _ = build_orchestrator()
-    orchestrator = AiCallOrchestrator(config=template.config, livekit_room_manager=livekit)
+    orchestrator = AiCallOrchestrator(
+        config=replace(template.config, customer_speech_review_enabled=True), livekit_room_manager=livekit,
+    )
     classifier = orchestrator.agent_runner.customer_speech_classifier
     clients = []
     client_class = httpx.AsyncClient
