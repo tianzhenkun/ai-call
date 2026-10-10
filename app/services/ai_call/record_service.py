@@ -122,6 +122,8 @@ PERSISTED_EVENT_TYPES = frozenset({
     "model_error",
     "model_response_done",
     "model_response_started",
+    "model_response_trace",
+    "response_failure_prompt",
     "model_session_started",
     "model_session_updated",
     "no_barge_unstarted_response_deferred",

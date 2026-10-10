@@ -3803,9 +3803,11 @@ async def test_realtime_agent_runner_records_provider_events_and_updates_session
         "user_speech_started",
         "user_transcript_delta",
         "user_speech_stopped",
+        "model_response_trace",
         "call_policy_customer_turn",
         "model_audio_delta",
         "model_response_done",
+        "model_response_trace",
     ]
 
 
@@ -4217,10 +4219,13 @@ async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_pl
         "tool_call_done",
         "call_end_tool_requested",
         "model_response_done",
+        "model_response_trace",
+        "model_response_trace",
         "model_response_started",
         "model_audio_delta",
         "ai_audio_published",
         "model_response_done",
+        "model_response_trace",
         "call_end_scheduled",
     ]
 
@@ -4800,6 +4805,8 @@ async def test_realtime_agent_runner_queues_call_end_tool_response_until_active_
         "tool_call_done",
         "call_end_tool_requested",
         "model_response_done",
+        "model_response_trace",
+        "model_response_trace",
     ]
 
 
@@ -4893,6 +4900,7 @@ async def test_realtime_agent_runner_does_not_create_extra_call_end_response_aft
         "tool_call_done",
         "call_end_tool_requested",
         "model_response_done",
+        "model_response_trace",
         "call_end_scheduled",
     ]
 
@@ -6592,6 +6600,8 @@ async def test_realtime_agent_runner_asks_confirmation_after_business_handoff_to
         "tool_call_done",
         "handoff_tool_requested",
         "model_response_done",
+        "model_response_trace",
+        "model_response_trace",
     ]
 
 
@@ -6694,6 +6704,7 @@ async def test_realtime_agent_runner_clarifies_after_transcription_failure() -> 
         "user_transcript_done",
         "customer_speech_classified",
         "user_speech_stopped",
+        "model_response_trace",
     ]
 
 
@@ -6964,6 +6975,7 @@ async def test_realtime_agent_runner_tracks_opening_audio_metrics_and_state() ->
         "model_audio_delta",
         "ai_audio_published",
         "model_response_done",
+        "model_response_trace",
     ]
 
 
@@ -9950,6 +9962,7 @@ async def test_model_response_done_waits_for_application_playout_queue() -> None
         audio_publisher=publisher,
         ai_speaking_tail_grace_seconds=0,
     )
+    runner._providers[call_id] = provider
     runner._mark_response_started(call_id, {"response": {"id": "resp_wait"}})
     publish_task = asyncio.create_task(
         runner._publish_model_audio_delta(

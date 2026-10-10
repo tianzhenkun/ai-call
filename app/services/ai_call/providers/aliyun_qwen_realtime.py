@@ -5,6 +5,7 @@ import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
@@ -229,6 +230,7 @@ class AliyunQwenRealtimeProvider:
         self.websocket_factory = websocket_factory or _default_websocket_factory
         self._websocket: QwenWebSocketProtocol | None = None
         self._emitted_tool_call_ids: set[str] = set()
+        self.response_diagnostics: dict[str, Any] = {}
 
     async def connect(self) -> None:
         self._websocket = await self.websocket_factory(
@@ -281,6 +283,19 @@ class AliyunQwenRealtimeProvider:
                 payload = await websocket.receive_json()
             except StopAsyncIteration:
                 return
+            received_at = datetime.now(timezone.utc).isoformat()
+            raw_type = payload.get("type")
+            self.response_diagnostics.update({"lastRawType": raw_type, "lastRawReceivedAt": received_at})
+            if raw_type == "session.created":
+                self.response_diagnostics["sessionId"] = (payload.get("session") or {}).get("id")
+            if raw_type == "response.created":
+                self.response_diagnostics["responseId"] = (payload.get("response") or {}).get("id")
+                self.response_diagnostics["rawAudioDeltas"] = 0
+                self.response_diagnostics["rawTextDeltas"] = 0
+            if raw_type in {"response.audio.delta", "response.audio_transcript.delta", "response.text.delta"}:
+                key = "rawAudioDeltas" if raw_type == "response.audio.delta" else "rawTextDeltas"
+                self.response_diagnostics[key] = self.response_diagnostics.get(key, 0) + 1
+                self.response_diagnostics["lastRawOutputAt"] = received_at
             event_type = map_qwen_server_event(payload)
             tool_payload: dict[str, Any] | None = None
             if event_type == "tool_call_done":
@@ -309,7 +324,12 @@ class AliyunQwenRealtimeProvider:
         self._websocket = None
 
     async def _send(self, payload: dict[str, Any]) -> None:
+        kind = payload.get("type")
+        if kind in {"response.create", "response.cancel"}:
+            self.response_diagnostics[f"{kind}AttemptAt"] = datetime.now(timezone.utc).isoformat()
         await self._require_websocket().send_json(payload)
+        if kind in {"response.create", "response.cancel"}:
+            self.response_diagnostics[f"{kind}SentAt"] = datetime.now(timezone.utc).isoformat()
 
     def _require_websocket(self) -> QwenWebSocketProtocol:
         if self._websocket is None:
