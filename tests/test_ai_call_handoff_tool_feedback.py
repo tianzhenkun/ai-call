@@ -325,12 +325,17 @@ async def test_real_worker_failure_is_delivered_even_when_emitted_during_enqueue
 
 
 @pytest.mark.anyio
-async def test_valid_handoff_request_cancels_pending_policy_goodbye():
+@pytest.mark.parametrize("followup_spent", [False, True])
+async def test_valid_handoff_request_cancels_pending_policy_goodbye(followup_spent):
     runner, provider, _publisher, _store = make_runner()
     scheduled = []
     runner.call_end_scheduler = lambda call_id, reason: scheduled.append((call_id, reason))
     runner._prepare_policy_call_end("call-handoff-result", end_reason="policy_turn_limit")
     runner._pending_call_ends["call-handoff-result"].final_response_started = True
+    if followup_spent:
+        runner._turn_limit_followups["call-handoff-result"] = runner_module.PendingUserTurn(
+            response_requested=True,
+        )
     try:
         await request_handoff(runner, provider)
         await runner._apply_provider_event(

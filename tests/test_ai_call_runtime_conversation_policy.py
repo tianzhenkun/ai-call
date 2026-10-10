@@ -643,7 +643,7 @@ async def test_transcript_fragments_do_not_exhaust_customer_turn_budget() -> Non
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("duplicate_final_transcript", [False, True])
-async def test_fifteenth_committed_turn_answers_question_before_polite_end(
+async def test_fifteenth_committed_turn_starts_wrap_up_without_hanging_up(
     duplicate_final_transcript: bool,
 ) -> None:
     runner, provider, scheduled = _runner()
@@ -667,7 +667,7 @@ async def test_fifteenth_committed_turn_answers_question_before_polite_end(
     assert provider.created_responses[-1] != CALL_POLICY_FINAL_INPUT
     assert "当前问题" in provider.created_responses[-1]
     assert "收尾" in provider.created_responses[-1]
-    assert runner._pending_call_ends["call-policy"].end_reason == "policy_turn_limit"
+    assert "call-policy" not in runner._pending_call_ends
     assert scheduled == []
 
     runner._mark_response_started("call-policy", {"response_id": "knowledge-tool"})
@@ -687,7 +687,64 @@ async def test_fifteenth_committed_turn_answers_question_before_polite_end(
     await runner._apply_provider_event(
         "call-policy", provider, "model_response_done", datetime.now(timezone.utc), {}
     )
-    assert scheduled == [("call-policy", "policy_turn_limit")]
+    assert scheduled == []
+    await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("barge_in_enabled", [True, False])
+async def test_turn_limit_wait_does_not_spend_the_single_followup(barge_in_enabled) -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner.registry.get(call_id).effective_config["barge_in_enabled"] = barge_in_enabled
+    runner._customer_turn_counts[call_id] = 14
+    try:
+        for index, text in enumerate(("你们等会儿。", "请稍等一下。", "具体支持哪些平台？")):
+            turn = runner._pending_turn(call_id, reset_if_finished=True)
+            turn.transcript_parts = [text]
+            turn.stopped_at = datetime.now(timezone.utc)
+            await runner._request_response_from_turn(call_id, provider, turn)
+            assert call_id not in runner._pending_call_ends
+            runner._mark_response_started(call_id, {"response_id": f"answer-{index}"})
+            await runner._complete_response_and_flush_pending(call_id, provider)
+            assert scheduled == []
+            if index < 2:
+                assert CALL_POLICY_FINAL_INPUT not in provider.created_responses
+
+        assert provider.created_responses[-1] == CALL_POLICY_FINAL_INPUT
+        assert runner._pending_call_ends[call_id].end_reason == "policy_turn_limit"
+        assert not runner._pending_call_ends[call_id].final_response_started
+
+        # 继续问不会获得第二次业务补答，也不会直接跳过告别挂断。
+        await runner._complete_response_and_flush_pending(call_id, provider)
+        turn = runner._pending_turn(call_id, reset_if_finished=True)
+        turn.transcript_parts = ["还有，你们多少钱？"]
+        turn.stopped_at = datetime.now(timezone.utc)
+        await runner._request_response_from_turn(call_id, provider, turn)
+        assert provider.created_responses[-1] == CALL_POLICY_FINAL_INPUT
+        assert scheduled == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_turn_limit_exhaustion_still_allows_explicit_handoff_request() -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner._turn_limit_followups[call_id] = agent_runner_module.PendingUserTurn(
+        response_requested=True,
+    )
+    turn = runner._pending_turn(call_id)
+    turn.transcript_parts = ["请帮我转人工。"]
+    turn.stopped_at = datetime.now(timezone.utc)
+    try:
+        await runner._request_response_from_turn(call_id, provider, turn)
+        assert "request_handoff" in provider.created_responses[-1]
+        assert "请帮我转人工。" in provider.created_responses[-1]
+        assert call_id not in runner._pending_call_ends
+        assert scheduled == []
+    finally:
+        await runner.stop(call_id)
 
 
 @pytest.mark.anyio
@@ -757,8 +814,13 @@ async def test_opening_and_system_prompts_do_not_count_as_customer_turns() -> No
 
 
 @pytest.mark.anyio
-async def test_duration_safety_limit_survives_interrupted_polite_closing(monkeypatch) -> None:
+@pytest.mark.parametrize("wrap_up_started", [False, True])
+async def test_duration_safety_limit_survives_interrupted_polite_closing(
+    monkeypatch, wrap_up_started,
+) -> None:
     runner, provider, scheduled = _runner()
+    if wrap_up_started:
+        runner._turn_limit_followups["call-policy"] = None
     sleep_count = 0
 
     async def advance_clock(_seconds: float) -> None:
@@ -771,6 +833,7 @@ async def test_duration_safety_limit_survives_interrupted_polite_closing(monkeyp
     await runner._run_call_policy("call-policy")
 
     assert scheduled == [("call-policy", "policy_duration_limit")]
+    await runner.stop("call-policy")
 
 
 class GatedPlayoutPublisher:
@@ -781,6 +844,102 @@ class GatedPlayoutPublisher:
     async def wait_for_playout(self, _call_id: str) -> None:
         self.started.set()
         await self.release.wait()
+
+
+@pytest.mark.anyio
+async def test_turn_limit_followup_tool_and_playout_finish_before_separate_goodbye() -> None:
+    runner, provider, scheduled = _runner()
+    publisher = GatedPlayoutPublisher()
+    runner.audio_publisher = publisher
+    runner.ai_speaking_tail_grace_seconds = 0
+    call_id = "call-policy"
+    runner._customer_turn_counts[call_id] = 14
+
+    async def emit(event_type, response_id):
+        await runner._apply_provider_event(
+            call_id, provider, event_type, datetime.now(timezone.utc),
+            {"response_id": response_id},
+        )
+
+    try:
+        for text in ("你们等会儿。", "你们有哪些渠道？"):
+            turn = runner._pending_turn(call_id, reset_if_finished=True)
+            turn.transcript_parts = [text]
+            turn.stopped_at = datetime.now(timezone.utc)
+            await runner._request_response_from_turn(call_id, provider, turn)
+            if text == "你们等会儿。":
+                await runner._complete_response_and_flush_pending(call_id, provider)
+
+        await emit("model_response_started", "knowledge-tool")
+        runner._queue_response_create(call_id)
+        await emit("model_response_done", "knowledge-tool")
+        assert "当前问题" in provider.created_responses[-1]
+        assert CALL_POLICY_FINAL_INPUT not in provider.created_responses
+        assert runner._customer_turn_counts[call_id] == 16
+
+        for response_id in ("followup-answer", "final-goodbye"):
+            publisher.started.clear()
+            publisher.release.clear()
+            for event in ("model_response_started", "model_audio_delta", "model_response_done"):
+                await emit(event, response_id)
+            waiter = runner._playout_tasks[call_id]
+            await asyncio.wait_for(publisher.started.wait(), 1)
+            assert scheduled == []
+            if response_id == "followup-answer":
+                assert CALL_POLICY_FINAL_INPUT not in provider.created_responses
+            publisher.release.set()
+            await asyncio.wait_for(waiter, 1)
+            assert provider.created_responses[-1] == CALL_POLICY_FINAL_INPUT
+            if response_id == "followup-answer":
+                assert scheduled == []
+        assert scheduled == [(call_id, "policy_turn_limit")]
+        assert provider.created_responses.count(CALL_POLICY_FINAL_INPUT) == 1
+    finally:
+        await runner.stop(call_id)
+    assert not runner._turn_limit_followups
+
+
+@pytest.mark.anyio
+async def test_turn_limit_silence_starts_goodbye_without_inviting_more_questions(monkeypatch) -> None:
+    runner, provider, scheduled = _runner()
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SILENCE_SECONDS", 0)
+    call_id = "call-policy"
+    runner._customer_turn_counts[call_id] = 14
+    turn = runner._pending_turn(call_id)
+    turn.transcript_parts = ["你们等会儿。"]
+    turn.stopped_at = datetime.now(timezone.utc)
+    try:
+        await runner._request_response_from_turn(call_id, provider, turn)
+        await runner._complete_response_and_flush_pending(call_id, provider)
+        await runner._handle_silence_timeout(call_id)
+        assert provider.created_responses[-1] == CALL_POLICY_FINAL_INPUT
+        assert runner._pending_call_ends[call_id].end_reason == "policy_turn_limit"
+        assert scheduled == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("barge_in_enabled", [True, False])
+async def test_goodbye_cannot_hang_up_while_a_customer_question_is_pending(barge_in_enabled) -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner.registry.get(call_id).effective_config["barge_in_enabled"] = barge_in_enabled
+    try:
+        await runner._begin_policy_call_end(call_id, provider, end_reason="policy_turn_limit")
+        runner._mark_response_started(call_id, {"response_id": "goodbye"})
+        turn = runner._pending_turn(call_id)
+        turn.transcript_parts = ["你们等会儿，我还有个问题。"]
+        turn.stopped_at = datetime.now(timezone.utc)
+        await runner._complete_response_and_flush_pending(call_id, provider)
+        assert scheduled == []
+        assert runner._pending_call_ends[call_id].deferred_for_user_turn
+        await runner._handle_user_transcript(call_id, provider, ProviderEvent(
+            type="user_transcript_done", payload={"transcript": turn.transcript},
+        ), datetime.now(timezone.utc))
+        assert call_id not in runner._pending_call_ends
+    finally:
+        await runner.stop(call_id)
 
 
 @pytest.mark.anyio

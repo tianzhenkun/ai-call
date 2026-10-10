@@ -69,6 +69,7 @@ PERSISTED_EVENT_TYPES = frozenset({
     "call_end_tool_requested",
     "call_policy_customer_turn",
     "call_policy_end_requested",
+    "call_policy_wrap_up_requested",
     "customer_speech_classified",
     "speech_output_configured",
     "speech_draft",

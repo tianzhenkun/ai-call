@@ -6647,7 +6647,7 @@ async def test_realtime_agent_runner_uses_qwen_text_stash_transcript_preview() -
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_records_transcription_failure_without_reply() -> None:
+async def test_realtime_agent_runner_clarifies_after_transcription_failure() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = FakeRealtimeProvider([
@@ -6683,12 +6683,16 @@ async def test_realtime_agent_runner_records_transcription_failure_without_reply
     await runner.start(session)
     await runner.wait("call_transcript_failed")
 
-    assert provider.created_responses == []
+    assert len(provider.created_responses) == 1
+    assert "再说一遍" in provider.created_responses[0]
+    assert not runner._customer_turn_counts
     assert registry.get("call_transcript_failed").status == CallSessionStatus.CONNECTED
     assert [event.type for event in store.list("call_transcript_failed")] == [
         "model_session_started",
         "user_speech_started",
         "user_transcript_failed",
+        "user_transcript_done",
+        "customer_speech_classified",
         "user_speech_stopped",
     ]
 
