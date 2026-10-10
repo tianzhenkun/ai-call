@@ -10072,10 +10072,13 @@ class RealtimeCallAgentRunner:
                 provider = self._providers[call_id]
                 self._trace_response(call_id, "cancel_timeout" if state.cancel_pending else "output_stalled")
                 if not state.recovering:
-                    if state.recovery_count or state.processing_tool:
+                    if state.processing_tool or (state.recovery_count and not state.cancel_pending):
                         await self._fail_response_recovery(call_id, "回复连续恢复失败或工具未结束")
                         return
-                    state.recovery_count += 1
+                    # 客户打断是在停止旧回复，不代表新回复生成失败；取消无确认仍换连接隔离。
+                    # 只有无进展的回复消耗重试次数，避免连续补话直接耗尽恢复机会。
+                    if not state.cancel_pending:
+                        state.recovery_count += 1
                     state.recovering = True
                 if state.cancel_pending:
                     await self._reconnect_stalled_response(call_id, provider)

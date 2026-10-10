@@ -36,6 +36,52 @@ async def _setup(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_consecutive_customer_interruptions_can_recover_without_a_completed_reply(monkeypatch):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    monkeypatch.setattr(module, "RESPONSE_STALL_SECONDS", .5)
+    runner.user_turn_stability_delay_seconds = 0
+    third = QueueRealtimeProvider()
+    providers = iter([new, third])
+    runner.provider_factory = lambda _: next(providers)
+    try:
+        await runner._request_response("call-policy", old, input_text="方便。")
+        await old.emit(_response("model_response_started"))
+        await _until(lambda: runner._playback_guard("call-policy").current_response_id == "old")
+        await old.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "first"}))
+        await old.emit(ProviderEvent(type="user_transcript_done", payload={
+            "item_id": "first", "transcript": "方便，我还想问一下。",
+        }))
+        await _until(lambda: new.connected)
+        await new.emit(ProviderEvent(type="user_speech_stopped"))
+        await _until(lambda: bool(new.created_responses))
+        # 真实通话的新回复尚未开始播音，客户补话先于创建确认到达。
+        # 本地 SIP 候选先建立新发言，随后供应商确认起说。
+        runner._pending_turn("call-policy", reset_if_finished=True)
+        await new.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "second"}))
+        await _until(lambda: new.cancelled_response_count == 1)
+        await new.emit(_response("model_response_started", "recovered"))
+        await _until(lambda: new.cancelled_response_count == 2)
+        await new.emit(ProviderEvent(type="user_transcript_done", payload={
+            "item_id": "second", "transcript": "我想了解价格。",
+        }))
+        await new.emit(ProviderEvent(type="user_speech_stopped"))
+        await _until(lambda: bool(third.created_responses) or bool(scheduled))
+        assert not scheduled, "客户连续补话后的取消超时不应直接播故障并结束"
+        assert new.closed and len(third.created_responses) == 1
+        assert "我想了解价格" in third.created_responses[0]
+        assert not runner.audio_publisher.published
+        await third.emit(_response("model_response_started", "latest"))
+        await third.emit(ProviderEvent(type="model_audio_delta", payload={
+            "response_id": "latest", "delta": base64.b64encode(b"\x01\x02" * 480).decode(),
+        }))
+        await third.emit(_response("model_response_done", "latest", status="completed"))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+        assert runner.audio_publisher.published
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("late_no_active_error", [False, True])
 async def test_cancel_before_created_is_retried_once_without_reconnecting(monkeypatch, late_no_active_error):
     runner, old, new, scheduled = await _setup(monkeypatch)
@@ -84,7 +130,7 @@ async def test_cancel_before_created_is_retried_once_without_reconnecting(monkey
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("completion", ["played", "cancelled", "no_audio", "interrupted_playout"])
-async def test_separate_cancel_timeouts_recover_after_a_successful_reply(monkeypatch, completion):
+async def test_only_completed_playout_resets_stall_recovery_budget(monkeypatch, completion):
     runner, old, new, scheduled = await _setup(monkeypatch)
     third = QueueRealtimeProvider()
     providers = iter([new, third])
@@ -124,10 +170,7 @@ async def test_separate_cancel_timeouts_recover_after_a_successful_reply(monkeyp
         await runner._request_response("call-policy", new, input_text="内容创作方面")
         await new.emit(_response("model_response_started", "second"))
         await _until(lambda: runner._playback_guard("call-policy").current_response_id == "second")
-        await runner._invalidate_audio_for_interrupt_candidate(
-            call_id="call-policy", provider=new, trigger_timestamp=datetime.now(timezone.utc),
-            source="provider", reason="user_speech_started_during_ai_audio",
-        )
+        # 没有新插话，第二条回复再次无输出；这才属于连续生成失败。
         await _until(lambda: bool(third.created_responses) or bool(scheduled))
         if completion == "played":
             assert not scheduled and new.closed
