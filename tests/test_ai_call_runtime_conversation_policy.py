@@ -506,6 +506,39 @@ async def test_three_business_turns_do_not_authorize_off_topic_hangup() -> None:
 
 
 @pytest.mark.anyio
+async def test_duration_wrap_up_keeps_talking_and_final_uses_reconnected_provider(monkeypatch):
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_WRAP_UP_SECONDS", 0)
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_FINAL_RESPONSE_SECONDS", .1)
+    monkeypatch.setattr(agent_runner_module, "CALL_POLICY_SAFETY_END_SECONDS", 1)
+    runner, provider, scheduled = _runner()
+    replacement = FakeProvider()
+    runner._start_call_policy_task("call-policy")
+    try:
+        async with asyncio.timeout(1):
+            while not provider.created_responses:
+                await asyncio.sleep(.001)
+        assert "call-policy" not in runner._pending_call_ends
+        await runner._handle_tool_call_done("call-policy", provider, ProviderEvent(
+            type="tool_call_done", payload={
+                "name": "schedule_call_end", "call_id": "duration-as-off-topic",
+                "arguments": {"reason": "policy_limit"},
+            },
+        ))
+        assert "call-policy" not in runner._pending_call_ends and not scheduled
+        await runner._complete_response_and_flush_pending("call-policy", provider)
+        await runner._complete_response_and_flush_pending("call-policy", provider)
+        runner._providers["call-policy"] = replacement
+        async with asyncio.timeout(1):
+            while "call-policy" not in runner._pending_call_ends:
+                await asyncio.sleep(.001)
+        assert replacement.created_responses == [CALL_POLICY_FINAL_INPUT]
+        assert runner._pending_call_ends["call-policy"].end_reason == "policy_duration_limit"
+        assert not scheduled
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
 async def test_policy_end_speaks_before_scheduling_hangup() -> None:
     runner, provider, scheduled = _runner()
 

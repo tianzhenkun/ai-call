@@ -36,6 +36,116 @@ async def _setup(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("late_no_active_error", [False, True])
+async def test_cancel_before_created_is_retried_once_without_reconnecting(monkeypatch, late_no_active_error):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+
+    async def cancel():
+        old.cancelled_response_count += 1
+        if old.cancelled_response_count == 2:
+            if late_no_active_error:
+                await old.emit(ProviderEvent(type="model_error", payload={
+                    "message": "Conversation has none active response",
+                }))
+            else:
+                await old.emit(_response("model_response_done", status="cancelled"))
+
+    old.cancel_response = cancel
+    try:
+        await runner._request_response("call-policy", old, input_text="那哪些大模型？")
+        await runner._invalidate_audio_for_interrupt_candidate(
+            call_id="call-policy", provider=old, trigger_timestamp=datetime.now(timezone.utc),
+            source="provider", reason="user_speech_started_during_ai_audio",
+        )
+        await runner._request_response("call-policy", old, input_text="我提供账号吗？")
+        # 真实通话中 created 比 cancel 晚 55 ms；重复事件不能触发重复取消。
+        await old.emit(_response("model_response_started"))
+        await old.emit(_response("model_response_started"))
+        await old.emit(ProviderEvent(type="model_audio_delta", payload={
+            "response_id": "old", "delta": base64.b64encode(b"\x01\x02" * 480).decode(),
+        }))
+        if late_no_active_error:
+            await _until(lambda: any(e.type == "model_error" for e in runner.event_store.list_all("call-policy")))
+            # 第一条取消的错误可能迟到，不能将它当成补发取消的结束确认。
+            assert runner._response_lifecycle("call-policy").cancel_pending
+            assert len(old.created_responses) == 1
+            await old.emit(_response("model_response_done", status="cancelled"))
+        await _until(lambda: len(old.created_responses) == 2 or new.connected)
+        assert not new.connected and not scheduled
+        assert old.cancelled_response_count == 2
+        assert old.created_responses[-1] == "我提供账号吗？"
+        assert not runner.audio_publisher.published
+        await old.emit(_response("model_response_started", "latest"))
+        await old.emit(_response("model_response_done", "latest", status="completed"))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("completion", ["played", "cancelled", "no_audio", "interrupted_playout"])
+async def test_separate_cancel_timeouts_recover_after_a_successful_reply(monkeypatch, completion):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    third = QueueRealtimeProvider()
+    providers = iter([new, third])
+    runner.provider_factory = lambda _: next(providers)
+    playout_started, release_playout = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_playout(_):
+        playout_started.set()
+        await release_playout.wait()
+
+    runner.audio_publisher.wait_for_playout = wait_for_playout
+    runner.ai_speaking_tail_grace_seconds = 0
+    try:
+        await runner._request_response("call-policy", old, input_text="那哪些大模型？")
+        await old.emit(_response("model_response_started"))
+        await _until(lambda: bool(new.created_responses))
+        await new.emit(_response("model_response_started", "recovered"))
+        if completion != "no_audio":
+            await new.emit(ProviderEvent(type="model_audio_delta", payload={
+                "response_id": "recovered", "delta": base64.b64encode(b"\x01\x02" * 480).decode(),
+            }))
+            await _until(lambda: bool(runner.audio_publisher.published))
+        await new.emit(_response("model_response_done", "recovered", status=(
+            "cancelled" if completion == "cancelled" else "completed"
+        )))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+        if completion != "no_audio":
+            await asyncio.wait_for(playout_started.wait(), 1)
+            assert runner._response_lifecycle("call-policy").recovery_count == 1
+        if completion == "interrupted_playout":
+            await runner._invalidate_audio_for_interrupt_candidate(
+                call_id="call-policy", provider=new, trigger_timestamp=datetime.now(timezone.utc),
+                source="provider", reason="user_speech_started_during_ai_audio",
+            )
+        release_playout.set()
+        await _until(lambda: "call-policy" not in runner._playout_tasks)
+        await runner._request_response("call-policy", new, input_text="内容创作方面")
+        await new.emit(_response("model_response_started", "second"))
+        await _until(lambda: runner._playback_guard("call-policy").current_response_id == "second")
+        await runner._invalidate_audio_for_interrupt_candidate(
+            call_id="call-policy", provider=new, trigger_timestamp=datetime.now(timezone.utc),
+            source="provider", reason="user_speech_started_during_ai_audio",
+        )
+        await _until(lambda: bool(third.created_responses) or bool(scheduled))
+        if completion == "played":
+            assert not scheduled and new.closed
+            assert len(third.created_responses) == 1
+            assert "内容创作方面" in third.created_responses[0]
+            assert not any(e.type == "response_failure_prompt" for e in runner.event_store.list_all("call-policy"))
+            await third.emit(_response("model_response_started", "latest"))
+            await third.emit(_response("model_response_done", "latest", status="completed"))
+            await _until(lambda: not runner._response_lifecycle("call-policy").active)
+        else:
+            assert not third.connected
+            assert scheduled == [("call-policy", "model_error")]
+    finally:
+        release_playout.set()
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("cancel_before_started", [False, True], ids=[
     "call_367171092849741824_partial_then_cancel", "call_367191336657997824_cancel_before_created",
 ])

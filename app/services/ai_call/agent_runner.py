@@ -110,7 +110,11 @@ CALL_POLICY_MAX_SILENCE_PROMPTS = 3
 RESPONSE_STALL_SECONDS = 8.0
 RESPONSE_CANCEL_SECONDS = 2.0
 RESPONSE_RECONNECT_SECONDS = 5.0
-CALL_POLICY_WRAP_UP_INPUT = "通话即将达到时长上限，请从当前话题自然收尾，不要开启新问题。"
+CALL_POLICY_WRAP_UP_INPUT = (
+    "请简短总结当前话题，开始自然收尾，不要扩展话题或提出新问题；客户继续提问时仍简短回应。"
+    "时长控制和最终告别由系统单独通知，此次提示不是结束通话指令，"
+    "不要据此调用 schedule_call_end，policy_limit 仅适用于连续三轮有效客户发言离题。"
+)
 CALL_POLICY_FINAL_INPUT = (
     "请只说：感谢您的时间，今天先沟通到这里，祝您生活愉快，再见。"
     "不要添加其他内容，不要再提出问题。"
@@ -841,6 +845,7 @@ class SipPreStopAuthorityDecision:
 @dataclass(slots=True)
 class ResponseLifecycle:
     active: bool = False
+    completed_successfully: bool = False
     active_started_at: datetime | None = None
     cancel_pending: bool = False
     cancel_race_ignore_until: datetime | None = None
@@ -1358,6 +1363,10 @@ class RealtimeCallAgentRunner:
                 CALL_POLICY_FINAL_RESPONSE_SECONDS - CALL_POLICY_WRAP_UP_SECONDS
             )
             if not self._call_policy_is_running(call_id):
+                return
+            # 收尾等待期间可能已更换模型连接，最终告别必须发到当前连接。
+            provider = self._providers.get(call_id)
+            if provider is None:
                 return
             await self._begin_policy_call_end(
                 call_id,
@@ -6185,13 +6194,37 @@ class RealtimeCallAgentRunner:
                     return
                 completed.add(response_id)
             self._trace_response(call_id, "response_done")
+            lifecycle = self._response_lifecycle(call_id)
+            lifecycle.completed_successfully = (
+                isinstance(payload.get("response"), dict)
+                and payload["response"].get("status") == "completed"
+                and not lifecycle.cancel_pending
+                and not self._playback_guard(call_id).cancel_requested
+            )
 
         if event_type == "model_session_started" and session.status == CallSessionStatus.READY:
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         elif event_type == "model_response_started":
             if session.status == CallSessionStatus.READY:
                 session = self.registry.transition(call_id, CallSessionStatus.CONNECTED)
+            guard = self._playback_guard(call_id)
+            retry_cancel = (
+                self._response_lifecycle(call_id).cancel_pending
+                and guard.current_response_id is None
+            )
             self._mark_response_started(call_id, payload, timestamp)
+            if retry_cancel and guard.current_response_id:
+                # 创建确认迟到时，之前的取消可能没有目标；仅补发一次，沿用原超时期限。
+                guard.cancelled_response_ids.add(guard.current_response_id)
+                self._trace_response(call_id, "cancel_retried_after_created")
+                try:
+                    async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
+                        await provider.cancel_response()
+                except Exception as exc:
+                    self._append_event(call_id, "interrupt_cleanup_failed", "agent", {
+                        "step": "cancel_response_after_created",
+                        "errorType": type(exc).__name__, "message": str(exc),
+                    })
         elif event_type == "user_speech_started" and session.status == CallSessionStatus.CONNECTED:
             self.registry.transition(call_id, CallSessionStatus.USER_SPEAKING)
         elif (
@@ -7131,7 +7164,11 @@ class RealtimeCallAgentRunner:
         if tool_reason == "task_completed":
             return TASK_COMPLETED_REJECTED_TOOL_RESULT
         if tool_reason == "policy_limit":
-            return "没有连续三轮有效客户发言离题的证据。背景声、未确认发言和累计轮数不能作为挂断依据，请继续当前沟通。"
+            return (
+                "没有连续三轮有效客户发言离题的证据。背景声、未确认发言、累计轮数和通话时长不能作为此工具的挂断依据。"
+                "如果已收到系统收尾提示，请继续简短收尾，不要开启新问题；最终告别由系统单独通知。"
+                "否则继续当前沟通。"
+            )
         if rejection_reason == "customer_end_without_terminal_user_signal":
             return CALL_END_NO_TERMINAL_SIGNAL_REJECTED_TOOL_RESULT
         return CALL_END_REJECTED_TOOL_RESULT
@@ -9930,6 +9967,7 @@ class RealtimeCallAgentRunner:
             lifecycle.recovery_context = None
         # 发送期间也可能收到 created/done，不能在 await 返回后覆盖已经到达的状态。
         lifecycle.active = True
+        lifecycle.completed_successfully = False
         lifecycle.active_started_at = datetime.now(timezone.utc)
         lifecycle.last_progress_at = asyncio.get_running_loop().time()
         lifecycle.active_input_text = input_text
@@ -10035,7 +10073,7 @@ class RealtimeCallAgentRunner:
                 self._trace_response(call_id, "cancel_timeout" if state.cancel_pending else "output_stalled")
                 if not state.recovering:
                     if state.recovery_count or state.processing_tool:
-                        await self._fail_response_recovery(call_id, "回复恢复次数已耗尽或工具未结束")
+                        await self._fail_response_recovery(call_id, "回复连续恢复失败或工具未结束")
                         return
                     state.recovery_count += 1
                     state.recovering = True
@@ -10277,6 +10315,7 @@ class RealtimeCallAgentRunner:
         timestamp = timestamp or datetime.now(timezone.utc)
         lifecycle = self._response_lifecycle(call_id)
         lifecycle.active = True
+        lifecycle.completed_successfully = False
         lifecycle.active_started_at = timestamp
         lifecycle.last_progress_at = asyncio.get_running_loop().time()
         self._ensure_response_watchdog(call_id)
@@ -10378,6 +10417,16 @@ class RealtimeCallAgentRunner:
         # 模型生成结束不等于客户已听完；下一回复会替换 response_id 并丢弃旧缓冲。
         if lifecycle.opening_playout_pending or call_id in self._playout_tasks:
             return
+        if (
+            lifecycle.recovery_count and lifecycle.completed_successfully
+            and guard.current_response_id
+            and guard.current_response_audio_published
+            and guard.current_response_generation == guard.generation
+            and guard.current_response_id not in guard.cancelled_response_ids
+        ):
+            # 完整回复且播放完成，才结束这次故障；取消、工具空回复不补充恢复额度。
+            lifecycle.recovery_count = 0
+            self._trace_response(call_id, "recovery_completed")
         if not lifecycle.pending_create:
             if await self._maybe_recover_sip_confirmed_without_transcript(call_id, provider):
                 return
@@ -10761,9 +10810,9 @@ class RealtimeCallAgentRunner:
         if not (lifecycle.cancel_pending or guard.cancel_requested or race_window_active):
             return False
 
-        if lifecycle.active and lifecycle.cancel_pending and guard.current_response_id is None:
-            # 取消先于 created 时，无活动回复的错误不证明已提交的创建请求不会迟到。
-            self._trace_response(call_id, "cancel_no_active_before_created")
+        if lifecycle.active and lifecycle.cancel_pending:
+            # 无活动回复的错误可能来自较早的取消，不能替代当前回复的结束确认。
+            self._trace_response(call_id, "cancel_no_active_awaiting_done")
             return True
 
         lifecycle.active = False
