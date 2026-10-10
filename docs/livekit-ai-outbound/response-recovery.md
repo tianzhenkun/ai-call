@@ -76,4 +76,4 @@ python -m pytest tests/test_ai_call_phase_a_core.py tests/test_ai_call_runtime_c
 
 真实 Runner 验证只在独立进程替换模块，使用正式 2 秒取消、5 秒重连时限；仅替换测试提示词以生成较长回复并移除工具，确保打断时回复尚未自然结束。未丢弃或伪造供应商事件，没有接入 SIP 或拨打电话。基线样本仅触发一次取消超时，不能声称已完成相同故障条件下的真实接口 A/B；确定性旧代码失败来自事件回归和原始通话。
 
-证据保存于主工作区 `build/call-analysis-20261010/call-367257620696510464-probe-evidence/`。测试模块 SHA-256：`32a8d6107538d3c7c57db99e7da393c3e2bad3cbdf7481a5982bafa9e9af8eed`。本次修复尚未发布；线上源码指纹、启动时间和重启次数保持不变，真实电话效果尚未验收。
+修复阶段证据保存于主工作区 `build/call-analysis-20261010/call-367257620696510464-probe-evidence/`。测试模块 SHA-256：`32a8d6107538d3c7c57db99e7da393c3e2bad3cbdf7481a5982bafa9e9af8eed`。本次修复已于 19:27 发布，运行容器源码指纹与上述模块一致；上线后的真实模型测试再次完成两次取消超时、两次连接替换及正常回答。部署与验证结果见[发布记录](production-deployed-20261010-cancel-recovery.md)，真实电话效果尚未验收。
