@@ -302,7 +302,19 @@ async def test_rule_based_handoff_classifier_matches_customer_manager_request() 
 
 
 @pytest.mark.anyio
-async def test_rule_based_handoff_classifier_matches_product_follow_up_intent() -> None:
+@pytest.mark.parametrize("transcript", ["怎么联系？", "怎么联系这些海外客户？", "你们怎么联系我？"])
+async def test_contact_questions_do_not_authorize_handoff(transcript) -> None:
+    primary = SlowHandoffIntentClassifier()
+    classifier = CompositeHandoffIntentClassifier(
+        primary=primary, fallback=RuleBasedHandoffIntentClassifier(),
+    )
+    result = await asyncio.wait_for(classifier.classify(transcript=transcript), .2)
+    assert not result.matched
+    assert primary.transcripts == []
+
+
+@pytest.mark.anyio
+async def test_rule_based_handoff_classifier_separates_contact_questions_and_human_requests() -> None:
     classifier = RuleBasedHandoffIntentClassifier()
 
     contact = await classifier.classify(transcript="可以，你们怎么联系我呢？你们有 demo 吗？")
@@ -315,15 +327,15 @@ async def test_rule_based_handoff_classifier_matches_product_follow_up_intent() 
     trial_question = await classifier.classify(transcript="可以试用吗？")
     off_topic = await classifier.classify(transcript="明天几号？")
 
-    assert contact.matched is True
-    assert contact.reason == "business_escalation"
+    assert contact.matched is False
+    assert contact.reason == "not_handoff"
     assert contact.source == "rule_fallback"
-    assert generic_contact.matched is True
-    assert generic_contact.reason == "business_escalation"
-    assert contact_method.matched is True
-    assert contact_method.reason == "business_escalation"
+    assert generic_contact.matched is False
+    assert generic_contact.reason == "not_handoff"
+    assert contact_method.matched is False
+    assert contact_method.reason == "not_handoff"
     assert advisor_contact.matched is True
-    assert schedule.matched is True
+    assert schedule.matched is False
     assert demo_question.matched is False
     assert demo_question.reason == "not_handoff"
     assert demo_question.confidence >= 0.9
@@ -362,7 +374,7 @@ async def test_composite_handoff_classifier_uses_strong_rule_before_primary(tran
 
 
 @pytest.mark.anyio
-async def test_composite_handoff_classifier_uses_product_follow_up_rule_before_slow_primary() -> None:
+async def test_composite_handoff_classifier_keeps_contact_consultation_without_primary_wait() -> None:
     primary = SlowHandoffIntentClassifier()
     classifier = CompositeHandoffIntentClassifier(
         primary=primary,
@@ -374,8 +386,8 @@ async def test_composite_handoff_classifier_uses_product_follow_up_rule_before_s
         timeout=0.2,
     )
 
-    assert result.matched is True
-    assert result.reason == "business_escalation"
+    assert result.matched is False
+    assert result.reason == "not_handoff"
     assert result.source == "rule_fallback"
     assert primary.transcripts == []
 
@@ -3264,8 +3276,9 @@ async def test_handoff_trigger_worker_treats_transfer_urge_as_confirmation(
 
 
 @pytest.mark.anyio
-async def test_handoff_trigger_worker_uses_recent_affirmation_for_late_business_escalation_tool(
-    b1_service,
+@pytest.mark.parametrize("transcript,expected", [("好的。", 0), ("转吧。", 1)])
+async def test_late_business_escalation_requires_explicit_transfer_acceptance(
+    b1_service, transcript, expected,
 ) -> None:
     service, record_service = b1_service
     classifier = FakeHandoffIntentClassifier(
@@ -3306,7 +3319,7 @@ async def test_handoff_trigger_worker_uses_recent_affirmation_for_late_business_
             call_id=result.call_id,
             type="user_transcript_done",
             source="provider",
-            payload={"item_id": "item_recent_handoff_yes", "transcript": "好的。"},
+            payload={"item_id": "item_recent_handoff_yes", "transcript": transcript},
         )
         await worker.flush_pending()
 
@@ -3322,19 +3335,18 @@ async def test_handoff_trigger_worker_uses_recent_affirmation_for_late_business_
         await worker.flush_pending()
 
         handoffs = await service.list_handoffs(result.call_id)
-        assert handoffs["total"] == 1
-        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
-        assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
-        assert classifier.transcripts == ["好的。"]
+        assert handoffs["total"] == expected
+        assert b1_service.agent_runner.suspended_call_ids == ([result.call_id] if expected else [])
+        assert classifier.transcripts == [transcript]
 
         await b1_service.flush_events()
         event_types = [
             event.event_type for event in await record_service.list_events(result.call_id)
         ]
         assert "handoff_confirmation_requested" in event_types
-        assert "handoff_confirmation_confirmed" in event_types
-        assert "handoff_auto_triggered" in event_types
-        assert "handoff_requested" in event_types
+        assert ("handoff_confirmation_confirmed" in event_types) is bool(expected)
+        assert ("handoff_auto_triggered" in event_types) is bool(expected)
+        assert ("handoff_requested" in event_types) is bool(expected)
     finally:
         worker.detach_all()
         await worker.stop()
@@ -3669,8 +3681,9 @@ async def test_handoff_trigger_worker_ignores_product_consultation_without_class
 
 
 @pytest.mark.anyio
-async def test_handoff_trigger_worker_creates_handoff_for_product_contact_question(
-    b1_service,
+@pytest.mark.parametrize("classifier_business_escalation", [False, True])
+async def test_handoff_trigger_worker_keeps_ai_for_product_contact_question(
+    b1_service, classifier_business_escalation,
 ) -> None:
     service, record_service = b1_service
     primary = SlowHandoffIntentClassifier()
@@ -3678,6 +3691,11 @@ async def test_handoff_trigger_worker_creates_handoff_for_product_contact_questi
         primary=primary,
         fallback=RuleBasedHandoffIntentClassifier(),
     )
+    if classifier_business_escalation:
+        classifier = FakeHandoffIntentClassifier(HandoffIntentResult(
+            matched=True, confidence=.95, reason="business_escalation",
+            summary="需要业务升级", source="test_primary",
+        ))
 
     def service_factory(db):
         repository = AiCallRecordRepository(db)
@@ -3712,19 +3730,18 @@ async def test_handoff_trigger_worker_creates_handoff_for_product_contact_questi
 
         await worker.flush_pending()
         handoffs = await service.list_handoffs(result.call_id)
-        assert handoffs["total"] == 1
-        assert handoffs["rows"][0]["requestReason"] == "business_escalation"
-        assert b1_service.agent_runner.suspended_call_ids == [result.call_id]
+        assert handoffs["total"] == 0
+        assert b1_service.agent_runner.suspended_call_ids == []
         assert primary.transcripts == []
 
         await b1_service.flush_events()
         events = await record_service.list_events(result.call_id)
         event_types = [event.event_type for event in events]
-        assert "handoff_intent_detected" in event_types
-        assert "handoff_requested" in event_types
-        detected = next(event for event in events if event.event_type == "handoff_intent_detected")
-        assert detected.payload["classifierSource"] == "rule_fallback"
-        assert detected.payload["reason"] == "business_escalation"
+        assert "handoff_intent_detected" not in event_types
+        assert "handoff_requested" not in event_types
+        ignored = next(event for event in events if event.event_type == "handoff_intent_ignored")
+        assert ignored.payload["classifierSource"] == ("test_primary" if classifier_business_escalation else "rule_fallback")
+        assert ignored.payload["reason"] == ("confirmation_required" if classifier_business_escalation else "not_handoff")
     finally:
         worker.detach_all()
         await worker.stop()

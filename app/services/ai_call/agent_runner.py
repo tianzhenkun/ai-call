@@ -849,6 +849,7 @@ class ResponseLifecycle:
     recovery_count: int = 0
     recovering: bool = False
     recovery_context: str | None = None
+    recovery_silence_ms: float | None = None
     processing_tool: bool = False
 
 
@@ -1264,8 +1265,44 @@ class RealtimeCallAgentRunner:
                 if current is not provider:
                     provider = current
                     await provider.send_audio(chunk)
+                    await self._observe_response_recovery_input(call_id, provider, chunk)
                     continue
                 raise ProviderTransportError(str(exc)) from exc
+            await self._observe_response_recovery_input(call_id, provider, chunk)
+
+    async def _observe_response_recovery_input(
+        self, call_id: str, provider: RealtimeProviderProtocol, chunk: bytes,
+    ) -> None:
+        if self._providers.get(call_id) is not provider:
+            return
+        state = self._response_lifecycle(call_id)
+        if state.recovery_silence_ms is None:
+            return
+        # 新连接不会补发旧连接的停说事件；只在收到连续静音后解除旧说话状态。
+        frame = PcmAudioFrame(chunk, self.audio_bridge.qwen_input_sample_rate_hz, 1)
+        duration_ms = len(chunk) * 1000 / (frame.sample_rate_hz * frame.sample_width_bytes)
+        rms = SipBargeInDetector._pcm16_rms_dbfs(frame)
+        if duration_ms not in {10, 20, 30} or rms is None or (
+            rms >= self.sip_barge_in_config.rms_threshold_dbfs
+            and self._sip_barge_in_vad.is_speech(frame)
+        ):
+            state.recovery_silence_ms = 0
+            return
+        state.recovery_silence_ms += duration_ms
+        silence_ms = int(self._config_value(self.registry.get(call_id).effective_config,
+                                           "vad_silence_duration_ms", 800))
+        if state.recovery_silence_ms < silence_ms:
+            return
+        state.recovery_silence_ms = None
+        self._trace_response(call_id, "recovered_speech_stop", silenceMs=silence_ms)
+        timestamp = self._append_event(call_id, "user_speech_stopped", "agent", {
+            "reason": "response_recovery_input_silence",
+        })
+        await self._handle_user_speech_stopped(call_id, provider, timestamp)
+        turn = self._pending_turn(call_id)
+        if not turn.transcript and not turn.transcript_review_pending:
+            state.pending_input_text = "连接刚恢复，未完整听清客户刚才的发言，请客户再说一遍。"
+            await self._complete_response_and_flush_pending(call_id, provider)
 
     async def start_opening(self, call_id: str) -> None:
         provider = self._providers[call_id]
@@ -5858,6 +5895,12 @@ class RealtimeCallAgentRunner:
                     return
                 response_id = self._response_id_from_payload(provider_event.payload)
                 guard = self._playback_guard(call_id)
+                # 已取消回复的后续文字也不能进入对话记录或恢复上下文。
+                if provider_event.type in {"ai_transcript_delta", "ai_transcript_done"} and (
+                    response_id in guard.cancelled_response_ids
+                    or guard.current_response_generation != guard.generation
+                ):
+                    continue
                 if response_id and response_id != guard.current_response_id and response_id in self._seen_response_ids.get(call_id, set()):
                     continue
                 if provider_event.type.startswith("model_") or provider_event.type.startswith("ai_transcript"):
@@ -6204,6 +6247,8 @@ class RealtimeCallAgentRunner:
         previous_turn = self._pending_user_turns.get(call_id)
         guard = self._playback_guard(call_id)
         guard.user_speech_active = True
+        # 新连接已观察到本轮起说，后续停说由该连接负责，不再沿用旧连接的恢复兜底。
+        self._response_lifecycle(call_id).recovery_silence_ms = None
         turn = self._pending_turn(call_id, reset_if_finished=True)
         self._cancel_turn_response_task_nowait(call_id)
         if turn.stopped_at is not None and not turn.response_requested:
@@ -6478,6 +6523,7 @@ class RealtimeCallAgentRunner:
         if self._is_sip_participant(self.registry.get(call_id)):
             self._last_sip_provider_speech_stopped_at[call_id] = timestamp
         self._playback_guard(call_id).user_speech_active = False
+        self._response_lifecycle(call_id).recovery_silence_ms = None
         turn = self._pending_turn(call_id)
         if self.customer_speech_classifier is not None:
             turn.stability_updated_at = asyncio.get_running_loop().time()
@@ -10074,6 +10120,7 @@ class RealtimeCallAgentRunner:
                 state.cancel_started_at = None
                 state.opening_playout_pending = False
                 state.recovery_context = context
+                state.recovery_silence_ms = 0 if guard.user_speech_active else None
                 guard.cancel_requested = False
                 self._providers[call_id] = replacement
                 self._tasks[call_id] = asyncio.create_task(self._consume_provider_events(call_id, replacement))

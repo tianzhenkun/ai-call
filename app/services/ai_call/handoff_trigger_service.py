@@ -99,7 +99,7 @@ class RuleBasedHandoffIntentClassifier:
         "真人聊",
         "人来接",
     )
-    PRODUCT_FOLLOW_UP_PATTERNS = (
+    PRODUCT_CONSULTATION_PATTERNS = (
         "怎么联系",
         "如何联系",
         "联系方式",
@@ -116,20 +116,7 @@ class RuleBasedHandoffIntentClassifier:
         "回头联系",
         "后续联系",
         "到时候联系",
-    )
-    PRODUCT_FOLLOW_UP_ROLE_TERMS = (
-        "客服",
-        "顾问",
-        "产品顾问",
-        "销售",
-    )
-    PRODUCT_FOLLOW_UP_ACTION_TERMS = (
-        "联系",
-        "沟通",
         "一起聊",
-        "聊吧",
-    )
-    PRODUCT_CONSULTATION_PATTERNS = (
         "有demo",
         "demo吗",
         "安排demo",
@@ -152,6 +139,7 @@ class RuleBasedHandoffIntentClassifier:
         "客服",
         "客户经理",
         "客户顾问",
+        "产品顾问",
         "人工顾问",
         "销售顾问",
         "业务经理",
@@ -237,20 +225,12 @@ class RuleBasedHandoffIntentClassifier:
                 summary="用户明确要求联系人工角色",
                 source="rule_fallback",
             )
-        if self._matches_product_follow_up_intent(normalized):
-            return HandoffIntentResult(
-                matched=True,
-                confidence=0.95,
-                reason="business_escalation",
-                summary="用户表达产品合作推进或顾问沟通意向",
-                source="rule_fallback",
-            )
         if self._matches_product_consultation(normalized):
             return HandoffIntentResult(
                 matched=False,
                 confidence=0.95,
                 reason="not_handoff",
-                summary="用户只是咨询产品信息或演示安排",
+                summary="用户咨询产品或联系方法，未明确要求转人工",
                 source="rule_fallback",
             )
         return HandoffIntentResult(
@@ -279,14 +259,6 @@ class RuleBasedHandoffIntentClassifier:
             if any(f"{role}{suffix}" in normalized for suffix in cls.ROLE_REQUEST_SUFFIXES):
                 return True
         return False
-
-    @classmethod
-    def _matches_product_follow_up_intent(cls, normalized: str) -> bool:
-        if any(pattern in normalized for pattern in cls.PRODUCT_FOLLOW_UP_PATTERNS):
-            return True
-        return any(role in normalized for role in cls.PRODUCT_FOLLOW_UP_ROLE_TERMS) and any(
-            action in normalized for action in cls.PRODUCT_FOLLOW_UP_ACTION_TERMS
-        )
 
     @classmethod
     def _matches_product_consultation(cls, normalized: str) -> bool:
@@ -638,6 +610,15 @@ class AiCallHandoffTriggerService:
                 reason=result.reason or "low_confidence",
                 transcript=transcript,
                 confidence=result.confidence,
+                classifier_source=result.source,
+            )
+            return
+
+        # 分类器不能替客户同意业务升级；由对话模型提出转接并走工具确认流程。
+        if result.reason != "customer_request":
+            self._append_ignored(
+                event_store, event.call_id, reason="confirmation_required",
+                transcript=transcript, confidence=result.confidence,
                 classifier_source=result.source,
             )
             return
@@ -1117,7 +1098,10 @@ class AiCallHandoffTriggerService:
         if self._is_confirmation_declined(normalized):
             self._recent_confirmation_candidates.pop(event.call_id, None)
             return
-        if self._is_confirmation_accepted(normalized):
+        # 工具请求到达前的普通“好的”可能在回答产品问题，不能追认为转接同意。
+        if self._is_confirmation_accepted(normalized) and any(
+            term in normalized for term in ("转", "人工", "客服")
+        ):
             self._recent_confirmation_candidates[event.call_id] = (
                 RecentHandoffConfirmationCandidate(
                     transcript=transcript,

@@ -77,7 +77,11 @@ REQUEST_HANDOFF_TOOL = {
     "type": "function",
     "function": {
         "name": "request_handoff",
-        "description": "当当前通话需要由人工坐席继续处理时，用于发起转人工请求。",
+                "description": (
+                    "客户明确要求人工，或业务需要人工继续处理时使用。询问产品、演示或联系方法"
+                    "不等于要求人工；联系对象有歧义时先结合上下文澄清。业务升级须等待客户确认，"
+                    "工具调用不代表转接已经开始，必须按工具返回结果继续对话。"
+                ),
         "parameters": {
             "type": "object",
             "properties": {

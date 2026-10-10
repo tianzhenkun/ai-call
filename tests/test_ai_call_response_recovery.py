@@ -8,6 +8,7 @@ from test_ai_call_runtime_conversation_policy import SpeechClassifier, _runner
 
 from app.services.ai_call import agent_runner as module
 from app.services.ai_call.audio_bridge import PcmAudioFrame
+from app.services.ai_call.dialogue_service import AiCallDialogueRuntimeStore
 from app.services.ai_call.providers.base import ProviderEvent
 
 
@@ -140,6 +141,63 @@ async def test_reconnect_waits_for_current_customer_and_uses_latest_question(mon
         await new.emit(_response("model_response_done", "new", status="completed"))
         await _until(lambda: not runner._response_lifecycle("call-policy").active)
     finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("keep_speaking", [False, True])
+async def test_reconnect_after_lost_speech_stop_answers_without_another_utterance(monkeypatch, keep_speaking):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    runner.user_turn_stability_delay_seconds = 0
+    try:
+        await runner._request_response("call-policy", old, input_text="嗯")
+        await old.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "customer"}))
+        await old.emit(_response("model_response_started"))
+        await old.emit(ProviderEvent(type="user_transcript_done", payload={
+            "item_id": "customer", "transcript": "找那个制造商",
+        }))
+        await _until(lambda: new.connected)
+        # 旧连接未交付 speech_stopped；新连接只收到静音，客户不会再补一句。
+        silence = PcmAudioFrame(data=b"\x00\x00" * 320, sample_rate_hz=16000,
+                                channels=1, sample_width_bytes=2)
+        if keep_speaking:
+            speech = PcmAudioFrame(data=b"\x00\x20" * 320, sample_rate_hz=16000,
+                                   channels=1, sample_width_bytes=2)
+            for frame in [silence] * 30 + [speech] * 50 + [silence] * 30 + [speech] * 10:
+                await runner.send_audio_frame("call-policy", frame)
+                await asyncio.sleep(.001)
+            assert not new.created_responses
+        for _ in range(50):
+            await runner.send_audio_frame("call-policy", silence)
+            await asyncio.sleep(.001)
+        await _until(lambda: bool(new.created_responses))
+        assert len(new.created_responses) == 1
+        assert "找那个制造商" in new.created_responses[0]
+        assert not scheduled
+        await new.emit(_response("model_response_started", "new"))
+        await new.emit(_response("model_response_done", "new", status="completed"))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+async def test_cancelled_before_created_does_not_persist_unplayed_reply(monkeypatch):
+    runner, old, new, _ = await _setup(monkeypatch)
+    dialogue = AiCallDialogueRuntimeStore()
+    runner.event_store.add_listener(dialogue.handle_event)
+    try:
+        await runner._request_response("call-policy", old, input_text="嗯")
+        await old.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "customer"}))
+        await old.emit(_response("model_response_started"))
+        await old.emit(ProviderEvent(type="ai_transcript_delta", payload={
+            "response_id": "old", "item_id": "old-item", "delta": "这句话没有播出",
+        }))
+        await _until(lambda: new.connected)
+        runner.event_store.append("call-policy", "session_completed", "test")
+        assert not [s for s in dialogue.list_preview("call-policy") if s.speaker_type == "ai"]
+    finally:
+        runner.event_store.remove_listener(dialogue.handle_event)
         await runner.stop("call-policy")
 
 
