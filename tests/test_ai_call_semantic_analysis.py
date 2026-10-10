@@ -2436,6 +2436,71 @@ async def test_semantic_analysis_marks_no_effective_user_input_without_llm_call(
 
 
 @pytest.mark.anyio
+async def test_semantic_summary_uses_recorded_ending_and_keeps_late_speech() -> None:
+    module = _semantic_module()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(MappedBase.metadata.create_all)
+
+    class Analyzer:
+        snapshot = None
+
+        async def analyze(self, *, transcript_snapshot, reference_date=None):
+            self.snapshot = transcript_snapshot
+            return {"summary": "客户询问试用与收费，未确认演示时间，最后表示稍等后未再回应，通话自然结束。"}
+
+    analyzer = Analyzer()
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+            repository = AiCallRecordRepository(db)
+            record = await repository.create_record(
+                call_id="call_semantic_evidence", business_type=None, business_id=None,
+                entry_type="outbound", room_name="room-ending", participant_identity="caller-test",
+                status="completed", started_at=datetime(2026, 7, 8, 10, 0, tzinfo=timezone.utc),
+            )
+            record.end_reason = "policy_turn_limit"
+            record.ended_at = datetime(2026, 7, 8, 10, 4, tzinfo=timezone.utc)
+            db.add_all([
+                _segment(segment_no=1, speaker_type="customer", text="你们怎么收费？"),
+                _segment(segment_no=2, speaker_type="customer", text="嗯，稍等会儿。", started_offset_seconds=10),
+                _segment(segment_no=3, speaker_type="customer", text="我没有说你让卷进啊。", started_offset_seconds=20),
+            ])
+            await db.flush()
+            result = await module.AiCallSemanticAnalysisService(
+                repository, analyzer=analyzer,
+            ).analyze_call_once(call_id=record.call_id)
+            assert result.analysis_status == module.ANALYSIS_STATUS_SUCCEEDED
+            assert analyzer.snapshot["metadata"]["call_outcome"]["end_reason"] == "policy_turn_limit"
+            summary = result.analysis_result_dict["summary"]
+            assert "轮次上限" in summary
+            assert "自然结束" not in summary and "未再回应" not in summary
+            assert "试用与收费" in summary and "未确认演示时间" in summary
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("reason,category,expected", [
+    ("policy_duration_limit", "system_normal", "时长上限"),
+    ("policy_no_response", "system_normal", "等待回应超时"),
+    ("sip_client_initiated", "customer", "客户侧线路断开"),
+    ("model_error", "system_error", "技术异常"),
+    ("sip_participant_left", "unknown", "具体结束原因未确认"),
+])
+def test_semantic_ending_never_invents_customer_hangup(reason, category, expected):
+    module = _semantic_module()
+    snapshot = {"metadata": {"call_outcome": {
+        "status": "completed", "end_reason": reason, "end_category": category,
+    }}}
+    result = module.enforce_semantic_evidence_on_result(
+        {"summary": "客户询问试用结束后怎么收费。客户主动挂断电话。"}, snapshot,
+    )
+    assert "客户询问试用结束后怎么收费。" in result["summary"]
+    assert "主动挂断" not in result["summary"]
+    assert expected in result["summary"]
+    assert module.enforce_semantic_evidence_on_result(result, snapshot) == result
+
+
+@pytest.mark.anyio
 async def test_semantic_analysis_snapshot_records_asr_timeout_fallback_reason() -> None:
     module = _semantic_module()
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

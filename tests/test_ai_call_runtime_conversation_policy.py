@@ -728,21 +728,96 @@ async def test_turn_limit_wait_does_not_spend_the_single_followup(barge_in_enabl
 
 
 @pytest.mark.anyio
-async def test_turn_limit_exhaustion_still_allows_explicit_handoff_request() -> None:
+@pytest.mark.parametrize("text", ["请帮我转人工。", "不是这个意思，请帮我转人工。"])
+async def test_turn_limit_exhaustion_still_allows_explicit_handoff_request(text) -> None:
     runner, provider, scheduled = _runner()
     call_id = "call-policy"
     runner._turn_limit_followups[call_id] = agent_runner_module.PendingUserTurn(
         response_requested=True,
     )
     turn = runner._pending_turn(call_id)
-    turn.transcript_parts = ["请帮我转人工。"]
+    turn.transcript_parts = [text]
     turn.stopped_at = datetime.now(timezone.utc)
     try:
         await runner._request_response_from_turn(call_id, provider, turn)
         assert "request_handoff" in provider.created_responses[-1]
-        assert "请帮我转人工。" in provider.created_responses[-1]
+        assert text in provider.created_responses[-1]
         assert call_id not in runner._pending_call_ends
         assert scheduled == []
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("text", ["嗯，稍等会儿。", "我没有说你让卷进啊。", "刚才没听清。"])
+async def test_turn_limit_wait_and_correction_preserve_followup(text) -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner._customer_turn_counts[call_id] = 15
+    runner._turn_limit_followups[call_id] = None
+    turn = runner._pending_turn(call_id)
+    turn.transcript_parts = [text]
+    turn.stopped_at = datetime.now(timezone.utc)
+    try:
+        await runner._request_response_from_turn(call_id, provider, turn)
+        await runner._apply_provider_event(
+            call_id, provider, "model_response_done", datetime.now(timezone.utc), {},
+        )
+        assert call_id not in runner._pending_call_ends
+        assert runner._turn_limit_followups[call_id] is None
+        assert CALL_POLICY_FINAL_INPUT not in provider.created_responses
+        assert not scheduled
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+async def test_turn_limit_clarification_response_waits_for_customer_answer() -> None:
+    runner, provider, scheduled = _runner()
+    call_id = "call-policy"
+    runner._customer_turn_counts[call_id] = 15
+    runner._turn_limit_followups[call_id] = None
+    turn = runner._pending_turn(call_id)
+    turn.transcript_parts = ["那个需要哪个？"]
+    turn.stopped_at = datetime.now(timezone.utc)
+    try:
+        await runner._request_response_from_turn(call_id, provider, turn)
+        await runner._apply_provider_event(
+            call_id, provider, "model_response_done", datetime.now(timezone.utc),
+            {"response": {"output": [{"content": [{
+                "transcript": "您是想确认试用条件吗？",
+            }]}]}},
+        )
+        assert call_id not in runner._pending_call_ends
+        assert CALL_POLICY_FINAL_INPUT not in provider.created_responses
+        assert not scheduled
+        # 澄清后的明确回答才完成最后一轮，而不是无限增加业务问题。
+        turn = runner._pending_turn(call_id, reset_if_finished=True)
+        turn.transcript_parts = ["对，试用需要哪些条件？"]
+        turn.stopped_at = datetime.now(timezone.utc)
+        await runner._request_response_from_turn(call_id, provider, turn)
+        await runner._apply_provider_event(
+            call_id, provider, "model_response_done", datetime.now(timezone.utc),
+            {"response": {"output": [{"content": [{"transcript": "目前还不能确认具体试用条件。"}]}]}},
+        )
+        assert provider.created_responses[-1] == CALL_POLICY_FINAL_INPUT
+    finally:
+        await runner.stop(call_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("text", ["不用等了，直接说价格。", "稍等会儿再联系我，先挂了吧。"])
+async def test_turn_limit_does_not_turn_substantive_or_end_intents_into_wait(text) -> None:
+    runner, provider, _ = _runner()
+    call_id = "call-policy"
+    runner._turn_limit_followups[call_id] = None
+    turn = runner._pending_turn(call_id)
+    turn.transcript_parts = [text]
+    turn.stopped_at = datetime.now(timezone.utc)
+    try:
+        await runner._request_response_from_turn(call_id, provider, turn)
+        assert not provider.created_responses[-1].startswith(agent_runner_module.CALL_POLICY_WAIT_INPUT)
+        assert not provider.created_responses[-1].startswith(agent_runner_module.CALL_POLICY_CLARIFY_INPUT)
     finally:
         await runner.stop(call_id)
 

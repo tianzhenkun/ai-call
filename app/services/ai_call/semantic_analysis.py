@@ -30,6 +30,7 @@ from app.api.v1.ai_call.model import (
 )
 from app.api.v1.ai_call.outbound.attempt_projection import reconcile_analyzed_call
 from app.core.logger import log
+from app.services.ai_call.call_termination import call_end_category
 from app.services.ai_call.classification_review import requires_classification_review
 from app.services.ai_call.dialogue_merge import (
     dialogue_time_ranges_touch,
@@ -178,6 +179,9 @@ TRANSCRIPT_UNCERTAINTY_ANALYSIS_GUIDANCE = (
 )
 SEMANTIC_ANALYSIS_SYSTEM_PROMPT = """你是 AI Call 通话后语义分析器。
 只根据 transcript_json 中的真实对话文本分析客户侧表达，不使用提示词配置或外部知识补全。
+metadata.call_outcome 是平台记录的通话状态和结束原因，描述结束经过时必须以它为准，不能从告别话术猜测自然结束或客户主动挂断。
+summary 聚焦业务内容；平台会根据真实结束原因补充结束说明，不需要自行描述挂断经过。
+转写含义不清不代表客户没有说话；低置信轮次仅限制内容推断，不得因为它不适合写入摘要就断言客户后续未发言。
 只把 role=user 的轮次当作客户表达；role=assistant 或 speaker_type=ai 的轮次只能作为上下文，不能作为客户意向、诉求、异议或时间线证据。
 即使 assistant 轮次使用客户口吻、第一人称或疑问句，也必须识别为 AI 话术异常，不得把它归因给客户。
 必须查看 transcript_json.metadata.transcript_quality；当 has_uncertain_transcript 为 true 时，将孤立、冲突或单路 ASR 片段视为低置信证据。
@@ -1807,6 +1811,13 @@ class AiCallSemanticAnalysisService:
             asr_jobs=asr_jobs,
             handoffs=handoffs,
         )
+        if record is not None:
+            snapshot["metadata"]["call_outcome"] = {
+                "status": record.status,
+                "end_reason": record.end_reason,
+                "end_category": call_end_category(record),
+                "ended_at": record.ended_at.isoformat() if record.ended_at else None,
+            }
         snapshot_json = snapshot_to_json(snapshot)
         snapshot_hash = transcript_snapshot_hash(snapshot)
         if not self.transcript_builder.has_effective_user_input(snapshot):
@@ -1992,6 +2003,7 @@ def enforce_semantic_evidence_on_result(
     normalized = _remove_transcript_listing_summary(normalized)
     normalized = _append_transcript_quality_risk_tags(normalized, snapshot)
     normalized = _enforce_follow_up_evidence(normalized, snapshot)
+    normalized = _enforce_recorded_call_outcome(normalized, snapshot)
     if _snapshot_supports_strong_fact(snapshot, "identity"):
         return normalized
     unsupported_identity_texts = _snapshot_unsupported_strong_fact_texts(snapshot, "identity")
@@ -2016,6 +2028,45 @@ def enforce_semantic_evidence_on_result(
         "key_points": cleaned_key_points,
         "tags": cleaned_tags,
     })
+
+
+def _enforce_recorded_call_outcome(
+    result: dict[str, Any], snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    outcome = snapshot.get("metadata", {}).get("call_outcome")
+    if not isinstance(outcome, dict) or outcome.get("status") not in {"completed", "failed"}:
+        return result
+    ending = {
+        "policy_turn_limit": "系统因达到对话轮次上限结束通话。",
+        "policy_duration_limit": "系统因达到通话时长上限结束通话。",
+        "policy_no_response": "系统在等待回应超时后结束通话。",
+        "customer_end": "系统根据客户结束意愿结束通话。",
+    }.get(outcome.get("end_reason")) or {
+        "agent": "通话由人工坐席结束。",
+        "customer": "通话因客户侧线路断开而结束。",
+        "system_normal": "通话由系统结束。",
+        "system_error": "通话因技术异常结束。",
+    }.get(outcome.get("end_category"), "通话已结束，具体结束原因未确认。")
+    # 挂断和无回应属于运行事实，不能由摘要模型根据低置信文字补全。
+    ending_claim = re.compile(
+        r"(?:通话|电话).{0,20}(?:结束|挂断|断开|中断)|"
+        r"(?:结束|挂断|断开|中断)(?:了)?(?:通话|电话)|"
+        r"(?:客户|用户|对方).{0,20}(?:挂断|挂了|掉线|断线)|"
+        r"(?:客户|用户|对方|最后|随后|之后|后).{0,20}(?:未|不再|没有|无).{0,8}(?:回应|回复|响应)"
+    )
+    summary = "".join(
+        sentence for sentence in re.split(
+            r"(?<=[。！？!?；;，,])\s*", result["summary"].removesuffix(ending),
+        )
+        if not ending_claim.search(sentence)
+    ).rstrip(" ，,；;")
+    if summary and not summary.endswith(("。", "！", "？", "!", "?")):
+        summary += "。"
+    return {
+        **result,
+        "summary": summary + ending,
+        "key_points": [point for point in result["key_points"] if not ending_claim.search(point)],
+    }
 
 
 def sanitize_analysis_result_for_response(

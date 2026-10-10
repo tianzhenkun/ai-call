@@ -118,15 +118,21 @@ CALL_POLICY_FINAL_INPUT = (
 CALL_POLICY_TURN_LIMIT_INPUT = (
     "本次对话开始收尾。请先简短回答客户的当前问题；需要知识证据时正常调用知识工具，"
     "不得编造答案。告知客户还可以补充一个问题，然后等待回应，不要现在告别。"
-    "客户仅要求稍等时，简短回应并等待其问题。客户明确要求转人工时，仍按转人工流程处理，"
+    "客户仅要求稍等时，简短回应并等待其问题；客户纠正或含义不清时，先简短澄清。"
+    "客户明确要求转人工时，仍按转人工流程处理，"
     "不得把回答问题或口头承诺当作已完成转接。"
 )
 CALL_POLICY_FOLLOWUP_INPUT = (
     "这是本次通话最后一个补充问题。请先简短回答客户的当前问题，需要知识证据时正常查询，"
-    "不得编造答案，不再邀请新问题或承诺后续安排。系统会在回答播放完成后另行请求告别。"
+    "不得编造答案，不再邀请新问题或承诺后续安排。含义不清时先用一个问句澄清并等待回应，"
+    "不要假装听懂；澄清不算回答完成。系统会在明确回答播放完成后另行请求告别。"
     "客户明确要求转人工时，仍按转人工流程处理。"
 )
 CALL_POLICY_WAIT_INPUT = "客户仅要求稍等。请简短回应并等待，不要告别；仍保留一个补充问题的机会。"
+CALL_POLICY_CLARIFY_INPUT = (
+    "客户在纠正理解或表示没听清。请先回应纠正；含义不明确时只问一个简短的澄清问题并等待。"
+    "不要假装听懂，不要承诺转接、安排顾问或回访，不要告别；澄清不消耗补充问题机会。"
+)
 CALL_POLICY_SILENCE_INPUTS = (
     "客户暂未回应，请简短询问一次是否还在听，不要重复之前的长内容。",
     "客户仍未回应，请最后确认一次是否方便继续沟通，保持一句话。",
@@ -730,6 +736,7 @@ class PendingUserTurn:
     current_speech_semantic_rejected: bool = False
     response_requested: bool = False
     customer_turn_counted: bool = False
+    followup_needs_reply: bool = False
     interrupt_candidate: bool = False
     interrupt_confirmed: bool = False
     interrupt_ignored: bool = False
@@ -9733,6 +9740,10 @@ class RealtimeCallAgentRunner:
             self._last_ai_question_completed_at[call_id] = timestamp
         else:
             self._last_ai_question_completed_at.pop(call_id, None)
+        followup = self._turn_limit_followups.get(call_id)
+        if text and followup is self._pending_user_turns.get(call_id) and followup is not None:
+            # 最后一轮仍在澄清时，不能把模型生成结束当作客户问题已答完。
+            followup.followup_needs_reply = self._looks_like_ai_question(text)
 
     @classmethod
     def _model_response_transcript(cls, payload: dict[str, Any]) -> str:
@@ -10196,26 +10207,36 @@ class RealtimeCallAgentRunner:
         else:
             followup_turn = self._turn_limit_followups[call_id]
             normalized = self._normalize_call_end_acknowledgement(turn.transcript)
+            handoff = await RuleBasedHandoffIntentClassifier().classify(transcript=turn.transcript)
+            if handoff.matched and handoff.reason == "customer_request":
+                return HANDOFF_CAPABILITY_INSTRUCTIONS + "\n客户当前原话：" + json.dumps(
+                    turn.transcript, ensure_ascii=False,
+                )
             if followup_turn is turn:
+                instruction = CALL_POLICY_FOLLOWUP_INPUT
+            elif new_customer_turn and re.fullmatch(
+                r"(?:嗯|好的)?(?:你们?|您)?(?:请|先)?"
+                r"(?:稍等(?:一下|一会儿?|会儿?)?|等(?:等|一下|一会儿?|会儿?))(?:啊|呀|哈)?",
+                normalized,
+            ):
+                self._turn_limit_followups[call_id] = None
+                instruction = CALL_POLICY_WAIT_INPUT
+            elif new_customer_turn and (
+                self.call_end_decision_service.decide(turn.transcript).action != "explicit_end"
+                and re.search(r"(?:我(?:没(?:有)?|不是)说|不是这个意思|[没不]听清|听不清|再说一遍)", normalized)
+            ):
+                self._turn_limit_followups[call_id] = None
+                instruction = CALL_POLICY_CLARIFY_INPUT
+            elif followup_turn is not None and followup_turn.followup_needs_reply:
+                self._turn_limit_followups[call_id] = turn
                 instruction = CALL_POLICY_FOLLOWUP_INPUT
             elif followup_turn is not None or (
                 new_customer_turn and normalized in CALL_END_ACKNOWLEDGEMENT_TEXTS
             ):
-                handoff = await RuleBasedHandoffIntentClassifier().classify(transcript=turn.transcript)
-                if handoff.matched and handoff.reason == "customer_request":
-                    return HANDOFF_CAPABILITY_INSTRUCTIONS + "\n客户当前原话：" + json.dumps(
-                        turn.transcript, ensure_ascii=False,
-                    )
                 self._prepare_policy_call_end(call_id, end_reason="policy_turn_limit")
                 return CALL_POLICY_FINAL_INPUT
             elif not new_customer_turn:
                 instruction = CALL_POLICY_TURN_LIMIT_INPUT
-            elif re.fullmatch(
-                r"(?:嗯|好的)?(?:你们?|您)?(?:请|先)?"
-                r"(?:稍等(?:一下)?|等(?:等|一下|一会儿?|会儿?))(?:啊|呀|哈)?",
-                normalized,
-            ):
-                instruction = CALL_POLICY_WAIT_INPUT
             else:
                 self._turn_limit_followups[call_id] = turn
                 instruction = CALL_POLICY_FOLLOWUP_INPUT
@@ -10369,6 +10390,7 @@ class RealtimeCallAgentRunner:
                 return
             if (
                 self._turn_limit_followups.get(call_id) is not None
+                and not self._turn_limit_followups[call_id].followup_needs_reply
                 and call_id not in self._handoff_tool_results
                 and self._call_end_user_turn_deferral_reason(call_id) is None
                 and await self._begin_policy_call_end(
