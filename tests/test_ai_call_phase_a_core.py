@@ -3632,7 +3632,7 @@ async def test_default_qwen_websocket_factory_disables_implicit_proxy(
         "proxy": None,
         "ping_interval": 20.0,
         "ping_timeout": 120.0,
-        "close_timeout": 10.0,
+        "close_timeout": 1.5,
     }
 
 
