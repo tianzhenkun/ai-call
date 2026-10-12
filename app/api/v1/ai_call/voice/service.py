@@ -932,6 +932,7 @@ def build_default_voice_preview_service() -> VoicePreviewService:
         target_model=settings.QWEN_REALTIME_MODEL,
         preview_audio_provider_factory=lambda: AliyunQwenRealtimeProvider(
             realtime_url=settings.DASHSCOPE_REALTIME_URL,
+            workspace_realtime_url=settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
             api_key=settings.DASHSCOPE_API_KEY,
             model=settings.QWEN_REALTIME_MODEL,
         ),

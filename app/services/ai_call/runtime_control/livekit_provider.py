@@ -150,6 +150,7 @@ class DatabaseRuntimeProviderResourceResolver:
                         configured_model=config.qwen_realtime_model,
                         vad_type=config.vad_type,
                         customer_speech_review_enabled=config.customer_speech_review_enabled,
+                        workspace_realtime_url=config.dashscope_workspace_realtime_url,
                     )
                     await VoiceRepository(session).require_call_voice(
                         tenant_id=claim.tenant_id, voice=voice, target_model=model,

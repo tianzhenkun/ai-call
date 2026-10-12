@@ -1965,12 +1965,17 @@ async def test_models_flow_from_persisted_command_to_resource_and_provider(b4_se
     now = datetime.now(timezone.utc)
     clock = AsyncMock(return_value=now)
     monkeypatch.setattr(bootstrap_service, "read_database_time", clock)
+    workspace_url = "wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime"
+    service.orchestrator.config = replace(
+        service.orchestrator.config, dashscope_workspace_realtime_url=workspace_url,
+    )
     settings = SimpleNamespace(
         AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,direct_sip",
         QWEN_REALTIME_MODEL="qwen3.5-omni-plus-realtime",
         QWEN_REALTIME_TURN_DETECTION_TYPE="server_vad",
         QWEN_REALTIME_VOICE="Tina",
         AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED=False,
+        DASHSCOPE_WORKSPACE_REALTIME_URL=workspace_url,
     )
     entry = RuntimeEntryStartService(
         settings=settings, repository=RuntimeCommandRepository(repository.db, database_clock=clock),
@@ -1983,7 +1988,8 @@ async def test_models_flow_from_persisted_command_to_resource_and_provider(b4_se
     runner = service.orchestrator._build_default_agent_runner()
     capture.audio_transport = runner.audio_transport
     factory = runner.provider_factory
-    models = ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime", "qwen3.5-omni-plus-realtime"]
+    models = ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime",
+              "qwen3.8-omni-flash-realtime", "qwen3.5-omni-plus-realtime"]
     providers = []
     for index, model in enumerate(models):
         snapshot = await entry.submit(StartEntryRequest(
@@ -2021,6 +2027,10 @@ async def test_models_flow_from_persisted_command_to_resource_and_provider(b4_se
         provider = factory(session)
         assert provider.model == model
         assert provider._build_connect_url().endswith(f"model={model}")
+        assert provider.realtime_url == (
+            workspace_url if model == "qwen3.8-omni-flash-realtime"
+            else service.orchestrator.config.dashscope_realtime_url
+        )
         providers.append(provider)
         if entry_type == "web":
             bootstrap = await bootstrap_service.RuntimeBootstrapService(repository.db).get(
@@ -2042,12 +2052,16 @@ async def test_models_flow_from_persisted_command_to_resource_and_provider(b4_se
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime", "qwen3.8-omni-flash-realtime"])
 async def test_legacy_sip_model_reaches_agent_without_changing_default(b4_service, model) -> None:
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     service, _repository, _rooms, capture = b4_service
+    service.orchestrator.config = replace(
+        service.orchestrator.config,
+        dashscope_workspace_realtime_url="wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+    )
     await create_static_profile(service)
     service.sip_client = SimpleNamespace(
         preflight=lambda **_: SimpleNamespace(ok=True),
@@ -2068,16 +2082,21 @@ async def test_legacy_sip_model_reaches_agent_without_changing_default(b4_servic
 
 
 @pytest.mark.anyio
-async def test_legacy_web_model_and_flash_voice_list_use_selected_model(b4_service) -> None:
+@pytest.mark.parametrize("model", ["qwen3.5-omni-flash-realtime", "qwen3.8-omni-flash-realtime"])
+async def test_legacy_web_model_and_flash_voice_list_use_selected_model(b4_service, model) -> None:
     from app.api.v1.ai_call.voice.repository import VoiceRepository
+    from app.services.ai_call.voice_profile import builtin_voice_profile_values
 
     service, repository, _rooms, capture = b4_service
+    service.orchestrator.config = replace(
+        service.orchestrator.config,
+        dashscope_workspace_realtime_url="wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+    )
     await create_static_profile(service)
-    model = "qwen3.5-omni-flash-realtime"
     rows, total = await VoiceRepository(repository.db).list_profiles(
         tenant_id=TEST_TENANT_ID, target_model=model, available_only=True, page_size=200,
     )
-    assert total == len(BUILTIN_QWEN_OMNI_REALTIME_VOICES)
+    assert total == len(builtin_voice_profile_values(model))
     assert all(row.target_model == model for row in rows)
     result = await service.create_web_session(
         tenant_id=TEST_TENANT_ID, voice="Tina", prompt=None, model=model,

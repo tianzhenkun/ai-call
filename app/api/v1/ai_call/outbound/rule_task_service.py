@@ -1001,6 +1001,7 @@ class OutboundRuleTaskService:
                 configured_model=settings.QWEN_REALTIME_MODEL,
                 vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
                 customer_speech_review_enabled=settings.AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED,
+                workspace_realtime_url=settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
             )
         except ValueError as exc:
             raise CustomException(msg=str(exc), status_code=400) from exc

@@ -30,11 +30,12 @@ def _settings(entries: str) -> SimpleNamespace:
         QWEN_REALTIME_TURN_DETECTION_TYPE="server_vad",
         QWEN_REALTIME_VOICE="Tina",
         AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED=False,
+        DASHSCOPE_WORKSPACE_REALTIME_URL="wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
     )
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime", "qwen3.8-omni-flash-realtime"])
 @pytest.mark.parametrize("entry", ["web", "direct_sip"])
 async def test_session_model_and_default_voice_are_persisted_without_changing_settings(model, entry) -> None:
     repository = _FakeRepository([])
@@ -56,6 +57,7 @@ async def test_session_model_and_default_voice_are_persisted_without_changing_se
     [
         ("web", "arbitrary-model", {}, "仅支持"),
         ("web", "", {}, "仅支持"),
+        ("web", "qwen3.8-omni-flash-realtime", {"DASHSCOPE_WORKSPACE_REALTIME_URL": ""}, "业务空间"),
         ("web", {}, {}, "仅支持"),
         ("web", "qwen3.5-omni-flash-realtime", {"QWEN_REALTIME_MODEL": "qwen-audio-3.1-realtime-plus"}, "基线"),
         ("web", "qwen3.5-omni-flash-realtime", {"QWEN_REALTIME_TURN_DETECTION_TYPE": "smart_turn"}, "基线"),

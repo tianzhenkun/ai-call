@@ -142,6 +142,7 @@ class AiCallRuntimeConfig:
     llm_model: str = "qwen-plus"
     customer_speech_review_enabled: bool = False
     customer_speech_model: str = ""
+    dashscope_workspace_realtime_url: str = ""
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -153,6 +154,7 @@ class AiCallRuntimeConfig:
             browser_token_ttl_seconds=settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
             dashscope_api_key=settings.DASHSCOPE_API_KEY,
             dashscope_realtime_url=settings.DASHSCOPE_REALTIME_URL,
+            dashscope_workspace_realtime_url=settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
             qwen_realtime_model=settings.QWEN_REALTIME_MODEL,
             qwen_realtime_voice=settings.QWEN_REALTIME_VOICE,
             default_prompt=settings.AI_CALL_DEFAULT_PROMPT,
@@ -403,6 +405,7 @@ class AiCallOrchestrator:
         return RealtimeCallAgentRunner(
             provider_factory=lambda session: AliyunQwenRealtimeProvider(
                 realtime_url=self.config.dashscope_realtime_url,
+                workspace_realtime_url=self.config.dashscope_workspace_realtime_url,
                 api_key=self.config.dashscope_api_key,
                 model=self._config_value(session.effective_config, "model", self.config.qwen_realtime_model),
             ),
@@ -1551,6 +1554,7 @@ class AiCallOrchestrator:
                 configured_model=self.config.qwen_realtime_model,
                 vad_type=self.config.vad_type,
                 customer_speech_review_enabled=self.config.customer_speech_review_enabled,
+                workspace_realtime_url=self.config.dashscope_workspace_realtime_url,
             )
         except ValueError as exc:
             raise AiCallError(error_id="invalid_realtime_model", msg=str(exc), status_code=400) from exc

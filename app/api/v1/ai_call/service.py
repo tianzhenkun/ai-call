@@ -178,6 +178,7 @@ class AiCallService:
                     configured_model=self.orchestrator.config.qwen_realtime_model,
                     vad_type=self.orchestrator.config.vad_type,
                     customer_speech_review_enabled=self.orchestrator.config.customer_speech_review_enabled,
+                    workspace_realtime_url=self.orchestrator.config.dashscope_workspace_realtime_url,
                 )
             except ValueError as exc:
                 raise CustomException(msg=str(exc), status_code=400) from exc
@@ -289,6 +290,7 @@ class AiCallService:
                     configured_model=self.orchestrator.config.qwen_realtime_model,
                     vad_type=self.orchestrator.config.vad_type,
                     customer_speech_review_enabled=self.orchestrator.config.customer_speech_review_enabled,
+                    workspace_realtime_url=self.orchestrator.config.dashscope_workspace_realtime_url,
                 )
             except ValueError as exc:
                 raise CustomException(msg=str(exc), status_code=400) from exc

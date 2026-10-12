@@ -715,6 +715,7 @@ async def test_model_create_reconciliation_observes_resources_after_configuratio
     config = SimpleNamespace(
         qwen_realtime_model="qwen3.5-omni-plus-realtime", vad_type="server_vad",
         customer_speech_review_enabled=False,
+        dashscope_workspace_realtime_url="",
     )
     resolver = DatabaseRuntimeProviderResourceResolver(
         FakeSession, orchestrator=SimpleNamespace(config=config),

@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from urllib.parse import urlencode
 
 from app.services.ai_call.providers.base import ProviderEvent
+from app.services.ai_call.realtime_model import resolve_realtime_url
 
 
 class QwenWebSocketProtocol(Protocol):
@@ -227,8 +228,9 @@ class AliyunQwenRealtimeProvider:
         api_key: str,
         model: str,
         websocket_factory: WebSocketFactory | None = None,
+        workspace_realtime_url: str = "",
     ) -> None:
-        self.realtime_url = realtime_url.rstrip("?")
+        self.realtime_url = resolve_realtime_url(model, realtime_url, workspace_realtime_url).rstrip("?")
         self.api_key = api_key
         self.model = model
         self.websocket_factory = websocket_factory or _default_websocket_factory

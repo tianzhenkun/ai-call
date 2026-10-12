@@ -86,6 +86,7 @@ class RuntimeEntryStartService:
                     configured_model=self._settings.QWEN_REALTIME_MODEL,
                     vad_type=self._settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
                     customer_speech_review_enabled=self._settings.AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED,
+                    workspace_realtime_url=getattr(self._settings, "DASHSCOPE_WORKSPACE_REALTIME_URL", ""),
                 )
             except ValueError as exc:
                 raise RuntimeEntryStartError(str(exc)) from exc

@@ -63,7 +63,7 @@ class VoiceRepository:
         page_num: int = 1,
         page_size: int = 20,
     ) -> tuple[list[VoiceProfileOut], int]:
-        if target_model == "qwen3.5-omni-flash-realtime":
+        if target_model in {"qwen3.5-omni-flash-realtime", "qwen3.8-omni-flash-realtime"}:
             from app.api.v1.ai_call.crud import AiCallRecordRepository
             await AiCallRecordRepository(self.db).ensure_builtin_voice_profiles(
                 target_model=target_model,

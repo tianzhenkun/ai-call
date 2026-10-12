@@ -196,6 +196,7 @@ class Settings(BaseSettings):
     DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     DASHSCOPE_WEBSOCKET_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
     DASHSCOPE_REALTIME_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+    DASHSCOPE_WORKSPACE_REALTIME_URL: str = ""
 
     QWEN_REALTIME_MODEL: str = "qwen3.5-omni-plus-realtime"
     QWEN_REALTIME_VOICE: str = "Tina"

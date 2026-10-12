@@ -2186,7 +2186,7 @@ async def test_scheduled_task_can_be_rescheduled_and_cancelled_but_not_run_actio
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("model", [None, "qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+@pytest.mark.parametrize("model", [None, "qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime", "qwen3.8-omni-flash-realtime"])
 async def test_batch_upload_to_task_preserves_model_and_legacy_config(database, monkeypatch, model):
     from io import BytesIO
     from fastapi import UploadFile
@@ -2197,6 +2197,8 @@ async def test_batch_upload_to_task_preserves_model_and_legacy_config(database, 
     monkeypatch.setattr(settings, "QWEN_REALTIME_MODEL", "qwen3.5-omni-plus-realtime")
     monkeypatch.setattr(settings, "QWEN_REALTIME_TURN_DETECTION_TYPE", "server_vad")
     monkeypatch.setattr(settings, "AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED", False)
+    monkeypatch.setattr(settings, "DASHSCOPE_WORKSPACE_REALTIME_URL",
+                        "wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime")
     prompt_id, voice_id = await _seed_references(database)
     tasks = OutboundRuleTaskService(database)
     validations = OutboundValidationService(database)
