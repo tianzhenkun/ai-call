@@ -2183,3 +2183,118 @@ async def test_scheduled_task_can_be_rescheduled_and_cancelled_but_not_run_actio
     assert task_out.status == "CANCELLED"
     assert task_out.scheduled_at == "2026-07-29 10:00:00"
     assert targets[0].status == "CANCELLED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("model", [None, "qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+async def test_batch_upload_to_task_preserves_model_and_legacy_config(database, monkeypatch, model):
+    from io import BytesIO
+    from fastapi import UploadFile
+    from openpyxl import Workbook
+    from app.api.v1.ai_call.outbound.controller import _parse_request
+    from app.api.v1.ai_call.outbound.service import OutboundValidationService
+
+    monkeypatch.setattr(settings, "QWEN_REALTIME_MODEL", "qwen3.5-omni-plus-realtime")
+    monkeypatch.setattr(settings, "QWEN_REALTIME_TURN_DETECTION_TYPE", "server_vad")
+    monkeypatch.setattr(settings, "AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED", False)
+    prompt_id, voice_id = await _seed_references(database)
+    tasks = OutboundRuleTaskService(database)
+    validations = OutboundValidationService(database)
+    async with database() as db:
+        voice = await db.get(AiCallVoiceProfileModel, voice_id)
+        voice.target_model = model or "qwen3.5-omni-plus-realtime"
+        rule = await tasks.create_rule(db, "tenant-a", 10, _rule_payload())
+        await db.commit()
+    config = _validation_config(task_mode="batch", rule_id=rule.id, prompt_id=prompt_id)
+    if model is not None:
+        config["model"] = model
+    request = _parse_request(json.dumps(config))
+    workbook = Workbook()
+    workbook.active.append(["手机号"])
+    workbook.active.append(["19900001001"])
+    data = BytesIO()
+    workbook.save(data)
+    workbook.close()
+    data.seek(0)
+    async with database() as db:
+        validation = await validations.accept_batch(
+            db=db, tenant_id="tenant-a", user_id=10,
+            file=UploadFile(data, filename="模型对比.xlsx"), request=request,
+        )
+        await db.commit()
+        assert json.loads(validation.task_config_json) == config
+    await validations.process_validation("tenant-a", validation.id)
+    async with database() as db:
+        task, created = await tasks.create_task(
+            db, "tenant-a", 10, "管理员", "batch-model", _create_task_request(config, validation.id),
+        )
+        await db.commit()
+        assert created and task.total_targets == 1
+        snapshot = json.loads(task.config_snapshot_json)
+        assert snapshot["request"] == config
+        assert snapshot["voice"]["targetModel"] == (model or "qwen3.5-omni-plus-realtime")
+
+
+
+@pytest.mark.anyio
+async def test_web_task_freezes_requested_model_and_matching_voice(database, monkeypatch):
+    monkeypatch.setattr(settings, "QWEN_REALTIME_MODEL", "qwen3.5-omni-plus-realtime")
+    monkeypatch.setattr(settings, "QWEN_REALTIME_TURN_DETECTION_TYPE", "server_vad")
+    monkeypatch.setattr(settings, "AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED", False)
+    prompt_id, voice_id = await _seed_references(database)
+    service = OutboundRuleTaskService(database)
+    async with database() as db:
+        voice = await db.get(AiCallVoiceProfileModel, voice_id)
+        voice.target_model = "qwen3.5-omni-flash-realtime"
+        rule = await service.create_rule(db, "tenant-a", 10, _rule_payload())
+        await db.commit()
+        request = SingleValidationRequest.model_validate({
+            **_validation_config(task_mode="single", rule_id=rule.id,
+                                 prompt_id=prompt_id, answer_mode="web"),
+            "model": "qwen3.5-omni-flash-realtime",
+        })
+        validation = await service.validate_single(db, "tenant-a", 10, request)
+        await db.commit()
+        task, _ = await service.create_task(
+            db, "tenant-a", 10, "管理员", "web-flash-model",
+            _create_task_request(request.config_dict(), validation.id),
+        )
+        await db.commit()
+        snapshot = json.loads(task.config_snapshot_json)
+        assert snapshot["request"]["model"] == "qwen3.5-omni-flash-realtime"
+        assert snapshot["voice"]["targetModel"] == "qwen3.5-omni-flash-realtime"
+        result = await service.get_task(db, "tenant-a", task.id)
+        assert result.model == "qwen3.5-omni-flash-realtime"
+
+
+
+@pytest.mark.parametrize("task_mode", ["single", "batch"])
+@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+def test_phone_task_preserves_explicit_model(task_mode, model):
+    from app.api.v1.ai_call.outbound.rule_task_schema import TaskConfigRequest
+
+    request = TaskConfigRequest.model_validate({
+        **_validation_config(task_mode=task_mode, rule_id=1, prompt_id=2,
+                             answer_mode="linphone", phone_number="1001"),
+        "model": model,
+    })
+    assert request.config_dict()["model"] == model
+
+
+
+@pytest.mark.parametrize("answer_mode", ["web", "linphone"])
+def test_task_rejects_model_outside_omni_comparison(answer_mode):
+    with pytest.raises(ValidationError):
+        SingleValidationRequest.model_validate({
+            **_validation_config(task_mode="single", rule_id=1, prompt_id=2,
+                                 answer_mode=answer_mode, phone_number="1001"),
+            "model": "qwen-audio-3.1-realtime-plus",
+        })
+
+
+
+def test_legacy_task_config_does_not_add_empty_model():
+    request = SingleValidationRequest.model_validate(_validation_config(
+        task_mode="single", rule_id=1, prompt_id=2, answer_mode="web",
+    ))
+    assert "model" not in request.config_dict()

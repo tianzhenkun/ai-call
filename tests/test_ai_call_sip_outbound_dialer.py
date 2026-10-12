@@ -101,6 +101,7 @@ def dial_request():
         customer_name="刘先生",
         scene_code="intro_geo",
         voice="Tina",
+        model="qwen3.5-omni-flash-realtime",
         prompt_profile_id=None,
         line=line_snapshot(),
         business_params={},
@@ -271,6 +272,7 @@ async def test_dial_does_not_mark_connected_after_session_creation(database):
         )
     )
     await service.session_created.wait()
+    assert service.requests[0]["model"] == "qwen3.5-omni-flash-realtime"
     connected.assert_not_awaited()
     await finish_record(
         database,

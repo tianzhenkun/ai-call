@@ -130,6 +130,7 @@ PERSISTED_EVENT_TYPES = frozenset({
     "opening_started",
     "playout_queue_flushed",
     "provider_event_unmapped",
+    "provider_session_configured",
     "response_generation_invalidated",
     "room_created",
     "session_completed",

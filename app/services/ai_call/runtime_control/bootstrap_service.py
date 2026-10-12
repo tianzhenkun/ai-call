@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Literal
 
@@ -8,7 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallRecordModel
-from app.services.ai_call.runtime_control.models import AiCallRuntimeEffectModel
+from app.services.ai_call.runtime_control.models import (
+    AiCallRuntimeCommandModel,
+    AiCallRuntimeEffectModel,
+)
 from app.services.ai_call.runtime_control.timing import read_database_time
 
 RuntimeBootstrapPhase = Literal["starting", "ready", "ending", "terminal"]
@@ -38,6 +42,7 @@ class RuntimeBootstrapSnapshot:
     resource_cleanup_error: str | None
     failure_stage: str | None
     failure_message: str | None
+    model: str | None = None
 
 
 def _value(value: object) -> object:
@@ -171,4 +176,15 @@ class RuntimeBootstrapService:
                 )
             ).all()
         )
-        return build_runtime_bootstrap_snapshot(record, effects, now=now)
+        payload_json = await self._session.scalar(
+            select(AiCallRuntimeCommandModel.payload_json).where(
+                AiCallRuntimeCommandModel.tenant_id == tenant_id,
+                AiCallRuntimeCommandModel.call_id == call_id,
+                AiCallRuntimeCommandModel.command_type == "START_CALL",
+            )
+        )
+        payload = json.loads(payload_json) if payload_json else {}
+        return replace(
+            build_runtime_bootstrap_snapshot(record, effects, now=now),
+            model=payload.get("model"),
+        )

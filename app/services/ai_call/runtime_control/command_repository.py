@@ -206,6 +206,10 @@ def start_call_request_fingerprint(request: StartCallIntent) -> str:
 
 
 def _validate_start_call_intent(request: StartCallIntent) -> None:
+    if request.payload.get("model") is not None:
+        from app.services.ai_call.realtime_model import OMNI_REALTIME_MODELS
+        if request.entry_type not in {"web", "direct_sip", "outbound"} or request.payload["model"] not in OMNI_REALTIME_MODELS:
+            raise InvalidCommandIntentError("会话级 model 仅支持浏览器或 SIP 的 Omni Plus/Flash")
     phone_fields = (
         request.callee_phone_number,
         request.callee_phone_number_masked,
@@ -295,6 +299,14 @@ class RuntimeCommandRepository:
         )
         if existing is not None:
             return self._matching_snapshot(existing, fingerprint)
+
+        if request.payload.get("model") is not None:
+            from app.api.v1.ai_call.voice.repository import VoiceRepository
+            await VoiceRepository(self._session).require_call_voice(
+                tenant_id=request.tenant_id,
+                voice=request.payload.get("voice"),
+                target_model=request.payload["model"],
+            )
 
         if request.scene_code and request.entry_type in {"web", "direct_sip"} and not admitted_task:
             from app.services.ai_call.prompt_editor import require_available_profile

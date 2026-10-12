@@ -672,6 +672,98 @@ async def test_livekit_provider_reconcile_only_reports_missing_create_resource()
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("effect_type", ["CREATE_ROOM", "ATTACH_AGENT_PARTICIPANT"])
+@pytest.mark.parametrize("configuration_change", ["voice_disabled", "baseline_changed"])
+@pytest.mark.parametrize("resource_present", [True, False])
+async def test_model_create_reconciliation_observes_resources_after_configuration_change(
+    monkeypatch, effect_type, configuration_change, resource_present,
+) -> None:
+    from app.api.v1.ai_call.model import AiCallRecordModel
+    from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+        LiveKitRuntimeProvider,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+
+    rows = {
+        AiCallRecordModel: SimpleNamespace(
+            call_id="call-1", room_name="ai-call-call-1",
+            participant_identity="caller-call-1", callee_phone_number=None,
+            entry_type="web",
+        ),
+        AiCallRuntimeCommandModel: SimpleNamespace(payload_json=json.dumps({
+            "model": "qwen3.5-omni-flash-realtime", "voice": "tenant_voice_1",
+        })),
+        AiCallRuntimeEffectModel: SimpleNamespace(command_id=77, resource_generation=7),
+        AiCallTenantVoiceProfileModel: 100,
+    }
+
+    class FakeSession:
+        async def scalar(self, statement):
+            return rows.get(statement.column_descriptions[0]["entity"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    config = SimpleNamespace(
+        qwen_realtime_model="qwen3.5-omni-plus-realtime", vad_type="server_vad",
+        customer_speech_review_enabled=False,
+    )
+    resolver = DatabaseRuntimeProviderResourceResolver(
+        FakeSession, orchestrator=SimpleNamespace(config=config),
+    )
+    monkeypatch.setattr(resolver, "_resolve_prompt_effective_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(resolver, "_resolve_knowledge_context", AsyncMock(return_value=None))
+    room_manager = FakeRoomManager()
+    room_manager.participants.add("agent-call-1-g7")
+    agent_manager = FakeAgentManager()
+    provider = LiveKitRuntimeProvider(
+        resolver=resolver, room_manager=room_manager, agent_manager=agent_manager,
+        sip_client=FakeSipClient(), egress_manager=FakeEgressManager(),
+    )
+    created = await provider.apply(_effect(effect_type))
+    assert created.kind == ProviderObservationKind.RESOURCE_PRESENT
+
+    if configuration_change == "voice_disabled":
+        rows[AiCallTenantVoiceProfileModel] = None
+        expected_failure = "音色不存在、未启用或不适用于当前租户及模型"
+    else:
+        config.qwen_realtime_model = "qwen-audio-3.1-realtime-plus"
+        expected_failure = "模型对照需使用 Omni、server_vad 且关闭客户发言审核的服务基线"
+    if not resource_present:
+        room_manager.rooms.clear()
+        room_manager.participants.clear()
+        agent_manager.active.clear()
+    room_manager.calls.clear()
+    agent_manager.calls.clear()
+
+    rejected = await provider.apply(_effect(effect_type))
+    assert rejected.kind == ProviderObservationKind.PERMANENT_NO_RESOURCE
+    assert rejected.failure_code == expected_failure
+    assert room_manager.calls == []
+    assert agent_manager.calls == []
+
+    observation = await provider.apply(_effect(effect_type, reconcile_only=True))
+    assert observation.kind == (
+        ProviderObservationKind.RESOURCE_PRESENT
+        if resource_present else ProviderObservationKind.RESOURCE_ABSENT
+    )
+    if effect_type == "CREATE_ROOM":
+        assert room_manager.calls == [("room_exists", "ai-call-call-1")]
+        assert agent_manager.calls == []
+    else:
+        assert room_manager.calls == [("participant_exists", "ai-call-call-1|agent-call-1-g7")]
+        assert agent_manager.calls == [("exists", "call-1")]
+
+
+@pytest.mark.anyio
 async def test_livekit_provider_missing_egress_reference_queries_stable_key() -> None:
     class MissingEgressResolver(FakeResolver):
         async def resolve(self, effect):

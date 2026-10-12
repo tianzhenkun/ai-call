@@ -24,7 +24,57 @@ class _FakeRepository:
 
 
 def _settings(entries: str) -> SimpleNamespace:
-    return SimpleNamespace(AI_CALL_OWNER_COMMAND_V1_ENTRIES=entries)
+    return SimpleNamespace(
+        AI_CALL_OWNER_COMMAND_V1_ENTRIES=entries,
+        QWEN_REALTIME_MODEL="qwen3.5-omni-plus-realtime",
+        QWEN_REALTIME_TURN_DETECTION_TYPE="server_vad",
+        QWEN_REALTIME_VOICE="Tina",
+        AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED=False,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+@pytest.mark.parametrize("entry", ["web", "direct_sip"])
+async def test_session_model_and_default_voice_are_persisted_without_changing_settings(model, entry) -> None:
+    repository = _FakeRepository([])
+    settings = _settings("web,direct_sip")
+    await RuntimeEntryStartService(settings=settings, repository=repository).submit(
+        StartEntryRequest(
+            tenant_id="tenant-a", entry_type=entry, idempotency_key="test:model",
+            payload={"model": model},
+            callee_phone_number="19900001001" if entry == "direct_sip" else None,
+        )
+    )
+    assert repository.requests[0].payload == {"model": model, "voice": "Tina"}
+    assert settings.QWEN_REALTIME_MODEL == "qwen3.5-omni-plus-realtime"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "entry,model,overrides,error",
+    [
+        ("web", "arbitrary-model", {}, "仅支持"),
+        ("web", "", {}, "仅支持"),
+        ("web", {}, {}, "仅支持"),
+        ("web", "qwen3.5-omni-flash-realtime", {"QWEN_REALTIME_MODEL": "qwen-audio-3.1-realtime-plus"}, "基线"),
+        ("web", "qwen3.5-omni-flash-realtime", {"QWEN_REALTIME_TURN_DETECTION_TYPE": "smart_turn"}, "基线"),
+        ("web", "qwen3.5-omni-flash-realtime", {"AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED": True}, "基线"),
+    ],
+)
+async def test_web_model_rejects_unsupported_models_entries_and_baselines(entry, model, overrides, error) -> None:
+    repository = _FakeRepository([])
+    settings = _settings("web,direct_sip")
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    with pytest.raises(RuntimeEntryStartError, match=error):
+        await RuntimeEntryStartService(settings=settings, repository=repository).submit(
+            StartEntryRequest(
+                tenant_id="tenant-a", entry_type=entry, idempotency_key="web:bad-model",
+                payload={"model": model, "voice": "Tina"},
+            )
+        )
+    assert repository.requests == []
 
 
 @pytest.mark.anyio

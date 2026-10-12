@@ -29,6 +29,7 @@ from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     validate_sip_outbound_preflight,
 )
+from app.services.ai_call.realtime_model import validate_realtime_model
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.utils.id_util import generate_snowflake_id
 
@@ -993,6 +994,16 @@ class OutboundRuleTaskService:
         AiCallPromptProfileModel,
         AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel,
     ]:
+        try:
+            validate_realtime_model(
+                request.model,
+                entry_type=request.answer_mode,
+                configured_model=settings.QWEN_REALTIME_MODEL,
+                vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
+                customer_speech_review_enabled=settings.AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED,
+            )
+        except ValueError as exc:
+            raise CustomException(msg=str(exc), status_code=400) from exc
         rule_id = self._business_id(request.rule_id, "ruleId")
         rule = await db.scalar(
             select(AiCallOutboundRuleModel).where(
@@ -1037,6 +1048,7 @@ class OutboundRuleTaskService:
             tenant_id=tenant_id,
             voice=request.voice,
             lock_tenant_voice=lock_tenant_voice,
+            target_model=request.model,
         )
         return rule, prompt, voice
 
@@ -1047,11 +1059,12 @@ class OutboundRuleTaskService:
         tenant_id: str,
         voice: str,
         lock_tenant_voice: bool,
+        target_model: str | None = None,
     ) -> AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel:
         builtin_voice = await db.scalar(
             select(AiCallVoiceProfileModel)
             .where(
-                AiCallVoiceProfileModel.target_model == settings.QWEN_REALTIME_MODEL,
+                AiCallVoiceProfileModel.target_model == (target_model or settings.QWEN_REALTIME_MODEL),
                 AiCallVoiceProfileModel.voice == voice,
             )
             .order_by(AiCallVoiceProfileModel.sort_order, AiCallVoiceProfileModel.id)
@@ -1062,7 +1075,7 @@ class OutboundRuleTaskService:
 
         tenant_statement = select(AiCallTenantVoiceProfileModel).where(
             AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
-            AiCallTenantVoiceProfileModel.target_model == settings.QWEN_REALTIME_MODEL,
+            AiCallTenantVoiceProfileModel.target_model == (target_model or settings.QWEN_REALTIME_MODEL),
             AiCallTenantVoiceProfileModel.voice == voice,
         )
         if lock_tenant_voice:
@@ -1169,6 +1182,7 @@ class OutboundRuleTaskService:
             task_name=task.task_name,
             task_mode=task.task_mode,
             answer_mode=task.answer_mode,
+            model=(OutboundRuleTaskService._load_object(task.config_snapshot_json).get("request") or {}).get("model"),
             status=task.status,
             total_targets=task.total_targets,
             completed_targets=task.completed_targets,

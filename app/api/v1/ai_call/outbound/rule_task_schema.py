@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from app.services.ai_call.realtime_model import OmniRealtimeModel
+
 from .schema import OutboundSchema
 
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -84,6 +86,7 @@ class TaskConfigRequest(OutboundSchema):
     prompt_profile_id: str | None = None
     scene_code: str = Field(min_length=1, max_length=64)
     voice: str = Field(min_length=1, max_length=128)
+    model: OmniRealtimeModel | None = None
     rule_id: str = Field(min_length=1, max_length=64)
     execution_mode: Literal["immediate", "scheduled"]
     scheduled_at: str | None = None
@@ -124,6 +127,8 @@ class TaskConfigRequest(OutboundSchema):
 
     def config_dict(self) -> dict:
         result = self.model_dump(mode="json", by_alias=True)
+        if self.model is None:
+            result.pop("model", None)
         if self.task_mode == "batch" or self.answer_mode == "web":
             result.pop("phoneNumber", None)
         if self.task_mode == "batch":
@@ -173,6 +178,7 @@ class OutboundTaskOut(OutboundSchema):
     task_name: str
     task_mode: Literal["single", "batch"]
     answer_mode: Literal["linphone", "web"]
+    model: str | None = None
     status: str
     total_targets: int
     completed_targets: int

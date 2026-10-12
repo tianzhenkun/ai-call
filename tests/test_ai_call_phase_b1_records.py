@@ -9580,3 +9580,41 @@ async def test_failed_owner_customer_track_keeps_main_recording_closed_and_asr_r
     assert main_recording is not None
     assert main_recording.status == "completed"
     assert track.failure_message is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("b1_service", ["file"], indirect=True)
+async def test_provider_session_configuration_survives_runtime_event_store_cleanup(
+    b1_service,
+) -> None:
+    service, _record_service = b1_service
+    payload = {
+        "model": "qwen3.5-omni-flash-realtime",
+        "voice": "Tina",
+        "vadType": "server_vad",
+        "customerSpeechReviewEnabled": False,
+    }
+    event = service.orchestrator.event_store.append(
+        call_id="call_provider_configuration",
+        type="provider_session_configured",
+        source="agent",
+        payload=payload,
+    )
+
+    assert b1_service.event_worker.queue.qsize() == 1
+    await b1_service.flush_events()
+    assert b1_service.event_worker.persisted_count == 1
+    assert b1_service.event_worker.failed_count == 0
+    b1_service.event_worker.detach_all()
+    await b1_service.event_worker.stop()
+    service.orchestrator.event_store = InMemoryEventStore()
+    assert service.orchestrator.event_store.list_all(event.call_id) == []
+
+    async with b1_service.session_maker() as db:
+        events = await AiCallRecordService(AiCallRecordRepository(db)).list_events(
+            event.call_id,
+            event_type="provider_session_configured",
+        )
+    assert [row.event_id for row in events] == [event.event_id]
+    assert events[0].source == "agent"
+    assert events[0].payload == payload

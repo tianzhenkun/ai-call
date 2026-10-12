@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
+from app.services.ai_call.realtime_model import OmniRealtimeModel
 from app.services.ai_call.session_registry import CallSessionStatus
 
 
@@ -20,6 +21,7 @@ class AiCallBaseSchema(BaseModel):
 class CreateWebSessionRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
+    model: OmniRealtimeModel | None = Field(default=None, description="仅本次浏览器会话的模型")
     voice: str | None = Field(default=None, description="Qwen Realtime voice 参数")
     business_id: str | None = Field(default=None, description="上游业务ID")
     scene_code: str = Field(description="业务场景编码")
@@ -32,6 +34,7 @@ class CreateWebSessionRequest(AiCallBaseSchema):
 class CreateSipSessionRequest(AiCallBaseSchema):
     model_config = ConfigDict(extra="forbid")
 
+    model: OmniRealtimeModel | None = Field(default=None, description="仅本次 SIP 会话的模型")
     callee_phone_number: str = Field(
         min_length=3,
         max_length=32,
@@ -200,6 +203,7 @@ class RuntimeBootstrapOut(AiCallBaseSchema):
     resource_cleanup_error: str | None = None
     failure_stage: str | None = None
     failure_message: str | None = None
+    model: str | None = None
 
 
 class TokenOut(AiCallBaseSchema):

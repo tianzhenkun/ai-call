@@ -11,7 +11,12 @@ from app.api.v1.ai_call.model import AiCallVoiceProfileModel
 from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.schema import VoiceProfileOut, VoiceStatus
-from app.services.ai_call.voice_profile import VOICE_SPEAKING_STYLE_INSTRUCTIONS, VoiceSpeakingStyle
+from app.core.exceptions import CustomException
+from app.services.ai_call.voice_profile import (
+    VOICE_SPEAKING_STYLE_INSTRUCTIONS,
+    VoiceSpeakingStyle,
+    builtin_voice_profile_values,
+)
 
 BLOCKING_TASK_STATUSES = ("SCHEDULED", "RUNNING", "PAUSING", "PAUSED", "STOPPING")
 HISTORICAL_TASK_STATUSES = ("STOPPED", "COMPLETED", "FAILED", "CANCELLED")
@@ -29,6 +34,22 @@ class VoiceRepository:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def require_call_voice(self, *, tenant_id: str, voice: str, target_model: str) -> None:
+        if not isinstance(voice, str) or not voice.strip():
+            raise CustomException(msg="会话音色不能为空且必须为字符串", status_code=400)
+        if any(profile["voice"] == voice for profile in builtin_voice_profile_values(target_model)):
+            return
+        profile_id = await self.db.scalar(
+            select(AiCallTenantVoiceProfileModel.id).where(
+                AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                AiCallTenantVoiceProfileModel.voice == voice,
+                AiCallTenantVoiceProfileModel.target_model == target_model,
+                AiCallTenantVoiceProfileModel.status == "ENABLED",
+            )
+        )
+        if profile_id is None:
+            raise CustomException(msg="音色不存在、未启用或不适用于当前租户及模型", status_code=400)
+
     async def list_profiles(
         self,
         *,
@@ -42,6 +63,12 @@ class VoiceRepository:
         page_num: int = 1,
         page_size: int = 20,
     ) -> tuple[list[VoiceProfileOut], int]:
+        if target_model == "qwen3.5-omni-flash-realtime":
+            from app.api.v1.ai_call.crud import AiCallRecordRepository
+            await AiCallRecordRepository(self.db).ensure_builtin_voice_profiles(
+                target_model=target_model,
+                profiles=builtin_voice_profile_values(target_model),
+            )
         global_statement = select(AiCallVoiceProfileModel).where(
             AiCallVoiceProfileModel.target_model == target_model
         )

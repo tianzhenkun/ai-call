@@ -70,6 +70,7 @@ class OutboundDialRequest:
     prompt_snapshot: dict | None = None
     line: SipLineSnapshot | None = None
     answer_mode: Literal["linphone", "web"] = "linphone"
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +302,7 @@ class OutboundTaskExecutor:
                 prompt_profile_id=task.prompt_profile_id,
                 prompt_snapshot=self._task_prompt_snapshot(task),
                 line=self._task_line_snapshot(task),
+                model=self._task_model(task),
             )
             call_id = uuid4().hex
             db.add(
@@ -460,6 +462,7 @@ class OutboundTaskExecutor:
                     prompt_snapshot=self._task_prompt_snapshot(task),
                     line=self._task_line_snapshot(task),
                     answer_mode=task.answer_mode,
+                    model=self._task_model(task),
                 )
                 if attempt.dialer_type in {None, "mock"}:
                     result = DialResult(
@@ -998,6 +1001,7 @@ class OutboundTaskExecutor:
                     prompt_snapshot=self._task_prompt_snapshot(task),
                     line=line,
                     answer_mode=task.answer_mode,
+                    model=self._task_model(task),
                 )
                 if self.owner_runtime_start is not None:
                     call_id = await self.owner_runtime_start.create(
@@ -1327,6 +1331,11 @@ class OutboundTaskExecutor:
             return line
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _task_model(task: AiCallOutboundTaskModel) -> str | None:
+        snapshot = json.loads(task.config_snapshot_json)
+        return (snapshot.get("request") or {}).get("model")
 
     @staticmethod
     def _task_prompt_snapshot(task: AiCallOutboundTaskModel) -> dict | None:

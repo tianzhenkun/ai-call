@@ -58,6 +58,7 @@ class OwnerRuntimeOutboundStart:
             f"{request.target_id}:{request.attempt_no}"
         )
         payload = {
+            **({"model": request.model} if request.model is not None else {}),
             "attempt_id": str(attempt_id),
             "attempt_no": request.attempt_no,
             "business_params": request.business_params,

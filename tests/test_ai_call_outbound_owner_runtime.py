@@ -415,8 +415,10 @@ async def test_owner_runtime_executor_atomically_queues_start_without_dialing(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("model", [None, "qwen3.5-omni-flash-realtime"])
 async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
     database,
+    model,
 ) -> None:
     from app.api.v1.ai_call.outbound.owner_runtime_start import (
         OwnerRuntimeOutboundStart,
@@ -428,6 +430,13 @@ async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
         now,
         answer_mode="web",
     )
+    if model is not None:
+        async with database() as session:
+            task = await session.get(AiCallOutboundTaskModel, task_id)
+            snapshot = json.loads(task.config_snapshot_json)
+            snapshot["request"] = {"model": model}
+            task.config_snapshot_json = json.dumps(snapshot)
+            await session.commit()
     worker_id = await _seed_ready_worker(database, now)
     executor = OutboundTaskExecutor(
         database,
@@ -470,6 +479,7 @@ async def test_owner_runtime_web_task_queues_without_sip_line_or_reservation(
     assert record.callee_phone_number_hash is None
     assert command is not None
     assert json.loads(command.payload_json or "{}") == {
+        **({"model": model} if model is not None else {}),
         "attempt_id": str(attempt.id),
         "attempt_no": 1,
         "business_params": {"customerName": "客户1"},
@@ -686,8 +696,9 @@ async def test_parallel_owner_runtime_executors_create_one_start_chain(database)
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("model", [None, "qwen3.5-omni-flash-realtime"])
 async def test_dispatcher_atomically_assigns_outbound_owner_line_and_attempt(
-    database,
+    database, model,
 ) -> None:
     from app.api.v1.ai_call.outbound.owner_runtime_start import (
         OwnerRuntimeOutboundStart,
@@ -695,6 +706,13 @@ async def test_dispatcher_atomically_assigns_outbound_owner_line_and_attempt(
 
     now = datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
     task_id, _target_id, _phone_number = await _seed_due_task(database, now)
+    if model is not None:
+        async with database() as db:
+            task = await db.get(AiCallOutboundTaskModel, task_id)
+            snapshot = json.loads(task.config_snapshot_json)
+            snapshot["request"]["model"] = model
+            task.config_snapshot_json = json.dumps(snapshot)
+            await db.commit()
     worker_id = await _seed_ready_worker(database, now)
     executor = OutboundTaskExecutor(
         database,

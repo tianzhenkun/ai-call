@@ -23,6 +23,7 @@ from app.services.ai_call.livekit_room import BrowserRoomToken, LiveKitRoomManag
 from app.services.ai_call.metrics import CallMetrics
 from app.services.ai_call.prompt_config import PromptEffectiveConfig
 from app.services.ai_call.providers.aliyun_qwen_realtime import AliyunQwenRealtimeProvider
+from app.services.ai_call.realtime_model import validate_realtime_model
 from app.services.ai_call.session_registry import (
     ALLOWED_TRANSITIONS,
     RUNNING_STATUSES,
@@ -400,10 +401,10 @@ class AiCallOrchestrator:
             api_secret=self.config.livekit_api_secret,
         )
         return RealtimeCallAgentRunner(
-            provider_factory=lambda _session: AliyunQwenRealtimeProvider(
+            provider_factory=lambda session: AliyunQwenRealtimeProvider(
                 realtime_url=self.config.dashscope_realtime_url,
                 api_key=self.config.dashscope_api_key,
-                model=self.config.qwen_realtime_model,
+                model=self._config_value(session.effective_config, "model", self.config.qwen_realtime_model),
             ),
             registry=self.registry,
             event_store=self.event_store,
@@ -482,6 +483,7 @@ class AiCallOrchestrator:
         prompt: str | None,
         call_id: str | None = None,
         prompt_effective_config: PromptEffectiveConfig | None = None,
+        model: str | None = None,
     ) -> CreateSessionResult:
         self.config.ensure_ready()
         call_id = call_id or self._new_call_id()
@@ -491,6 +493,7 @@ class AiCallOrchestrator:
             voice=voice,
             prompt=prompt,
             prompt_effective_config=prompt_effective_config,
+            model=model,
         )
         session = CallSession(
             call_id=call_id,
@@ -610,6 +613,7 @@ class AiCallOrchestrator:
         call_id: str | None = None,
         prompt_effective_config: PromptEffectiveConfig | None = None,
         knowledge_context: KnowledgeRuntimeContext | None = None,
+        model: str | None = None,
     ) -> CreateSipRoomSessionResult:
         self.config.ensure_ready()
         call_id = call_id or self._new_call_id()
@@ -619,6 +623,8 @@ class AiCallOrchestrator:
             voice=voice,
             prompt=prompt,
             prompt_effective_config=prompt_effective_config,
+            model=model,
+            entry_type="sip_outbound",
         )
         session = CallSession(
             call_id=call_id,
@@ -1535,7 +1541,19 @@ class AiCallOrchestrator:
         voice: str | None,
         prompt: str | None,
         prompt_effective_config: PromptEffectiveConfig | None = None,
+        model: str | None = None,
+        entry_type: str = "web",
     ) -> EffectiveConfig:
+        try:
+            validate_realtime_model(
+                model,
+                entry_type=entry_type,
+                configured_model=self.config.qwen_realtime_model,
+                vad_type=self.config.vad_type,
+                customer_speech_review_enabled=self.config.customer_speech_review_enabled,
+            )
+        except ValueError as exc:
+            raise AiCallError(error_id="invalid_realtime_model", msg=str(exc), status_code=400) from exc
         resolved_voice = voice or self.config.qwen_realtime_voice
         if prompt_effective_config is not None:
             if not prompt_effective_config.instructions.strip():
@@ -1551,7 +1569,7 @@ class AiCallOrchestrator:
                     status_code=status.HTTP_400_BAD_REQUEST,
                 )
             return EffectiveConfig(
-                model=self.config.qwen_realtime_model,
+                model=model or self.config.qwen_realtime_model,
                 voice=resolved_voice,
                 prompt=prompt_effective_config.instructions,
                 prompt_hash=prompt_effective_config.prompt_hash,
@@ -1581,7 +1599,7 @@ class AiCallOrchestrator:
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         return EffectiveConfig(
-            model=self.config.qwen_realtime_model,
+            model=model or self.config.qwen_realtime_model,
             voice=resolved_voice,
             prompt=resolved_prompt,
             prompt_hash=self._hash_text(resolved_prompt),

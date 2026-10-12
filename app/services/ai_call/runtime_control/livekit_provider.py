@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from sqlalchemy import select
 
+from app.core.exceptions import CustomException
 from app.services.ai_call.livekit_egress import (
     LiveKitEgressAlreadyCompleteError,
     LiveKitEgressNotFoundError,
@@ -19,6 +20,7 @@ from app.services.ai_call.prompt_config import (
     PromptResolveContext,
     resolve_static_prompt_snapshot,
 )
+from app.services.ai_call.realtime_model import validate_realtime_model
 from app.services.ai_call.runtime_control.customer_track import customer_track_keys
 from app.services.ai_call.runtime_control.dialogue_bridge import (
     OwnerDialogueFinalizeResult,
@@ -50,6 +52,7 @@ class RuntimeProviderResource:
     callee_phone_number: str | None = None
     egress_id: str | None = None
     voice: str | None = None
+    model: str | None = None
     tenant_id: str | None = None
     runtime_owner_id: str | None = None
     runtime_fencing_token: int | None = None
@@ -128,6 +131,31 @@ class DatabaseRuntimeProviderResourceResolver:
             voice = self._payload_voice(
                 getattr(command, "payload_json", None) if command is not None else None
             )
+            payload = self._payload(getattr(command, "payload_json", None))
+            model = payload.get("model")
+            # 对账必须查询已创建的资源，不能用当前配置变化推断资源不存在。
+            if (
+                not claim.reconcile_only
+                and model is not None
+                and claim.effect_type in {"CREATE_ROOM", "ATTACH_AGENT_PARTICIPANT"}
+            ):
+                if self._orchestrator is None:
+                    raise ProviderPreconditionError("会话级模型缺少运行时配置")
+                from app.api.v1.ai_call.voice.repository import VoiceRepository
+                config = self._orchestrator.config
+                try:
+                    validate_realtime_model(
+                        model,
+                        entry_type=record.entry_type,
+                        configured_model=config.qwen_realtime_model,
+                        vad_type=config.vad_type,
+                        customer_speech_review_enabled=config.customer_speech_review_enabled,
+                    )
+                    await VoiceRepository(session).require_call_voice(
+                        tenant_id=claim.tenant_id, voice=voice, target_model=model,
+                    )
+                except (ValueError, CustomException) as exc:
+                    raise ProviderPreconditionError(str(exc)) from exc
             sip_config = self._resolve_sip_config(record, command, claim.effect_type)
             prompt_effective_config = None
             knowledge_context = None
@@ -185,6 +213,7 @@ class DatabaseRuntimeProviderResourceResolver:
                 ),
                 egress_id=egress_id,
                 voice=voice,
+                model=model,
                 tenant_id=claim.tenant_id,
                 runtime_owner_id=claim.processing_owner_id,
                 runtime_fencing_token=claim.processing_fencing_token,
@@ -267,7 +296,7 @@ class DatabaseRuntimeProviderResourceResolver:
         style = await VoiceRepository(session).resolve_call_speaking_style(
             tenant_id=context.tenant_id,
             voice=payload.get("voice") or self._orchestrator.config.qwen_realtime_voice,
-            target_model=self._orchestrator.config.qwen_realtime_model,
+            target_model=payload.get("model") or self._orchestrator.config.qwen_realtime_model,
             business_type=record.business_type,
             business_id=context.business_id,
         )
@@ -453,9 +482,13 @@ class OwnerRuntimeAgentManager:
                 resource.voice,
                 None,
                 resource.prompt_effective_config,
+                **({"model": resource.model} if resource.model is not None else {}),
             )
             if resource.prompt_effective_config is not None
-            else self._orchestrator._build_effective_config(resource.voice, None)
+            else self._orchestrator._build_effective_config(
+                resource.voice, None,
+                **({"model": resource.model} if resource.model is not None else {}),
+            )
         )
         session = CallSession(
             call_id=resource.call_id,

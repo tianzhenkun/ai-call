@@ -1066,6 +1066,7 @@ class RealtimeCallAgentRunner:
         state = self._provider_transport_state(session.call_id)
         state.update({
             "providerClass": f"{type(provider).__module__}.{type(provider).__name__}",
+            "providerModel": getattr(provider, "model", None),
             "providerCreatedAt": self._utcnow_text(),
         })
         await provider.connect()
@@ -1079,6 +1080,14 @@ class RealtimeCallAgentRunner:
             "sessionVadThreshold": session_config.vad_threshold,
             "sessionVadSilenceDurationMs": session_config.vad_silence_duration_ms,
         })
+        if state["providerModel"] is not None:
+            self._append_event(session.call_id, "provider_session_configured", "agent", {
+                "model": state["providerModel"],
+                "voice": session_config.voice,
+                "vadType": session_config.vad_type,
+                "vadThreshold": session_config.vad_threshold,
+                "vadSilenceDurationMs": session_config.vad_silence_duration_ms,
+            })
         self._tasks[session.call_id] = asyncio.create_task(
             self._consume_provider_events(session.call_id, provider)
         )
@@ -6868,6 +6877,7 @@ class RealtimeCallAgentRunner:
                     customer_transcript_event_id=turn.customer_transcript_event_id,
                     tool_call_id=tool_call_id,
                     query=self._tool_call_arguments(provider_event.payload).get("query"),
+                    model_name=getattr(session.effective_config, "model", None),
                 )
             except Exception as exc:
                 unavailable_message = (

@@ -559,6 +559,7 @@ class KnowledgeRealtimeSearchService:
         customer_transcript_event_id: str | None,
         tool_call_id: str,
         query: Any,
+        model_name: str | None = None,
     ) -> KnowledgeRealtimeSearchResult:
         started = perf_counter()
         hits: list[KnowledgeSearchHit] = []
@@ -595,6 +596,7 @@ class KnowledgeRealtimeSearchService:
                 status=status,
                 hits=hits,
                 latency_ms=latency_ms,
+                model_name=model_name or self.model_name,
             )
         except Exception as exc:
             log.warning(
@@ -661,6 +663,7 @@ class KnowledgeRealtimeSearchService:
         status: str,
         hits: list[KnowledgeSearchHit],
         latency_ms: int,
+        model_name: str | None,
     ) -> int:
         audit_id = generate_snowflake_id()
         evidence = [self._audit_evidence(hit) for hit in hits]
@@ -690,7 +693,7 @@ class KnowledgeRealtimeSearchService:
                     version_snapshot_hash=context.version_snapshot_hash,
                     status=status,
                     retriever_version=context.retriever_version,
-                    model_name=self.model_name,
+                    model_name=model_name,
                     evidence_json=json.dumps(
                         evidence,
                         ensure_ascii=False,

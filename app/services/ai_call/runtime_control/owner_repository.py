@@ -14,6 +14,7 @@ from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallEventModel, AiCallRecordModel
+from app.services.ai_call.realtime_model import OMNI_REALTIME_MODELS
 from app.services.ai_call.runtime_control.models import (
     AiCallRuntimeCommandModel,
     AiCallRuntimeEffectModel,
@@ -1152,6 +1153,7 @@ _OUTBOUND_START_PAYLOAD_KEYS = frozenset({
     "attempt_id",
     "attempt_no",
     "business_params",
+    "model",
     "line_code",
     "line_id",
     "sip_line",
@@ -1174,7 +1176,7 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
     if (
         not isinstance(payload, dict)
         or not _OUTBOUND_START_PAYLOAD_KEYS
-        - {"business_params", "prompt_snapshot", "sip_line"}
+        - {"business_params", "prompt_snapshot", "sip_line", "model"}
         <= set(payload)
         or not set(payload) <= _OUTBOUND_START_PAYLOAD_KEYS
     ):
@@ -1209,6 +1211,8 @@ def parse_outbound_start_refs(payload_json: str | None) -> OutboundStartRefs | N
         line_id = _canonical_positive_decimal(line_id_value)
         if line_id is None:
             return None
+    if "model" in payload and payload["model"] not in OMNI_REALTIME_MODELS:
+        return None
     sip_line = payload.get("sip_line", _INVALID_LINE_ID)
     if line_id is None:
         if sip_line is not _INVALID_LINE_ID and sip_line is not None:

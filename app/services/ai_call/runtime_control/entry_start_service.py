@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from app.services.ai_call.realtime_model import validate_realtime_model
 from app.services.ai_call.runtime_control.command_repository import (
     CommandSnapshot,
     RuntimeCommandRepository,
@@ -77,6 +78,18 @@ class RuntimeEntryStartService:
             raise RuntimeEntryStartError("START_CALL 排队超时必须大于 0 秒")
 
         payload = dict(request.payload)
+        if payload.get("model") is not None:
+            try:
+                validate_realtime_model(
+                    payload["model"],
+                    entry_type=entry.value,
+                    configured_model=self._settings.QWEN_REALTIME_MODEL,
+                    vad_type=self._settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
+                    customer_speech_review_enabled=self._settings.AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED,
+                )
+            except ValueError as exc:
+                raise RuntimeEntryStartError(str(exc)) from exc
+            payload["voice"] = payload.get("voice") or self._settings.QWEN_REALTIME_VOICE
         direct_sip_phone: DirectSipPhone | None = None
         if entry is OwnerCommandEntry.DIRECT_SIP:
             try:

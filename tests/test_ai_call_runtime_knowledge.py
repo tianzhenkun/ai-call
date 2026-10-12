@@ -203,7 +203,7 @@ async def test_realtime_knowledge_tool_uses_only_trusted_session_scope_and_links
         room_name="room-1",
         participant_identity="sip-call-1",
         status=CallSessionStatus.CONNECTED,
-        effective_config=SimpleNamespace(prompt="业务提示词", voice="Tina"),
+        effective_config=SimpleNamespace(prompt="业务提示词", voice="Tina", model="qwen3.5-omni-flash-realtime"),
         knowledge_context=context,
     )
     registry.add(session)
@@ -235,6 +235,7 @@ async def test_realtime_knowledge_tool_uses_only_trusted_session_scope_and_links
             "customer_transcript_event_id": "evt-customer",
             "tool_call_id": "tool-1",
             "query": "退款审核后多久能到账？",
+            "model_name": "qwen3.5-omni-flash-realtime",
         }
     ]
     assert json.loads(provider.results[0][1])["evidenceType"] == (
@@ -300,6 +301,34 @@ def test_realtime_knowledge_tool_is_not_registered_without_trusted_context() -> 
     )
 
     assert SEARCH_SCENE_KNOWLEDGE_TOOL not in runner._session_config(session).tools
+
+
+@pytest.mark.anyio
+async def test_knowledge_audit_persists_each_session_model(tmp_path) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from app.api.v1.ai_call.model import AiCallKnowledgeUsageModel
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'model-audit.db'}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(AiCallKnowledgeUsageModel.__table__.create)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        service = KnowledgeRealtimeSearchService(factory, model_name="qwen3.5-omni-plus-realtime")
+        context = parse_knowledge_runtime_context(_snapshot(), tenant_id="tenant-a", task_id=7)
+        models = ["qwen3.5-omni-flash-realtime", "qwen3.5-omni-plus-realtime"]
+        for index, model in enumerate(models):
+            result = await service.search(
+                context=context, call_id=f"call-{index}", customer_transcript_event_id=None,
+                tool_call_id=f"tool-{index}", query=None, model_name=model,
+            )
+            assert result.audit_id is not None
+        async with factory() as db:
+            rows = list((await db.scalars(select(AiCallKnowledgeUsageModel).order_by(AiCallKnowledgeUsageModel.call_id))).all())
+            assert [row.model_name for row in rows] == models
+        assert service.model_name == "qwen3.5-omni-plus-realtime"
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio

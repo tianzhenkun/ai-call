@@ -3745,6 +3745,35 @@ async def test_qwen_provider_normalizes_output_item_done_tool_call_once() -> Non
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("model", [None, "qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+async def test_provider_configuration_event_records_known_model(model) -> None:
+    registry = InMemorySessionRegistry()
+    store = InMemoryEventStore()
+    provider = FakeRealtimeProvider([])
+    if model is not None:
+        provider.model = model
+    session = CallSession(
+        call_id="call_model", room_name="room_model", participant_identity="sip-model",
+        status=CallSessionStatus.READY, effective_config={"voice": "Tina", "prompt": "业务提示词"},
+    )
+    registry.add(session)
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _: provider, registry=registry, event_store=store,
+        metrics_by_call_id={},
+    )
+    try:
+        await runner.start(session)
+        events = [event for event in store.list(session.call_id) if event.type == "provider_session_configured"]
+        assert len(events) == (0 if model is None else 1)
+        if model is not None:
+            assert events[0].payload["model"] == model
+            assert events[0].payload["voice"] == "Tina"
+            assert events[0].payload["vadType"] == "server_vad"
+    finally:
+        await runner.stop(session.call_id)
+
+
+@pytest.mark.anyio
 async def test_realtime_agent_runner_records_provider_events_and_updates_session_state() -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()

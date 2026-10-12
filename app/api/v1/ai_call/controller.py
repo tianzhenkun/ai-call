@@ -270,6 +270,7 @@ async def create_session_controller(
                     entry_type="web",
                     idempotency_key=normalized_idempotency_key,
                     payload={
+                        **({"model": request.model} if request.model is not None else {}),
                         "voice": request.voice,
                         "business_id": request.business_id,
                         "scene_code": request.scene_code,
@@ -282,6 +283,8 @@ async def create_session_controller(
                     ),
                 )
             )
+        except RuntimeEntryStartError as exc:
+            raise CustomException(msg=str(exc), status_code=400) from exc
         except IdempotencyConflictError as exc:
             raise CustomException(
                 msg="幂等键已用于不同的请求",
@@ -306,6 +309,7 @@ async def create_session_controller(
         )
 
     result = await service.create_web_session(
+        **({"model": request.model} if request.model is not None else {}),
         voice=request.voice,
         prompt=None,
         business_id=request.business_id,
@@ -377,6 +381,7 @@ async def create_sip_session_controller(
                     entry_type="direct_sip",
                     idempotency_key=normalized_idempotency_key,
                     payload={
+                        **({"model": request.model} if request.model is not None else {}),
                         "voice": request.voice,
                         "business_id": request.business_id,
                         "scene_code": request.scene_code,
@@ -424,6 +429,7 @@ async def create_sip_session_controller(
 
     try:
         result = await service.create_sip_session(
+            **({"model": request.model} if request.model is not None else {}),
             callee_phone_number=request.callee_phone_number,
             voice=request.voice,
             business_id=request.business_id,

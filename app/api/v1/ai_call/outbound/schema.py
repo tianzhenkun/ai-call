@@ -12,6 +12,8 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
+from app.services.ai_call.realtime_model import OmniRealtimeModel
+
 
 class OutboundSchema(BaseModel):
     model_config = ConfigDict(
@@ -28,6 +30,7 @@ class BatchValidationRequest(OutboundSchema):
     prompt_profile_id: str | None = None
     scene_code: str = Field(min_length=1, max_length=64)
     voice: str = Field(min_length=1, max_length=128)
+    model: OmniRealtimeModel | None = None
     rule_id: str = Field(min_length=1, max_length=64)
     execution_mode: Literal["immediate", "scheduled"]
     scheduled_at: str | None = None

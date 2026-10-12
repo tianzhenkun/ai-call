@@ -79,6 +79,9 @@ class OutboundValidationService:
             )
 
         line = await self.line_service.resolve_default(db, tenant_id)
+        config = request.model_dump(mode="json", by_alias=True)
+        if request.model is None:
+            config.pop("model", None)
         temp_path: str | None = None
         try:
             temp_path, file_size = await self._save_upload(file)
@@ -92,7 +95,7 @@ class OutboundValidationService:
                 temp_file_path=temp_path,
                 file_size=file_size,
                 task_config_json=json.dumps(
-                    request.model_dump(mode="json", by_alias=True),
+                    config,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),

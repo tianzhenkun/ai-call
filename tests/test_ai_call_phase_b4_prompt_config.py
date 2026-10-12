@@ -1933,3 +1933,191 @@ def test_prompt_config_api_routes_return_expected_response_shapes() -> None:
     assert applications["rows"][0]["fromVersionNo"] == 2
     assert applications["rows"][0]["toVersionNo"] == 1
     assert applications["rows"][0]["appliedByName"] == "测试用户"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entry_type", ["web", "direct_sip"])
+async def test_models_flow_from_persisted_command_to_resource_and_provider(b4_service, monkeypatch, entry_type) -> None:
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import select
+
+    from app.services.ai_call.runtime_control import bootstrap_service
+    from app.services.ai_call.runtime_control.command_repository import RuntimeCommandRepository
+    from app.services.ai_call.runtime_control.effect_repository import EffectClaim
+    from app.services.ai_call.runtime_control.entry_start_service import (
+        RuntimeEntryStartService,
+        StartEntryRequest,
+    )
+    from app.services.ai_call.runtime_control.livekit_provider import (
+        DatabaseRuntimeProviderResourceResolver,
+        OwnerRuntimeAgentManager,
+        ProviderPreconditionError,
+    )
+    from app.services.ai_call.runtime_control.models import (
+        AiCallRuntimeCommandModel,
+        AiCallRuntimeEffectModel,
+    )
+    from app.services.ai_call.runtime_control.runtime_service import RuntimeRegistry
+
+    service, repository, _rooms, capture = b4_service
+    await create_static_profile(service)
+    now = datetime.now(timezone.utc)
+    clock = AsyncMock(return_value=now)
+    monkeypatch.setattr(bootstrap_service, "read_database_time", clock)
+    settings = SimpleNamespace(
+        AI_CALL_OWNER_COMMAND_V1_ENTRIES="web,direct_sip",
+        QWEN_REALTIME_MODEL="qwen3.5-omni-plus-realtime",
+        QWEN_REALTIME_TURN_DETECTION_TYPE="server_vad",
+        QWEN_REALTIME_VOICE="Tina",
+        AI_CALL_CUSTOMER_SPEECH_REVIEW_ENABLED=False,
+    )
+    entry = RuntimeEntryStartService(
+        settings=settings, repository=RuntimeCommandRepository(repository.db, database_clock=clock),
+    )
+    session_factory = async_sessionmaker(repository.db.bind, expire_on_commit=False)
+    resolver = DatabaseRuntimeProviderResourceResolver(session_factory, orchestrator=service.orchestrator)
+    manager = OwnerRuntimeAgentManager(
+        orchestrator=service.orchestrator, runtime_registry=RuntimeRegistry(), session_factory=session_factory,
+    )
+    runner = service.orchestrator._build_default_agent_runner()
+    capture.audio_transport = runner.audio_transport
+    factory = runner.provider_factory
+    models = ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime", "qwen3.5-omni-plus-realtime"]
+    providers = []
+    for index, model in enumerate(models):
+        snapshot = await entry.submit(StartEntryRequest(
+            tenant_id=TEST_TENANT_ID, entry_type=entry_type, idempotency_key=f"{entry_type}:model:{index}",
+            callee_phone_number="19900001001" if entry_type == "direct_sip" else None,
+            payload={"model": model, "voice": "Tina", "business_params": {"customerName": "张总"}},
+            scene_code="debt_promise_repay_reminder",
+        ))
+        command = await repository.db.scalar(select(AiCallRuntimeCommandModel).where(AiCallRuntimeCommandModel.id == snapshot.command_id))
+        assert json.loads(command.payload_json)["model"] == model
+        effect_id = 900 + index
+        repository.db.add(AiCallRuntimeEffectModel(
+            id=effect_id, tenant_id=TEST_TENANT_ID, call_id=snapshot.call_id,
+            command_id=snapshot.command_id, effect_type="ATTACH_AGENT_PARTICIPANT",
+            idempotency_key=f"agent:{index}", fencing_token=1, status="PROCESSING",
+            provider_namespace="livekit:test", provider_idempotency_key=f"agent:{index}",
+            resource_key=f"agent:{index}", resource_generation=1, created_at=now, updated_at=now,
+        ))
+        await repository.db.commit()
+        claim = EffectClaim(
+            effect_id=effect_id, tenant_id=TEST_TENANT_ID, call_id=snapshot.call_id,
+            effect_type="ATTACH_AGENT_PARTICIPANT", processing_owner_id="runtime-1",
+            processing_fencing_token=1, processing_token="token", processing_expires_at=now,
+            source_create_effect_id=None, create_protection_deadline_at=None,
+            attempt_count=1, reconcile_only=False, provider_namespace="livekit:test",
+            resource_key=f"agent:{index}", reservation_token="reservation-1",
+        )
+        resource = await resolver.resolve(claim)
+        assert resource.model == model
+        assert "张总" in resource.prompt_effective_config.instructions
+        await manager.start(resource)
+        session = capture.started_sessions[-1]
+        assert session.effective_config.model == model
+        assert session.effective_config.vad_type == "server_vad"
+        provider = factory(session)
+        assert provider.model == model
+        assert provider._build_connect_url().endswith(f"model={model}")
+        providers.append(provider)
+        if entry_type == "web":
+            bootstrap = await bootstrap_service.RuntimeBootstrapService(repository.db).get(
+                tenant_id=TEST_TENANT_ID, call_id=snapshot.call_id,
+            )
+            assert bootstrap.model == model
+    assert [provider.model for provider in providers] == models
+    assert service.orchestrator.config.qwen_realtime_model == models[0]
+    assert service.orchestrator.config.customer_speech_review_enabled is False
+    for payload, error in (
+        ({"model": "arbitrary-model", "voice": "Tina"}, "仅支持"),
+        ({"model": models[1], "voice": "longanqian_v3.1"}, "当前租户及模型"),
+    ):
+        command.payload_json = json.dumps(payload)
+        await repository.db.commit()
+        with pytest.raises(ProviderPreconditionError, match=error):
+            await resolver.resolve(claim)
+
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("model", ["qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"])
+async def test_legacy_sip_model_reaches_agent_without_changing_default(b4_service, model) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    service, _repository, _rooms, capture = b4_service
+    await create_static_profile(service)
+    service.sip_client = SimpleNamespace(
+        preflight=lambda **_: SimpleNamespace(ok=True),
+        create_participant=AsyncMock(return_value=SimpleNamespace(
+            participant_identity="sip-test", sip_call_id="sip-test", sip_call_id_full="sip-test-full",
+            sip_trunk_id="test-trunk", sip_call_status="active",
+        )),
+    )
+    await service.create_sip_session(
+        tenant_id=TEST_TENANT_ID, voice="Tina", model=model,
+        callee_phone_number="19900001001", scene_code="debt_promise_repay_reminder",
+        business_params={"customerName": "张总"},
+    )
+    assert capture.started_sessions[-1].effective_config.model == model
+    assert service.orchestrator.config.qwen_realtime_model == "qwen3.5-omni-plus-realtime"
+    service.sip_client.create_participant.assert_awaited_once()
+
+
+
+@pytest.mark.anyio
+async def test_legacy_web_model_and_flash_voice_list_use_selected_model(b4_service) -> None:
+    from app.api.v1.ai_call.voice.repository import VoiceRepository
+
+    service, repository, _rooms, capture = b4_service
+    await create_static_profile(service)
+    model = "qwen3.5-omni-flash-realtime"
+    rows, total = await VoiceRepository(repository.db).list_profiles(
+        tenant_id=TEST_TENANT_ID, target_model=model, available_only=True, page_size=200,
+    )
+    assert total == len(BUILTIN_QWEN_OMNI_REALTIME_VOICES)
+    assert all(row.target_model == model for row in rows)
+    result = await service.create_web_session(
+        tenant_id=TEST_TENANT_ID, voice="Tina", prompt=None, model=model,
+        scene_code="debt_promise_repay_reminder", business_params={"customerName": "张总"},
+    )
+    assert result.effective_config.model == model
+    assert capture.started_sessions[-1].effective_config.model == model
+    assert service.orchestrator.config.qwen_realtime_model == "qwen3.5-omni-plus-realtime"
+
+
+
+@pytest.mark.anyio
+async def test_web_model_rejects_voice_from_another_model_or_tenant_before_room(b4_service) -> None:
+    from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
+    from app.api.v1.ai_call.voice.repository import VoiceRepository
+
+    service, repository, rooms, _capture = b4_service
+    now = datetime.now(timezone.utc)
+    profile = AiCallTenantVoiceProfileModel(
+        id=98765, tenant_id="other-tenant", display_name="测试音色", voice="custom_test_voice",
+        voice_type="自定义复刻", gender="未知", language="zh", target_model="qwen3.5-omni-flash-realtime",
+        provider="aliyun", status="ENABLED", created_by=1, created_at=now, updated_at=now,
+    )
+    repository.db.add(profile)
+    await repository.db.flush()
+    for voice in ("custom_test_voice", "longanqian_v3.1", "missing-voice"):
+        with pytest.raises(CustomException, match="当前租户及模型"):
+            await service.create_web_session(
+                tenant_id=TEST_TENANT_ID, voice=voice, prompt=None, model="qwen3.5-omni-flash-realtime",
+            )
+    profile.tenant_id = TEST_TENANT_ID
+    profile.target_model = "qwen3.5-omni-plus-realtime"
+    await repository.db.flush()
+    with pytest.raises(CustomException, match="当前租户及模型"):
+        await service.create_web_session(
+            tenant_id=TEST_TENANT_ID, voice=profile.voice, prompt=None, model="qwen3.5-omni-flash-realtime",
+        )
+    profile.target_model = "qwen3.5-omni-flash-realtime"
+    await repository.db.flush()
+    await VoiceRepository(repository.db).require_call_voice(
+        tenant_id=TEST_TENANT_ID, voice=profile.voice, target_model=profile.target_model,
+    )
+    assert not rooms.created_rooms

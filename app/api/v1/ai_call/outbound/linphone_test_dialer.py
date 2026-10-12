@@ -71,6 +71,7 @@ class LinphoneTestDialer:
                     tenant_id=request.tenant_id,
                     callee_phone_number=request.phone_number,
                     voice=request.voice,
+                    **({"model": request.model} if request.model is not None else {}),
                     call_id=call_id,
                     business_type="outbound_task",
                     business_id=str(request.task_id),

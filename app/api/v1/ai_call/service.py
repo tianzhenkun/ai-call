@@ -165,11 +165,31 @@ class AiCallService:
         scene_code: str | None = None,
         business_params: dict | None = None,
         tenant_id: str | None = None,
+        model: str | None = None,
     ) -> CreateSessionResult:
         self._ensure_legacy_entry_allowed("web")
+        if model is not None:
+            from app.services.ai_call.realtime_model import validate_realtime_model
+
+            try:
+                validate_realtime_model(
+                    model,
+                    entry_type="web",
+                    configured_model=self.orchestrator.config.qwen_realtime_model,
+                    vad_type=self.orchestrator.config.vad_type,
+                    customer_speech_review_enabled=self.orchestrator.config.customer_speech_review_enabled,
+                )
+            except ValueError as exc:
+                raise CustomException(msg=str(exc), status_code=400) from exc
+            from app.api.v1.ai_call.voice.repository import VoiceRepository
+
+            voice = voice or self.orchestrator.config.qwen_realtime_voice
+            await VoiceRepository(self._ensure_prompt_repository().db).require_call_voice(
+                tenant_id=tenant_id, voice=voice, target_model=model,
+            )
         if self.record_service is None:
             try:
-                return await self.orchestrator.create_web_session(voice=voice, prompt=prompt)
+                return await self.orchestrator.create_web_session(voice=voice, prompt=prompt, model=model)
             except AiCallError as exc:
                 raise self._to_custom_exception(exc) from exc
 
@@ -182,7 +202,7 @@ class AiCallService:
                     status_code=400,
                 )
 
-        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id)
+        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id, target_model=model)
         call_id = f"call_{generate_snowflake_id()}"
         if scene_code and self.prompt_repository is not None:
             from app.services.ai_call.prompt_editor import require_available_profile
@@ -205,6 +225,7 @@ class AiCallService:
                 business_params=business_params or {},
                 debug_prompt=None,
                 voice=resolved_voice,
+                target_model=model,
             )
             await self.record_service.update_prompt_context(
                 call_id,
@@ -220,6 +241,7 @@ class AiCallService:
                 prompt=None,
                 call_id=call_id,
                 prompt_effective_config=prompt_effective_config,
+                model=model,
             )
         except AiCallError as exc:
             await self.record_service.fail_session(
@@ -254,8 +276,22 @@ class AiCallService:
         before_sip_invite: Callable[[], Awaitable[None]] | None = None,
         tenant_id: str | None = None,
         prompt_snapshot: dict | None = None,
+        model: str | None = None,
     ) -> CreateSipSessionResult:
         self._ensure_legacy_entry_allowed("direct_sip")
+        if model is not None:
+            from app.services.ai_call.realtime_model import validate_realtime_model
+
+            try:
+                validate_realtime_model(
+                    model,
+                    entry_type="direct_sip",
+                    configured_model=self.orchestrator.config.qwen_realtime_model,
+                    vad_type=self.orchestrator.config.vad_type,
+                    customer_speech_review_enabled=self.orchestrator.config.customer_speech_review_enabled,
+                )
+            except ValueError as exc:
+                raise CustomException(msg=str(exc), status_code=400) from exc
         self._ensure_record_service()
         if self.sip_client is None:
             raise CustomException(
@@ -273,7 +309,10 @@ class AiCallService:
             callee_phone_number_masked=callee_phone_number_masked,
         )
 
-        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id)
+        resolved_voice = await self._resolve_voice(
+            (voice or self.orchestrator.config.qwen_realtime_voice) if model is not None else voice,
+            tenant_id=tenant_id, target_model=model,
+        )
         resolved_call_id = call_id or f"call_{generate_snowflake_id()}"
         if scene_code and self.prompt_repository is not None:
             from app.services.ai_call.prompt_editor import require_available_profile
@@ -306,6 +345,7 @@ class AiCallService:
                 prompt_snapshot=prompt_snapshot,
                 voice=resolved_voice,
                 business_type=business_type,
+                target_model=model,
             )
             await self.record_service.update_prompt_context(
                 resolved_call_id,
@@ -327,6 +367,7 @@ class AiCallService:
                 call_id=resolved_call_id,
                 prompt_effective_config=prompt_effective_config,
                 knowledge_context=knowledge_context,
+                model=model,
             )
             await self.record_service.mark_status(resolved_call_id, room_session.status)
             self._record_sip_event(
@@ -2638,12 +2679,13 @@ class AiCallService:
         voice: str | None,
         *,
         tenant_id: str | None = None,
+        target_model: str | None = None,
     ) -> str | None:
         normalized_voice = _strip_or_none(voice)
         if not normalized_voice:
             return None
         repository = self._ensure_prompt_repository()
-        target_model = self.orchestrator.config.qwen_realtime_model
+        target_model = target_model or self.orchestrator.config.qwen_realtime_model
         await self._ensure_builtin_voice_profiles(repository, target_model)
         profile = await repository.get_voice_profile_by_voice(
             voice=normalized_voice,
@@ -2718,6 +2760,7 @@ class AiCallService:
         prompt_snapshot: dict | None = None,
         voice: str | None = None,
         business_type: str | None = None,
+        target_model: str | None = None,
     ) -> PromptEffectiveConfig | None:
         if self.prompt_resolver is None or self.prompt_composer is None:
             return None
@@ -2749,7 +2792,7 @@ class AiCallService:
         style = await VoiceRepository(self._ensure_prompt_repository().db).resolve_call_speaking_style(
             tenant_id=tenant_id,
             voice=voice or self.orchestrator.config.qwen_realtime_voice,
-            target_model=self.orchestrator.config.qwen_realtime_model,
+            target_model=target_model or self.orchestrator.config.qwen_realtime_model,
             business_type=business_type,
             business_id=business_id,
         )

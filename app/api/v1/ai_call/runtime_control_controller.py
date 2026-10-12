@@ -34,6 +34,7 @@ from app.services.ai_call.runtime_control.command_repository import (
     RuntimeRecordNotFoundError,
 )
 from app.services.ai_call.runtime_control.entry_start_service import (
+    RuntimeEntryStartError,
     RuntimeEntryStartService,
     StartEntryRequest,
 )
@@ -125,6 +126,8 @@ async def create_runtime_start_call_controller(
                 callee_phone_number=request.callee_phone_number,
             )
         )
+    except RuntimeEntryStartError as exc:
+        raise CustomException(msg=str(exc), status_code=400) from exc
     except IdempotencyConflictError as exc:
         raise CustomException(
             msg="幂等键已用于不同的请求",
