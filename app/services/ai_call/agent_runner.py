@@ -1236,7 +1236,7 @@ class RealtimeCallAgentRunner:
         provider = self._providers.get(call_id)
         if provider is not None:
             with suppress(Exception):
-                await provider.cancel_response()
+                await self._cancel_active_provider_response(call_id, provider)
             with suppress(Exception):
                 await provider.clear_input_audio()
             self._clear_response_lifecycle(call_id)
@@ -6223,7 +6223,7 @@ class RealtimeCallAgentRunner:
             )
             self._mark_response_started(call_id, payload, timestamp)
             if retry_cancel and guard.current_response_id:
-                # 创建确认迟到时，之前的取消可能没有目标；仅补发一次，沿用原超时期限。
+                # 创建确认前的取消已延后；现在发送一次，沿用原超时期限。
                 guard.cancelled_response_ids.add(guard.current_response_id)
                 self._trace_response(call_id, "cancel_retried_after_created")
                 try:
@@ -8379,17 +8379,9 @@ class RealtimeCallAgentRunner:
             reason=reason,
         )
 
-        lifecycle = self._response_lifecycle(call_id)
-        if cancel_provider_response and not guard.cancel_requested and not lifecycle.cancel_pending:
-            should_wait_for_response_done = lifecycle.active
+        if cancel_provider_response:
             try:
-                if should_wait_for_response_done:
-                    lifecycle.cancel_pending = True
-                    self._mark_provider_cancel_race_window(lifecycle)
-                self._trace_response(call_id, "cancel_requested")
-                guard.cancel_requested = True
-                async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
-                    await provider.cancel_response()
+                await self._cancel_active_provider_response(call_id, provider)
             except Exception as exc:
                 # 发送失败不能证明远端回复已结束，保留等待态交给取消超时恢复。
                 cleanup_errors.append({
@@ -9315,8 +9307,7 @@ class RealtimeCallAgentRunner:
             provider = self._providers.get(call_id)
             if provider is not None:
                 try:
-                    await provider.cancel_response()
-                    guard.cancel_requested = True
+                    await self._cancel_active_provider_response(call_id, provider)
                 except Exception as exc:
                     cleanup_errors.append({
                         "step": "cancel_response",
@@ -9833,7 +9824,6 @@ class RealtimeCallAgentRunner:
         self._transition_to_interrupted_for_confirmed_interrupt(call_id)
 
         cleanup_errors: list[dict[str, str]] = []
-        guard = self._playback_guard(call_id)
         cleanup_errors.extend(
             await self._stop_audio_playout_queue(
                 call_id,
@@ -9841,18 +9831,8 @@ class RealtimeCallAgentRunner:
                 reason=reason,
             )
         )
-        response_lifecycle = self._response_lifecycle(call_id)
         try:
-            if guard.cancel_requested or response_lifecycle.cancel_pending:
-                pass
-            else:
-                if response_lifecycle.active:
-                    response_lifecycle.cancel_pending = True
-                    self._mark_provider_cancel_race_window(response_lifecycle)
-                self._trace_response(call_id, "cancel_requested")
-                guard.cancel_requested = True
-                async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
-                    await provider.cancel_response()
+            await self._cancel_active_provider_response(call_id, provider)
         except Exception as exc:
             cleanup_errors.append({
                 "step": "cancel_response",
@@ -10804,6 +10784,24 @@ class RealtimeCallAgentRunner:
         lifecycle.cancel_race_ignore_until = datetime.now(timezone.utc) + timedelta(
             seconds=PROVIDER_CANCEL_RACE_GRACE_SECONDS
         )
+
+    async def _cancel_active_provider_response(
+        self, call_id: str, provider: RealtimeProviderProtocol,
+    ) -> None:
+        lifecycle = self._response_lifecycle(call_id)
+        guard = self._playback_guard(call_id)
+        if not lifecycle.active or lifecycle.cancel_pending or guard.cancel_requested:
+            return
+        lifecycle.cancel_pending = True
+        guard.cancel_requested = True
+        self._mark_provider_cancel_race_window(lifecycle)
+        if guard.current_response_id is None:
+            # 本地已停播并隔离旧代次；等 response.created 后才能取消远端生成。
+            self._trace_response(call_id, "cancel_deferred_until_created")
+            return
+        self._trace_response(call_id, "cancel_requested")
+        async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
+            await provider.cancel_response()
 
     def _ignore_provider_cancel_race_error(
         self,

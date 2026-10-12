@@ -36,6 +36,74 @@ async def _setup(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("response_completed", [False, True])
+async def test_interrupt_cancels_only_a_created_active_response(monkeypatch, confirm, response_completed):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    monkeypatch.setattr(module, "RESPONSE_CANCEL_SECONDS", .5)
+    monkeypatch.setattr(module, "RESPONSE_STALL_SECONDS", .5)
+    remote_active = False
+
+    async def cancel():
+        old.cancelled_response_count += 1
+        if remote_active:
+            await old.emit(_response("model_response_done", status="cancelled"))
+        else:
+            # 重放 call_367940689544138752 的供应商拒绝，验证实际挂断路径。
+            message = ("Conversation has none active response" if response_completed
+                       else "Cannot cancel response before response.created")
+            await old.emit(ProviderEvent(type="model_error", payload={"error": {
+                "type": "invalid_request_error", "message": message, "param": "response",
+            }}))
+
+    old.cancel_response = cancel
+    try:
+        await runner._request_response("call-policy", old, input_text="介绍产品")
+        if response_completed:
+            await old.emit(_response("model_response_started"))
+            await old.emit(_response("model_response_done", status="completed"))
+            await _until(lambda: not runner._response_lifecycle("call-policy").active)
+            runner._queue_response_create("call-policy", "上一轮待处理的回复")
+            runner.registry.transition("call-policy", module.CallSessionStatus.AI_SPEAKING)
+        runner._playback_guard("call-policy").user_speech_active = True
+        if confirm:
+            await runner._confirm_interrupt("call-policy", old, datetime.now(timezone.utc))
+        else:
+            await runner._invalidate_audio_for_interrupt_candidate(
+                call_id="call-policy", provider=old, trigger_timestamp=datetime.now(timezone.utc),
+                source="provider", reason="user_speech_started_during_ai_audio",
+            )
+        await old.emit(ProviderEvent(type="test_barrier", payload={}))
+        await _until(lambda: any(e.type == "test_barrier" for e in runner.event_store.list_all("call-policy")))
+        assert not scheduled, "创建确认前取消回复不能导致 model_error 挂断"
+        assert old.cancelled_response_count == 0
+        assert len(old.created_responses) == 1, "客户还在说话时不能释放旧的待处理回复"
+        if not confirm:
+            # 候选由有效转写确认后，解除临时音频抑制，再回答客户的新问题。
+            await runner._confirm_interrupt("call-policy", old, datetime.now(timezone.utc))
+            assert old.cancelled_response_count == 0
+        runner._playback_guard("call-policy").user_speech_active = False
+        await runner._request_response("call-policy", old, input_text="你们是怎么收费的？")
+        if not response_completed:
+            remote_active = True
+            await old.emit(_response("model_response_started"))
+            await old.emit(_response("model_response_started"))
+            await _until(lambda: len(old.created_responses) == 2)
+            assert old.cancelled_response_count == 1
+        assert old.created_responses[-1] == "你们是怎么收费的？"
+        assert not new.connected and not runner.audio_publisher.published
+        await old.emit(_response("model_response_started", "latest"))
+        await old.emit(ProviderEvent(type="model_audio_delta", payload={
+            "response_id": "latest", "delta": base64.b64encode(b"\x01\x02" * 480).decode(),
+        }))
+        await old.emit(_response("model_response_done", "latest", status="completed"))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+        assert runner.audio_publisher.published and not scheduled
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
 async def test_consecutive_customer_interruptions_can_recover_without_a_completed_reply(monkeypatch):
     runner, old, new, scheduled = await _setup(monkeypatch)
     monkeypatch.setattr(module, "RESPONSE_STALL_SECONDS", .5)
@@ -58,9 +126,10 @@ async def test_consecutive_customer_interruptions_can_recover_without_a_complete
         # 本地 SIP 候选先建立新发言，随后供应商确认起说。
         runner._pending_turn("call-policy", reset_if_finished=True)
         await new.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "second"}))
-        await _until(lambda: new.cancelled_response_count == 1)
+        await _until(lambda: runner._response_lifecycle("call-policy").cancel_pending)
+        assert new.cancelled_response_count == 0
         await new.emit(_response("model_response_started", "recovered"))
-        await _until(lambda: new.cancelled_response_count == 2)
+        await _until(lambda: new.cancelled_response_count == 1)
         await new.emit(ProviderEvent(type="user_transcript_done", payload={
             "item_id": "second", "transcript": "我想了解价格。",
         }))
@@ -83,12 +152,12 @@ async def test_consecutive_customer_interruptions_can_recover_without_a_complete
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("late_no_active_error", [False, True])
-async def test_cancel_before_created_is_retried_once_without_reconnecting(monkeypatch, late_no_active_error):
+async def test_cancel_is_deferred_until_created_without_reconnecting(monkeypatch, late_no_active_error):
     runner, old, new, scheduled = await _setup(monkeypatch)
 
     async def cancel():
         old.cancelled_response_count += 1
-        if old.cancelled_response_count == 2:
+        if old.cancelled_response_count == 1:
             if late_no_active_error:
                 await old.emit(ProviderEvent(type="model_error", payload={
                     "message": "Conversation has none active response",
@@ -104,7 +173,7 @@ async def test_cancel_before_created_is_retried_once_without_reconnecting(monkey
             source="provider", reason="user_speech_started_during_ai_audio",
         )
         await runner._request_response("call-policy", old, input_text="我提供账号吗？")
-        # 真实通话中 created 比 cancel 晚 55 ms；重复事件不能触发重复取消。
+        # 真实通话中创建确认迟到；重复事件不能触发重复取消。
         await old.emit(_response("model_response_started"))
         await old.emit(_response("model_response_started"))
         await old.emit(ProviderEvent(type="model_audio_delta", payload={
@@ -112,13 +181,13 @@ async def test_cancel_before_created_is_retried_once_without_reconnecting(monkey
         }))
         if late_no_active_error:
             await _until(lambda: any(e.type == "model_error" for e in runner.event_store.list_all("call-policy")))
-            # 第一条取消的错误可能迟到，不能将它当成补发取消的结束确认。
+            # 取消错误可能迟到，不能将它当成当前回复的结束确认。
             assert runner._response_lifecycle("call-policy").cancel_pending
             assert len(old.created_responses) == 1
             await old.emit(_response("model_response_done", status="cancelled"))
         await _until(lambda: len(old.created_responses) == 2 or new.connected)
         assert not new.connected and not scheduled
-        assert old.cancelled_response_count == 2
+        assert old.cancelled_response_count == 1
         assert old.created_responses[-1] == "我提供账号吗？"
         assert not runner.audio_publisher.published
         await old.emit(_response("model_response_started", "latest"))

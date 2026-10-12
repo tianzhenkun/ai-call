@@ -7180,6 +7180,7 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
         ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
         ProviderEvent(type="user_speech_started", payload={}),
         ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}),
         ProviderEvent(
             type="model_audio_delta",
             payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
@@ -7187,6 +7188,7 @@ async def test_realtime_agent_runner_confirms_interrupt_when_user_speaks_during_
         ProviderEvent(type="user_speech_started", payload={}),
         ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}),
         ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="model_response_done", payload={"response": {"id": "initial", "status": "cancelled"}}),
     ])
     publisher = FakeAudioPublisher()
     session = CallSession(
@@ -7236,6 +7238,7 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
         ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
         ProviderEvent(type="user_speech_started", payload={}),
         ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}),
         ProviderEvent(
             type="model_audio_delta",
             payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
@@ -7272,7 +7275,7 @@ async def test_realtime_agent_runner_confirms_interrupt_until_published_audio_pl
     await runner.start(session)
     await runner.wait("call_playout_interrupt")
 
-    assert provider.cancelled_response_count == 1
+    assert provider.cancelled_response_count == 0  # 生成已结束，只停止尚未播完的音频。
     assert provider.cleared_input_count == 0
     assert provider.created_responses == [None]
     assert publisher.stopped_call_ids
@@ -7293,6 +7296,7 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
         ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"}),
         ProviderEvent(type="user_speech_started", payload={}),
         ProviderEvent(type="user_speech_stopped", payload={}),
+        ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}),
         ProviderEvent(
             type="model_audio_delta",
             payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
@@ -7328,7 +7332,7 @@ async def test_realtime_agent_runner_confirms_interrupt_during_ai_audio_tail_gra
     await runner.start(session)
     await runner.wait("call_tail_interrupt")
 
-    assert provider.cancelled_response_count == 1
+    assert provider.cancelled_response_count == 0  # 尾音播放不代表远端仍在生成。
     assert provider.created_responses == [None]
     assert publisher.stopped_call_ids
     assert set(publisher.stopped_call_ids) == {"call_tail_interrupt"}
@@ -8958,6 +8962,10 @@ async def test_realtime_agent_runner_provider_speech_upgrades_recently_expired_b
     await runner.start(session)
     registry.transition("call_recently_expired_browser_candidate", CallSessionStatus.CONNECTED)
     registry.transition("call_recently_expired_browser_candidate", CallSessionStatus.AI_SPEAKING)
+    await runner._apply_provider_event(
+        session.call_id, provider, "model_response_started", datetime.now(timezone.utc),
+        {"response": {"id": "initial"}},
+    )
     accepted = await runner.record_browser_speech_candidate(
         "call_recently_expired_browser_candidate",
         datetime.now(timezone.utc) - timedelta(seconds=1.6),
@@ -9519,6 +9527,10 @@ async def test_realtime_agent_runner_confirms_browser_candidate_after_provider_t
     await runner.start(session)
     registry.transition("call_browser_text_alone", CallSessionStatus.CONNECTED)
     registry.transition("call_browser_text_alone", CallSessionStatus.AI_SPEAKING)
+    await runner._apply_provider_event(
+        session.call_id, provider, "model_response_started", datetime.now(timezone.utc),
+        {"response": {"id": "initial"}},
+    )
     accepted = await runner.record_browser_speech_candidate(
         "call_browser_text_alone",
         datetime.now(timezone.utc),
@@ -10181,9 +10193,11 @@ async def test_realtime_agent_runner_recovers_from_stop_audio_failure_during_int
     await runner.start(session)
     registry.transition("call_stop_audio_failure_interrupt", CallSessionStatus.CONNECTED)
     registry.transition("call_stop_audio_failure_interrupt", CallSessionStatus.AI_SPEAKING)
+    await provider.emit(ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}))
     await provider.emit(ProviderEvent(type="user_speech_started", payload={}))
     await provider.emit(ProviderEvent(type="user_transcript_delta", payload={"delta": "你好"}))
     await provider.emit(ProviderEvent(type="user_speech_stopped", payload={}))
+    await provider.emit(ProviderEvent(type="model_response_done", payload={"response": {"id": "initial", "status": "cancelled"}}))
     await provider.close_events()
     await runner.wait("call_stop_audio_failure_interrupt")
 
@@ -10232,6 +10246,7 @@ async def test_realtime_agent_runner_ignores_stale_audio_after_confirmed_interru
     await provider.emit(
         ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
     )
+    await provider.emit(ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}))
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -10737,6 +10752,7 @@ async def test_realtime_agent_runner_drops_inflight_audio_when_interrupt_is_conf
     await provider.emit(
         ProviderEvent(type="model_session_started", payload={"sessionId": "sess_1"})
     )
+    await provider.emit(ProviderEvent(type="model_response_started", payload={"response": {"id": "initial"}}))
     await provider.emit(
         ProviderEvent(
             type="model_audio_delta",
@@ -18031,7 +18047,7 @@ async def test_realtime_agent_runner_does_not_play_fixed_handoff_prompt_before_s
 
     assert publisher.stopped_call_ids == ["call_handoff_prompt"]
     assert publisher.published == []
-    assert provider.cancelled_response_count == 1
+    assert provider.cancelled_response_count == 0  # 未创建回复时直接关闭连接。
     assert provider.cleared_input_count == 1
     assert provider.closed is True
     event_types = [event.type for event in store.list("call_handoff_prompt")]
