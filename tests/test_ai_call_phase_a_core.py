@@ -3487,7 +3487,7 @@ async def test_qwen_provider_connects_and_sends_protocol_events() -> None:
     async def websocket_factory(url: str, headers: dict[str, str]) -> FakeQwenWebSocket:
         captured["url"] = url
         captured["headers"] = headers
-        socket = FakeQwenWebSocket()
+        socket = FakeQwenWebSocket(incoming=[{"type": "session.updated"}])
         sockets.append(socket)
         return socket
 

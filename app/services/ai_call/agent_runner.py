@@ -6223,8 +6223,9 @@ class RealtimeCallAgentRunner:
             )
             self._mark_response_started(call_id, payload, timestamp)
             if retry_cancel and guard.current_response_id:
-                # 创建确认前的取消已延后；现在发送一次，沿用原超时期限。
+                # 创建确认前没有发送取消；从这次实际发送开始等待取消确认。
                 guard.cancelled_response_ids.add(guard.current_response_id)
+                self._mark_provider_cancel_race_window(self._response_lifecycle(call_id))
                 self._trace_response(call_id, "cancel_retried_after_created")
                 try:
                     async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
@@ -6572,7 +6573,11 @@ class RealtimeCallAgentRunner:
         if self._is_sip_participant(self.registry.get(call_id)):
             self._last_sip_provider_speech_stopped_at[call_id] = timestamp
         self._playback_guard(call_id).user_speech_active = False
-        self._response_lifecycle(call_id).recovery_silence_ms = None
+        lifecycle = self._response_lifecycle(call_id)
+        lifecycle.recovery_silence_ms = None
+        if lifecycle.active and self._playback_guard(call_id).current_response_id is None:
+            # 供应商可能等客户续说提交后才建立回复，不能沿用续说前的创建期限。
+            lifecycle.last_progress_at = asyncio.get_running_loop().time()
         turn = self._pending_turn(call_id)
         if self.customer_speech_classifier is not None:
             turn.stability_updated_at = asyncio.get_running_loop().time()
@@ -10048,9 +10053,8 @@ class RealtimeCallAgentRunner:
                 if not state.active and not state.cancel_pending:
                     return
                 now = asyncio.get_running_loop().time()
-                if state.cancel_pending:
-                    if state.cancel_started_at is None:
-                        state.cancel_started_at = now
+                waiting_created = self._playback_guard(call_id).current_response_id is None
+                if state.cancel_pending and state.cancel_started_at is not None:
                     remaining = RESPONSE_CANCEL_SECONDS - (now - state.cancel_started_at)
                 else:
                     # 工具仍在执行时不得重放有外部影响的操作；超限直接走故障结束。
@@ -10060,7 +10064,10 @@ class RealtimeCallAgentRunner:
                     await asyncio.sleep(min(remaining, RESPONSE_CANCEL_SECONDS / 2))
                     continue
                 provider = self._providers[call_id]
-                self._trace_response(call_id, "cancel_timeout" if state.cancel_pending else "output_stalled")
+                phase = "create_timeout" if waiting_created else (
+                    "cancel_timeout" if state.cancel_pending else "output_stalled"
+                )
+                self._trace_response(call_id, phase)
                 if not state.recovering:
                     if state.processing_tool or (state.recovery_count and not state.cancel_pending):
                         await self._fail_response_recovery(call_id, "回复连续恢复失败或工具未结束")
@@ -10070,7 +10077,7 @@ class RealtimeCallAgentRunner:
                     if not state.cancel_pending:
                         state.recovery_count += 1
                     state.recovering = True
-                if state.cancel_pending:
+                if state.cancel_pending or waiting_created:
                     await self._reconnect_stalled_response(call_id, provider)
                     continue
                 if not state.pending_create:
@@ -10794,11 +10801,11 @@ class RealtimeCallAgentRunner:
             return
         lifecycle.cancel_pending = True
         guard.cancel_requested = True
-        self._mark_provider_cancel_race_window(lifecycle)
         if guard.current_response_id is None:
             # 本地已停播并隔离旧代次；等 response.created 后才能取消远端生成。
             self._trace_response(call_id, "cancel_deferred_until_created")
             return
+        self._mark_provider_cancel_race_window(lifecycle)
         self._trace_response(call_id, "cancel_requested")
         async with asyncio.timeout(RESPONSE_CANCEL_SECONDS):
             await provider.cancel_response()

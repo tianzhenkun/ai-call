@@ -3,12 +3,13 @@ import base64
 from datetime import datetime, timezone
 
 import pytest
-from test_ai_call_phase_a_core import FakeAudioPublisher, QueueRealtimeProvider
+from test_ai_call_phase_a_core import FakeAudioPublisher, FakeQwenWebSocket, QueueRealtimeProvider
 from test_ai_call_runtime_conversation_policy import SpeechClassifier, _runner
 
 from app.services.ai_call import agent_runner as module
 from app.services.ai_call.audio_bridge import PcmAudioFrame
 from app.services.ai_call.dialogue_service import AiCallDialogueRuntimeStore
+from app.services.ai_call.providers import aliyun_qwen_realtime as qwen
 from app.services.ai_call.providers.base import ProviderEvent
 
 
@@ -33,6 +34,149 @@ async def _setup(monkeypatch):
     runner.audio_publisher = FakeAudioPublisher()
     await runner.start(runner.registry.get("call-policy"))
     return runner, old, new, scheduled
+
+
+class SessionAckSocket(FakeQwenWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.queue = asyncio.Queue()
+
+    async def receive_json(self):
+        payload = await self.queue.get()
+        if payload is None:
+            raise StopAsyncIteration
+        return payload
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reconnect", [False, True])
+@pytest.mark.parametrize("ack", ["updated", "timeout", "error", "closed", "hangup"])
+async def test_qwen_session_ack_gates_runner_start_and_recovery(monkeypatch, reconnect, ack):
+    runner, old, _, scheduled = await _setup(monkeypatch)
+    if not reconnect:
+        await runner.stop("call-policy")
+    socket = SessionAckSocket()
+    monkeypatch.setattr(qwen, "QWEN_SESSION_UPDATE_TIMEOUT_SECONDS", .1, raising=False)
+
+    async def connect(_url, _headers):
+        return socket
+
+    replacement = qwen.AliyunQwenRealtimeProvider(
+        "wss://qwen.test/realtime", "test-key", "qwen3.8-omni-flash-realtime",
+        websocket_factory=connect,
+        workspace_realtime_url="wss://test.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+    )
+    runner.provider_factory = lambda _: replacement
+
+    async def run():
+        if reconnect:
+            runner._queue_response_create("call-policy", "怎么收费？")
+            await runner._reconnect_stalled_response("call-policy", old)
+        else:
+            await runner.start(runner.registry.get("call-policy"))
+            await runner.start_opening("call-policy")
+
+    task = asyncio.create_task(run())
+    try:
+        await _until(lambda: bool(socket.sent_json))
+        socket.queue.put_nowait({"type": "session.created", "session": {"id": "new-session"}})
+        await asyncio.sleep(.01)
+        assert [p["type"] for p in socket.sent_json] == ["session.update"]
+        assert not task.done(), "配置未确认，不能发布新连接或创建回复"
+        if ack == "updated":
+            socket.queue.put_nowait({"type": "session.updated", "session": {"id": "new-session"}})
+            await asyncio.wait_for(task, 1)
+            await _until(lambda: any(e.type == "model_session_updated"
+                                     for e in runner.event_store.list_all("call-policy")))
+            assert [p["type"] for p in socket.sent_json].count("response.create") == 1
+            assert [e.type for e in runner.event_store.list_all("call-policy")
+                    if e.type in {"model_session_started", "model_session_updated"}] == [
+                        "model_session_started", "model_session_updated",
+                    ]
+        else:
+            if ack == "error":
+                socket.queue.put_nowait({"type": "error", "error": {"message": "bad voice"}})
+            elif ack == "closed":
+                socket.queue.put_nowait(None)
+            elif ack == "hangup":
+                task.cancel()
+            with pytest.raises((TimeoutError, RuntimeError, asyncio.CancelledError)):
+                await asyncio.wait_for(task, 1)
+            assert [p["type"] for p in socket.sent_json] == ["session.update"]
+            if reconnect:
+                assert socket.closed
+        assert not scheduled
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("continued_text", ["你们主要做什么行业的呀？", "怎么收费？"], ids=[
+    "call_368224794126262272", "call_368225741963468800",
+])
+async def test_continued_speech_before_created_gets_separate_create_and_cancel_deadlines(
+    monkeypatch, continued_text,
+):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    monkeypatch.setattr(module, "RESPONSE_STALL_SECONDS", .3)
+    runner.user_turn_stability_delay_seconds = 0
+    try:
+        await runner._request_response("call-policy", old, input_text="嗯")
+        await old.emit(ProviderEvent(type="user_speech_started", payload={"item_id": "continued"}))
+        await _until(lambda: runner._response_lifecycle("call-policy").cancel_pending)
+        await asyncio.sleep(.05)
+        assert not new.connected, "取消尚未发送，不能按 2 秒取消期限提前重连"
+        assert old.cancelled_response_count == 0
+        assert runner._response_lifecycle("call-policy").cancel_started_at is None
+        # 创建等待将到期时才停说，模型应有完整的创建等待时间。
+        state = runner._response_lifecycle("call-policy")
+        state.last_progress_at = asyncio.get_running_loop().time() - .29
+        await old.emit(ProviderEvent(type="user_transcript_done", payload={
+            "item_id": "continued", "transcript": continued_text,
+        }))
+        await old.emit(ProviderEvent(type="user_speech_stopped"))
+        await _until(lambda: not runner._playback_guard("call-policy").user_speech_active)
+        await asyncio.sleep(.04)
+        assert not new.connected
+        await old.emit(_response("model_response_started"))
+        await old.emit(_response("model_response_started"))
+        await _until(lambda: old.cancelled_response_count == 1)
+        await asyncio.sleep(.015)
+        assert not new.connected, "取消确认期限应从实际发出取消开始"
+        await old.emit(_response("model_response_done", status="cancelled"))
+        await _until(lambda: len(old.created_responses) == 2)
+        assert not new.connected and not scheduled
+        assert old.cancelled_response_count == 1
+        await old.emit(_response("model_response_started", "latest"))
+        await old.emit(_response("model_response_done", "latest", status="completed"))
+        await _until(lambda: not state.active)
+    finally:
+        await runner.stop("call-policy")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_missing_created_is_bounded_and_never_reported_as_unsent_cancel_timeout(
+    monkeypatch, interrupted,
+):
+    runner, old, new, scheduled = await _setup(monkeypatch)
+    try:
+        await runner._request_response("call-policy", old, input_text="怎么收费？")
+        if interrupted:
+            await runner._cancel_active_provider_response("call-policy", old)
+        await _until(lambda: bool(new.created_responses))
+        phases = [e.payload.get("phase") for e in runner.event_store.list_all("call-policy")
+                  if e.type == "model_response_trace"]
+        assert "create_timeout" in phases and "cancel_timeout" not in phases
+        assert old.cancelled_response_count == 0 and not scheduled
+        assert runner._response_lifecycle("call-policy").recovery_count == int(not interrupted)
+        await new.emit(_response("model_response_started", "latest"))
+        await new.emit(_response("model_response_done", "latest", status="completed"))
+        await _until(lambda: not runner._response_lifecycle("call-policy").active)
+    finally:
+        await runner.stop("call-policy")
 
 
 @pytest.mark.anyio

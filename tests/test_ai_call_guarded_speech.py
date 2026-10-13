@@ -81,6 +81,7 @@ async def test_default_provider_streams_audio_without_output_review(monkeypatch)
     provider = orchestrator.agent_runner.provider_factory(session)
     await provider.connect()
     try:
+        socket.incoming.put_nowait({"type": "session.updated"})
         await provider.update_session(orchestrator.agent_runner._session_config(session))
         assert socket.sent[-1]["session"]["modalities"] == ["text", "audio"]
         audio = {"type": "response.audio.delta", "response_id": "response",
@@ -88,8 +89,8 @@ async def test_default_provider_streams_audio_without_output_review(monkeypatch)
         socket.incoming.put_nowait(audio)
         socket.incoming.put_nowait(None)
         events = [event async for event in provider.receive_events()]
-        assert [event.type for event in events] == ["model_audio_delta"]
-        assert events[0].payload == audio
+        assert [event.type for event in events] == ["model_session_updated", "model_audio_delta"]
+        assert events[-1].payload == audio
     finally:
         await provider.close()
 
@@ -98,6 +99,7 @@ async def test_default_provider_streams_audio_without_output_review(monkeypatch)
 async def test_isolated_guarded_provider_never_releases_unreviewed_audio_after_rejected_handoff():
     provider, socket, _store, _reviewer, _tts = await make_provider([])
     try:
+        socket.incoming.put_nowait({"type": "session.updated"})
         await provider.update_session(qwen.QwenRealtimeSessionConfig(
             voice="Tina", instructions="测试", vad_type="server_vad",
             vad_threshold=0.5, vad_silence_duration_ms=800,

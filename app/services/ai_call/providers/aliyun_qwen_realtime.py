@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -129,6 +131,7 @@ QWEN_WEBSOCKET_PING_INTERVAL_SECONDS = 20.0
 QWEN_WEBSOCKET_PING_TIMEOUT_SECONDS = 120.0
 # 转人工会等待模型连接关闭；握手超时后由 websockets 终止 TCP，避免阻塞业务提示。
 QWEN_WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 1.5
+QWEN_SESSION_UPDATE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +240,7 @@ class AliyunQwenRealtimeProvider:
         self.websocket_factory = websocket_factory or _default_websocket_factory
         self._websocket: QwenWebSocketProtocol | None = None
         self._emitted_tool_call_ids: set[str] = set()
+        self._session_events: deque[dict[str, Any]] = deque()
         self.response_diagnostics: dict[str, Any] = {}
 
     async def connect(self) -> None:
@@ -245,9 +249,24 @@ class AliyunQwenRealtimeProvider:
             {"Authorization": f"Bearer {self.api_key}"},
         )
         self._emitted_tool_call_ids.clear()
+        self._session_events.clear()
 
     async def update_session(self, config: QwenRealtimeSessionConfig) -> None:
-        await self._send(build_session_update_event(config))
+        # 初始化先于事件消费者启动；确认配置生效后才允许调用方发送音频或回复。
+        # 保留握手事件，后续仍由 receive_events 按原顺序交给 Runner 记录。
+        async with asyncio.timeout(QWEN_SESSION_UPDATE_TIMEOUT_SECONDS):
+            await self._send(build_session_update_event(config))
+            while True:
+                try:
+                    payload = await self._require_websocket().receive_json()
+                except StopAsyncIteration as exc:
+                    raise RuntimeError("Qwen 连接在 session.updated 确认前结束") from exc
+                self._session_events.append(payload)
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"Qwen 会话配置失败: {sanitize_qwen_event_payload(payload)}")
+                if payload.get("type") == "session.updated":
+                    self.response_diagnostics["sessionUpdatedAt"] = datetime.now(timezone.utc).isoformat()
+                    return
 
     async def send_audio(self, pcm_frame: bytes) -> None:
         await self._send({
@@ -287,7 +306,7 @@ class AliyunQwenRealtimeProvider:
         websocket = self._require_websocket()
         while True:
             try:
-                payload = await websocket.receive_json()
+                payload = self._session_events.popleft() if self._session_events else await websocket.receive_json()
             except StopAsyncIteration:
                 return
             received_at = datetime.now(timezone.utc).isoformat()
