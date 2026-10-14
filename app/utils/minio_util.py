@@ -316,11 +316,17 @@ class MinioUtil:
             )
         except httpx.HTTPStatusError as error:
             failure_message = f"MinIO读取对象失败: HTTP {error.response.status_code}"
-        except httpx.HTTPError:
+            error_type, http_status = type(error).__name__, error.response.status_code
+        except httpx.HTTPError as error:
             failure_message = "MinIO读取对象失败: 网络请求异常"
+            error_type, http_status = type(error).__name__, None
         else:
             return response.content
-        raise CustomException(msg=failure_message, code=RET.SERVERERR.code)
+        # 保留可定位的类型与状态码，不保留可能含签名或密钥的异常链。
+        failure = CustomException(msg=failure_message, code=RET.SERVERERR.code)
+        failure.storage_error_type = error_type
+        failure.storage_http_status = http_status
+        raise failure
 
     @classmethod
     async def put_object(

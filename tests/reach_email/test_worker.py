@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -6,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.services.reach_email.models import (
@@ -604,7 +605,7 @@ def test_attachment_prepare_failure_preserves_specific_safe_error(ids, expected)
     asyncio.run(check())
 
 
-def test_attachment_prepare_failure_never_exposes_storage_error():
+def test_attachment_prepare_failure_never_exposes_storage_error(caplog):
     from app.services.reach_email.models import Attachment
 
     async def check():
@@ -617,9 +618,65 @@ def test_attachment_prepare_failure_never_exposes_storage_error():
             with patch('app.services.reach_email.worker.transport.send_message') as send:
                 await worker.send_one('m')
             send.assert_not_called()
+            assert 'EMAIL_SEND_FAILED' in caplog.text
+            assert 'stage=load_attachments' in caplog.text
+            assert 'error_type=ValueError' in caplog.text
+            assert 'elapsed_ms=' in caplog.text
+            assert 'private-storage-secret' not in caplog.text
             async with sessions() as db:
                 message = await db.get(Message, 'm')
                 assert message.status == 'failed' and message.error_code == 'PREPARE_SEND_FAILED'
+                assert message.attempt_count == 0
+                assert not await db.scalar(select(Attempt.id))
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('direction,active', [('outbound', True), ('inbound', True), ('outbound', False)])
+def test_attachment_io_refreshes_storage_config_and_fails_closed(direction, active):
+    from app.services.ai_call.knowledge import PlatformOssKnowledgeStore
+    from app.services.reach_email.models import Attachment
+
+    async def check():
+        async with setup() as (worker, sessions):
+            old = {'endpoint': 'old.invalid:9000', 'bucket_name': 'bucket', 'prefix': 'old',
+                   'access_key': 'test-key', 'secret_key': 'test-secret', 'status': '0'}
+            worker.store = PlatformOssKnowledgeStore(old)
+            async with sessions() as db, db.begin():
+                await db.execute(text('CREATE TABLE sys_oss_config (endpoint TEXT, bucket_name TEXT, '
+                    'prefix TEXT, access_key TEXT, secret_key TEXT, status TEXT)'))
+                await db.execute(text('INSERT INTO sys_oss_config VALUES '
+                    '(:endpoint, :bucket_name, :prefix, :access_key, :secret_key, :status)'),
+                    dict(old, endpoint='current.invalid:9000', prefix='current', status='0' if active else '1'))
+                db.add(Attachment(id='file', tenant_id='t', owner_id='o', name='file.pdf', size=5,
+                    content_type='application/pdf', object_key='key', sha256=hashlib.sha256(b'hello').hexdigest()))
+                (await db.get(Message, 'm')).attachment_ids = '["file"]'
+
+            async def storage_io(config, key, *args, **kwargs):
+                assert config['endpoint'] == 'current.invalid:9000'
+                assert key.startswith('current/reach/')
+                return b'hello'
+
+            with patch('app.utils.minio_util.MinioUtil.get_object', side_effect=storage_io) as read, \
+                    patch('app.utils.minio_util.MinioUtil.put_object', side_effect=storage_io) as write, \
+                    patch('app.services.reach_email.worker.transport.send_message', return_value={'status': 'accepted'}) as send:
+                if direction == 'outbound':
+                    await worker.send_one('m')
+                    async with sessions() as db:
+                        message = await db.get(Message, 'm')
+                        assert message.status == ('accepted' if active else 'failed')
+                        if not active:
+                            assert message.error_code == 'PREPARE_SEND_FAILED'
+                            assert message.attempt_count == 0
+                    assert send.call_count == int(active)
+                    assert read.await_count == int(active)
+                else:
+                    reply = incoming()
+                    reply['attachments'] = [{'filename': 'file.pdf', 'content': b'%PDF-1.4\n%%EOF', 'content_type': 'application/pdf'}]
+                    result = {'uidvalidity': '1', 'last_uid': 1, 'drained': True, 'messages': [reply]}
+                    with patch('app.services.reach_email.worker.transport.sync_messages', return_value=result):
+                        await worker.sync_account('a', require_worker_lease=False)
+                    write.assert_awaited_once()
+                    send.assert_not_called()
     asyncio.run(check())
 
 
