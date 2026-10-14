@@ -457,7 +457,7 @@ def test_permissions_default_deny_management_but_allow_available_read(
     assert write.status_code == 403
     assert available.status_code == 200
     assert repository.calls[-1]["available_only"] is True
-    assert repository.calls[-1]["target_model"] == TARGET_MODEL
+    assert repository.calls[-1]["target_model"] == "qwen3.8-omni-flash-realtime"
     assert service.create_calls == []
 
 

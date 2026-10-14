@@ -1961,13 +1961,49 @@ async def test_follow_up_data_call_prefers_source_task_sip_line_snapshot(
 
 
 @pytest.mark.anyio
-async def test_follow_up_data_call_rejects_outside_source_task_window_before_dial(
+@pytest.mark.parametrize("entrypoint", ["task", "data"])
+@pytest.mark.parametrize(
+    ("now", "call_windows"),
+    [
+        pytest.param(
+            datetime(2026, 8, 27, 1, 30, tzinfo=timezone.utc),
+            [{"startTime": "10:00", "endTime": "11:00"}],
+            id="outside-task-window",
+        ),
+        pytest.param(
+            datetime(2026, 8, 27, 0, 22, tzinfo=timezone.utc),
+            [{"startTime": "00:00", "endTime": "23:59"}],
+            id="before-nine",
+        ),
+        pytest.param(
+            datetime(2026, 8, 27, 13, 0, tzinfo=timezone.utc),
+            [{"startTime": "00:00", "endTime": "23:59"}],
+            id="at-twenty-one",
+        ),
+    ],
+)
+async def test_manual_callback_ignores_call_windows(
     session_factory,
+    entrypoint,
+    now,
+    call_windows,
 ) -> None:
-    console_session_id, data_id = await _seed_follow_up_data_without_task(
-        session_factory,
-        call_windows=[{"startTime": "10:00", "endTime": "11:00"}],
-    )
+    if entrypoint == "task":
+        console_session_id = await _seed_agent(
+            session_factory, user_id=20, agent_identity="agent-20"
+        )
+        await _seed_unanswered_follow_up(
+            session_factory, owner_agent_identity="agent-20"
+        )
+        await _seed_outbound_context(
+            session_factory,
+            call_id="call-unanswered-100",
+            call_windows=call_windows,
+        )
+    else:
+        console_session_id, data_id = await _seed_follow_up_data_without_task(
+            session_factory, call_windows=call_windows
+        )
     callback_factory = _FakeCallbackFactory()
     line_service = _FakeSipLineService()
     async with session_factory() as db:
@@ -1975,59 +2011,31 @@ async def test_follow_up_data_call_rejects_outside_source_task_window_before_dia
             db,
             callback_factory=callback_factory,
             sip_line_service=line_service,
-            # Asia/Shanghai 09:30：在线路 09:00–21:00 内，但不在原任务 10:00–11:00 内。
-            clock=lambda: datetime(2026, 8, 27, 1, 30, tzinfo=timezone.utc),
+            clock=lambda: now,
         )
-        with pytest.raises(CustomException) as outside_window:
-            await service.start_follow_up_data_callback(
+        if entrypoint == "task":
+            callback = await service.start_callback(
+                _auth(db, user_id=20),
+                follow_up_id=100,
+                payload=FollowUpCallIn(console_session_id=console_session_id),
+            )
+        else:
+            callback, _ = await service.start_follow_up_data_callback(
                 _auth(db, user_id=20),
                 follow_up_data_id=data_id,
                 payload=FollowUpDataCallIn(console_session_id=console_session_id),
-                idempotency_key="outside-source-task-window",
+                idempotency_key="outside-call-window",
             )
 
-        assert _error_code(outside_window.value) == "CALLBACK_OUTSIDE_TASK_WINDOW"
-        assert line_service.resolved_tenant_id is None
-        assert callback_factory.calls == []
-
-
-@pytest.mark.anyio
-async def test_follow_up_data_call_rejects_outside_carrier_window_before_dial(
-    session_factory,
-) -> None:
-    console_session_id, data_id = await _seed_follow_up_data_without_task(
-        session_factory,
-        call_windows=[{"startTime": "00:00", "endTime": "23:59"}],
-    )
-    callback_factory = _FakeCallbackFactory()
-    line_service = _FakeSipLineService()
-
-    async with session_factory() as db:
-        service = AiCallFollowUpService(
-            db,
-            callback_factory=callback_factory,
-            sip_line_service=line_service,
-            clock=lambda: datetime(2026, 8, 27, 0, 22, tzinfo=timezone.utc),
-        )
-        with pytest.raises(CustomException) as outside_window:
-            await service.start_follow_up_data_callback(
-                _auth(db, user_id=20),
-                follow_up_data_id=data_id,
-                payload=FollowUpDataCallIn(console_session_id=console_session_id),
-                idempotency_key="outside-carrier-window",
-            )
-
-        assert _error_code(outside_window.value) == "CALLBACK_OUTSIDE_CALL_WINDOW"
-        assert line_service.resolved_tenant_id is None
-        assert callback_factory.calls == []
-        assert await db.scalar(
-            select(func.count())
-            .select_from(AiCallRecordModel)
-            .where(AiCallRecordModel.entry_type == "sip_callback")
-        ) == 0
-        assert await db.scalar(
-            select(func.count()).select_from(AiCallFollowUpCallRequestModel)
-        ) == 0
+    assert callback.status == "accepted"
+    assert line_service.resolved_tenant_id == "tenant-a"
+    assert callback_factory.calls == [
+        {
+            "call_id": callback.call_id,
+            "callee_phone_number": "13800000000",
+            "config": line_service.config,
+        }
+    ]
 
 
 @pytest.mark.anyio

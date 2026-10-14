@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, NoReturn
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import status
 from sqlalchemy import and_, func, or_, select, update
@@ -37,7 +36,6 @@ from app.api.v1.ai_call.model import (
     AiCallHandoffModel,
     AiCallRecordModel,
 )
-from app.api.v1.ai_call.outbound.call_window import task_allows_call_at
 from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundAttemptModel,
     AiCallOutboundTargetModel,
@@ -1274,7 +1272,6 @@ class AiCallFollowUpService:
                     "跟进数据缺少原外呼任务上下文",
                     "FOLLOW_UP_DATA_CONTEXT_MISSING",
                 )
-            self._require_callback_window(outbound_task, now)
             line = self._source_task_sip_line(outbound_task)
             if line is None:
                 line = await self.sip_line_service.resolve_default(
@@ -1465,41 +1462,6 @@ class AiCallFollowUpService:
             config.default_ringing_timeout_seconds,
             config.max_ringing_timeout_seconds,
         )
-
-    @staticmethod
-    def _require_callback_window(
-        outbound_task: AiCallOutboundTaskModel,
-        now: datetime,
-    ) -> None:
-        start_value = settings.AI_CALL_MANUAL_CALLBACK_WINDOW_START
-        end_value = settings.AI_CALL_MANUAL_CALLBACK_WINDOW_END
-        try:
-            start = datetime.strptime(start_value, "%H:%M").time()
-            end = datetime.strptime(end_value, "%H:%M").time()
-            business_timezone = ZoneInfo(settings.AI_CALL_OUTBOUND_TIMEZONE)
-            local_time = now.astimezone(business_timezone).time()
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            raise CustomException(
-                msg="人工回拨时段配置错误",
-                status_code=503,
-                data={"errorCode": "CALLBACK_WINDOW_INVALID"},
-            ) from exc
-        if start >= end:
-            raise CustomException(
-                msg="人工回拨时段配置错误",
-                status_code=503,
-                data={"errorCode": "CALLBACK_WINDOW_INVALID"},
-            )
-        if not task_allows_call_at(outbound_task, now, business_timezone):
-            AiCallFollowUpService._raise_conflict(
-                f"当前时间不在原任务「{outbound_task.rule_name}」允许的外呼时段内",
-                "CALLBACK_OUTSIDE_TASK_WINDOW",
-            )
-        if not start <= local_time < end:
-            AiCallFollowUpService._raise_conflict(
-                f"人工回拨仅允许在 {start_value}–{end_value} 发起",
-                "CALLBACK_OUTSIDE_CALL_WINDOW",
-            )
 
     async def end_callback(
         self,

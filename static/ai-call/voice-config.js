@@ -1,4 +1,4 @@
-const DEFAULT_TARGET_MODEL = "qwen3.5-omni-plus-realtime";
+const DEFAULT_TARGET_MODEL = "qwen3.8-omni-flash-realtime";
 
 const state = {
   voices: [],

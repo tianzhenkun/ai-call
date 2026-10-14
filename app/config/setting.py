@@ -198,7 +198,7 @@ class Settings(BaseSettings):
     DASHSCOPE_REALTIME_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
     DASHSCOPE_WORKSPACE_REALTIME_URL: str = ""
 
-    QWEN_REALTIME_MODEL: str = "qwen3.5-omni-plus-realtime"
+    QWEN_REALTIME_MODEL: str = "qwen3.8-omni-flash-realtime"
     QWEN_REALTIME_VOICE: str = "Tina"
     QWEN_REALTIME_TURN_DETECTION_TYPE: str = "server_vad"
     QWEN_REALTIME_VAD_THRESHOLD: float = 0.5
@@ -256,8 +256,6 @@ class Settings(BaseSettings):
     AI_CALL_OUTBOUND_ALLOCATION_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_OUTBOUND_DIALING_TIMEOUT_SECONDS: int = 300
     AI_CALL_OUTBOUND_TIMEZONE: str = "Asia/Shanghai"
-    AI_CALL_MANUAL_CALLBACK_WINDOW_START: str = "09:00"
-    AI_CALL_MANUAL_CALLBACK_WINDOW_END: str = "21:00"
     AI_CALL_OUTBOUND_LINPHONE_TEST_ENABLED: bool = False
     AI_CALL_OUTBOUND_LINPHONE_ALLOWED_CALLEE: str = "19900001001"
     AI_CALL_OUTBOUND_LINPHONE_POLL_SECONDS: float = 1.0

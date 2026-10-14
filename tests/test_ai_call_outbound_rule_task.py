@@ -370,7 +370,7 @@ async def _seed_references(database) -> tuple[int, int]:
                 display_name="甜甜 Tina",
                 voice_type="内置",
                 gender="女声",
-                target_model="qwen3.5-omni-plus-realtime",
+                target_model=QWEN_OMNI_REALTIME_TARGET_MODEL,
                 description=None,
                 sort_order=1,
                 remark=None,

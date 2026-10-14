@@ -445,6 +445,7 @@ async def _seed_task(
                 scene_code="intro_contract",
                 voice="Tina",
                 voice_name="Tina",
+                voice_target_model="qwen3.5-omni-plus-realtime",
                 rule_id=generate_snowflake_id(),
                 rule_name="测试规则",
                 rule_summary="测试规则摘要",
@@ -1005,6 +1006,31 @@ async def test_sip_executor_fails_task_without_line_snapshot(database) -> None:
     assert task.error_message == "任务缺少有效的 SIP 线路快照"
     assert target is not None and target.status == "PENDING"
     assert attempts == []
+
+
+@pytest.mark.anyio
+async def test_sip_executor_pauses_task_without_model_snapshot(database) -> None:
+    now = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
+    dialer = SipSequenceDialer([DialResult(call_result="connected")])
+    task_id, target_ids = await _seed_task(
+        database, now=now, line_snapshot=available_line_snapshot()
+    )
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        assert task is not None
+        task.voice_target_model = None
+        await db.commit()
+
+    executor = OutboundTaskExecutor(database, dialer, now_provider=lambda: now)
+
+    assert await executor.run_once() == 0
+    assert dialer.requests == []
+    async with database() as db:
+        task = await db.get(AiCallOutboundTaskModel, task_id)
+        target = await db.get(AiCallOutboundTargetModel, target_ids[0])
+    assert task is not None and task.status == "PAUSED"
+    assert task.error_message == "任务缺少模型快照，请确认模型后重新创建任务"
+    assert target is not None and target.status == "PENDING"
 
 
 @pytest.mark.anyio

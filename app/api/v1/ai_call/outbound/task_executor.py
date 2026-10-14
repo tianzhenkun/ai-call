@@ -238,6 +238,10 @@ class OutboundTaskExecutor:
             )
             if task is None or task.status != "SCHEDULED":
                 raise ValueError("人工测试只接受 SCHEDULED 任务")
+            if task.answer_mode == "linphone" and (
+                self.dialer.dialer_type == "sip" or self.owner_runtime_start is not None
+            ) and not self._task_model(task):
+                raise ValueError("任务缺少模型快照，请确认模型后重新创建任务")
 
             targets = (
                 await db.scalars(
@@ -810,6 +814,12 @@ class OutboundTaskExecutor:
             is_formal_phone_call = task.answer_mode == "linphone" and (
                 self.dialer.dialer_type == "sip" or self.owner_runtime_start is not None
             )
+            if is_formal_phone_call and not self._task_model(task):
+                task.status = "PAUSED"
+                task.error_message = "任务缺少模型快照，请确认模型后重新创建任务"
+                task.updated_at = now
+                await db.commit()
+                return None
             if is_formal_phone_call and self.credit_metering_client is not None:
                 try:
                     await self.credit_metering_client.require_eligible(
