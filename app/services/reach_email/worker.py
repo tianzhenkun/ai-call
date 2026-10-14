@@ -7,9 +7,11 @@ import html
 import json
 import logging
 import re
+import traceback
 from datetime import timedelta
+from time import perf_counter
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -169,6 +171,20 @@ class EmailWorker:
             return None
         return selected
 
+    async def refresh_store(self, db):
+        from app.config.setting import settings
+        from app.services.ai_call.knowledge import PlatformOssKnowledgeStore
+
+        if not isinstance(self.store, PlatformOssKnowledgeStore):
+            return
+        # 独立 worker 常驻运行，附件读写前重新读取配置，避免继续连接已迁移的存储。
+        result = await db.execute(text("SELECT * FROM sys_oss_config WHERE status = '0' LIMIT 1"))
+        config = result.mappings().first()
+        if config is None:
+            raise RuntimeError('EMAIL_STORAGE_CONFIG_MISSING')
+        if dict(config) != self.store.config:
+            self.store = PlatformOssKnowledgeStore(dict(config), prefix=settings.AI_CALL_KNOWLEDGE_OSS_PREFIX)
+
     async def load_attachments(self, db, message):
         result = []
         identities = json.loads(message.attachment_ids)
@@ -176,6 +192,8 @@ class EmailWorker:
             raise ValueError('ATTACHMENT_COUNT_LIMIT')
         if len(set(identities)) != len(identities):
             raise ValueError('ATTACHMENT_DUPLICATE')
+        if identities:
+            await self.refresh_store(db)
         for identity in identities:
             attachment = await db.scalar(owned(Attachment, message, identity))
             if not attachment:
@@ -268,9 +286,12 @@ class EmailWorker:
             return
         message, attempt_id, config, account_version = claimed
         submitted = False
+        started = perf_counter()
+        stage = 'load_attachments'
         try:
             async with self.sessions() as db:
                 attachments = await self.load_attachments(db, message)
+                stage = 'eligibility_check'
                 await self.require_lease(db)
                 task = await db.scalar(owned(Task, message, message.task_id))
                 lead = await db.scalar(owned(Lead, message, message.lead_id))
@@ -285,12 +306,19 @@ class EmailWorker:
                 else:
                     outcome = None
             if outcome is None:
+                stage = 'smtp_submit'
                 submitted = True
                 outcome = await asyncio.to_thread(transport.send_message, config,
                     recipient=message.to_email, subject=message.subject, html=message.html,
                     attachments=attachments, message_id=message.message_id,
                     in_reply_to=message.in_reply_to, references=message.references)
         except Exception as exc:
+            # 异常文本和完整堆栈可能带凭据，仅保留诊断元数据及函数位置。
+            log.error('EMAIL_SEND_FAILED message=%s stage=%s elapsed_ms=%d error_type=%s '
+                      'storage_error_type=%s storage_http_status=%s frames=%s',
+                      message.id, stage, (perf_counter() - started) * 1000, type(exc).__name__,
+                      getattr(exc, 'storage_error_type', None), getattr(exc, 'storage_http_status', None),
+                      '>'.join(f'{frame.name}:{frame.lineno}' for frame in traceback.extract_tb(exc.__traceback__)))
             outcome = {'status': 'unknown' if submitted else 'failed',
                        'errorCode': ('SEND_INTERRUPTED' if submitted else
                                      str(exc) if isinstance(exc, ValueError) and str(exc) in ATTACHMENT_ERROR_CODES
@@ -496,6 +524,8 @@ class EmailWorker:
                 attachment_ids = []
                 from app.services.reach_email.service import EmailService
 
+                if attachments:
+                    await self.refresh_store(db)
                 attachment_service = EmailService(db, account.tenant_id, account.owner_id, '', self.store)
                 for item in attachments:
                     saved = await attachment_service.save_attachment(

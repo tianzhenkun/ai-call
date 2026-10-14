@@ -458,6 +458,9 @@ async def test_private_object_http_error_does_not_expose_secret(
         )
 
     assert "private-secret" not in str(error.value)
+    if method_name == "get_object":
+        assert error.value.storage_error_type == "HTTPStatusError"
+        assert error.value.storage_http_status == 403
 
 
 @pytest.mark.anyio
@@ -480,3 +483,6 @@ async def test_private_object_network_error_clears_sensitive_exception_chain(
         )
 
     assert "private-secret" not in _exception_chain_text(error.value)
+    if method_name == "get_object":
+        assert error.value.storage_error_type == "ConnectError"
+        assert error.value.storage_http_status is None
