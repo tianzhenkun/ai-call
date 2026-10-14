@@ -36,6 +36,7 @@ from app.services.reach_email.models import (
     new_id,
     now,
 )
+from app.services.reach_email.reporting import canonical_reply_reference
 from app.services.reach_email.security import CredentialCipher, configured_secret
 
 log = logging.getLogger(__name__)
@@ -58,14 +59,11 @@ async def match_reply(db, account, incoming):
         references += re.findall(r'<[^<>\s]+>', incoming.get('original_message_id', ''))
     marker_fallback = False
     if not incoming.get('bounce'):
-        tokens = set(re.findall(r'\[REACH:([0-9a-f]{32})\]', incoming.get('subject', '')))
         recipients = {address.lower() for address in incoming.get('to_emails', [])}
-        # 仅恢复带前缀且与主题标记一致的 REACH 编号；保留其他引用以检查歧义。
-        rewritten = {match[1] for reference in references
-            if (match := re.fullmatch(r'<[^<>\s@+]+\+([0-9a-f]{32})@reach\.local>', reference))}
-        headerless = not incoming.get('in_reply_to') and not incoming.get('references')
-        if len(tokens) == 1 and account.email.lower() in recipients and (headerless or tokens <= rewritten):
-            references.append(f'<{next(iter(tokens))}@reach.local>')
+        marker = canonical_reply_reference(incoming.get('subject', ''), references,
+            headerless=not incoming.get('in_reply_to') and not incoming.get('references'))
+        if marker and account.email.lower() in recipients:
+            references.append(marker)
             marker_fallback = True
     if references:
         sources = (await db.scalars(select(Message).where(*scope(Message, account),

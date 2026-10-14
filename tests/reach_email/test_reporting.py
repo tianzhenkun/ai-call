@@ -3,12 +3,13 @@ import json
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.reach_email.controller import recipient_summary, summary
 from app.services.reach_email.migrate import migrate_tables
 from app.services.reach_email.models import Message, Task
-from app.services.reach_email.reporting import summarize
+from app.services.reach_email.reporting import reply_parents, summarize
 from app.services.reach_email.service import EmailService
 
 
@@ -59,6 +60,50 @@ def test_auto_reply_confirms_only_its_original_without_counting_as_customer_repl
     automatic.from_email = 'lead@example.com'
     automatic.kind = 'bounce'
     assert summarize(rows)['deliveredCount'] == 0
+
+
+@pytest.mark.parametrize('mismatch', [None, 'sender', 'recipient', 'unaccepted', 'duplicate',
+    'unknown_header', 'no_marker', 'two_tokens', 'foreign_domain', 'different_token'])
+def test_prefixed_parent_requires_unique_evidence(mismatch):
+    token = 'a44188e1c0e246dbb3670a7c005336d5'
+    source = mail('original', message_id=f'<{token}@reach.local>')
+    incoming = mail('reply', direction='inbound', kind='reply',
+        from_email=source.to_email, to_email=source.from_email,
+        in_reply_to=f'<431FAAAD64166961+{token}@reach.local>',
+        subject=f'Re: test [REACH:{token}]')
+    rows = [source, incoming]
+    if mismatch == 'sender':
+        incoming.from_email = 'other@example.com'
+    if mismatch == 'recipient':
+        incoming.to_email = 'other@example.com'
+    if mismatch == 'unaccepted':
+        source.status = 'unknown'
+    if mismatch == 'duplicate':
+        rows.append(mail('duplicate', message_id=source.message_id))
+    if mismatch == 'unknown_header':
+        incoming.in_reply_to, incoming.references = '<unknown>', source.message_id
+    if mismatch == 'no_marker':
+        incoming.subject = 'Re: test'
+    if mismatch == 'two_tokens':
+        incoming.subject += ' [REACH:fedcba9876543210fedcba9876543210]'
+    if mismatch == 'foreign_domain':
+        incoming.in_reply_to = incoming.in_reply_to.replace('@reach.local>', '@example.com>')
+    if mismatch == 'different_token':
+        incoming.in_reply_to = incoming.in_reply_to.replace(token, 'fedcba9876543210fedcba9876543210')
+    assert reply_parents(rows).get(incoming.id) is (source if mismatch is None else None)
+    assert summarize(rows)['deliveredCount'] == (1 if mismatch is None else 0)
+
+
+def test_parent_links_keep_followups_manual_replies_and_nearest_reference():
+    first = mail('first')
+    followup = mail('followup', kind='follow_up', in_reply_to=first.message_id)
+    incoming = mail('incoming', direction='inbound', kind='reply',
+        from_email=first.to_email, to_email=first.from_email,
+        references=f'{first.message_id} {followup.message_id}')
+    manual = mail('manual', kind='reply', in_reply_to=incoming.message_id)
+    rows = [first, followup, incoming, manual]
+    assert reply_parents(rows) == {'followup': first, 'incoming': followup, 'manual': incoming}
+    assert summarize(rows)['deliveredCount'] == 1
 
 
 def test_task_summary_pagination_search_and_owner_scope():

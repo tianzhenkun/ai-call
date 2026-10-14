@@ -640,20 +640,15 @@ async def conversation(
 ):
     lead = await s.owned(Lead, identifier)
     rows, meta = await s.page(Message, page, pageSize, [Message.lead_id == lead.id])
-    from app.services.reach_email.reporting import delivery_evidence
+    from app.services.reach_email.reporting import delivery_evidence, reply_parents
     all_messages = (await s.db.scalars(s.query(Message).where(Message.lead_id == lead.id))).all()
     latest_inbound = max(
         (row for row in all_messages if row.direction == 'inbound' and row.kind == 'reply'),
         key=lambda row: (row.created_at, row.id), default=None,
     )
     delivered, failed, _ = delivery_evidence(all_messages)
-    parent_headers = {row.in_reply_to for row in rows if row.in_reply_to}
-    parents = list((await s.db.scalars(s.query(Message).where(
-        Message.lead_id == lead.id, Message.message_id.in_(parent_headers)
-    ))).all()) if parent_headers else []
-    parent_map = {}
-    for parent in parents:
-        parent_map.setdefault(parent.message_id, []).append(parent)
+    parent_map = reply_parents(all_messages)
+    parents = [parent_map[row.id] for row in rows if row.id in parent_map]
     attachment_ids = {identifier for row in [*rows, *parents, *([latest_inbound] if latest_inbound else [])]
                       for identifier in json.loads(row.attachment_ids)}
     attachments = list((await s.db.scalars(s.query(Attachment).where(Attachment.id.in_(attachment_ids)))).all()) if attachment_ids else []
@@ -665,8 +660,8 @@ async def conversation(
             attachments=[files[i] for i in json.loads(row.attachment_ids) if i in files])
     messages = []
     for row in reversed(rows):
-        matches = parent_map.get(row.in_reply_to, [])
-        messages.append(dict(present(row), replyTo=present(matches[0]) if len(matches) == 1 else None))
+        parent = parent_map.get(row.id)
+        messages.append(dict(present(row), replyTo=present(parent) if parent else None))
     first, send_blocked_reason = await s.manual_send_context(lead)
     return SuccessResponse(
         data=dict(
