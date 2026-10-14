@@ -299,7 +299,8 @@ def test_followup_waits_for_its_sync_round_without_rescheduling():
 
 
 @pytest.mark.parametrize('mismatch', [None, 'sender', 'recipient', 'account', 'owner', 'tenant', 'unaccepted', 'two_tokens', 'headers'])
-def test_headerless_reply_uses_exact_marker_and_scoped_participants(mismatch):
+@pytest.mark.parametrize('reference_kind', ['headerless', 'prefixed'])
+def test_reply_marker_requires_scoped_participants(mismatch, reference_kind):
     async def check():
         async with setup() as (worker, sessions):
             token = '0123456789abcdef0123456789abcdef'
@@ -308,6 +309,7 @@ def test_headerless_reply_uses_exact_marker_and_scoped_participants(mismatch):
                 source.account_id, source.status = 'a', 'accepted'
                 source.message_id = f'<{token}@reach.local>'
                 (await db.get(Lead, 'l')).account_id = 'a'
+                (await db.get(Task, 't')).status = 'ended'
                 if mismatch == 'account':
                     source.account_id = 'other'
                 if mismatch == 'owner':
@@ -318,6 +320,8 @@ def test_headerless_reply_uses_exact_marker_and_scoped_participants(mismatch):
                     source.status = 'failed'
             item = incoming()
             item.update(in_reply_to='', references='', subject=f'Re: Hello [REACH:{token}]')
+            if reference_kind == 'prefixed':
+                item['in_reply_to'] = item['references'] = f'<431FAAAD64166961+{token}@reach.local>'
             if mismatch == 'sender':
                 item['from_email'] = 'stranger@example.com'
             if mismatch == 'recipient':
@@ -325,13 +329,52 @@ def test_headerless_reply_uses_exact_marker_and_scoped_participants(mismatch):
             if mismatch == 'two_tokens':
                 item['subject'] += ' [REACH:fedcba9876543210fedcba9876543210]'
             if mismatch == 'headers':
-                item['in_reply_to'] = '<different@example.com>'
+                item['in_reply_to'] = item['references'] = '<different@example.com>'
             with patch('app.services.reach_email.worker.transport.sync_messages', return_value={
                 'uidvalidity': '1', 'last_uid': 1, 'messages': [item]}):
                 await worker.sync_account('a')
             async with sessions() as db:
                 reply = await db.scalar(select(Message).where(Message.direction == 'inbound'))
                 assert (reply.task_id, reply.lead_id) == (('t', 'l') if mismatch is None else (None, None))
+                assert ((await db.get(Lead, 'l')).last_reply_at is not None) == (mismatch is None)
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('case', ['no_marker', 'foreign_domain', 'different_token', 'ambiguous', 'auto_reply'])
+def test_prefixed_reply_preserves_matching_boundaries(case):
+    async def check():
+        async with setup() as (worker, sessions):
+            token = '0123456789abcdef0123456789abcdef'
+            async with sessions() as db, db.begin():
+                source = await db.get(Message, 'm')
+                source.account_id, source.status = 'a', 'accepted'
+                source.message_id = f'<{token}@reach.local>'
+                (await db.get(Lead, 'l')).account_id = 'a'
+                if case == 'ambiguous':
+                    db.add(Lead(id='other', tenant_id='t', owner_id='o', task_id='other',
+                        email='lead@example.com', account_id='a', values='{}'))
+                    db.add(Message(id='other', tenant_id='t', owner_id='o', task_id='other',
+                        lead_id='other', account_id='a', status='accepted', dedup_key='initial:other',
+                        message_id='<other@example.com>', to_email='lead@example.com', subject='Other', html=''))
+            item = incoming()
+            item.update(in_reply_to=f'<431FAAAD64166961+{token}@reach.local>', references='',
+                subject=f'Re: Hello [REACH:{token}]')
+            if case == 'no_marker':
+                item['subject'] = 'Re: Hello'
+            if case == 'foreign_domain':
+                item['in_reply_to'] = item['in_reply_to'].replace('@reach.local>', '@example.com>')
+            if case == 'different_token':
+                item['in_reply_to'] = item['in_reply_to'].replace(token, 'fedcba9876543210fedcba9876543210')
+            if case == 'ambiguous':
+                item['references'] = '<other@example.com>'
+            item['auto_reply'] = case == 'auto_reply'
+            with patch('app.services.reach_email.worker.transport.sync_messages', return_value={
+                'uidvalidity': '1', 'last_uid': 1, 'messages': [item]}):
+                await worker.sync_account('a')
+            async with sessions() as db:
+                reply = await db.scalar(select(Message).where(Message.direction == 'inbound'))
+                assert (reply.task_id, reply.lead_id) == (('t', 'l') if case == 'auto_reply' else (None, None))
+                assert (await db.get(Lead, 'l')).last_reply_at is None
     asyncio.run(check())
 
 

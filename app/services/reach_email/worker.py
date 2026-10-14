@@ -51,6 +51,43 @@ def owned(model, row, identity):
     return select(model).where(model.id == identity, *scope(model, row))
 
 
+async def match_reply(db, account, incoming):
+    """同步和历史补关联使用同一套编号、参与人及归属校验。"""
+    references = re.findall(r'<[^<>\s]+>', incoming.get('in_reply_to', '') + ' ' + incoming.get('references', ''))
+    if incoming.get('bounce'):
+        references += re.findall(r'<[^<>\s]+>', incoming.get('original_message_id', ''))
+    marker_fallback = False
+    if not incoming.get('bounce'):
+        tokens = set(re.findall(r'\[REACH:([0-9a-f]{32})\]', incoming.get('subject', '')))
+        recipients = {address.lower() for address in incoming.get('to_emails', [])}
+        # 仅恢复带前缀且与主题标记一致的 REACH 编号；保留其他引用以检查歧义。
+        rewritten = {match[1] for reference in references
+            if (match := re.fullmatch(r'<[^<>\s@+]+\+([0-9a-f]{32})@reach\.local>', reference))}
+        headerless = not incoming.get('in_reply_to') and not incoming.get('references')
+        if len(tokens) == 1 and account.email.lower() in recipients and (headerless or tokens <= rewritten):
+            references.append(f'<{next(iter(tokens))}@reach.local>')
+            marker_fallback = True
+    if references:
+        sources = (await db.scalars(select(Message).where(*scope(Message, account),
+            Message.account_id == account.id, Message.direction == 'outbound',
+            Message.message_id.in_(references)))).all()
+        matched = []
+        for candidate in sources:
+            if marker_fallback and candidate.status != 'accepted':
+                continue
+            lead = await db.scalar(owned(Lead, account, candidate.lead_id))
+            direct_reply = lead and lead.email.lower() == incoming['from_email'].lower()
+            dsn_reply = (lead and incoming.get('bounce')
+                and candidate.message_id == incoming.get('original_message_id')
+                and lead.email.lower() in (incoming.get('failed_recipients', []) +
+                    [report['recipient'] for report in incoming.get('delivery_reports', [])]))
+            if lead and lead.task_id == candidate.task_id and lead.account_id == account.id and (direct_reply or dsn_reply):
+                matched.append((candidate, lead))
+        if len({lead.id for _, lead in matched}) == 1:
+            return matched[0]
+    return None, None
+
+
 class EmailWorker:
     def __init__(self, sessions, cipher, store, ai, *, batch_size=10):
         self.sessions, self.cipher, self.store, self.ai = sessions, cipher, store, ai
@@ -492,35 +529,7 @@ class EmailWorker:
                 key = f'inbound:{account.id}:{fingerprint.hexdigest()}'
                 if await db.scalar(select(Message.id).where(*scope(Message, account), Message.dedup_key == key)):
                     continue
-                references = re.findall(r'<[^<>\s]+>', incoming.get('in_reply_to', '') + ' ' + incoming.get('references', ''))
-                if incoming.get('bounce'):
-                    references += re.findall(r'<[^<>\s]+>', incoming.get('original_message_id', ''))
-                source = None
-                marker_fallback = False
-                if not incoming.get('in_reply_to') and not incoming.get('references') and not incoming.get('bounce'):
-                    tokens = set(re.findall(r'\[REACH:([0-9a-f]{32})\]', incoming.get('subject', '')))
-                    recipients = {address.lower() for address in incoming.get('to_emails', [])}
-                    if len(tokens) == 1 and account.email.lower() in recipients:
-                        references = [f'<{next(iter(tokens))}@reach.local>']
-                        marker_fallback = True
-                if references:
-                    sources = (await db.scalars(select(Message).where(*scope(Message, account),
-                        Message.account_id == account.id, Message.direction == 'outbound',
-                        Message.message_id.in_(references)))).all()
-                    matched = []
-                    for candidate in sources:
-                        if marker_fallback and candidate.status != 'accepted':
-                            continue
-                        lead = await db.scalar(owned(Lead, account, candidate.lead_id))
-                        direct_reply = lead and lead.email.lower() == incoming['from_email'].lower()
-                        dsn_reply = (lead and incoming.get('bounce')
-                            and candidate.message_id == incoming.get('original_message_id')
-                            and lead.email.lower() in (incoming.get('failed_recipients', []) +
-                                [report['recipient'] for report in incoming.get('delivery_reports', [])]))
-                        if lead and lead.task_id == candidate.task_id and lead.account_id == account.id and (direct_reply or dsn_reply):
-                            matched.append((candidate, lead))
-                    if len({lead.id for _, lead in matched}) == 1:
-                        source, lead = matched[0]
+                source, lead = await match_reply(db, account, incoming)
                 attachment_ids = []
                 from app.services.reach_email.service import EmailService
 
