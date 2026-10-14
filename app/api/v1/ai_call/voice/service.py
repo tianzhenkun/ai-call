@@ -1470,6 +1470,7 @@ class VoiceEnrollmentService:
             )
 
         profile_id: int | None = existing_profile_id
+        target_model = self.target_model
         if existing_profile_id is not None:
             profile, profile_lookup_failed = await self._lookup_profile(
                 db,
@@ -1489,6 +1490,7 @@ class VoiceEnrollmentService:
                     msg="只有创建失败的音色可以重新上传",
                     status_code=status.HTTP_409_CONFLICT,
                 )
+            target_model = profile.target_model
 
         await self._safe_rollback(db)
 
@@ -1631,6 +1633,7 @@ class VoiceEnrollmentService:
             enrollment_id=enrollment_id,
             status="CREATING",
             display_name=request.display_name,
+            target_model=target_model,
         )
 
     def _generate_sample_identity(
@@ -2000,6 +2003,7 @@ class VoiceEnrollmentService:
             enrollment_id=enrollment.id,
             status="CREATING",
             display_name=profile.display_name,
+            target_model=profile.target_model,
         )
 
     async def _reconcile_enrollment(
@@ -2051,6 +2055,7 @@ class VoiceEnrollmentService:
                 enrollment_id=enrollment.id,
                 status="CREATING",
                 display_name=profile.display_name,
+                target_model=profile.target_model,
             ),
             sample_object_key=enrollment.sample_object_key,
         )

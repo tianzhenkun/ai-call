@@ -1335,7 +1335,12 @@ class OutboundTaskExecutor:
     @staticmethod
     def _task_model(task: AiCallOutboundTaskModel) -> str | None:
         snapshot = json.loads(task.config_snapshot_json)
-        return (snapshot.get("request") or {}).get("model")
+        # 旧任务未保存 request.model 时，沿用创建时的音色模型，避免默认值切换影响重试。
+        return (
+            (snapshot.get("request") or {}).get("model")
+            or task.voice_target_model
+            or (snapshot.get("voice") or {}).get("targetModel")
+        )
 
     @staticmethod
     def _task_prompt_snapshot(task: AiCallOutboundTaskModel) -> dict | None:

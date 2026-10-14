@@ -9,7 +9,13 @@ from app.services.ai_call.prompt_config import PromptEffectiveConfig
 VoiceSpeakingStyle = Literal["natural", "gentle", "professional", "lively", "serious"]
 
 VOICE_SPEAKING_STYLE_INSTRUCTIONS: dict[VoiceSpeakingStyle, str] = {
-    "natural": "",
+    "natural": (
+        "使用自然、亲切的普通话交谈，语速适中，按语义自然停顿，重点词轻微强调，句尾自然收住。"
+        "根据对方的反应调整语气：解释时耐心，遇到疑虑时放缓，避免逐字播报、夸张表演，"
+        "不刻意添加语气词和笑声。自由回复优先使用 1 到 2 个短句，单句尽量 10 到 20 字，"
+        "整轮不超过 60 字，只讲一个重点，详细解释分轮展开，等待对方回应；简短确认不为凑字数加长。"
+        "金额、时间、否定和必要条件必须完整表达；固定开场白和要求原文朗读的内容保持原文。"
+    ),
     "gentle": "使用温和、耐心、亲切的语气，表达舒缓，不刻意撒娇。",
     "professional": "使用专业、沉稳、自信的语气，表达清晰克制，避免机械播报。",
     "lively": "使用活泼、明快、有活力的语气，适度增加语气起伏，不夸张表演。",
@@ -23,7 +29,7 @@ def append_voice_style(instructions: str, style: VoiceSpeakingStyle) -> str:
         return instructions
     return (
         f"{instructions}\n\n音色表达风格：{direction}"
-        "保持当前音色的身份特征，仅调整声音表达；不改变业务事实、原定话术和工具调用规则。"
+        "保持当前音色的身份特征，仅调整声音表达；不改变业务事实、必须原文朗读的内容和工具调用规则。"
     )
 
 

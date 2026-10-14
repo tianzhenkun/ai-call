@@ -219,6 +219,25 @@ def _voice_service(
     )
 
 
+@pytest.mark.anyio
+async def test_omni38_catalog_hides_legacy_voices_without_deleting_them(voice_database) -> None:
+    _engine, factory = voice_database
+    async with factory() as db:
+        db.add_all([
+            _tenant_voice(profile_id=3801, tenant_id="tenant-a", voice="custom-38", target_model="qwen3.8-omni-flash-realtime"),
+            _tenant_voice(profile_id=3501, tenant_id="tenant-a", voice="custom-35", target_model=TARGET_MODEL),
+        ])
+        await db.commit()
+        rows, total = await VoiceRepository(db).list_profiles(
+            tenant_id="tenant-a", target_model="qwen3.8-omni-flash-realtime", page_size=1000,
+        )
+        assert total == len(rows) and total > 1
+        assert {row.target_model for row in rows} == {"qwen3.8-omni-flash-realtime"}
+        assert "custom-38" in {row.voice for row in rows}
+        assert "custom-35" not in {row.voice for row in rows}
+        assert await db.get(AiCallTenantVoiceProfileModel, 3501) is not None
+
+
 def test_voice_service_uses_configured_private_sample_prefix() -> None:
     service = VoiceEnrollmentService(
         storage=FakeVoiceSampleStorage(),
@@ -1417,6 +1436,7 @@ def test_enrollment_accepted_output_stringifies_ids() -> None:
         enrollment_id=9_007_199_254_740_994,
         status="CREATING",
         display_name="客服小林",
+        target_model=TARGET_MODEL,
     )
 
     assert output.voice_profile_id == "9007199254740993"
@@ -1455,6 +1475,7 @@ async def test_create_persists_normalized_profile_and_enrollment(enrollment_data
         "enrollmentId": "223456789012345678",
         "status": "CREATING",
         "displayName": "客服小林",
+        "targetModel": TARGET_MODEL,
     }
     assert profile is not None
     assert enrollment is not None
@@ -1507,6 +1528,7 @@ async def test_create_reuses_same_tenant_key_and_canonical_hash_without_upload(
             request=_enrollment_request(),
             sample=_upload(),
         )
+        service.target_model = "qwen3.8-omni-flash-realtime"
         second = await service.create(
             database,
             tenant_id="tenant-a",
@@ -1520,6 +1542,7 @@ async def test_create_reuses_same_tenant_key_and_canonical_hash_without_upload(
         )
 
     assert second == first
+    assert second.target_model == TARGET_MODEL
     assert len(storage.put_calls) == 1
 
 
@@ -2499,6 +2522,7 @@ async def test_reenroll_updates_failed_profile_and_is_idempotent(enrollment_data
     engine, factory = enrollment_database
     storage = FakeVoiceSampleStorage()
     service = _voice_service(storage, factory, ids=(202,))
+    service.target_model = "qwen3.8-omni-flash-realtime"
     update_statements: list[str] = []
 
     def capture_sql(
@@ -2555,6 +2579,7 @@ async def test_reenroll_updates_failed_profile_and_is_idempotent(enrollment_data
     assert first.voice_profile_id == "101"
     assert first.enrollment_id == "202"
     assert first.display_name == "新名称"
+    assert first.target_model == TARGET_MODEL
     assert saved_profile is not None
     assert saved_profile.status == "CREATING"
     assert saved_profile.latest_enrollment_id == 202

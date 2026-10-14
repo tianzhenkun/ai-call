@@ -263,10 +263,8 @@ class RuntimeWebhookRepository:
             )
             if user_unavailable:
                 record.failure_stage = record.failure_stage or "sip"
-                record.failure_message = record.failure_message or (
-                    "SIP 480 Temporarily Unavailable; "
-                    "hangup_cause=USER_UNAVAILABLE"
-                )
+                # 退出原因也可能来自本地超时，不能据此补造线路的 SIP 响应码。
+                record.failure_message = record.failure_message or "hangup_cause=USER_UNAVAILABLE"
             decision = await RuntimeCommandRepository(
                 self._session,
                 id_generator=self._id_generator,

@@ -73,10 +73,12 @@ class FakeProvider:
         *,
         preferred_name: str,
         audio_data_url: str,
+        target_model: str,
     ) -> VoiceCreateResult:
         self.create_calls.append({
             "preferred_name": preferred_name,
             "audio_data_url": audio_data_url,
+            "target_model": target_model,
         })
         if self.on_create is not None:
             await self.on_create()
@@ -1078,6 +1080,21 @@ async def test_claimed_batch_runs_concurrently_and_isolates_task_failure(
     assert sorted(entered) == [failed_task.id, successful_task.id]
     assert (await harness.enrollment(failed_task.id)).status == "PROCESSING"
     assert (await harness.enrollment(successful_task.id)).status == "SUCCEEDED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("model", [TARGET_MODEL, "qwen3.8-omni-flash-realtime"])
+async def test_worker_uses_the_enrollment_model_on_retry(harness, model) -> None:
+    task = await harness.seed_enrollment(attempt_count=1)
+    async with harness.factory() as database:
+        profile = await database.get(AiCallTenantVoiceProfileModel, task.voice_profile_id)
+        profile.target_model = model
+        await database.commit()
+
+    await harness.worker.run_once()
+
+    assert (await harness.enrollment(task.id)).status == "SUCCEEDED"
+    assert harness.provider.create_calls[0]["target_model"] == model
 
 
 @pytest.mark.anyio

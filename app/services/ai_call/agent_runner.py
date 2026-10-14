@@ -4,13 +4,13 @@ import asyncio
 import base64
 import hashlib
 import json
-import re
 import wave
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal, Protocol
 
 from app.services.ai_call.audio_bridge import PcmAudioBridge, PcmAudioFrame
@@ -98,44 +98,19 @@ CallEndScheduler = Callable[[str, str], None]
 
 AUDIO_PLAYOUT_MAX_RESPONSE_DURATION_MS = 60_000
 AUDIO_PLAYOUT_HIGH_WATERMARK_PERCENT = 80
-CALL_POLICY_WRAP_UP_SECONDS = 240
-CALL_POLICY_FINAL_RESPONSE_SECONDS = 290
+CALL_POLICY_WRAP_UP_LEAD_SECONDS = 60
+CALL_POLICY_FINAL_RESPONSE_LEAD_SECONDS = 30
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
-# 300 秒业务上限后最多留 15 秒播完收尾；供应商或播放卡住时仍有硬截止。
-CALL_POLICY_SAFETY_END_SECONDS = 315
-CALL_POLICY_MAX_CUSTOMER_TURNS = 15
 CALL_POLICY_SILENCE_SECONDS = 8
 CALL_POLICY_MAX_SILENCE_PROMPTS = 3
 # 只约束异常回复；持续生成、播放或工具处理各自更新进度，不串行增加正常首声等待。
 RESPONSE_STALL_SECONDS = 8.0
 RESPONSE_CANCEL_SECONDS = 2.0
 RESPONSE_RECONNECT_SECONDS = 5.0
-CALL_POLICY_WRAP_UP_INPUT = (
-    "请简短总结当前话题，开始自然收尾，不要扩展话题或提出新问题；客户继续提问时仍简短回应。"
-    "时长控制和最终告别由系统单独通知，此次提示不是结束通话指令，"
-    "不要据此调用 schedule_call_end，policy_limit 仅适用于连续三轮有效客户发言离题。"
-)
+CALL_POLICY_WRAP_UP_INPUT = "通话即将达到时长上限，请从当前话题自然收尾，不要开启新问题。"
 CALL_POLICY_FINAL_INPUT = (
     "请只说：感谢您的时间，今天先沟通到这里，祝您生活愉快，再见。"
     "不要添加其他内容，不要再提出问题。"
-)
-CALL_POLICY_TURN_LIMIT_INPUT = (
-    "本次对话开始收尾。请先简短回答客户的当前问题；需要知识证据时正常调用知识工具，"
-    "不得编造答案。告知客户还可以补充一个问题，然后等待回应，不要现在告别。"
-    "客户仅要求稍等时，简短回应并等待其问题；客户纠正或含义不清时，先简短澄清。"
-    "客户明确要求转人工时，仍按转人工流程处理，"
-    "不得把回答问题或口头承诺当作已完成转接。"
-)
-CALL_POLICY_FOLLOWUP_INPUT = (
-    "这是本次通话最后一个补充问题。请先简短回答客户的当前问题，需要知识证据时正常查询，"
-    "不得编造答案，不再邀请新问题或承诺后续安排。含义不清时先用一个问句澄清并等待回应，"
-    "不要假装听懂；澄清不算回答完成。系统会在明确回答播放完成后另行请求告别。"
-    "客户明确要求转人工时，仍按转人工流程处理。"
-)
-CALL_POLICY_WAIT_INPUT = "客户仅要求稍等。请简短回应并等待，不要告别；仍保留一个补充问题的机会。"
-CALL_POLICY_CLARIFY_INPUT = (
-    "客户在纠正理解或表示没听清。请先回应纠正；含义不明确时只问一个简短的澄清问题并等待。"
-    "不要假装听懂，不要承诺转接、安排顾问或回访，不要告别；澄清不消耗补充问题机会。"
 )
 CALL_POLICY_SILENCE_INPUTS = (
     "客户暂未回应，请简短询问一次是否还在听，不要重复之前的长内容。",
@@ -740,7 +715,6 @@ class PendingUserTurn:
     current_speech_semantic_rejected: bool = False
     response_requested: bool = False
     customer_turn_counted: bool = False
-    followup_needs_reply: bool = False
     interrupt_candidate: bool = False
     interrupt_confirmed: bool = False
     interrupt_ignored: bool = False
@@ -871,6 +845,7 @@ class PlaybackGuard:
     current_response_id: str | None = None
     current_response_generation: int = 0
     current_response_audio_published: bool = False
+    current_response_transcript: str = ""
     cancelled_response_ids: set[str] = field(default_factory=set)
     overflowed_responses: set[tuple[str | None, int]] = field(default_factory=set)
     cancel_requested: bool = False
@@ -907,6 +882,7 @@ class PendingCallEnd:
     scheduled: bool = False
     local_explicit_intent: bool = False
     deferred_for_user_turn: bool = False
+    farewell_retry_requested: bool = False
 
 
 @dataclass(slots=True)
@@ -951,6 +927,7 @@ class RealtimeCallAgentRunner:
         call_end_scheduler: CallEndScheduler | None = None,
         knowledge_search_service: Any | None = None,
         customer_speech_classifier: CustomerSpeechClassifier | None = None,
+        max_call_duration_seconds: int = 900,
     ) -> None:
         self.provider_factory = provider_factory
         self.registry = registry
@@ -993,6 +970,7 @@ class RealtimeCallAgentRunner:
         self.call_end_scheduler = call_end_scheduler
         self.knowledge_search_service = knowledge_search_service
         self.customer_speech_classifier = customer_speech_classifier
+        self.max_call_duration_seconds = max(1, max_call_duration_seconds)
         self._interrupt_policy = InterruptDecisionPolicy()
         self._sip_barge_in_vad = sip_barge_in_vad or (
             WebRtcVadAdapter()
@@ -1035,8 +1013,6 @@ class RealtimeCallAgentRunner:
         self._silence_watchdog_tasks: dict[str, asyncio.Task[None]] = {}
         self._silence_prompt_counts: dict[str, int] = {}
         self._customer_turn_counts: dict[str, int] = {}
-        # None 表示已提醒收尾；保存补答所属轮次，工具续答不能再次消耗机会。
-        self._turn_limit_followups: dict[str, PendingUserTurn | None] = {}
         self._off_topic_turn_event_ids: dict[str, list[str]] = {}
         self._browser_audio_hold_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_pre_stop_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1199,7 +1175,6 @@ class RealtimeCallAgentRunner:
         self._pending_knowledge_audit_ids.pop(call_id, None)
         self._silence_prompt_counts.pop(call_id, None)
         self._customer_turn_counts.pop(call_id, None)
-        self._turn_limit_followups.pop(call_id, None)
         self._off_topic_turn_event_ids.pop(call_id, None)
         self._provider_transport_diagnostics.pop(call_id, None)
         self._last_ai_question_completed_at.pop(call_id, None)
@@ -1330,14 +1305,14 @@ class RealtimeCallAgentRunner:
         session = self.registry.get(call_id)
         opening_message = str(self._config_value(session.effective_config, "opening_message", ""))
         input_text = f"请主动说出开场白：{opening_message}" if opening_message else None
+        if self._is_sip_participant(session):
+            self._start_call_policy_task(call_id)
         await self._request_response(
             call_id,
             provider,
             input_text=input_text,
             opening_response=True,
         )
-        if self._is_sip_participant(session):
-            self._start_call_policy_task(call_id)
 
     def _start_call_policy_task(self, call_id: str) -> None:
         task = self._call_policy_tasks.get(call_id)
@@ -1349,43 +1324,37 @@ class RealtimeCallAgentRunner:
         )
 
     async def _run_call_policy(self, call_id: str) -> None:
+        answered_at = self.registry.get(call_id).answered_at
+        elapsed = max(0.0, (datetime.now(timezone.utc) - answered_at).total_seconds()) if answered_at else 0.0
+        deadline = monotonic() + max(0.0, self.max_call_duration_seconds - elapsed)
         try:
-            await asyncio.sleep(CALL_POLICY_WRAP_UP_SECONDS)
-            if not self._call_policy_is_running(call_id):
-                return
-            provider = self._providers.get(call_id)
-            if provider is None:
-                return
-            self._append_event(
-                call_id,
-                "call_policy_wrap_up_requested",
-                "agent",
-                {"elapsedSeconds": CALL_POLICY_WRAP_UP_SECONDS},
-            )
-            await self._request_response(
-                call_id,
-                provider,
-                input_text=CALL_POLICY_WRAP_UP_INPUT,
-            )
+            # 所有节点共用接通后的固定截止时间，模型请求耗时、打断和重连不延长通话。
+            for lead, next_lead in (
+                (CALL_POLICY_WRAP_UP_LEAD_SECONDS, CALL_POLICY_FINAL_RESPONSE_LEAD_SECONDS),
+                (CALL_POLICY_FINAL_RESPONSE_LEAD_SECONDS, 0),
+            ):
+                await asyncio.sleep(max(0.0, deadline - lead - monotonic()))
+                if not self._call_policy_is_running(call_id):
+                    return
+                provider = self._providers.get(call_id)
+                if provider is None:
+                    return
+                remaining = deadline - next_lead - monotonic()
+                if remaining <= 0:
+                    continue
+                try:
+                    async with asyncio.timeout(remaining):
+                        if next_lead:
+                            self._append_event(call_id, "call_policy_wrap_up_requested", "agent", {
+                                "elapsedSeconds": self.max_call_duration_seconds - lead,
+                            })
+                            await self._request_response(call_id, provider, input_text=CALL_POLICY_WRAP_UP_INPUT)
+                        else:
+                            await self._begin_policy_call_end(call_id, provider, end_reason="policy_duration_limit")
+                except TimeoutError:
+                    self._append_event(call_id, "call_policy_response_timeout", "agent", {"leadSeconds": lead})
 
-            await asyncio.sleep(
-                CALL_POLICY_FINAL_RESPONSE_SECONDS - CALL_POLICY_WRAP_UP_SECONDS
-            )
-            if not self._call_policy_is_running(call_id):
-                return
-            # 收尾等待期间可能已更换模型连接，最终告别必须发到当前连接。
-            provider = self._providers.get(call_id)
-            if provider is None:
-                return
-            await self._begin_policy_call_end(
-                call_id,
-                provider,
-                end_reason="policy_duration_limit",
-            )
-
-            await asyncio.sleep(
-                CALL_POLICY_SAFETY_END_SECONDS - CALL_POLICY_FINAL_RESPONSE_SECONDS
-            )
+            await asyncio.sleep(max(0.0, deadline - monotonic()))
             pending = self._pending_call_ends.get(call_id)
             if (
                 not self._call_policy_is_running(call_id)
@@ -1399,7 +1368,7 @@ class RealtimeCallAgentRunner:
                 call_id,
                 "call_policy_safety_end",
                 "agent",
-                {"elapsedSeconds": CALL_POLICY_SAFETY_END_SECONDS},
+                {"elapsedSeconds": self.max_call_duration_seconds},
             )
             self.call_end_scheduler(
                 call_id,
@@ -1485,11 +1454,6 @@ class RealtimeCallAgentRunner:
                 return
             provider = self._providers.get(call_id)
             if provider is None:
-                return
-            if call_id in self._turn_limit_followups:
-                await self._begin_policy_call_end(
-                    call_id, provider, end_reason="policy_turn_limit",
-                )
                 return
             prompt_count = self._silence_prompt_counts.get(call_id, 0) + 1
             self._silence_prompt_counts[call_id] = prompt_count
@@ -6203,6 +6167,9 @@ class RealtimeCallAgentRunner:
                     return
                 completed.add(response_id)
             self._trace_response(call_id, "response_done")
+            transcript = self._model_response_transcript(payload)
+            if transcript:
+                self._playback_guard(call_id).current_response_transcript = transcript
             lifecycle = self._response_lifecycle(call_id)
             lifecycle.completed_successfully = (
                 isinstance(payload.get("response"), dict)
@@ -6211,7 +6178,11 @@ class RealtimeCallAgentRunner:
                 and not self._playback_guard(call_id).cancel_requested
             )
 
-        if event_type == "model_session_started" and session.status == CallSessionStatus.READY:
+        if event_type == "ai_transcript_done":
+            guard = self._playback_guard(call_id)
+            if self._response_id_from_payload(payload) == guard.current_response_id:
+                guard.current_response_transcript = self._payload_string(payload, "transcript", "text")
+        elif event_type == "model_session_started" and session.status == CallSessionStatus.READY:
             self.registry.transition(call_id, CallSessionStatus.CONNECTED)
         elif event_type == "model_response_started":
             if session.status == CallSessionStatus.READY:
@@ -6732,7 +6703,7 @@ class RealtimeCallAgentRunner:
             "call_policy_customer_turn",
             "agent",
             {
-                "count": count, "limit": CALL_POLICY_MAX_CUSTOMER_TURNS,
+                "count": count, "limit": None,
                 "customerTranscriptEventId": turn.customer_transcript_event_id if turn else None,
                 "topicRelation": decision.topic if decision else "uncertain",
                 "consecutiveOffTopicTurns": len(off_topic_ids),
@@ -7080,7 +7051,7 @@ class RealtimeCallAgentRunner:
             tool_reason == "customer_end" and call_id in self._pending_call_end_intents
         )
         self._pending_call_end_intents.pop(call_id, None)
-        final_audio_already_spoken = self._has_current_response_audio(call_id)
+        final_audio_already_spoken = self._current_response_has_farewell(call_id)
         if call_id not in self._pending_call_ends:
             self._pending_call_ends[call_id] = PendingCallEnd(
                 tool_call_id=tool_call_id,
@@ -9653,9 +9624,14 @@ class RealtimeCallAgentRunner:
             {"reason": "transcript_arrived_after_ai_response_done"},
         )
 
-    def _has_current_response_audio(self, call_id: str) -> bool:
-        return self._response_lifecycle(call_id).active and (
-            self._playback_guard(call_id).current_response_audio_published
+    def _current_response_has_farewell(self, call_id: str) -> bool:
+        guard = self._playback_guard(call_id)
+        text = self._normalize_call_end_acknowledgement(guard.current_response_transcript)
+        return bool(
+            guard.current_response_audio_published
+            and guard.current_response_generation == guard.generation
+            and guard.current_response_id not in guard.cancelled_response_ids
+            and text.endswith(("再见", "拜拜", "祝您工作顺利", "祝您生活愉快", "不打扰您了"))
         )
 
     def _decide_realtime_transcript_trust(
@@ -9783,10 +9759,6 @@ class RealtimeCallAgentRunner:
             self._last_ai_question_completed_at[call_id] = timestamp
         else:
             self._last_ai_question_completed_at.pop(call_id, None)
-        followup = self._turn_limit_followups.get(call_id)
-        if text and followup is self._pending_user_turns.get(call_id) and followup is not None:
-            # 最后一轮仍在澄清时，不能把模型生成结束当作客户问题已答完。
-            followup.followup_needs_reply = self._looks_like_ai_question(text)
 
     @classmethod
     def _model_response_transcript(cls, payload: dict[str, Any]) -> str:
@@ -9934,10 +9906,6 @@ class RealtimeCallAgentRunner:
             and not turn.current_speech_semantic_rejected
             and not turn.customer_turn_counted
         )
-        if input_text is None and not opening_response and turn is not None:
-            input_text = await self._turn_limit_response_input(
-                call_id, turn, new_customer_turn=count_customer_turn,
-            )
         if (
             input_text is None and turn is not None and turn.speech_decision is not None
             and turn.speech_decision.accepted
@@ -9984,6 +9952,7 @@ class RealtimeCallAgentRunner:
         guard.current_response_id = None
         guard.current_response_generation = lifecycle.response_generation
         guard.current_response_audio_published = False
+        guard.current_response_transcript = ""
         self._response_traces[call_id] = {"createSentAt": self._utcnow_text()}
         self._trace_response(call_id, "create_requested")
         self._ensure_response_watchdog(call_id)
@@ -10228,58 +10197,6 @@ class RealtimeCallAgentRunner:
         self._fail_running_session(call_id, end_reason="model_error",
                                    failure_stage="response_recovery", failure_message=message)
 
-    async def _turn_limit_response_input(
-        self, call_id: str, turn: PendingUserTurn, *, new_customer_turn: bool,
-    ) -> str | None:
-        if call_id not in self._turn_limit_followups:
-            if not new_customer_turn or (
-                self._customer_turn_counts.get(call_id, 0) + 1 < CALL_POLICY_MAX_CUSTOMER_TURNS
-            ):
-                return None
-            self._turn_limit_followups[call_id] = None
-            self._append_event(call_id, "call_policy_wrap_up_requested", "agent", {
-                "reason": "policy_turn_limit", "limit": CALL_POLICY_MAX_CUSTOMER_TURNS,
-                "remainingFollowupQuestions": 1,
-            })
-            instruction = CALL_POLICY_TURN_LIMIT_INPUT
-        else:
-            followup_turn = self._turn_limit_followups[call_id]
-            normalized = self._normalize_call_end_acknowledgement(turn.transcript)
-            handoff = await RuleBasedHandoffIntentClassifier().classify(transcript=turn.transcript)
-            if handoff.matched and handoff.reason == "customer_request":
-                return HANDOFF_CAPABILITY_INSTRUCTIONS + "\n客户当前原话：" + json.dumps(
-                    turn.transcript, ensure_ascii=False,
-                )
-            if followup_turn is turn:
-                instruction = CALL_POLICY_FOLLOWUP_INPUT
-            elif new_customer_turn and re.fullmatch(
-                r"(?:嗯|好的)?(?:你们?|您)?(?:请|先)?"
-                r"(?:稍等(?:一下|一会儿?|会儿?)?|等(?:等|一下|一会儿?|会儿?))(?:啊|呀|哈)?",
-                normalized,
-            ):
-                self._turn_limit_followups[call_id] = None
-                instruction = CALL_POLICY_WAIT_INPUT
-            elif new_customer_turn and (
-                self.call_end_decision_service.decide(turn.transcript).action != "explicit_end"
-                and re.search(r"(?:我(?:没(?:有)?|不是)说|不是这个意思|[没不]听清|听不清|再说一遍)", normalized)
-            ):
-                self._turn_limit_followups[call_id] = None
-                instruction = CALL_POLICY_CLARIFY_INPUT
-            elif followup_turn is not None and followup_turn.followup_needs_reply:
-                self._turn_limit_followups[call_id] = turn
-                instruction = CALL_POLICY_FOLLOWUP_INPUT
-            elif followup_turn is not None or (
-                new_customer_turn and normalized in CALL_END_ACKNOWLEDGEMENT_TEXTS
-            ):
-                self._prepare_policy_call_end(call_id, end_reason="policy_turn_limit")
-                return CALL_POLICY_FINAL_INPUT
-            elif not new_customer_turn:
-                instruction = CALL_POLICY_TURN_LIMIT_INPUT
-            else:
-                self._turn_limit_followups[call_id] = turn
-                instruction = CALL_POLICY_FOLLOWUP_INPUT
-        return instruction + "\n客户当前原话：" + json.dumps(turn.transcript, ensure_ascii=False)
-
     def _should_defer_no_barge_response_until_model_done(self, call_id: str) -> bool:
         session = self.registry.get(call_id)
         return self._response_lifecycle(call_id).opening_playout_pending or (
@@ -10324,6 +10241,7 @@ class RealtimeCallAgentRunner:
         guard.current_response_id = response_id
         guard.current_response_generation = lifecycle.response_generation
         guard.current_response_audio_published = False
+        guard.current_response_transcript = ""
         if self._defer_unstarted_no_barge_response_for_active_user(call_id, response_id):
             return
         if response_id and guard.current_response_generation != guard.generation:
@@ -10427,6 +10345,18 @@ class RealtimeCallAgentRunner:
             # 完整回复且播放完成，才结束这次故障；取消、工具空回复不补充恢复额度。
             lifecycle.recovery_count = 0
             self._trace_response(call_id, "recovery_completed")
+        pending = self._pending_call_ends.get(call_id)
+        if (
+            pending is not None
+            and self._current_response_has_farewell(call_id)
+            and lifecycle.pending_input_text in (None, CALL_POLICY_FINAL_INPUT)
+            and not lifecycle.pending_response_is_opening
+            and call_id not in self._handoff_tool_results
+            and self._call_end_user_turn_deferral_reason(call_id) is None
+        ):
+            pending.final_response_started = True
+            lifecycle.pending_create = False
+            lifecycle.pending_input_text = None
         if not lifecycle.pending_create:
             if await self._maybe_recover_sip_confirmed_without_transcript(call_id, provider):
                 return
@@ -10437,15 +10367,23 @@ class RealtimeCallAgentRunner:
                     input_text=self._call_end_final_response_tool_result("customer_end"),
                 )
                 return
+            pending = self._pending_call_ends.get(call_id)
             if (
-                self._turn_limit_followups.get(call_id) is not None
-                and not self._turn_limit_followups[call_id].followup_needs_reply
+                pending is not None and pending.final_response_started and not pending.scheduled
+                and not self._current_response_has_farewell(call_id)
                 and call_id not in self._handoff_tool_results
                 and self._call_end_user_turn_deferral_reason(call_id) is None
-                and await self._begin_policy_call_end(
-                    call_id, provider, end_reason="policy_turn_limit",
-                )
             ):
+                if pending.farewell_retry_requested:
+                    await self._fail_response_recovery(call_id, "收尾回复未产生可播放的告别音频")
+                else:
+                    pending.farewell_retry_requested = True
+                    self._append_event(call_id, "call_end_farewell_retry", "agent", {
+                        "endReason": pending.end_reason,
+                        "responseId": guard.current_response_id,
+                        "audioPublished": guard.current_response_audio_published,
+                    })
+                    await self._request_response(call_id, provider, input_text=CALL_POLICY_FINAL_INPUT)
                 return
             self._schedule_pending_call_end_nowait(call_id)
             return
@@ -10640,6 +10578,9 @@ class RealtimeCallAgentRunner:
                 pending_call_end,
                 reason=defer_reason,
             )
+            return
+
+        if not self._current_response_has_farewell(call_id):
             return
 
         pending_call_end.scheduled = True

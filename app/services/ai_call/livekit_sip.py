@@ -20,7 +20,7 @@ class SipOutboundConfig:
     allowed_callee_prefixes: str = ""
     default_ringing_timeout_seconds: int = 45
     max_ringing_timeout_seconds: int = 120
-    max_call_duration_seconds: int = 600
+    max_call_duration_seconds: int = 900
     trunk_id: str = ""
     trunk_hostname: str = ""
     destination_country: str = "CN"

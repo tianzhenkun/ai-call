@@ -65,11 +65,12 @@ class QwenVoiceEnrollmentProvider:
         *,
         preferred_name: str,
         audio_data_url: str,
+        target_model: str | None = None,
     ) -> VoiceCreateResult:
         body, request_id = await self._request(
             {
                 "action": "create",
-                "target_model": self.target_model,
+                "target_model": target_model or self.target_model,
                 "preferred_name": preferred_name,
                 "audio": {"data": audio_data_url},
             },
@@ -139,6 +140,16 @@ class QwenVoiceEnrollmentProvider:
         result_unknown_on_timeout: bool = False,
         result_unknown_on_ambiguous_response: bool = False,
     ) -> tuple[dict[str, Any], str | None]:
+        payload: dict[str, Any] = {
+            "model": QWEN_VOICE_ENROLLMENT_MODEL,
+            "input": input_values,
+        }
+        if (
+            input_values.get("action") == "create"
+            and str(input_values.get("target_model", "")).startswith("qwen3.8-omni-")
+        ):
+            # 3.8 复刻必须显式指定模式，避免供应商回退到 3.5 的兼容模式。
+            payload["parameters"] = {"voice_clone_mode": "normal"}
         network_error: VoiceProviderError | None = None
         try:
             async with httpx.AsyncClient(
@@ -151,10 +162,7 @@ class QwenVoiceEnrollmentProvider:
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": QWEN_VOICE_ENROLLMENT_MODEL,
-                        "input": input_values,
-                    },
+                    json=payload,
                 )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             if result_unknown_on_ambiguous_response:

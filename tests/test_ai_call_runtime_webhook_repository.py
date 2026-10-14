@@ -475,11 +475,20 @@ async def test_old_processing_token_cannot_write_evidence_or_command(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("entry_type", "disconnect_reason", "expected_end_reason"),
+    ("entry_type", "disconnect_reason", "expected_end_reason", "failure_message", "status_code"),
     (
-        ("web", None, "browser_disconnect"),
-        ("direct_sip", None, "sip_participant_left"),
-        ("direct_sip", "USER_UNAVAILABLE", "user_unavailable"),
+        ("web", None, "browser_disconnect", None, None),
+        ("direct_sip", None, "sip_participant_left", None, None),
+        ("direct_sip", "USER_UNAVAILABLE", "user_unavailable", None, None),
+        ("direct_sip", "USER_UNAVAILABLE", "user_unavailable", "sip request timed out", None),
+        (
+            "direct_sip",
+            "USER_UNAVAILABLE",
+            "user_unavailable",
+            "SIP 480 Temporarily Unavailable",
+            "480",
+        ),
+        ("direct_sip", "USER_UNAVAILABLE", "user_unavailable", "SIP 408 Request Timeout", "408"),
     ),
 )
 async def test_customer_participant_left_uses_entry_specific_end_reason(
@@ -487,12 +496,19 @@ async def test_customer_participant_left_uses_entry_specific_end_reason(
     entry_type: str,
     disconnect_reason: str | None,
     expected_end_reason: str,
+    failure_message: str | None,
+    status_code: str | None,
 ) -> None:
+    from app.api.v1.ai_call.outbound.attempt_projection import extract_provider_status_code
     from app.services.ai_call.runtime_control.webhook_repository import (
         RuntimeWebhookRepository,
     )
 
     await _seed_owner_record(webhook_session_factory, entry_type=entry_type)
+    if failure_message:
+        async with webhook_session_factory() as session, session.begin():
+            record = await session.scalar(select(AiCallRecordModel))
+            record.failure_message = failure_message
     now = datetime(2026, 8, 2, 3, 4, tzinfo=timezone.utc)
     intent = _receive_intent(
         dedupe_key="EV_sip_left_1",
@@ -547,9 +563,8 @@ async def test_customer_participant_left_uses_entry_specific_end_reason(
     if disconnect_reason:
         assert disconnect_reason in evidence.evidence_json
         assert record.failure_stage == "sip"
-        assert record.failure_message == (
-            "SIP 480 Temporarily Unavailable; hangup_cause=USER_UNAVAILABLE"
-        )
+        assert record.failure_message == (failure_message or "hangup_cause=USER_UNAVAILABLE")
+        assert extract_provider_status_code(record.failure_message) == status_code
     assert inbox.status == "SUCCEEDED"
 
 

@@ -1899,6 +1899,18 @@ def test_ai_call_runtime_config_defaults_to_server_vad(monkeypatch: pytest.Monke
     assert runtime_config.vad_type == "server_vad"
 
 
+@pytest.mark.parametrize("configured,expected", [(None, 900), (600, 600)])
+def test_ai_call_duration_config_is_shared_by_runner_and_sip(monkeypatch, configured, expected) -> None:
+    from app.services.ai_call.livekit_sip import SipOutboundConfig
+
+    monkeypatch.delenv("AI_CALL_SIP_MAX_CALL_DURATION_SECONDS", raising=False)
+    values = {} if configured is None else {"AI_CALL_SIP_MAX_CALL_DURATION_SECONDS": configured}
+    settings = Settings(_env_file=None, **values)
+    orchestrator = AiCallOrchestrator(AiCallRuntimeConfig.from_settings(settings))
+    assert orchestrator.agent_runner.max_call_duration_seconds == expected
+    assert SipOutboundConfig.from_settings(settings).max_call_duration_seconds == expected
+
+
 def test_customer_speech_model_is_independent_from_general_text_model() -> None:
     config = AiCallRuntimeConfig.from_settings(Settings(
         _env_file=None, LLM_MODEL="qwen-plus", AI_CALL_CUSTOMER_SPEECH_MODEL="qwen-flash",
@@ -4229,7 +4241,9 @@ async def test_realtime_agent_runner_schedules_customer_end_after_final_audio_pl
             payload={"delta": base64.b64encode(output_pcm).decode("ascii")},
         )
     )
-    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.emit(ProviderEvent(type="model_response_done", payload={
+        "response": {"status": "completed", "output": [{"content": [{"transcript": "好的，再见。"}]}]},
+    }))
     await asyncio.wait_for(
         _wait_until(lambda: scheduler_calls == [("call_end_tool", "customer_end")]),
         timeout=1,
@@ -4291,6 +4305,8 @@ async def test_outbound_missing_transcript_resumes_silence_policy_and_waits_for_
         event_store=store,
         audio_publisher=publisher,
         ai_speaking_tail_grace_seconds=0,
+        # 本用例快速推进多段语音；不让真实秒级抑制窗吞掉模拟告别音频。
+        browser_interrupt_audio_suppress_seconds=0,
         customer_speech_classifier=NoTranscriptClassifier(),
         call_end_scheduler=lambda call, reason: scheduled.append((call, reason)),
     )
@@ -4304,7 +4320,9 @@ async def test_outbound_missing_transcript_resumes_silence_policy_and_waits_for_
             "delta": base64.b64encode(b"\x01\x02" * 240).decode("ascii"),
         }))
         await provider.emit(ProviderEvent(type="model_response_done", payload={
-            "response": {"id": response_id, "status": "completed"},
+            "response": {"id": response_id, "status": "completed", "output": [{"content": [{
+                "transcript": "好的，再见。" if response_id == "farewell" else "请问您还在听吗？",
+            }]}]},
         }))
         await asyncio.wait_for(publisher.playout_wait_started.wait(), timeout=1)
         assert scheduled == []
@@ -4482,7 +4500,8 @@ async def test_realtime_agent_runner_schedules_call_end_after_final_audio_hold_e
         await provider.emit(
             ProviderEvent(
                 type="model_response_done",
-                payload={"response": {"id": "resp_final_goodbye", "status": "completed"}},
+                payload={"response": {"id": "resp_final_goodbye", "status": "completed",
+                                      "output": [{"content": [{"transcript": "好的，再见。"}]}]}},
             )
         )
         await asyncio.wait_for(publisher.playout_wait_started.wait(), timeout=1)
@@ -4840,7 +4859,10 @@ async def test_realtime_agent_runner_queues_call_end_tool_response_until_active_
 
 
 @pytest.mark.anyio
-async def test_realtime_agent_runner_does_not_create_extra_call_end_response_after_audio() -> None:
+@pytest.mark.parametrize("transcript_before_tool", [True, False])
+async def test_realtime_agent_runner_does_not_create_extra_call_end_response_after_audio(
+    transcript_before_tool: bool,
+) -> None:
     registry = InMemorySessionRegistry()
     store = InMemoryEventStore()
     provider = QueueRealtimeProvider()
@@ -4892,6 +4914,10 @@ async def test_realtime_agent_runner_does_not_create_extra_call_end_response_aft
         )
     )
     await asyncio.wait_for(_wait_until(lambda: len(publisher.published) == 1), timeout=1)
+    if transcript_before_tool:
+        await provider.emit(ProviderEvent(type="ai_transcript_done", payload={
+            "response_id": "resp_final_goodbye", "transcript": "好的，感谢您的时间，再见。",
+        }))
     await provider.emit(
         ProviderEvent(
             type="tool_call_done",
@@ -4905,7 +4931,10 @@ async def test_realtime_agent_runner_does_not_create_extra_call_end_response_aft
     await provider.emit(
         ProviderEvent(
             type="model_response_done",
-            payload={"response": {"id": "resp_final_goodbye", "status": "completed"}},
+            payload={"response": {
+                "id": "resp_final_goodbye", "status": "completed",
+                "output": [{"content": [{"transcript": "好的，感谢您的时间，再见。"}]}],
+            }},
         )
     )
     await asyncio.wait_for(
@@ -4919,13 +4948,18 @@ async def test_realtime_agent_runner_does_not_create_extra_call_end_response_aft
 
     assert provider.created_responses == []
     assert provider.submitted_tool_results == [
-        ("tool_after_audio", "结束请求已确认。系统将结束通话，不要再生成额外回复。")
+        ("tool_after_audio", (
+            "结束请求已确认。系统将结束通话，不要再生成额外回复。"
+            if transcript_before_tool else
+            "请直接回复：“好的，感谢您的时间，再见。”不要添加其他内容，不要再提出问题。"
+        ))
     ]
     assert [event.type for event in store.list("call_end_audio_already_spoken")] == [
         "model_session_started",
         "model_response_started",
         "model_audio_delta",
         "ai_audio_published",
+        *(["ai_transcript_done"] if transcript_before_tool else []),
         "tool_call_done",
         "call_end_tool_requested",
         "model_response_done",
@@ -5113,7 +5147,8 @@ async def test_realtime_agent_runner_plays_fallback_closing_before_explicit_cust
         await provider.emit(
             ProviderEvent(
                 type="model_response_done",
-                payload={"response": {"id": "resp_fallback_goodbye", "status": "completed"}},
+                payload={"response": {"id": "resp_fallback_goodbye", "status": "completed",
+                                      "output": [{"content": [{"transcript": "好的，祝您工作顺利。"}]}]}},
             )
         )
         await asyncio.wait_for(
@@ -5229,6 +5264,7 @@ async def test_realtime_agent_runner_fast_ends_explicit_customer_end_during_ai_a
                     "response": {
                         "id": "resp_fallback_after_interrupt",
                         "status": "completed",
+                        "output": [{"content": [{"transcript": "好的，祝您工作顺利。"}]}],
                     }
                 },
             )
@@ -5334,7 +5370,8 @@ async def test_realtime_agent_runner_schedules_customer_end_when_model_misses_ca
     await provider.emit(
         ProviderEvent(
             type="model_response_done",
-            payload={"response": {"id": f"resp_{call_id}", "status": "completed"}},
+            payload={"response": {"id": f"resp_{call_id}", "status": "completed",
+                                  "output": [{"content": [{"transcript": "好的，再见。"}]}]}},
         )
     )
     await asyncio.wait_for(
@@ -6191,6 +6228,8 @@ async def test_realtime_agent_runner_maps_task_completed_call_end_reason() -> No
         provider_factory=lambda _session: provider,
         registry=registry,
         event_store=store,
+        audio_publisher=ImmediatePlayoutAudioPublisher(),
+        ai_speaking_tail_grace_seconds=0,
         call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
     )
 
@@ -6218,7 +6257,12 @@ async def test_realtime_agent_runner_maps_task_completed_call_end_reason() -> No
     )
     await provider.emit(ProviderEvent(type="model_response_done", payload={}))
     await provider.emit(ProviderEvent(type="model_response_started", payload={}))
-    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.emit(ProviderEvent(type="model_audio_delta", payload={
+        "delta": base64.b64encode(b"\x01\x02" * 240).decode("ascii"),
+    }))
+    await provider.emit(ProviderEvent(type="model_response_done", payload={
+        "response": {"status": "completed", "output": [{"content": [{"transcript": "好的，再见。"}]}]},
+    }))
     await asyncio.wait_for(
         _wait_until(lambda: scheduler_calls == [("call_task_completed", "normal_completed")]),
         timeout=1,
@@ -6325,6 +6369,8 @@ async def test_realtime_agent_runner_accepts_task_completed_with_online_meeting_
         provider_factory=lambda _session: provider,
         registry=registry,
         event_store=store,
+        audio_publisher=ImmediatePlayoutAudioPublisher(),
+        ai_speaking_tail_grace_seconds=0,
         user_turn_stability_delay_seconds=0,
         call_end_scheduler=lambda call_id, reason: scheduler_calls.append((call_id, reason)),
     )
@@ -6350,7 +6396,12 @@ async def test_realtime_agent_runner_accepts_task_completed_with_online_meeting_
     )
     await provider.emit(ProviderEvent(type="model_response_done", payload={}))
     await provider.emit(ProviderEvent(type="model_response_started", payload={}))
-    await provider.emit(ProviderEvent(type="model_response_done", payload={}))
+    await provider.emit(ProviderEvent(type="model_audio_delta", payload={
+        "delta": base64.b64encode(b"\x01\x02" * 240).decode("ascii"),
+    }))
+    await provider.emit(ProviderEvent(type="model_response_done", payload={
+        "response": {"status": "completed", "output": [{"content": [{"transcript": "好的，再见。"}]}]},
+    }))
     await asyncio.wait_for(
         _wait_until(lambda: scheduler_calls == [(call_id, "normal_completed")]),
         timeout=1,

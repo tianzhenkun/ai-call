@@ -90,6 +90,7 @@ class VoiceEnrollmentAcceptedOut(BaseModel):
     enrollment_id: str
     status: Literal["CREATING"]
     display_name: str
+    target_model: str
 
     @field_validator("voice_profile_id", "enrollment_id", mode="before")
     @classmethod

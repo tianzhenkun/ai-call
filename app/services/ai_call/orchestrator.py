@@ -143,6 +143,7 @@ class AiCallRuntimeConfig:
     customer_speech_review_enabled: bool = False
     customer_speech_model: str = ""
     dashscope_workspace_realtime_url: str = ""
+    max_call_duration_seconds: int = 900
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AiCallRuntimeConfig:
@@ -155,6 +156,7 @@ class AiCallRuntimeConfig:
             dashscope_api_key=settings.DASHSCOPE_API_KEY,
             dashscope_realtime_url=settings.DASHSCOPE_REALTIME_URL,
             dashscope_workspace_realtime_url=settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
+            max_call_duration_seconds=settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS,
             qwen_realtime_model=settings.QWEN_REALTIME_MODEL,
             qwen_realtime_voice=settings.QWEN_REALTIME_VOICE,
             default_prompt=settings.AI_CALL_DEFAULT_PROMPT,
@@ -429,6 +431,7 @@ class AiCallOrchestrator:
             sip_vad_shadow_enabled=self.config.sip_vad_shadow_enabled,
             sip_vad_shadow_detector=self._build_sip_vad_shadow_detector(),
             call_end_scheduler=self._schedule_auto_end_session,
+            max_call_duration_seconds=self.config.max_call_duration_seconds,
             customer_speech_classifier=self._customer_speech_classifier,
             knowledge_search_service=KnowledgeRealtimeSearchService(
                 async_db_session,
@@ -1475,6 +1478,8 @@ class AiCallOrchestrator:
                 )
             },
         )
+        if session.answered_at is None:
+            session.answered_at = opening_started_at
         metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
         metrics.mark_model_response_requested(opening_started_at)
         session.metrics = metrics.snapshot()

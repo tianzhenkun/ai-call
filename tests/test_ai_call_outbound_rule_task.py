@@ -2233,7 +2233,7 @@ async def test_batch_upload_to_task_preserves_model_and_legacy_config(database, 
         await db.commit()
         assert created and task.total_targets == 1
         snapshot = json.loads(task.config_snapshot_json)
-        assert snapshot["request"] == config
+        assert snapshot["request"] == {**config, "model": model or "qwen3.5-omni-plus-realtime"}
         assert snapshot["voice"]["targetModel"] == (model or "qwen3.5-omni-plus-realtime")
 
 

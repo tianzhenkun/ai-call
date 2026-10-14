@@ -73,6 +73,7 @@ class FakeEnrollmentService:
             enrollment_id=BIG_ENROLLMENT_ID,
             status="CREATING",
             display_name=values["request"].display_name,
+            target_model=TARGET_MODEL,
         )
 
     async def reenroll(self, db, **values):
@@ -88,6 +89,7 @@ class FakeEnrollmentService:
             enrollment_id=BIG_ENROLLMENT_ID,
             status="CREATING",
             display_name=values["request"].display_name,
+            target_model=TARGET_MODEL,
         )
 
 
@@ -355,6 +357,7 @@ def test_create_voice_accepts_multipart_and_returns_202(
         "enrollmentId": str(BIG_ENROLLMENT_ID),
         "status": "CREATING",
         "displayName": "客服小林",
+        "targetModel": TARGET_MODEL,
     }
     assert service.create_calls[0]["tenant_id"] == "tenant-a"
     assert service.create_calls[0]["user_id"] == 7
@@ -454,6 +457,7 @@ def test_permissions_default_deny_management_but_allow_available_read(
     assert write.status_code == 403
     assert available.status_code == 200
     assert repository.calls[-1]["available_only"] is True
+    assert repository.calls[-1]["target_model"] == TARGET_MODEL
     assert service.create_calls == []
 
 

@@ -87,6 +87,39 @@ async def test_create_uses_server_owned_contract_and_bearer_key() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("default_model", [TARGET_MODEL, "qwen3.8-omni-flash-realtime"])
+async def test_create_uses_enrollment_model_instead_of_provider_default(default_model: str) -> None:
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(httpx.Response(200, content=request.read()).json())
+        return httpx.Response(200, json={"output": {"voice": "cloned-voice"}})
+
+    provider = QwenVoiceEnrollmentProvider(
+        api_key=API_KEY, target_model=default_model,
+        endpoint=ENDPOINT, transport=httpx.MockTransport(handler),
+    )
+    await provider.create(
+        preferred_name="vc38", audio_data_url=AUDIO_DATA_URL,
+        target_model="qwen3.8-omni-flash-realtime",
+    )
+    await provider.create(
+        preferred_name="vc35", audio_data_url=AUDIO_DATA_URL, target_model=TARGET_MODEL,
+    )
+    await provider.create(preferred_name="vcdefault", audio_data_url=AUDIO_DATA_URL)
+    assert [payload["input"]["target_model"] for payload in seen] == [
+        "qwen3.8-omni-flash-realtime", TARGET_MODEL, default_model,
+    ]
+    assert [payload.get("parameters") for payload in seen] == [
+        {"voice_clone_mode": "normal"},
+        None,
+        {"voice_clone_mode": "normal"} if default_model == "qwen3.8-omni-flash-realtime" else None,
+    ]
+    assert all("voice_clone_mode" not in payload["input"] for payload in seen)
+    assert provider.target_model == default_model
+
+
+@pytest.mark.anyio
 async def test_list_sends_pagination_and_parses_voice_list() -> None:
     seen: dict[str, Any] = {}
 

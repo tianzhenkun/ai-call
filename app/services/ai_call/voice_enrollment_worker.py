@@ -62,6 +62,7 @@ class VoiceEnrollmentProvider(Protocol):
         *,
         preferred_name: str,
         audio_data_url: str,
+        target_model: str,
     ) -> VoiceCreateResult:
         raise NotImplementedError
 
@@ -418,7 +419,7 @@ class VoiceEnrollmentWorker:
         if item.status == "RECONCILING":
             await self._reconcile(item)
             return
-        if item.sample_object_key is None:
+        if item.sample_object_key is None or not item.target_model:
             await self._fail_enrollment(item)
             return
         if self._stop_event.is_set():
@@ -433,6 +434,7 @@ class VoiceEnrollmentWorker:
         try:
             result = await self.provider.create(
                 preferred_name=item.preferred_name,
+                target_model=item.target_model,
                 audio_data_url=_audio_data_url(
                     sample,
                     item.sample_object_key,

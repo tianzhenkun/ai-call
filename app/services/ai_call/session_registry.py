@@ -122,6 +122,7 @@ class CallSession:
     last_event_at: datetime = field(default_factory=utc_now)
     metrics: dict[str, Any] = field(default_factory=dict)
     entry_type: str | None = None
+    answered_at: datetime | None = None
 
 
 class InMemorySessionRegistry:

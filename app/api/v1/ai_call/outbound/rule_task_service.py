@@ -441,7 +441,7 @@ class OutboundRuleTaskService:
             frozen_at=now,
         )
         snapshot = {
-            "request": request_config,
+            "request": {**request_config, "model": voice.target_model},
             "prompt": {
                 "id": str(prompt.id),
                 "sceneCode": prompt.scene_code,
@@ -1183,7 +1183,11 @@ class OutboundRuleTaskService:
             task_name=task.task_name,
             task_mode=task.task_mode,
             answer_mode=task.answer_mode,
-            model=(OutboundRuleTaskService._load_object(task.config_snapshot_json).get("request") or {}).get("model"),
+            model=(
+                (OutboundRuleTaskService._load_object(task.config_snapshot_json).get("request") or {}).get("model")
+                or task.voice_target_model
+                or (OutboundRuleTaskService._load_object(task.config_snapshot_json).get("voice") or {}).get("targetModel")
+            ),
             status=task.status,
             total_targets=task.total_targets,
             completed_targets=task.completed_targets,
