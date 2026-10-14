@@ -502,7 +502,7 @@ def test_settings_expose_sip_outbound_defaults() -> None:
     assert settings.AI_CALL_SIP_ALLOWED_CALLEE_PREFIXES == ""
     assert settings.AI_CALL_SIP_DEFAULT_RINGING_TIMEOUT_SECONDS == 45
     assert settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS == 120
-    assert settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS == 600
+    assert settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS == 900
     assert settings.LIVEKIT_SIP_OUTBOUND_TRUNK_ID == ""
     assert settings.LIVEKIT_SIP_OUTBOUND_TRUNK_HOSTNAME == ""
     assert settings.LIVEKIT_SIP_OUTBOUND_DESTINATION_COUNTRY == "CN"

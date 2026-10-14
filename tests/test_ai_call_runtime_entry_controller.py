@@ -407,6 +407,7 @@ async def test_runtime_bootstrap_controller_returns_readiness_without_token(
     assert body["data"] == {
         "callId": "call-1",
         "entryType": "web",
+        "model": None,
         "phase": "ready",
         "roomName": "ai-call-call-1",
         "participantIdentity": "caller-call-1",
