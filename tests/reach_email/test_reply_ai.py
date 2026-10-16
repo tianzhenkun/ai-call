@@ -32,8 +32,12 @@ def test_reply_ai_uses_selected_inbound_and_scoped_context_without_sending():
             assert payload['context']['replyTo']['content'] == mail.html
             assert payload['context']['mode'] == 'reply'
             assert payload['allowed_variables'] == []
-            old_hash = hashlib.sha256(dump(dict(version=task.version, **payload)).encode()).hexdigest()
-            assert job.source_hash != old_hash
+            for old_version in (None, 6):
+                old_source = dict(version=task.version, **payload)
+                if old_version is not None:
+                    old_source['promptVersion'] = old_version
+                old_hash = hashlib.sha256(dump(old_source).encode()).hexdigest()
+                assert job.source_hash != old_hash
             assert (await s.reply_ai_job(lead.id, data))['id'] == job.id
             with pytest.raises(ValueError, match='不存在'):
                 await EmailService(db, 'other', 'owner', '').reply_ai_job(lead.id, data)

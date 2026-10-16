@@ -223,7 +223,7 @@ ENVIRONMENT=dev .venv/bin/python -m app.services.reach_email.worker
 
 ### AI 输出纠正与调用记录
 
-- API 与 worker 的 `REACH_EMAIL_LLM_MODEL` 配置统一使用 `deepseek-flash`；向 DeepSeek 发出的请求显式设置 `thinking.type=enabled`、`reasoning_effort=high`，调用记录保留这两项。其他兼容接口不附加 DeepSeek 专用参数。
+- API 与 worker 的 `REACH_EMAIL_LLM_MODEL` 配置统一使用 `deepseek-flash`；向 DeepSeek 发出的请求显式设置 `thinking.type=enabled`、`reasoning_effort=high`，调用记录保留这两项。其他兼容接口不附加 DeepSeek 专用参数。提示词版本更新为 7，使同一输入重新生成时不复用版本 6 的旧模型结果。
 - 模板生成、修改、回复起草和中文审阅共用适配器。JSON、必填字段、空正文、模板变量或译文链接未通过校验时，仅追加一次纠正请求；保留完整原始输入，在系统提示中指出具体校验原因，再次执行全部校验。网络、鉴权、上下文超限、输出截断及模型拒绝不进入这次纠正流程。
 - 作业在纠正期间保持 `running`，有效结果才进入 `ready`；第二次仍无效则进入 `failed`。`errorCode` 保留原有分类，`errorMessage` 提供可展示的具体原因；模板和回复弹窗均保留当前草稿。源版本变化仍进入 `stale`，不应用旧结果，不触发邮件发送。
 - `reach_email_ai_job.attempts` 是内部 JSON 文本记录。每次响应在返回结果或发起纠正前独立提交，记录请求指纹、模型、提示词版本、开始时间、耗时、响应 ID、完整 `usage`、完成原因和校验结果；供应商未返回用量时保留 `null`，不视为零费用。人工重试复用作业时追加记录，不清空已产生的用量。

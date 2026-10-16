@@ -15,7 +15,7 @@ from app.services.reach_email.content import has_email_content
 from app.services.reach_email.transport import sanitize_html
 
 VARIABLE = re.compile(r'\{\{\s*([^{}]+?)\s*\}\}')
-PROMPT_VERSION = 6
+PROMPT_VERSION = 7
 
 
 class EmailAIOutputError(ValueError):
