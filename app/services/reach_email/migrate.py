@@ -5,6 +5,7 @@
 
 import argparse
 import asyncio
+
 from sqlalchemy import inspect, text
 
 from app.services.reach_email.models import TABLES
@@ -19,6 +20,9 @@ def migrate_tables(conn):
     columns = {column["name"] for column in inspect(conn).get_columns("reach_email_message")}
     if "delivery_report" not in columns:
         conn.execute(text("ALTER TABLE reach_email_message ADD COLUMN delivery_report TEXT"))
+    columns = {column["name"] for column in inspect(conn).get_columns("reach_email_ai_job")}
+    if "attempts" not in columns:
+        conn.execute(text("ALTER TABLE reach_email_ai_job ADD COLUMN attempts TEXT"))
 
 
 async def apply():

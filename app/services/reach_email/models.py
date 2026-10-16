@@ -160,6 +160,7 @@ class AIJob(EmailRow):
     payload: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="queued")
     result: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[str | None] = mapped_column(Text)
     error_code: Mapped[str | None] = mapped_column(String(100))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime)
 

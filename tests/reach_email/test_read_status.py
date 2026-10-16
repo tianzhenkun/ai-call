@@ -56,3 +56,15 @@ def test_read_column_migration_is_additive_and_repeatable():
         assert "last_read_reply_at" in {column["name"] for column in inspect(conn).get_columns("reach_email_lead")}
         assert conn.scalar(text("SELECT id FROM reach_email_lead")) == "existing"
     engine.dispose()
+
+
+def test_ai_attempt_migration_preserves_historical_jobs():
+    engine = create_engine('sqlite://')
+    with engine.begin() as conn:
+        conn.execute(text('CREATE TABLE reach_email_ai_job (id TEXT PRIMARY KEY, result TEXT)'))
+        conn.execute(text("INSERT INTO reach_email_ai_job VALUES ('old', 'original-result')"))
+        migrate_tables(conn)
+        migrate_tables(conn)
+        row = conn.execute(text('SELECT result, attempts FROM reach_email_ai_job')).one()
+        assert row == ('original-result', None)
+    engine.dispose()

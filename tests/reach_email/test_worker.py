@@ -6,10 +6,13 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.services.reach_email.ai import EmailAI
 from app.services.reach_email.models import (
     TABLES,
     Account,
@@ -21,6 +24,8 @@ from app.services.reach_email.models import (
     WorkerLease,
     now,
 )
+from app.services.reach_email.security import CredentialCipher
+from app.services.reach_email.service import EmailService
 from app.services.reach_email.worker import EmailWorker
 
 
@@ -416,6 +421,63 @@ def test_ai_result_does_not_replace_new_version():
                 job = await db.get(AIJob, 'job')
                 assert job.status == 'stale' and job.result is None
                 assert (await db.get(Task, 't')).content == '{}'
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('outcome', ['ready', 'failed', 'stale'])
+def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(outcome):
+    async def check():
+        async with setup() as (worker, sessions):
+            worker.cipher = CredentialCipher(Fernet.generate_key().decode())
+            payload = {'action': 'generate', 'subject': '原主题', 'content': '<p>人工草稿</p>',
+                       'context': {'mode': 'reply'}}
+            original = json.dumps({'subject': payload['subject'], 'html': payload['content']})
+            async with sessions() as db, db.begin():
+                (await db.get(Task, 't')).content = original
+                db.add(AIJob(id='job', tenant_id='t', owner_id='o', task_id='t', action='generate',
+                    source_hash='hash', source_version=1, payload=json.dumps(payload)))
+            calls = []
+            invalid = '{"subject":"私密错误内容","content":null}'
+            usage = {'prompt_tokens': 10, 'completion_tokens': 20, 'total_tokens': 30,
+                     'completion_tokens_details': {'reasoning_tokens': 12}}
+
+            async def handler(request):
+                calls.append(request)
+                if len(calls) == 2:
+                    async with sessions() as db, db.begin():
+                        job = await db.get(AIJob, 'job')
+                        attempts = json.loads(job.attempts)
+                        assert len(attempts) == 1
+                        assert attempts[0]['usage'] == usage
+                        assert worker.cipher.decrypt(attempts[0]['raw_output_encrypted']) == {'content': invalid}
+                        if outcome == 'stale':
+                            (await db.get(Task, 't')).version += 1
+                raw = invalid if len(calls) == 1 or outcome == 'failed' else '{"subject":"回复","content":"<p>有效正文</p>"}'
+                return httpx.Response(200, json={'id': f'response-{len(calls)}', 'model': 'email-model',
+                    'usage': usage, 'choices': [{'finish_reason': 'stop', 'message': {'content': raw}}]})
+
+            worker.ai = EmailAI('https://example.test/v1', 'email-model', 'secret-api-key', httpx.MockTransport(handler))
+            await worker.ai_jobs()
+            assert len(calls) == 2
+            async with sessions() as db:
+                job = await db.get(AIJob, 'job')
+                assert job.status == outcome
+                attempts = json.loads(job.attempts)
+                assert len(attempts) == 2
+                assert [a['response_id'] for a in attempts] == ['response-1', 'response-2']
+                assert all(a['usage'] == usage for a in attempts)
+                assert '私密错误内容' not in job.attempts and 'secret-api-key' not in job.attempts
+                public = EmailService(db, 't', 'o', '').job_json(job)
+                assert 'attempts' not in public and 'raw_output_encrypted' not in json.dumps(public)
+                if outcome == 'failed':
+                    assert '正文' in public['errorMessage'] and job.result is None
+                elif outcome == 'stale':
+                    assert job.result is None and public['errorMessage'] is None
+                else:
+                    assert json.loads(job.result)['content'] == '<p>有效正文</p>'
+                    assert public['errorMessage'] is None
+                assert (await db.get(Task, 't')).content == original
+                assert (await db.get(Message, 'm')).status == 'queued'
     asyncio.run(check())
 
 

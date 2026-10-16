@@ -128,3 +128,179 @@ def test_review_revision_uses_instruction_and_preserves_variables():
     result = asyncio.run(client.run('translate', subject='产品介绍', content='<p>尊敬的{{客户姓名}}：</p>',
                                     instruction='语气自然', allowed_variables=['客户姓名']))
     assert result['reviewContent'] == '<p>{{客户姓名}}，您好！</p>'
+
+
+@pytest.mark.parametrize('status,body,expected', [
+    (400, {'error': {'code': 'context_length_exceeded'}}, 'EMAIL_AI_CONTEXT_LENGTH_EXCEEDED'),
+    (400, {'error': {'code': None, 'message': "This model's maximum context length is 1048576 tokens."}}, 'EMAIL_AI_CONTEXT_LENGTH_EXCEEDED'),
+    (422, {'error': {'code': 'context_length_exceeded'}}, 'EMAIL_AI_CONTEXT_LENGTH_EXCEEDED'),
+    (400, {'error': {'message': 'Invalid response_format'}}, 'EMAIL_AI_REQUEST_FAILED'),
+    (500, {'error': {'code': 'context_length_exceeded'}}, 'EMAIL_AI_REQUEST_FAILED'),
+    (400, ['unexpected error response'], 'EMAIL_AI_REQUEST_FAILED'),
+])
+def test_model_context_limit_is_reported_without_hiding_other_http_errors(status, body, expected):
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key',
+                     httpx.MockTransport(lambda request: httpx.Response(status, json=body)))
+    with pytest.raises(ValueError, match=f'^{expected}$'):
+        asyncio.run(client.run('generate'))
+
+
+@pytest.mark.parametrize('content', ['{"subject":', '{"subject":"主题","content":"不完整正文"}'])
+def test_model_length_stop_never_returns_a_partial_draft(content):
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(
+        lambda request: httpx.Response(200, json={'choices': [{
+            'finish_reason': 'length', 'message': {'content': content},
+        }]}),
+    ))
+    with pytest.raises(ValueError, match='^EMAIL_AI_OUTPUT_TRUNCATED$'):
+        asyncio.run(client.run('generate'))
+
+
+def test_invalid_output_is_corrected_once_with_the_original_reply_context():
+    requests = []
+    draft = {'action': 'generate', 'subject': 'Re: 产品 [REACH:test]',
+             'content': '<p>人工草稿</p>', 'context': {'mode': 'reply', 'messages': ['完整往来']}}
+    expected = {'subject': draft['subject'], 'content': '<p>有效回复</p>'}
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 2:
+            assert body['messages'][1] == requests[0]['messages'][1]
+            assert 'content' in body['messages'][0]['content']
+            assert body['messages'][0] != requests[0]['messages'][0]
+        output = {'subject': draft['subject']} if len(requests) == 1 else expected
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'stop',
+            'message': {'content': json.dumps(output)}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    assert asyncio.run(client.run(**draft)) == expected
+    assert len(requests) == 2
+    assert draft['content'] == '<p>人工草稿</p>'
+
+
+def test_invalid_output_stops_after_one_correction():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'stop',
+            'message': {'content': '{"subject":"主题"}'}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match='^EMAIL_AI_INVALID_OUTPUT$'):
+        asyncio.run(client.run('generate'))
+    assert len(requests) == 2
+
+
+def test_subject_variable_is_corrected_without_changing_the_original_input():
+    requests = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 2:
+            assert '邮件主题不能包含模板变量' in payload['messages'][0]['content']
+            assert payload['messages'][1] == requests[0]['messages'][1]
+        result = {'subject': '联系{{企业名称}}' if len(requests) == 1 else '产品交流',
+                  'content': '<p>{{企业名称}}，您好。</p>'}
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'stop',
+            'message': {'content': json.dumps(result)}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    result = asyncio.run(client.run('generate', allowed_variables=['企业名称']))
+    assert len(requests) == 2
+    assert result == {'subject': '产品交流', 'content': '<p>{{企业名称}}，您好。</p>'}
+
+
+@pytest.mark.parametrize('base_url', ['https://api.deepseek.com', 'https://example.test/v1'])
+def test_thinking_is_explicit_for_deepseek_without_changing_other_providers(base_url):
+    attempts = []
+
+    async def record(attempt):
+        attempts.append(attempt)
+
+    def handler(request):
+        payload = json.loads(request.content)
+        if base_url == 'https://api.deepseek.com':
+            assert payload['model'] == 'deepseek-flash'
+            assert payload['thinking'] == {'type': 'enabled'}
+            assert payload['reasoning_effort'] == 'high'
+        else:
+            assert 'thinking' not in payload and 'reasoning_effort' not in payload
+        return httpx.Response(200, json={'choices': [{'message': {
+            'content': '{"subject":"产品交流","content":"正文"}'}}]})
+
+    client = EmailAI(base_url, 'deepseek-flash', 'test-key', httpx.MockTransport(handler))
+    asyncio.run(client.run('generate', on_attempt=record))
+    if base_url == 'https://api.deepseek.com':
+        assert attempts[0]['thinking'] == 'enabled'
+        assert attempts[0]['reasoning_effort'] == 'high'
+    else:
+        assert 'thinking' not in attempts[0] and 'reasoning_effort' not in attempts[0]
+
+
+@pytest.mark.parametrize('raw', [None, '[]', '{', '{"subject":5,"content":"text"}',
+    '{"subject":"标题","content":"<p><br>&nbsp;</p>"}'])
+def test_output_errors_record_usage_and_reason_before_correction(raw):
+    attempts = []
+    requests = []
+    usage = {'prompt_tokens': 10, 'completion_tokens': 20, 'total_tokens': 30,
+             'completion_tokens_details': {'reasoning_tokens': 12}}
+
+    async def record(attempt):
+        attempts.append(attempt)
+
+    def handler(request):
+        requests.append(request)
+        assert len(attempts) == len(requests) - 1
+        return httpx.Response(200, json={'id': f'id-{len(requests)}', 'model': 'resolved-model',
+            'usage': usage, 'choices': [{'finish_reason': 'stop', 'message': {'content':
+                raw if len(requests) == 1 else '{"subject":"标题","content":"正文"}'}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    assert asyncio.run(client.run('generate', on_attempt=record))['content'] == '正文'
+    assert [a['status'] for a in attempts] == ['failed', 'ready']
+    assert [a['response_id'] for a in attempts] == ['id-1', 'id-2']
+    assert all(a['usage'] == usage and a['response_model'] == 'resolved-model' for a in attempts)
+    assert attempts[0]['error_message'] and attempts[0]['raw_output'] == raw
+    assert 'raw_output' not in attempts[1]
+
+
+@pytest.mark.parametrize('failure', ['http', 'timeout', 'length', 'refusal'])
+def test_non_output_failures_are_recorded_without_correction(failure):
+    attempts, calls = [], []
+
+    async def record(attempt):
+        attempts.append(attempt)
+
+    def handler(request):
+        calls.append(request)
+        if failure == 'timeout':
+            raise httpx.ReadTimeout('test timeout')
+        if failure == 'http':
+            return httpx.Response(401, json={'error': {'message': 'test unauthorized'}})
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'length' if failure == 'length' else 'stop',
+            'message': {'content': None, 'refusal': 'test refusal' if failure == 'refusal' else None}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match='^EMAIL_AI_'):
+        asyncio.run(client.run('generate', on_attempt=record))
+    assert len(attempts) == len(calls) == 1
+    assert attempts[0]['status'] == 'failed' and attempts[0]['usage'] is None
+
+
+def test_audit_failure_stops_before_another_billable_attempt():
+    calls = []
+
+    async def record(attempt):
+        raise RuntimeError('audit unavailable')
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={'choices': [{'message': {'content': '{}'}}]})
+
+    client = EmailAI('https://example.test/v1', 'email-model', 'test-key', httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match='audit unavailable'):
+        asyncio.run(client.run('generate', on_attempt=record))
+    assert len(calls) == 1

@@ -1,9 +1,12 @@
 """Email-only model adapter. Results are drafts and never trigger sending."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import time
 from collections import Counter
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
@@ -15,6 +18,43 @@ VARIABLE = re.compile(r'\{\{\s*([^{}]+?)\s*\}\}')
 PROMPT_VERSION = 6
 
 
+class EmailAIOutputError(ValueError):
+    def __init__(self, reason, code='EMAIL_AI_INVALID_OUTPUT'):
+        super().__init__(code)
+        self.reason = reason
+
+
+def _validate_output(raw, fields, action, content, allowed, original, reply):
+    try:
+        result = json.loads(raw)
+    except (TypeError, ValueError):
+        raise EmailAIOutputError('返回内容不是有效的 JSON 对象') from None
+    if not isinstance(result, dict):
+        raise EmailAIOutputError('返回内容必须是 JSON 对象')
+    for field, label in zip(fields, ('主题', '正文'), strict=True):
+        if not isinstance(result.get(field), str) or not result[field].strip():
+            raise EmailAIOutputError(f'模型未返回有效的邮件{label}')
+    title, body = result[fields[0]], sanitize_html(result[fields[1]])
+    if len(title) > 512:
+        raise EmailAIOutputError('邮件主题超过 512 字符')
+    if len(body) > 200_000:
+        raise EmailAIOutputError('邮件正文超过 200000 字符')
+    if not has_email_content({'html': body}):
+        raise EmailAIOutputError('邮件正文清理后没有可见文字')
+    if action == 'generate' and not reply and VARIABLE.search(title):
+        raise EmailAIOutputError('邮件主题不能包含模板变量，请将变量保留在正文')
+    variables = Counter(VARIABLE.findall(title + '\n' + body))
+    if not set(variables).issubset(allowed):
+        raise EmailAIOutputError('正文使用了名单中不存在的变量', 'EMAIL_AI_UNDEFINED_VARIABLE')
+    if action in ('modify', 'translate') and variables != original:
+        raise EmailAIOutputError('原文中的模板变量及出现次数必须保留', 'EMAIL_AI_VARIABLES_CHANGED')
+    if action == 'translate':
+        links = re.compile(r'href\s*=\s*[\"\']([^\"\']*)[\"\']', re.I)
+        if Counter(links.findall(sanitize_html(content))) != Counter(links.findall(body)):
+            raise EmailAIOutputError('译文必须保留原有链接地址', 'EMAIL_AI_LINKS_CHANGED')
+    return {fields[0]: title, fields[1]: body}
+
+
 class EmailAI:
     def __init__(self, base_url, model, api_key, transport=None):
         self.base_url = (base_url or '').rstrip('/')
@@ -23,7 +63,7 @@ class EmailAI:
         self.transport = transport
 
     async def run(self, action, subject='', content='', instruction='', context=None,
-                  allowed_variables=None):
+                  allowed_variables=None, on_attempt=None):
         if not self.base_url or not self.model or not self.api_key:
             raise ValueError('EMAIL_AI_NOT_CONFIGURED')
         if urlparse(self.base_url).scheme != 'https':
@@ -83,37 +123,79 @@ class EmailAI:
         payload = {'action': action, 'subject': subject, 'content': content,
                    'instruction': instruction, 'context': context or {},
                    'allowedVariables': sorted(allowed)}
+        messages = [{'role': 'system', 'content': prompt},
+                    {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]
+        async with httpx.AsyncClient(timeout=60, transport=self.transport,
+                                     follow_redirects=False, trust_env=False) as client:
+            for number in (1, 2):
+                started = time.monotonic()
+                attempt = {'attempt': number, 'started_at': datetime.now(timezone.utc).isoformat(),
+                           'model': self.model, 'action': action, 'prompt_version': PROMPT_VERSION,
+                           'response_id': None, 'usage': None}
+                error, raw = None, None
+                try:
+                    choice = await self._request(client, messages, attempt)
+                    raw = choice['message'].get('content')
+                    if choice.get('finish_reason') == 'length':
+                        raise ValueError('EMAIL_AI_OUTPUT_TRUNCATED')
+                    if choice.get('finish_reason') == 'content_filter' or choice['message'].get('refusal'):
+                        raise ValueError('EMAIL_AI_OUTPUT_REFUSED')
+                    result = _validate_output(raw, fields, action, content, allowed, original,
+                                              (context or {}).get('mode') == 'reply')
+                except ValueError as exc:
+                    error = exc
+                    attempt['error_code'] = str(exc)
+                    if isinstance(exc, EmailAIOutputError):
+                        attempt['error_message'] = exc.reason
+                    attempt['raw_output'] = raw
+                attempt['status'] = 'failed' if error else 'ready'
+                attempt['elapsed_ms'] = round((time.monotonic() - started) * 1000)
+                if on_attempt:
+                    # 每次响应先落库，再纠正或返回；失败调用也可能已产生费用。
+                    await on_attempt(attempt)
+                if error is None:
+                    return result
+                if number == 2 or not isinstance(error, EmailAIOutputError):
+                    raise error from None
+                # 只反馈本地校验原因，不把无效输出当作指令或替换用户草稿。
+                messages[0] = {'role': 'system', 'content': prompt +
+                    '\n上一次输出未通过校验：' + error.reason +
+                    '。请根据同一份原始输入纠正这个问题，重新返回完整 JSON 邮件，保留原有业务意图。'}
+
+    async def _request(self, client, messages, attempt):
+        payload = {'model': self.model, 'temperature': 0,
+                   'response_format': {'type': 'json_object'}, 'messages': messages}
+        if urlparse(self.base_url).hostname == 'api.deepseek.com':
+            payload.update(thinking={'type': 'enabled'}, reasoning_effort='high')
+            attempt.update(thinking='enabled', reasoning_effort='high')
+        request = client.build_request(
+            'POST', self.base_url + '/chat/completions',
+            headers={'Authorization': 'Bearer ' + self.api_key},
+            json=payload)
+        attempt['request_sha256'] = hashlib.sha256(request.content).hexdigest()
         try:
-            async with httpx.AsyncClient(timeout=60, transport=self.transport,
-                                         follow_redirects=False, trust_env=False) as client:
-                response = await client.post(
-                    self.base_url + '/chat/completions',
-                    headers={'Authorization': 'Bearer ' + self.api_key},
-                    json={'model': self.model, 'temperature': 0,
-                          'response_format': {'type': 'json_object'},
-                          'messages': [{'role': 'system', 'content': prompt},
-                                       {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]})
-                response.raise_for_status()
-                result = json.loads(response.json()['choices'][0]['message']['content'])
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+            response = await client.send(request)
+            attempt['http_status'] = response.status_code
+            response.raise_for_status()
+            data = response.json()
+            attempt.update(response_id=data.get('id'), response_model=data.get('model'),
+                           usage=data.get('usage'))
+            choice = data['choices'][0]
+            if not isinstance(choice, dict) or not isinstance(choice.get('message'), dict):
+                raise ValueError('EMAIL_AI_REQUEST_FAILED')
+            attempt['finish_reason'] = choice.get('finish_reason')
+            return choice
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (400, 422):
+                try:
+                    error = exc.response.json()['error']
+                except (KeyError, TypeError, ValueError):
+                    error = None
+                if isinstance(error, dict) and (
+                    error.get('code') == 'context_length_exceeded'
+                    or 'maximum context length' in str(error.get('message', '')).lower()
+                ):
+                    raise ValueError('EMAIL_AI_CONTEXT_LENGTH_EXCEEDED') from None
             raise ValueError('EMAIL_AI_REQUEST_FAILED') from None
-        if not isinstance(result, dict) or any(not isinstance(result.get(k), str) or
-                                              not result[k].strip() for k in fields):
-            raise ValueError('EMAIL_AI_INVALID_OUTPUT')
-        title, body = result[fields[0]], sanitize_html(result[fields[1]])
-        if len(title) > 512 or len(body) > 200_000 or not body.strip():
-            raise ValueError('EMAIL_AI_INVALID_OUTPUT')
-        if (action == 'generate' and (context or {}).get('mode') != 'reply'
-                and VARIABLE.search(title)):
-            raise ValueError('EMAIL_AI_INVALID_OUTPUT')
-        variables = Counter(VARIABLE.findall(title + '\n' + body))
-        if not set(variables).issubset(allowed):
-            raise ValueError('EMAIL_AI_UNDEFINED_VARIABLE')
-        if action in ('modify', 'translate') and variables != original:
-            raise ValueError('EMAIL_AI_VARIABLES_CHANGED')
-        if action == 'translate':
-            # The model may translate labels, but must not create/change link targets.
-            links = re.compile(r'href\s*=\s*[\"\']([^\"\']*)[\"\']', re.I)
-            if Counter(links.findall(sanitize_html(content))) != Counter(links.findall(body)):
-                raise ValueError('EMAIL_AI_LINKS_CHANGED')
-        return {fields[0]: title, fields[1]: body}
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, AttributeError):
+            raise ValueError('EMAIL_AI_REQUEST_FAILED') from None

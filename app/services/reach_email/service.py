@@ -10,7 +10,6 @@ from pathlib import Path
 from sqlalchemy import delete, func, select, update
 
 from app.services.reach_email.ai import PROMPT_VERSION
-from app.services.reach_email.limits import MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_COUNT
 from app.services.reach_email.content import (
     clean_html,
     has_email_content,
@@ -19,6 +18,7 @@ from app.services.reach_email.content import (
     validate_recipient_domains,
     validate_variables,
 )
+from app.services.reach_email.limits import MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_COUNT
 from app.services.reach_email.models import (
     Account,
     AIJob,
@@ -740,7 +740,7 @@ class EmailService:
         )
         if target:
             query = query.where(Message.created_at <= target.created_at)
-        recent = (await self.db.scalars(query.order_by(Message.created_at.desc()).limit(10))).all()
+        messages = (await self.db.scalars(query.order_by(Message.created_at, Message.id))).all()
         payload = {
             "action": data.action,
             "subject": data.subject,
@@ -751,8 +751,8 @@ class EmailService:
                 "conversationId": lead.id,
                 "company": json.loads(task.settings),
                 "customer": json.loads(lead.values),
-                "replyTo": {"subject": target.subject, "content": target.html[:20000]} if target else None,
-                "messages": [{"direction": m.direction, "subject": m.subject, "content": m.html[:10000]} for m in reversed(recent)],
+                "replyTo": {"subject": target.subject, "content": target.html} if target else None,
+                "messages": [{"direction": m.direction, "subject": m.subject, "content": m.html} for m in messages],
             },
             "allowed_variables": list(json.loads(lead.values)),
         }
@@ -784,11 +784,15 @@ class EmailService:
         return self.job_json(job)
 
     def job_json(self, row):
+        attempts = json.loads(row.attempts or '[]') if row.status == 'failed' else []
+        detail = (attempts[-1].get('error_message') if attempts
+                  and attempts[-1].get('error_code') == row.error_code else None)
         return {
             "id": row.id,
             "status": row.status,
             "result": json.loads(row.result) if row.result else None,
             "errorCode": row.error_code,
+            "errorMessage": f"{detail}。当前草稿已保留，请重试。" if detail else None,
             "sourceVersion": row.source_version,
         }
 

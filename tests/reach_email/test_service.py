@@ -130,6 +130,13 @@ def test_task_identity_versions_and_missing_columns(valid_email_dns, task_settin
             payload = json.loads((await db.get(AIJob, generated["id"])).payload)
             assert payload["context"]["companyName"] == "发件方"
             assert payload["allowed_variables"] == ["邮箱", "客户姓名"]
+            failed = await db.get(AIJob, generated['id'])
+            failed.status, failed.error_code = 'failed', 'EMAIL_AI_INVALID_OUTPUT'
+            history = '[{"response_id":"previous-request","usage":{"total_tokens":30}}]'
+            failed.attempts = history
+            retried = await a.ai_job(task['id'], AIInput(version=1, action='generate'))
+            assert retried['id'] == failed.id and retried['status'] == 'queued'
+            assert retried['errorMessage'] is None and failed.attempts == history
             with pytest.raises(ValueError, match="不存在"):
                 await EmailService(db, "tenant-b", "1", "").task(task["id"])
             with pytest.raises(ValueError, match="不存在"):

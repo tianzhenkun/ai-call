@@ -476,8 +476,26 @@ class EmailWorker:
                 job.status, job.lease_until = 'running', now() + timedelta(seconds=LEASE_SECONDS)
                 payload = json.loads(job.payload)
                 tenant_id, owner_id = job.tenant_id, job.owner_id
+
+            async def record_attempt(attempt, identity=identity, tenant_id=tenant_id, owner_id=owner_id):
+                record = dict(attempt)
+                raw = record.pop('raw_output', None)
+                if raw is not None:
+                    record['raw_output_encrypted'] = self.cipher.encrypt({'content': raw})
+                async with self.sessions() as db, db.begin():
+                    await self.require_lease(db)
+                    current = await db.scalar(select(AIJob).where(AIJob.id == identity,
+                        AIJob.tenant_id == tenant_id, AIJob.owner_id == owner_id).with_for_update())
+                    if current is None or current.status != 'running':
+                        raise ValueError('EMAIL_AI_JOB_NOT_RUNNING')
+                    # 人工重试复用作业，已产生费用的调用记录必须继续保留。
+                    attempts = json.loads(current.attempts or '[]')
+                    attempts.append(record)
+                    current.attempts = json.dumps(attempts, ensure_ascii=False)
+                    current.lease_until = now() + timedelta(seconds=LEASE_SECONDS)
+
             try:
-                result = await self.ai.run(**payload)
+                result = await self.ai.run(**payload, on_attempt=record_attempt)
                 error = None
             except Exception as exc:
                 result = None
