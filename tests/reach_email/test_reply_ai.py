@@ -32,7 +32,7 @@ def test_reply_ai_uses_selected_inbound_and_scoped_context_without_sending():
             assert payload['context']['replyTo']['content'] == mail.html
             assert payload['context']['mode'] == 'reply'
             assert payload['allowed_variables'] == []
-            for old_version in (None, 6, 7):
+            for old_version in (None, 6, 7, 8):
                 old_source = dict(version=task.version, **payload)
                 if old_version is not None:
                     old_source['promptVersion'] = old_version

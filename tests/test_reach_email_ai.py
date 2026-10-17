@@ -319,7 +319,13 @@ def test_audit_failure_stops_before_another_billable_attempt():
     ('translate', '',
      '<p>Please confirm the target markets before we prepare a quotation.</p>',
      '<p>请先确认目标市场和语言，再根据服务范围提供准确报价。</p>'),
-], ids=['reply-english', 'reply-chinese', 'modify-english', 'review-chinese'])
+    ('generate', '用英文回复',
+     '<p>Thank you for your reply. To provide an accurate quotation for the GEO service, please confirm the target markets, required languages, scope of services and expected scale. We will prepare the quotation based on these details.</p><p>灵宸科技</p><p>一家和企业一起成长，拿到结果的有温度的公司</p>',
+     '<p>Please confirm the target markets and languages before we prepare an accurate quotation.</p><p>灵宸科技</p>'),
+    ('translate', '',
+     '<p>感谢您对我们的服务感兴趣，请先确认目标市场、语种、服务范围和规模。我们会根据实际需求整理对应的报价方案。</p><p>We look forward to hearing from you and discussing the next steps.</p>',
+     '<p>请先确认目标市场和语种，我们会根据实际需求准备报价。</p><p>期待您的回复。</p>'),
+], ids=['reply-english', 'reply-chinese', 'modify-english', 'review-chinese', 'untranslated-signature', 'untranslated-english-paragraph'])
 def test_wrong_body_language_is_corrected_and_both_calls_are_recorded(action, instruction, wrong, correct):
     requests, attempts = [], []
     fields = ('reviewSubject', 'reviewContent') if action == 'translate' else ('subject', 'content')
@@ -373,6 +379,7 @@ def test_wrong_language_after_correction_fails_instead_of_returning_a_draft():
 
 @pytest.mark.parametrize('instruction,content', [
     ('请用英语回复', '<p>Dear {{客户姓名}}, please confirm the target markets.</p><p>灵宸科技</p>'),
+    ('请用英语回复', '<p>Dear {{客户姓名}}, please confirm the target markets.</p><p><strong>灵宸</strong>科技</p>'),
     ('请写一封英文邮件', '<p>Please confirm the target markets and service scope.</p>'),
     ('不要用中文，请用英文回复', '<p>Please confirm the target markets and service scope.</p>'),
     ('Subject in English, body in Chinese.', '<p>您好，请先确认 GEO 服务范围，再为您提供报价。</p>'),

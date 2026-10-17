@@ -16,7 +16,7 @@ from app.services.reach_email.content import has_email_content
 from app.services.reach_email.transport import sanitize_html
 
 VARIABLE = re.compile(r'\{\{\s*([^{}]+?)\s*\}\}')
-PROMPT_VERSION = 8
+PROMPT_VERSION = 9
 
 
 def _target_language(action, instruction):
@@ -44,12 +44,28 @@ def _target_language(action, instruction):
 
 
 class _BodyText(HTMLParser):
+    BLOCK_TAGS = {'p', 'div', 'li', 'br', 'blockquote'}
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
+        self.blocks = []
 
     def handle_data(self, data):
         self.parts.append(data)
+
+    def flush(self):
+        if self.parts:
+            self.blocks.append(''.join(self.parts))
+            self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.BLOCK_TAGS:
+            self.flush()
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK_TAGS:
+            self.flush()
 
 
 def _validate_language(body, language, context):
@@ -57,25 +73,30 @@ def _validate_language(body, language, context):
         return
     parser = _BodyText()
     parser.feed(body)
-    text = VARIABLE.sub(' ', ' '.join(parser.parts))
+    parser.close()
+    parser.flush()
     company = context.get('company') or context
     customer = context.get('customer') or {}
     # 姓名、公司名、职务及模板变量可以保留原文，不参与正文语言判断。
     names = [company.get('companyName'), *(customer.get(key) for key in ('客户姓名', '企业名称', '职务'))]
-    for name in names:
-        if isinstance(name, str) and name.strip():
-            text = text.replace(name.strip(), ' ')
-    text = re.sub(r'https?://[\x21-\x7e]+|[\w.+-]+@[\w.-]+', ' ', text)
-    han = len(re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U0002fa1f]', text))
-    words = len(re.findall(r'[A-Za-z]+(?:[\u2019\x27-][A-Za-z]+)*', text))
-    # 按汉字与拉丁词比较正文主要语言，允许中文中的 GEO、AI 等术语。
-    if language == 'en':
-        mismatch = han > 0 and han >= words
-    else:
-        mismatch = words > 0 and (han == 0 or words >= max(3, han))
-    if mismatch:
-        label = '英文' if language == 'en' else '中文'
-        raise EmailAIOutputError(f'邮件正文语言与要求不符，请使用{label}；姓名、公司名及模板变量可保留原文', 'EMAIL_AI_LANGUAGE_MISMATCH')
+    for block in parser.blocks:
+        text = VARIABLE.sub(' ', block)
+        for name in names:
+            if isinstance(name, str) and name.strip():
+                text = text.replace(name.strip(), ' ')
+        text = re.sub(r'https?://[\x21-\x7e]+|[\w.+-]+@[\w.-]+', ' ', text)
+        han = len(re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U0002fa1f]', text))
+        words = len(re.findall(r'[A-Za-z]+(?:[\u2019\x27-][A-Za-z]+)*', text))
+        # 逐段检查，防止长正文掩盖未翻译的签名；中文仍允许 GEO、AI 等术语。
+        if language == 'en':
+            mismatch = han > 0
+        elif han == 0:
+            mismatch = words > 0 and not re.fullmatch(r'\W*[A-Z][A-Z0-9]{1,3}\W*', text.strip())
+        else:
+            mismatch = words >= max(3, han)
+        if mismatch:
+            label = '英文' if language == 'en' else '中文'
+            raise EmailAIOutputError(f'邮件正文语言与要求不符，请使用{label}；姓名、公司名及模板变量可保留原文', 'EMAIL_AI_LANGUAGE_MISMATCH')
 
 
 class EmailAIOutputError(ValueError):
@@ -180,7 +201,8 @@ class EmailAI:
                        '仅使用已知事实，不保证未提供的效果数据。')
         if language:
             prompt += ('本次正文语言必须使用' + ('英文' if language == 'en' else '中文') +
-                       '，不得沿用素材中的其他语言；姓名、公司名和模板变量可保留原文，回复主题仍保留原主题和 REACH 编号。')
+                       '，标题、列表及签名标语也必须使用该语言，不得沿用素材中的其他语言；'
+                       '只有姓名、公司名和模板变量可保留原文，回复主题仍保留原主题和 REACH 编号。')
         allowed = set(allowed_variables or [])
         original = Counter(VARIABLE.findall(subject + '\n' + content))
         if not set(original).issubset(allowed):
