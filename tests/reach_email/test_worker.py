@@ -425,12 +425,15 @@ def test_ai_result_does_not_replace_new_version():
 
 
 @pytest.mark.parametrize('outcome', ['ready', 'failed', 'stale'])
-def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(outcome):
+@pytest.mark.parametrize('invalid_kind', ['schema', 'language'])
+def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(outcome, invalid_kind):
     async def check():
         async with setup() as (worker, sessions):
             worker.cipher = CredentialCipher(Fernet.generate_key().decode())
             payload = {'action': 'generate', 'subject': '原主题', 'content': '<p>人工草稿</p>',
                        'context': {'mode': 'reply'}}
+            if invalid_kind == 'language':
+                payload['instruction'] = '用英文回复'
             original = json.dumps({'subject': payload['subject'], 'html': payload['content']})
             async with sessions() as db, db.begin():
                 (await db.get(Task, 't')).content = original
@@ -438,6 +441,10 @@ def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(out
                     source_hash='hash', source_version=1, payload=json.dumps(payload)))
             calls = []
             invalid = '{"subject":"私密错误内容","content":null}'
+            valid_content = '<p>有效正文</p>'
+            if invalid_kind == 'language':
+                invalid = '{"subject":"私密错误内容","content":"<p>请先确认目标市场和服务范围，再为您准备准确报价。</p>"}'
+                valid_content = '<p>Please confirm the target markets before we prepare a quotation.</p>'
             usage = {'prompt_tokens': 10, 'completion_tokens': 20, 'total_tokens': 30,
                      'completion_tokens_details': {'reasoning_tokens': 12}}
 
@@ -452,7 +459,7 @@ def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(out
                         assert worker.cipher.decrypt(attempts[0]['raw_output_encrypted']) == {'content': invalid}
                         if outcome == 'stale':
                             (await db.get(Task, 't')).version += 1
-                raw = invalid if len(calls) == 1 or outcome == 'failed' else '{"subject":"回复","content":"<p>有效正文</p>"}'
+                raw = invalid if len(calls) == 1 or outcome == 'failed' else json.dumps({'subject': '回复', 'content': valid_content})
                 return httpx.Response(200, json={'id': f'response-{len(calls)}', 'model': 'email-model',
                     'usage': usage, 'choices': [{'finish_reason': 'stop', 'message': {'content': raw}}]})
 
@@ -471,10 +478,13 @@ def test_ai_attempts_are_persisted_before_correction_without_changing_drafts(out
                 assert 'attempts' not in public and 'raw_output_encrypted' not in json.dumps(public)
                 if outcome == 'failed':
                     assert '正文' in public['errorMessage'] and job.result is None
+                    if invalid_kind == 'language':
+                        assert job.error_code == 'EMAIL_AI_LANGUAGE_MISMATCH'
+                        assert '语言' in public['errorMessage'] and '英文' in public['errorMessage']
                 elif outcome == 'stale':
                     assert job.result is None and public['errorMessage'] is None
                 else:
-                    assert json.loads(job.result)['content'] == '<p>有效正文</p>'
+                    assert json.loads(job.result)['content'] == valid_content
                     assert public['errorMessage'] is None
                 assert (await db.get(Task, 't')).content == original
                 assert (await db.get(Message, 'm')).status == 'queued'
