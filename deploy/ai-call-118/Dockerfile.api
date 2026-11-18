@@ -7,11 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
+COPY vendor/lingchen_knowledge-0.8.0-py3-none-any.whl ./vendor/
 COPY app ./app
 COPY main.py ./
 COPY deploy/ai-call-118/scripts/bootstrap_db.py /opt/ai-call/bootstrap_db.py
 
-RUN pip install . \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install ./vendor/*.whl . \
  && useradd --create-home --uid 10001 ai-call \
  && mkdir -p /app/logs /app/static/upload /app/static/download \
  && chown -R ai-call:ai-call /app /opt/ai-call

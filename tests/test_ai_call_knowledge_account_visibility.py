@@ -1,12 +1,14 @@
 """账号隔离回归：真实路由与临时数据库，对象存储和模型只使用测试替身。"""
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from tempfile import TemporaryFile
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile
 from httpx import ASGITransport, AsyncClient
+from lingchen_knowledge.formats import policy as public_upload_policy
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_ai_call_knowledge import _FakeCosClient, _upload
@@ -37,11 +39,12 @@ from app.services.ai_call.knowledge import (
     KnowledgeSearchService,
     KnowledgeService,
     KnowledgeWorker,
+    _validate_upload,
     knowledge_version_snapshot_hash,
 )
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 
-NOW = datetime(2026, 10, 24, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 24, tzinfo=UTC)
 
 
 class Extractor:
@@ -148,6 +151,107 @@ def app_for(scope, user_id, *, superuser=False, permissions=None):
     app.dependency_overrides[get_knowledge_service] = lambda: scope.service
     app.dependency_overrides[get_knowledge_product_info_service] = lambda: scope.product
     return app
+
+
+@pytest.mark.parametrize(("filename", "header"), [
+    ("guide.pdf", b"%PDF-1.7"), ("image.png", b"\x89PNG\r\n\x1a\n"),
+    ("voice.wav", b"RIFF0000WAVE"), ("video.mp4", b"\x00\x00\x00\x18ftypisom"),
+])
+def test_upload_validates_actual_size_at_public_limit(filename, header):
+    fmt = next(f for f in public_upload_policy()["formats"] if filename.endswith(f["suffix"]))
+    with TemporaryFile() as stream:
+        stream.write(header)
+        stream.truncate(fmt["maxBytes"])
+        upload = UploadFile(stream, filename=filename)
+        assert _validate_upload(upload, "0" * 64, "FAQ", None).byte_size == fmt["maxBytes"]
+        stream.truncate(fmt["maxBytes"] + 1)
+        with pytest.raises(CustomException) as too_large:
+            _validate_upload(upload, "0" * 64, "FAQ", None)
+        assert too_large.value.status_code == 413
+        assert stream.tell() == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("legacy_extension", ["pptx", "pdf"])
+async def test_public_upload_policy_excludes_ineligible_history_and_rejects_pptx_uploads(
+    knowledge_scope, legacy_extension,
+):
+    scope = knowledge_scope
+    item = await scope.db.get(AiCallKnowledgeItemModel, 1)
+    item.display_name = "曾经关联的产品资料"
+    old = await scope.db.get(AiCallKnowledgeVersionModel, 11)
+    old.extension = legacy_extension
+    old.source_filename = f"产品介绍.{legacy_extension}"
+    if legacy_extension == "pdf":
+        old.byte_size = next(f["maxBytes"] for f in public_upload_policy()["formats"] if f["suffix"] == ".pdf") + 1
+    await scope.db.commit()
+    scenes = "/prompt-profiles/101/knowledge-items"
+    async with AsyncClient(transport=ASGITransport(app_for(scope, 7)), base_url="http://test") as client:
+        assert (await client.get("/knowledge/upload-policy")).json()["data"] == public_upload_policy()
+        assert (await client.get("/knowledge/items")).json()["total"] == 0
+        for suffix in ("", "/versions"):
+            assert (await client.get(f"/knowledge/items/1{suffix}")).status_code == 404
+        for action in ("preview", "download", "processing"):
+            assert (await client.get(f"/knowledge/versions/11/{action}")).status_code == 404
+        assert (await client.get(scenes)).json()["data"] == []
+        assert (await client.put(scenes, json={"itemIds": ["1"], "expectedItemIds": []})).status_code == 409
+        assert (await client.post("/prompt-profiles/101/product-info:extract")).status_code == 409
+        for path in ("/knowledge/items/upload", "/knowledge/items/1/versions/upload"):
+            data = b"PK\x03\x04old-presentation"
+            response = await client.post(
+                path, headers={"Idempotency-Key": "pptx"},
+                files={"file": ("资料.PPTX", data, "application/octet-stream")},
+                data={"contentCategory": "FAQ", "fileSha256": hashlib.sha256(data).hexdigest()},
+            )
+            assert response.status_code == 400
+        frozen = await OutboundRuleTaskService._freeze_knowledge(
+            scope.db, tenant_id="tenant-a", user_id=7, prompt_profile_id=101, frozen_at=NOW,
+        )
+        assert frozen["versionIds"] == []
+        assert scope.extractor.inputs == []
+
+
+@pytest.mark.anyio
+async def test_media_filter_uses_latest_public_version_and_preserves_notes(knowledge_scope):
+    scope = knowledge_scope
+    item = await scope.db.get(AiCallKnowledgeItemModel, 1)
+    item.note = "保存的备注"
+    await scope.db.commit()
+    async with AsyncClient(transport=ASGITransport(app_for(scope, 7)), base_url="http://test") as client:
+        assert (await client.get("/knowledge/items", params={"carrierType": "image"})).json()["rows"] == []
+        data = b"\x89PNG\r\n\x1a\n" + b"sample"
+        result = await client.post(
+            "/knowledge/items/1/versions/upload", headers={"Idempotency-Key": "image-update"},
+            files={"file": ("说明.png", data, "image/png")},
+            data={"contentCategory": "FAQ", "fileSha256": hashlib.sha256(data).hexdigest()},
+        )
+        assert result.status_code == 202, result.text
+        page = (await client.get("/knowledge/items", params={"carrierType": "image"})).json()
+        assert page["total"] == 1
+        assert page["rows"][0]["carrierType"] == "image"
+        assert page["rows"][0]["note"] == "保存的备注"
+        conflict = await client.post(
+            "/knowledge/items/1/versions/upload", headers={"Idempotency-Key": "image-update"},
+            files={"file": ("说明.png", data, "image/png")},
+            data={"contentCategory": "FAQ", "fileSha256": hashlib.sha256(data).hexdigest(), "note": ""},
+        )
+        assert conflict.status_code == 409
+        assert page["rows"][0]["currentReadyVersionId"] == "11"
+        assert (await client.get("/knowledge/items", params={"carrierType": "document"})).json()["total"] == 0
+        # 有支持格式的新版本在处理时，旧 PPTX 也不能作为就绪版本参与选取或提取。
+        old = await scope.db.get(AiCallKnowledgeVersionModel, 11)
+        old.extension = "pptx"
+        await scope.db.commit()
+        assert (await client.get("/knowledge/items/1")).json()["data"]["currentReadyVersionId"] is None
+        assert (await client.get("/prompt-profiles/101/knowledge-items")).json()["data"] == []
+        assert (await client.post("/prompt-profiles/101/product-info:extract")).status_code == 409
+        result = await client.post(
+            "/knowledge/items/1/versions/upload", headers={"Idempotency-Key": "clear-note"},
+            files={"file": ("说明.png", data, "image/png")},
+            data={"contentCategory": "FAQ", "fileSha256": hashlib.sha256(data).hexdigest(), "note": ""},
+        )
+        assert result.status_code == 202
+        assert (await client.get("/knowledge/items/1")).json()["data"]["note"] is None
 
 
 @pytest.mark.anyio

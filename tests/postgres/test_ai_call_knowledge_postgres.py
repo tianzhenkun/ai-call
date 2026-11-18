@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
 import pytest
+from lingchen_knowledge.content import build_content
+from lingchen_knowledge.documents import material_document_policy, parse_document_bytes
 from psycopg import ClientCursor
 from sqlalchemy import create_engine, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -29,8 +31,8 @@ from app.services.ai_call.knowledge import (
     KnowledgeRealtimeSearchService,
     KnowledgeSearchService,
     KnowledgeService,
-    parse_text_knowledge,
 )
+from app.services.ai_call.knowledge_processing import chunk_set_hash, version_chunks
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 
 pytestmark = pytest.mark.anyio
@@ -103,10 +105,14 @@ def _create_portable_schema() -> None:
 
 
 def _insert_parsed_version_content() -> str:
-    parsed = parse_text_knowledge(
-        "# 售后政策\n\n退款将在审核通过后五个工作日内原路退回。".encode(),
-        extension=".md",
+    parsed = build_content(
+        parse_document_bytes(
+            "售后.md",
+            "# 售后政策\n\n退款将在审核通过后五个工作日内原路退回。".encode(),
+            policy=material_document_policy(),
+        )
     )
+    chunks = version_chunks(11, "tenant-a", "md", parsed, datetime.now(UTC))
     with psycopg.connect(_psycopg_dsn(), cursor_factory=ClientCursor) as connection:
         with connection.cursor() as cursor:
             cursor.executemany(
@@ -121,7 +127,7 @@ def _insert_parsed_version_content() -> str:
                 """,
                 [
                     (
-                        101 + chunk.chunk_index,
+                        100 + chunk.chunk_index,
                         chunk.chunk_index,
                         chunk.content,
                         chunk.content_checksum,
@@ -130,7 +136,7 @@ def _insert_parsed_version_content() -> str:
                         chunk.section_path,
                         chunk.source_path,
                     )
-                    for chunk in parsed.chunks
+                    for chunk in chunks
                 ],
             )
         connection.execute(
@@ -146,24 +152,26 @@ def _insert_parsed_version_content() -> str:
             where id = 11 and status = 'PROCESSING'
             """,
             (
-                parsed.parser_name,
+                "lingchen-knowledge",
                 parsed.parser_version,
-                parsed.chunk_strategy_version,
+                parsed.chunker_version,
                 len(parsed.chunks),
-                parsed.chunk_set_sha256,
+                chunk_set_hash(parsed),
             ),
         )
-    return parsed.chunk_set_sha256
+    return chunk_set_hash(parsed)
 
 
 async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None:
     _reset_schema()
     _create_portable_schema()
     migration = MIGRATION_PATH.read_text(encoding="utf-8")
-    _execute(migration)
-    _execute(migration)
     _execute(
         """
+        alter table ai_call_knowledge_version
+            drop column provider_run_no, drop column provider_name, drop column provider_request_key,
+            drop column provider_job_id, drop column provider_started_at;
+
         insert into ai_call_knowledge_item (
             id, tenant_id, display_name, content_category, created_by, created_at, updated_at
         ) values
@@ -223,6 +231,13 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
              repeat('6', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now());
         """
     )
+    _execute(migration)
+    _execute(migration)
+    with psycopg.connect(_psycopg_dsn()) as connection:
+        assert connection.execute(
+            "select status, provider_run_no, provider_name, provider_job_id, provider_request_key, "
+            "provider_started_at from ai_call_knowledge_version where id = 12"
+        ).fetchone() == ("READY", 1, None, None, None, None)
     parsed_chunk_set_sha256 = _insert_parsed_version_content()
 
     engine = create_async_engine(_dsn())
@@ -297,7 +312,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
                 user_id=7,
             )
             assert bindings[0]["promptProfileId"] == "101"
-            frozen_at = datetime.now(timezone.utc)
+            frozen_at = datetime.now(UTC)
             session.add(
                 AiCallPromptKnowledgeBindingModel(
                     id=301,
@@ -414,6 +429,13 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
                     user_id=7,
                 )
             assert cross_tenant.value.status_code == 400
+            await session.execute(update(AiCallKnowledgeVersionModel).where(
+                AiCallKnowledgeVersionModel.id == 11,
+            ).values(extension="pptx"))
+            assert await KnowledgeSearchService.search(
+                session, tenant_id="tenant-a", user_id=7, frozen_version_ids=[11],
+                query="退款审核后多久原路退回",
+            ) == []
     finally:
         await engine.dispose()
 

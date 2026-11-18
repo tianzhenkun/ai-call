@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI
 from fastapi.concurrency import asynccontextmanager
 from fastapi.openapi.docs import (
@@ -402,32 +403,46 @@ async def _start_ai_call_knowledge_worker():
     from app.services.ai_call.knowledge_binary_parser import (
         KnowledgeBinaryParserClient,
     )
+    from app.services.ai_call.knowledge_media import build_knowledge_media_providers
 
     parser_socket = settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
+    if not parser_socket and settings.ENVIRONMENT == EnvironmentEnum.PROD:
+        parser_socket = "/run/ai-call-parser/parser.sock"
 
-    worker = KnowledgeWorker(
-        async_db_session,
-        build_knowledge_store(settings),
-        worker_id=f"jobs:knowledge:{uuid4().hex}",
-        poll_interval_seconds=(settings.AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS),
-        lease_seconds=settings.AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS,
-        upload_reconcile_after_seconds=(settings.AI_CALL_KNOWLEDGE_UPLOAD_RECONCILE_AFTER_SECONDS),
-        binary_parser=(
-            KnowledgeBinaryParserClient(
-                parser_socket,
-                timeout_seconds=settings.AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS,
-            )
-            if parser_socket
-            else None
-        ),
-    )
-    await worker.start()
+    store = build_knowledge_store(settings)
+    client = httpx.AsyncClient(timeout=45, trust_env=False)
+    try:
+        worker = KnowledgeWorker(
+            async_db_session,
+            store,
+            worker_id=f"jobs:knowledge:{uuid4().hex}",
+            poll_interval_seconds=settings.AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS,
+            lease_seconds=settings.AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS,
+            upload_reconcile_after_seconds=settings.AI_CALL_KNOWLEDGE_UPLOAD_RECONCILE_AFTER_SECONDS,
+            providers=build_knowledge_media_providers(settings, store, client=client),
+            binary_parser=(
+                KnowledgeBinaryParserClient(
+                    parser_socket,
+                    timeout_seconds=settings.AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS,
+                )
+                if parser_socket
+                else None
+            ),
+        )
+        await worker.start()
+    except BaseException:
+        await client.aclose()
+        raise
     log.info("✅ AI Call Knowledge worker 已启动")
-    return worker
+    return worker, client
 
 
-async def _stop_ai_call_knowledge_worker(worker) -> None:
-    await worker.stop()
+async def _stop_ai_call_knowledge_worker(handle) -> None:
+    worker, client = handle
+    try:
+        await worker.stop()
+    finally:
+        await client.aclose()
     log.info("✅ AI Call Knowledge worker 已关闭")
 
 

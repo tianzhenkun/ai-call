@@ -4,7 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from multiprocessing import get_context
 from pathlib import Path
@@ -16,6 +16,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import httpx
 import pytest
 from fastapi import UploadFile
+from lingchen_knowledge.models import Block, KnowledgeError, Parsed
 from sqlalchemy import UniqueConstraint, func, inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.datastructures import Headers
@@ -40,12 +41,10 @@ from app.services.ai_call.knowledge import (
     KnowledgeDownload,
     KnowledgeProductInfoService,
     KnowledgeService,
-    KnowledgeTextParseError,
     KnowledgeWorker,
     PlatformOssKnowledgeStore,
     build_knowledge_store,
     parse_byte_range,
-    parse_text_knowledge,
 )
 from app.services.ai_call.knowledge_binary_parser import (
     KnowledgeBinaryParserClient,
@@ -251,32 +250,16 @@ def test_knowledge_routes_use_explicit_view_and_manage_permissions() -> None:
         assert get_knowledge_db in calls
 
 
-def test_txt_and_markdown_parser_is_deterministic_and_bounded() -> None:
-    source = (
-        "# 售后政策\r\n\r\n退款将在审核通过后原路退回。\r\n\r\n"
-        "## 补充说明\r\n\r\n" + "这是用于验证长段落切分的说明。" * 100
-    ).encode()
-
-    first = parse_text_knowledge(source, extension=".md")
-    second = parse_text_knowledge(source, extension="md")
-
-    assert first == second
-    assert first.parser_name == "text"
-    assert first.parser_version == "txt-markdown-utf8-v1"
-    assert first.chunk_strategy_version == "paragraph-900-1200-v1"
-    assert len(first.chunks) >= 2
-    assert all(0 < len(chunk.content) <= 1200 for chunk in first.chunks)
-    assert all(len(chunk.content_checksum) == 64 for chunk in first.chunks)
-    assert len(first.chunk_set_sha256) == 64
-    assert first.chunks[0].section_path == "售后政策"
-    assert first.chunks[-1].section_path == "售后政策 / 补充说明"
-
-
 @pytest.mark.parametrize(
     ("filename", "mime_type", "expected_media_type"),
     (
         ("faq.md", "text/markdown", "text/plain"),
+        ("note.html", "text/html", "text/plain"),
         ("guide.pdf", "application/pdf", "application/pdf"),
+        ("guide.docx", "application/octet-stream",
+         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("voice.mp3", "audio/mpeg", "audio/mpeg"),
+        ("clip.mp4", "video/mp4", "video/mp4"),
     ),
 )
 @pytest.mark.anyio
@@ -313,36 +296,6 @@ async def test_safe_preview_is_inline_and_cannot_be_sniffed_as_active_content(
     assert response.headers["content-security-policy"] == "sandbox"
 
 
-@pytest.mark.anyio
-async def test_office_preview_is_rejected() -> None:
-    class _PreviewService:
-        async def open_download(self, *args, **kwargs):
-            return KnowledgeDownload(
-                filename="guide.docx",
-                mime_type=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
-                ),
-                status_code=200,
-                content_length=1,
-                content_range=None,
-                body=iter(()),
-            )
-
-    with pytest.raises(CustomException) as exc_info:
-        await preview_knowledge_version_controller(
-            version_id=1,
-            auth=SimpleNamespace(
-                user=SimpleNamespace(tenant_id="tenant-a", user_id=7)
-            ),
-            db=object(),
-            service=_PreviewService(),
-            range_header=None,
-        )
-
-    assert exc_info.value.status_code == 415
-
-
 def test_product_draft_sections_render_as_text_and_keep_their_sources() -> None:
     source = {"claim": "登记到店人数", "chunkId": "12"}
     result = {"draftText": {
@@ -353,21 +306,6 @@ def test_product_draft_sections_render_as_text_and_keep_their_sources() -> None:
     assert draft["sources"] == [source]
     with pytest.raises(ValueError):
         KnowledgeProductInfoService._normalize_model_result({**result, "draftText": {"未知": {}}}, {"12"})
-
-
-def test_text_parser_rejects_unsupported_or_unsafe_input() -> None:
-    unsafe_inputs = (
-        (b"hello", ".pdf"),
-        (b"\xff", ".txt"),
-        (b"a\x00b", ".md"),
-        (("# " + "x" * 1001 + "\nbody").encode(), ".md"),
-    )
-    for payload, extension in unsafe_inputs:
-        try:
-            parse_text_knowledge(payload, extension=extension)
-        except KnowledgeTextParseError:
-            continue
-        raise AssertionError(f"expected parse failure for {extension}")
 
 
 class _Body:
@@ -509,28 +447,10 @@ def _pdf_payload(*pages: str) -> bytes:
     return bytes(payload)
 
 
-@pytest.mark.parametrize(
-    ("payload", "filename", "content_type"),
-    [
-        (
-            _pptx_payload("产品能力"),
-            "产品资料.pptx",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        ),
-        (
-            _docx_payload("产品能力"),
-            "产品资料.docx",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ),
-        (_pdf_payload("Product capability"), "产品资料.pdf", "application/pdf"),
-    ],
-)
 @pytest.mark.anyio
-async def test_binary_upload_stays_closed_without_isolated_parser(
-    payload: bytes,
-    filename: str,
-    content_type: str,
-) -> None:
+async def test_pptx_upload_is_outside_the_shared_format_catalog() -> None:
+    payload = _pptx_payload("产品能力")
+    content_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     service = KnowledgeService(
         CosKnowledgeStore(client=_FakeCosClient(), bucket="bucket-1", prefix="ai-call")
     )
@@ -543,7 +463,7 @@ async def test_binary_upload_stays_closed_without_isolated_parser(
             idempotency_key="upload-binary-disabled",
             file=_upload(
                 payload,
-                filename=filename,
+                filename="产品资料.pptx",
                 content_type=content_type,
             ),
             file_sha256=hashlib.sha256(payload).hexdigest(),
@@ -551,8 +471,7 @@ async def test_binary_upload_stays_closed_without_isolated_parser(
             note=None,
         )
 
-    assert error.value.status_code == 503
-    assert error.value.msg == "文档解析服务未启用，暂时无法上传 PPTX、DOCX 或 PDF，请联系管理员"
+    assert error.value.status_code == 400
 
 
 @pytest.mark.anyio
@@ -635,7 +554,9 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         )
         assert version is not None and version.status == "READY"
         assert item is not None and item.current_ready_version_id == version.id
-        assert len(chunks) == version.chunk_count == 1
+        assert len(chunks) == version.chunk_count == 2
+        assert version.parser_version == "markdown-v1"
+        assert {chunk.source_path for chunk in chunks} == {"paragraphs/1", "paragraphs/3"}
         assert processing["status"] == "READY"
 
         download = await service.open_download(
@@ -675,6 +596,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         f"ai-call/knowledge/tenant-a/{accepted.item_id}/{accepted.version_id}/source.md"
     )
     assert parse_byte_range("bytes=-4", len(payload)) == (len(payload) - 4, len(payload) - 1)
+    await engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -688,26 +610,18 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
     ),
     [
         (
-            _pptx_payload("第一页产品能力", "第二页交付周期"),
-            "产品资料.pptx",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            "pptx-ooxml-stdlib-v1",
-            [1, 2],
-            ["slides/1", "slides/2"],
-        ),
-        (
             _docx_payload("产品能力", "交付周期"),
             "产品资料.docx",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "docx-ooxml-stdlib-v1",
-            [None],
-            ["word/document.xml#paragraphs/1-2"],
+            "docx-xml-v1",
+            [None, None],
+            ["paragraphs/1", "paragraphs/2"],
         ),
         (
-            _pdf_payload("Product capability", "Delivery timeline"),
+            _pdf_payload("Product capability includes delivery scheduling.", "Delivery timeline is five business days."),
             "产品资料.pdf",
             "application/pdf",
-            "pdf-pypdf-6.16.1-v1",
+            "pypdf-v1",
             [1, 2],
             ["pages/1", "pages/2"],
         ),
@@ -721,6 +635,7 @@ async def test_binary_upload_worker_persists_parser_and_source_citations(
     parser_version: str,
     page_numbers: list[int | None],
     source_paths: list[str],
+    isolated_parser,
 ) -> None:
     client = _FakeCosClient()
     store = CosKnowledgeStore(client=client, bucket="bucket-1", prefix="ai-call")
@@ -732,42 +647,22 @@ async def test_binary_upload_worker_persists_parser_and_source_citations(
         await connection.run_sync(AiCallKnowledgeChunkModel.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
 
-    with TemporaryDirectory() as directory:
-        socket_path = Path(directory) / "parser.sock"
-        parser = get_context("spawn").Process(
-            target=serve_binary_parser,
-            kwargs={"socket_path": socket_path, "max_requests": 1},
+    service = KnowledgeService(store)
+    async with sessions() as db:
+        accepted = await service.accept_upload(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key=f"upload-{filename}",
+            file=_upload(payload, filename=filename, content_type=content_type),
+            file_sha256=hashlib.sha256(payload).hexdigest(),
+            content_category="PRODUCT_SERVICE",
+            note=None,
         )
-        parser.start()
-        deadline = monotonic() + 2
-        while not socket_path.exists() and monotonic() < deadline:
-            sleep(0.01)
-
-        service = KnowledgeService(store, binary_parser_enabled=True)
-        async with sessions() as db:
-            accepted = await service.accept_upload(
-                db,
-                tenant_id="tenant-a",
-                user_id=7,
-                idempotency_key=f"upload-{filename}",
-                file=_upload(
-                    payload,
-                    filename=filename,
-                    content_type=content_type,
-                ),
-                file_sha256=hashlib.sha256(payload).hexdigest(),
-                content_category="PRODUCT_SERVICE",
-                note=None,
-            )
-
-        worker = KnowledgeWorker(
-            sessions,
-            store,
-            worker_id="knowledge-binary-worker",
-            binary_parser=KnowledgeBinaryParserClient(socket_path, timeout_seconds=2),
-        )
-        assert await worker.run_once() is True
-        parser.join(timeout=2)
+    worker = KnowledgeWorker(
+        sessions, store, worker_id="knowledge-binary-worker", binary_parser=isolated_parser
+    )
+    assert await worker.run_once()
 
     async with sessions() as db:
         version = await db.get(AiCallKnowledgeVersionModel, accepted.version_id)
@@ -780,18 +675,398 @@ async def test_binary_upload_worker_persists_parser_and_source_citations(
         ).all()
     await engine.dispose()
 
-    assert not parser.is_alive()
     assert version is not None and version.status == "READY"
     assert version.parser_version == parser_version
     assert [chunk.page_no for chunk in chunks] == page_numbers
     assert [chunk.source_path for chunk in chunks] == source_paths
-    await engine.dispose()
+
+
+@pytest.fixture
+def isolated_parser():
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "parser.sock"
+        server = get_context("spawn").Process(
+            target=serve_binary_parser,
+            kwargs={"socket_path": path, "max_requests": 1},
+        )
+        server.start()
+        try:
+            deadline = monotonic() + 5
+            while not path.exists() and monotonic() < deadline:
+                sleep(0.01)
+            assert path.exists()
+            yield KnowledgeBinaryParserClient(path, timeout_seconds=3)
+            server.join(timeout=3)
+            assert server.exitcode == 0
+        finally:
+            if server.is_alive():
+                server.terminate()
+                server.join(timeout=3)
+            server.close()
+
+
+@pytest.mark.parametrize(
+    ("environment", "configured", "expected"),
+    [
+        ("prod", "", "/run/ai-call-parser/parser.sock"),
+        ("prod", "/custom/parser.sock", "/custom/parser.sock"),
+        ("dev", "", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_knowledge_worker_document_parser_for_environment(
+    monkeypatch, environment, configured, expected
+):
+    from app.common.enums import EnvironmentEnum
+    from app.plugin import init_app
+    from app.services.ai_call import knowledge
+
+    async def idle(_worker):
+        pass
+
+    monkeypatch.setattr(init_app.settings, "SQL_DB_ENABLE", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_KNOWLEDGE_WORKER_ENABLED", True)
+    monkeypatch.setattr(init_app.settings, "AI_CALL_KNOWLEDGE_PARSER_SOCKET", configured)
+    monkeypatch.setattr(init_app.settings, "ENVIRONMENT", EnvironmentEnum(environment))
+    monkeypatch.setattr(knowledge, "build_knowledge_store", lambda _settings: object())
+    monkeypatch.setattr(KnowledgeWorker, "start", idle)
+    handle = await init_app._start_ai_call_knowledge_worker()
+    worker, client = handle
+    try:
+        parser = worker.processor.binary_parser
+        assert (str(parser.socket_path) if parser else None) == expected
+    finally:
+        await init_app._stop_ai_call_knowledge_worker(handle)
+    assert client.is_closed
+
+
+@pytest.fixture
+async def shared_processing():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        for model in (
+            AiCallPromptProfileModel,
+            AiCallKnowledgeItemModel,
+            AiCallKnowledgeVersionModel,
+            AiCallKnowledgeChunkModel,
+            AiCallPromptKnowledgeBindingModel,
+            AiCallKnowledgeUsageModel,
+        ):
+            await connection.run_sync(model.__table__.create)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    store = CosKnowledgeStore(client=_FakeCosClient(), bucket="test", prefix="ai-call")
+    try:
+        yield sessions, store
+    finally:
+        await engine.dispose()
+
+
+async def _accept_media(sessions, store, filename, mime_type, payload):
+    async with sessions() as db:
+        return await KnowledgeService(store).accept_upload(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            idempotency_key=filename,
+            file=_upload(payload, filename, mime_type),
+            file_sha256=hashlib.sha256(payload).hexdigest(),
+            content_category="FAQ",
+            note=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "payload", "carrier", "block"),
+    [
+        (
+            "介绍.wav",
+            "audio/wav",
+            b"RIFF\x10\x00\x00\x00WAVEfmt ",
+            "audio",
+            Block("支持配送", start_ms=120, end_ms=890, speaker="A"),
+        ),
+        (
+            "介绍.mp4",
+            "video/mp4",
+            b"\x00\x00\x00\x14ftypisom",
+            "video",
+            Block("开场介绍", start_ms=230, end_ms=1510),
+        ),
+        ("产品.png", "image/png", b"\x89PNG\r\n\x1a\n", "image", Block("保修一年", page=1)),
+        ("扫描.pdf", "application/pdf", _pdf_payload(""), "document", Block("保修两年", page=1)),
+    ],
+    ids=["audio", "video", "image", "scanned-pdf"],
+)
+@pytest.mark.anyio
+async def test_media_worker_resumes_and_extraction_cites_the_source(
+    shared_processing,
+    request,
+    filename,
+    mime_type,
+    payload,
+    carrier,
+    block,
+) -> None:
+    class Provider:
+        name = "test-provider"
+        submissions = []
+
+        async def prepare(self, claim, content, request_key):
+            assert content == payload and claim.item.media_type == carrier
+            return content
+
+        async def submit(self, source, request_key):
+            self.submissions.append(request_key)
+            return "job-7"
+
+        async def poll(self, job_id):
+            assert job_id == "job-7"
+            return Parsed("test-parser-v1", (block,))
+
+    class Extractor:
+        model_name = "test-extractor"
+
+        async def extract(self, request):
+            chunk = request["chunks"][0]
+            assert chunk["content"] == block.text
+            return {
+                "draftText": chunk["content"],
+                "sources": [
+                    {"claim": chunk["content"], "chunkId": chunk["chunkId"]},
+                ],
+                "conflicts": [],
+            }
+
+    sessions, store = shared_processing
+    version = await _accept_media(sessions, store, filename, mime_type, payload)
+    provider = Provider()
+    parser = request.getfixturevalue("isolated_parser") if carrier == "document" else None
+    worker = KnowledgeWorker(
+        sessions,
+        store,
+        worker_id="before-restart",
+        providers={carrier: provider},
+        binary_parser=parser,
+    )
+    assert await worker.run_once()
+    async with sessions() as db:
+        waiting = await db.get(AiCallKnowledgeVersionModel, version.version_id)
+        assert waiting.status == "PROCESSING" and waiting.provider_job_id == "job-7"
+        assert waiting.provider_request_key == provider.submissions[0]
+        waiting.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+
+    restarted = KnowledgeWorker(
+        sessions, store, worker_id="after-restart", providers={carrier: provider}
+    )
+    assert await restarted.run_once()
+    async with sessions() as db:
+        ready = await db.get(AiCallKnowledgeVersionModel, version.version_id)
+        item = await db.get(AiCallKnowledgeItemModel, version.item_id)
+        chunk = (await db.scalars(select(AiCallKnowledgeChunkModel))).one()
+        assert ready.status == "READY" and item.current_ready_version_id == ready.id
+        assert (chunk.content, chunk.start_ms, chunk.end_ms, chunk.page_no, chunk.speaker_id) == (
+            block.text,
+            block.start_ms,
+            block.end_ms,
+            block.page,
+            block.speaker,
+        )
+        now = datetime.now(UTC)
+        db.add(
+            AiCallPromptProfileModel(
+                id=101,
+                tenant_id="tenant-a",
+                scene_code="intro",
+                name="产品介绍",
+                provider_key="static_profile",
+                product_info="",
+                variables_json="[]",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await db.commit()
+        await KnowledgeService(store).replace_scene_bindings(
+            db,
+            tenant_id="tenant-a",
+            item_id=item.id,
+            prompt_profile_ids=[101],
+            user_id=7,
+        )
+        extracted = await KnowledgeProductInfoService(Extractor()).extract(
+            db,
+            tenant_id="tenant-a",
+            prompt_profile_id=101,
+            user_id=7,
+        )
+        source = extracted["sources"][0]
+        assert source["sourceFilename"] == filename and source["excerpt"] == block.text
+        assert (source["startMs"], source["endMs"], source["pageNo"]) == (
+            block.start_ms,
+            block.end_ms,
+            block.page,
+        )
+        assert len(provider.submissions) == 1
+
+
+@pytest.mark.anyio
+async def test_unknown_provider_submission_is_held_without_resubmitting(shared_processing) -> None:
+    class Provider:
+        name = "unknown-ocr"
+        submissions = []
+        recoveries = []
+
+        async def prepare(self, claim, content, request_key):
+            return content
+
+        async def submit(self, source, request_key):
+            self.submissions.append(request_key)
+            raise TimeoutError
+
+        async def recover(self, request_key):
+            self.recoveries.append(request_key)
+            return None
+
+    sessions, store = shared_processing
+    version = await _accept_media(sessions, store, "扫描件.png", "image/png", b"\x89PNG\r\n\x1a\n")
+    provider = Provider()
+    worker = KnowledgeWorker(sessions, store, worker_id="unknown", providers={"image": provider})
+    for attempt in range(1, 4):
+        assert await worker.run_once()
+        async with sessions() as db:
+            row = await db.get(AiCallKnowledgeVersionModel, version.version_id)
+            assert row.failure_code == "SUBMISSION_UNKNOWN" and row.attempt_count == attempt
+            if attempt < 3:
+                assert row.next_attempt_at is not None
+                row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+                await db.commit()
+            else:
+                assert row.next_attempt_at is None and row.status == "PROCESSING"
+    assert not await worker.run_once()
+    assert provider.recoveries == provider.submissions * 2
+    assert len(provider.submissions) == 1
+
+
+@pytest.mark.anyio
+async def test_retry_continues_known_job_and_expired_job_creates_a_new_run(
+    shared_processing,
+) -> None:
+    sessions, store = shared_processing
+    payload = b"RIFF\x10\x00\x00\x00WAVEfmt "
+    first = await _accept_media(sessions, store, "录音.wav", "audio/wav", payload)
+    staged = []
+    submissions = []
+
+    class Provider:
+        name = "test-asr"
+
+        async def prepare(self, claim, content, request_key):
+            key = f"knowledge-asr/{claim.item.tenant_id}/{claim.item.id}-{claim.run_no}.mp3"
+            await store.put(key, BytesIO(b"mp3"), content_type="audio/mpeg", expected_size=3)
+            staged.append(key)
+            return content
+
+        async def submit(self, source, request_key):
+            submissions.append(request_key)
+            return f"job-{len(submissions)}"
+
+        async def poll(self, job_id):
+            if job_id == "job-1":
+                raise KnowledgeError("PROVIDER_JOB_EXPIRED", "任务已失效", retryable=True)
+            return Parsed("test-asr-v1", (Block("历史录音", start_ms=1, end_ms=200),))
+
+    service = KnowledgeService(store)
+    worker = KnowledgeWorker(sessions, store, worker_id="retries", providers={"audio": Provider()})
+    assert await worker.run_once()
+    async with sessions() as db:
+        waiting = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        assert waiting.provider_job_id == "job-1" and await store.stat_or_none(staged[0])
+        waiting.provider_started_at = datetime.now(UTC) - timedelta(hours=1)
+        waiting.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+    assert await worker.run_once()
+    async with sessions() as db:
+        failed = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        assert failed.failure_code == "PROVIDER_TIMEOUT" and failed.provider_job_id == "job-1"
+        assert await store.stat_or_none(staged[0])
+        await service.retry(db, tenant_id="tenant-a", user_id=7, version_id=first.version_id)
+        assert failed.attempt_count == 0 and failed.provider_request_key == submissions[0]
+
+    assert await worker.run_once()
+    async with sessions() as db:
+        expired = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        assert expired.failure_code == "PROVIDER_JOB_EXPIRED" and expired.provider_job_id is None
+        assert await store.stat_or_none(staged[0]) is None
+        await service.retry(db, tenant_id="tenant-a", user_id=7, version_id=first.version_id)
+    assert await worker.run_once()
+    assert len(submissions) == 2 and submissions[0] != submissions[1] and staged[0] != staged[1]
+
+    async with sessions() as db:
+        replacement = b"updated policy"
+        current = await service.accept_upload(
+            db,
+            tenant_id="tenant-a",
+            user_id=7,
+            item_id=first.item_id,
+            idempotency_key="newer",
+            file=_upload(replacement, "版本二.txt", "text/plain"),
+            file_sha256=hashlib.sha256(replacement).hexdigest(),
+            content_category="FAQ",
+            note=None,
+        )
+        pending = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        pending.next_attempt_at = datetime.now(UTC) + timedelta(hours=1)
+        await db.commit()
+    assert await worker.run_once()
+    async with sessions() as db:
+        pending = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        pending.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+    assert await worker.run_once()
+    async with sessions() as db:
+        old = await db.get(AiCallKnowledgeVersionModel, first.version_id)
+        item = await db.get(AiCallKnowledgeItemModel, first.item_id)
+        assert old.status == "READY" and old.sha256 == hashlib.sha256(payload).hexdigest()
+        assert item.current_ready_version_id == current.version_id
+        assert await store.stat_or_none(staged[1]) is None
+
+
+@pytest.mark.anyio
+async def test_expired_lease_cannot_publish_and_mismatched_original_is_rejected(
+    shared_processing,
+) -> None:
+    sessions, store = shared_processing
+    version = await _accept_media(sessions, store, "手册.txt", "text/plain", b"manual")
+    worker = KnowledgeWorker(sessions, store, worker_id="lease")
+    first = await worker.processor.claim(lease_seconds=300)
+    assert first is not None
+    async with sessions() as db:
+        row = await db.get(AiCallKnowledgeVersionModel, version.version_id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+    successor = await worker.processor.claim(lease_seconds=300)
+    assert successor is not None and successor.token != first.token
+    assert not await worker.processor.remember_provider(
+        first, name="stale", request_key="stale", job_id="stale"
+    )
+    assert not await worker.processor.release(first, status="failed", delay=None)
+    assert await worker.processor.release(successor, status="pending", delay=0)
+
+    key = store.physical_key(first.item.original.ref)
+    store.client.objects[key] = (b"broken", "text/plain")
+    assert await worker.run_once()
+    async with sessions() as db:
+        failed = await db.get(AiCallKnowledgeVersionModel, version.version_id)
+        item = await db.get(AiCallKnowledgeItemModel, version.item_id)
+        assert failed.status == "FAILED" and failed.failure_code == "ORIGINAL_CHECKSUM_MISMATCH"
+        assert item.current_ready_version_id is None and failed.chunk_count == 0
 
 
 @pytest.mark.anyio
 async def test_worker_reconciles_stale_uploads_from_cos() -> None:
     payload = "# 售后政策\n\n退款将在审核通过后原路退回。".encode()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     client = _FakeCosClient()
     client.objects["ai-call/knowledge/tenant-a/1/11/source.md"] = (
         payload,
@@ -878,7 +1153,7 @@ async def test_worker_reconciles_stale_uploads_from_cos() -> None:
 
 @pytest.mark.anyio
 async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         for table in (
@@ -1172,7 +1447,7 @@ async def test_product_info_extractor_marks_knowledge_as_untrusted_json_input() 
 
 @pytest.mark.anyio
 async def test_product_info_extraction_uses_all_current_chunks_and_keeps_audit() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         for table in (

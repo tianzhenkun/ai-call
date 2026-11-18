@@ -159,6 +159,14 @@ create table if not exists ai_call_knowledge_version (
     )
 );
 
+-- 为新建和既有版本表同时启用公共知识库任务的断点续查。
+alter table ai_call_knowledge_version
+    add column if not exists provider_run_no integer not null default 1,
+    add column if not exists provider_name varchar(128),
+    add column if not exists provider_request_key varchar(128),
+    add column if not exists provider_job_id varchar(128),
+    add column if not exists provider_started_at timestamptz;
+
 create index if not exists idx_ai_call_knowledge_version_item_created
     on ai_call_knowledge_version (tenant_id, knowledge_item_id, created_at);
 create index if not exists idx_ai_call_knowledge_version_claim

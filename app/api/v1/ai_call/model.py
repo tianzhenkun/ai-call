@@ -2206,6 +2206,13 @@ class AiCallKnowledgeVersionModel(MappedBase):
         server_default=text("0"),
     )
     chunk_set_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_run_no: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    provider_name: Mapped[str | None] = mapped_column(String(128))
+    provider_request_key: Mapped[str | None] = mapped_column(String(128))
+    provider_job_id: Mapped[str | None] = mapped_column(String(128))
+    provider_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempt_count: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

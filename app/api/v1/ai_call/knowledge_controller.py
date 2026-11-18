@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Header, Path, Query, Request, UploadFile
+from lingchen_knowledge.formats import classify, policy
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,12 +72,7 @@ def get_knowledge_service() -> Any:
     )
 
     try:
-        return KnowledgeService(
-            build_knowledge_store(settings),
-            binary_parser_enabled=bool(
-                settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
-            ),
-        )
+        return KnowledgeService(build_knowledge_store(settings))
     except RuntimeError as exc:
         raise CustomException(msg="知识库对象存储尚未配置", status_code=503) from exc
 
@@ -138,7 +134,7 @@ async def _accept_upload(
         file=file,
         file_sha256=file_sha256,
         content_category=content_category,
-        note=note,
+        note="" if note is None and "note" in form else note,
         item_id=item_id,
     )
     return _upload_response(result)
@@ -204,6 +200,11 @@ async def upload_knowledge_version_controller(
     )
 
 
+@KnowledgeRouter.get("/upload-policy", summary="查询公共知识资料上传规则", dependencies=[Depends(get_knowledge_viewer)])
+async def get_upload_policy_controller() -> SuccessResponse:
+    return SuccessResponse(data=policy())
+
+
 @KnowledgeRouter.get(
     "/items",
     summary="查询知识条目列表",
@@ -214,6 +215,7 @@ async def list_knowledge_items_controller(
     service: Annotated[Any, Depends(get_knowledge_service)],
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 20,
+    carrier_type: Annotated[str | None, Query(alias="carrierType", max_length=20)] = None,
     content_category: Annotated[
         str | None,
         Query(alias="contentCategory", max_length=20),
@@ -227,6 +229,7 @@ async def list_knowledge_items_controller(
         page_num=page_num,
         page_size=page_size,
         content_category=content_category,
+        carrier_type=carrier_type,
     )
     return TableResponse(rows=rows, total=total, msg="查询成功")
 
@@ -387,13 +390,11 @@ async def preview_knowledge_version_controller(
         version_id=version_id,
         range_header=range_header,
     )
-    extension = preview.filename.rsplit(".", 1)[-1].lower()
-    if extension not in {"txt", "md", "markdown", "pdf"}:
-        raise CustomException(msg="该文件类型不支持在线预览", status_code=415)
+    mime = classify(preview.filename).mime_type
     return _knowledge_file_response(
         preview,
         disposition="inline",
-        media_type="application/pdf" if extension == "pdf" else "text/plain",
+        media_type="text/plain" if mime.startswith("text/") or mime == "application/json" else mime,
     )
 
 

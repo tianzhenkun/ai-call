@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import AsyncIterator, Collection
+from collections.abc import AsyncIterator, Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any, BinaryIO, Protocol
 
 from fastapi import UploadFile
-from sqlalchemy import BigInteger, and_, bindparam, delete, func, or_, select, text, update
+from lingchen_knowledge.formats import (
+    classify,
+    policy,
+    validate_file,
+    validate_filename,
+    validate_size,
+)
+from lingchen_knowledge.models import KnowledgeError, MediaProvider, MediaType
+from sqlalchemy import BigInteger, and_, bindparam, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.model import (
@@ -30,31 +36,14 @@ from app.api.v1.ai_call.model import (
 )
 from app.core.exceptions import CustomException
 from app.core.logger import log
-from app.services.ai_call.knowledge_binary_parser import (
-    DOCX_CHUNK_STRATEGY_VERSION,
-    DOCX_PARSER_VERSION,
-    PDF_CHUNK_STRATEGY_VERSION,
-    PDF_PARSER_VERSION,
-    PPTX_CHUNK_STRATEGY_VERSION,
-    PPTX_PARSER_VERSION,
-    KnowledgeBinaryParseError,
-    KnowledgeBinaryParserClient,
-)
+from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
+from app.services.ai_call.knowledge_processing import KnowledgeVersionProcessor
 from app.services.ai_call.prompt_optimization import KnowledgeProductExtractorProtocol
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
 
-PARSER_NAME = "text"
-PARSER_VERSION = "txt-markdown-utf8-v1"
-CHUNK_STRATEGY_VERSION = "paragraph-900-1200-v1"
 RETRIEVER_VERSION = "postgres-ngram-tsvector-v1"
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
-_TARGET_CHARS = 900
-_MAX_CHARS = 1200
-_MAX_SECTION_PATH_CHARS = 1000
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
-_SENTENCE_ENDINGS = "。！？；.!?;\n"
 _STREAM_CHUNK_BYTES = 64 * 1024
 _CONTENT_CATEGORIES = {
     "PRODUCT_SERVICE",
@@ -63,57 +52,9 @@ _CONTENT_CATEGORIES = {
     "INDUSTRY",
     "OTHER",
 }
-_SUPPORTED_MIME_TYPES = {
-    "text/plain",
-    "text/markdown",
-    "text/x-markdown",
-    "application/octet-stream",
-}
-_BINARY_MIME_TYPES = {
-    "pptx": {
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "application/octet-stream",
-    },
-    "docx": {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/octet-stream",
-    },
-    "pdf": {"application/pdf", "application/octet-stream"},
-}
-_BINARY_PARSER_CONTRACTS = {
-    "pptx": (PPTX_PARSER_VERSION, PPTX_CHUNK_STRATEGY_VERSION, "PPTX"),
-    "docx": (DOCX_PARSER_VERSION, DOCX_CHUNK_STRATEGY_VERSION, "DOCX"),
-    "pdf": (PDF_PARSER_VERSION, PDF_CHUNK_STRATEGY_VERSION, "PDF"),
-}
-_DOCX_SOURCE_PATH_RE = re.compile(r"word/document\.xml#paragraphs/(\d+)-(\d+)$")
+_FORMATS = {fmt["suffix"][1:]: fmt for fmt in policy()["formats"]}
+_MAX_BYTES = {ext: fmt["maxBytes"] for ext, fmt in _FORMATS.items()}
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-
-
-class KnowledgeTextParseError(ValueError):
-    """TXT/Markdown 内容不满足安全解析合同。"""
-
-
-@dataclass(frozen=True)
-class KnowledgeChunkDraft:
-    chunk_index: int
-    content: str
-    content_checksum: str
-    content_type: str
-    source_type: str
-    section_path: str | None
-    source_path: str
-    page_no: int | None = None
-    start_ms: int | None = None
-    end_ms: int | None = None
-
-
-@dataclass(frozen=True)
-class ParsedKnowledge:
-    parser_name: str
-    parser_version: str
-    chunk_strategy_version: str
-    chunk_set_sha256: str
-    chunks: tuple[KnowledgeChunkDraft, ...]
 
 
 @dataclass(frozen=True)
@@ -137,237 +78,6 @@ class KnowledgeRealtimeSearchResult:
     audit_id: int | None
     status: str
     output: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _Block:
-    body: str
-    section_path: str | None
-    start_line: int
-    end_line: int
-
-
-def parse_text_knowledge(payload: bytes, *, extension: str) -> ParsedKnowledge:
-    normalized_extension = extension.strip().lower().lstrip(".")
-    if normalized_extension not in {"txt", "md", "markdown"}:
-        raise KnowledgeTextParseError("只支持 TXT 和 Markdown")
-    try:
-        source = payload.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise KnowledgeTextParseError("文件必须是 UTF-8 编码") from exc
-    if "\x00" in source:
-        raise KnowledgeTextParseError("文件包含 NUL 字节")
-
-    source = source.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = _parse_blocks(source, markdown=normalized_extension in {"md", "markdown"})
-    if not blocks:
-        raise KnowledgeTextParseError("文件没有可用正文")
-
-    chunks = _build_chunks(
-        blocks, source_type="MARKDOWN" if normalized_extension != "txt" else "TXT"
-    )
-    chunk_set_sha256 = hashlib.sha256(
-        "".join(f"{chunk.chunk_index}:{chunk.content_checksum}\n" for chunk in chunks).encode()
-    ).hexdigest()
-    return ParsedKnowledge(
-        parser_name=PARSER_NAME,
-        parser_version=PARSER_VERSION,
-        chunk_strategy_version=CHUNK_STRATEGY_VERSION,
-        chunk_set_sha256=chunk_set_sha256,
-        chunks=chunks,
-    )
-
-
-def _parse_binary_result(payload: dict[str, Any]) -> ParsedKnowledge:
-    parser_name = payload.get("parserName")
-    contract = (
-        _BINARY_PARSER_CONTRACTS.get(parser_name)
-        if isinstance(parser_name, str)
-        else None
-    )
-    if contract is None:
-        raise KnowledgeBinaryParseError("解析器版本不受信任")
-    parser_version, chunk_strategy_version, source_type = contract
-    if (
-        payload.get("parserVersion") != parser_version
-        or payload.get("chunkStrategyVersion") != chunk_strategy_version
-    ):
-        raise KnowledgeBinaryParseError("解析器版本不受信任")
-    raw_chunks = payload.get("chunks")
-    if not isinstance(raw_chunks, list) or not 0 < len(raw_chunks) <= 100_000:
-        raise KnowledgeBinaryParseError("解析器切片数量不合法")
-
-    chunks: list[KnowledgeChunkDraft] = []
-    for index, raw in enumerate(raw_chunks):
-        if not isinstance(raw, dict) or raw.get("chunkIndex") != index:
-            raise KnowledgeBinaryParseError("解析器切片顺序不合法")
-        content = raw.get("content")
-        page_no = raw.get("pageNo")
-        source_path = raw.get("sourcePath")
-        if parser_name == "docx":
-            source_match = (
-                _DOCX_SOURCE_PATH_RE.fullmatch(source_path)
-                if isinstance(source_path, str)
-                else None
-            )
-            source_location_valid = (
-                page_no is None
-                and source_match is not None
-                and int(source_match.group(1)) <= int(source_match.group(2))
-            )
-        else:
-            source_prefix = "slides" if parser_name == "pptx" else "pages"
-            source_location_valid = (
-                isinstance(page_no, int)
-                and page_no > 0
-                and source_path == f"{source_prefix}/{page_no}"
-            )
-        if (
-            not isinstance(content, str)
-            or not 0 < len(content) <= _MAX_CHARS
-            or hashlib.sha256(content.encode()).hexdigest() != raw.get("contentChecksum")
-            or raw.get("contentType") != "TEXT"
-            or raw.get("sourceType") != source_type
-            or not source_location_valid
-            or raw.get("sectionPath") is not None
-            or raw.get("startMs") is not None
-            or raw.get("endMs") is not None
-        ):
-            raise KnowledgeBinaryParseError("解析器切片内容不合法")
-        chunks.append(
-            KnowledgeChunkDraft(
-                chunk_index=index,
-                content=content,
-                content_checksum=raw["contentChecksum"],
-                content_type="TEXT",
-                source_type=source_type,
-                section_path=None,
-                source_path=source_path,
-                page_no=page_no,
-            )
-        )
-
-    chunk_set_sha256 = hashlib.sha256(
-        "".join(f"{chunk.chunk_index}:{chunk.content_checksum}\n" for chunk in chunks).encode()
-    ).hexdigest()
-    if chunk_set_sha256 != payload.get("chunkSetSha256"):
-        raise KnowledgeBinaryParseError("解析器切片校验值不合法")
-    return ParsedKnowledge(
-        parser_name=parser_name,
-        parser_version=parser_version,
-        chunk_strategy_version=chunk_strategy_version,
-        chunk_set_sha256=chunk_set_sha256,
-        chunks=tuple(chunks),
-    )
-
-
-def _parse_blocks(source: str, *, markdown: bool) -> list[_Block]:
-    blocks: list[_Block] = []
-    section_stack: list[str] = []
-    paragraph: list[str] = []
-    paragraph_start = 0
-
-    def flush(end_line: int) -> None:
-        nonlocal paragraph, paragraph_start
-        body = " ".join(part.strip() for part in paragraph if part.strip()).strip()
-        if body:
-            blocks.append(
-                _Block(
-                    body=body,
-                    section_path=" / ".join(section_stack) or None,
-                    start_line=paragraph_start,
-                    end_line=end_line,
-                )
-            )
-        paragraph = []
-        paragraph_start = 0
-
-    lines = source.split("\n")
-    for line_no, raw_line in enumerate(lines, start=1):
-        stripped = raw_line.strip()
-        heading = _HEADING_RE.match(stripped) if markdown else None
-        if heading:
-            flush(line_no - 1)
-            level = len(heading.group(1))
-            title = heading.group(2).strip()
-            section_stack[level - 1 :] = [title]
-            if len(" / ".join(section_stack)) > _MAX_SECTION_PATH_CHARS:
-                raise KnowledgeTextParseError("Markdown 标题路径不能超过 1000 个字符")
-            continue
-        if not stripped:
-            flush(line_no - 1)
-            continue
-        if not paragraph:
-            paragraph_start = line_no
-        paragraph.append(stripped)
-    flush(len(lines))
-    return blocks
-
-
-def _build_chunks(blocks: list[_Block], *, source_type: str) -> tuple[KnowledgeChunkDraft, ...]:
-    drafts: list[KnowledgeChunkDraft] = []
-    current: list[_Block] = []
-
-    def render(parts: list[_Block]) -> str:
-        section_path = parts[0].section_path
-        prefix = f"{section_path}\n" if section_path else ""
-        return prefix + "\n\n".join(part.body for part in parts)
-
-    def emit(parts: list[_Block]) -> None:
-        content = render(parts)
-        checksum = hashlib.sha256(content.encode()).hexdigest()
-        drafts.append(
-            KnowledgeChunkDraft(
-                chunk_index=len(drafts),
-                content=content,
-                content_checksum=checksum,
-                content_type="TEXT",
-                source_type=source_type,
-                section_path=parts[0].section_path,
-                source_path=f"lines:{parts[0].start_line}-{parts[-1].end_line}",
-            )
-        )
-
-    pieces: list[_Block] = []
-    for block in blocks:
-        prefix_length = len(block.section_path) + 1 if block.section_path else 0
-        available = _MAX_CHARS - prefix_length
-        for body in _split_long_text(block.body, available):
-            pieces.append(
-                _Block(
-                    body=body,
-                    section_path=block.section_path,
-                    start_line=block.start_line,
-                    end_line=block.end_line,
-                )
-            )
-
-    for piece in pieces:
-        if current and (
-            current[0].section_path != piece.section_path
-            or len(render([*current, piece])) > _TARGET_CHARS
-        ):
-            emit(current)
-            current = []
-        current.append(piece)
-    if current:
-        emit(current)
-
-    return tuple(drafts)
-
-
-def _split_long_text(value: str, limit: int) -> list[str]:
-    parts: list[str] = []
-    remaining = value
-    while len(remaining) > limit:
-        boundary = max(remaining.rfind(char, 0, limit + 1) + 1 for char in _SENTENCE_ENDINGS)
-        if boundary < min(_TARGET_CHARS, limit):
-            boundary = limit
-        parts.append(remaining[:boundary].strip())
-        remaining = remaining[boundary:].strip()
-    if remaining:
-        parts.append(remaining)
-    return parts
 
 
 class KnowledgeSearchService:
@@ -407,11 +117,15 @@ class KnowledgeSearchService:
           and item.created_by = :user_id
           and chunk.knowledge_version_id = any(:frozen_version_ids)
           and version.status = 'READY'
+          and version.byte_size between 1 and cast(cast(:max_bytes as jsonb) ->> version.extension as bigint)
           and chunk.ngram_tsv @@ query_features.query_value
         order by score desc, chunk.knowledge_version_id, chunk.chunk_index, chunk.id
         limit :result_limit
         """
-    ).bindparams(bindparam("frozen_version_ids", type_=ARRAY(BigInteger)))
+    ).bindparams(
+        bindparam("frozen_version_ids", type_=ARRAY(BigInteger)),
+        bindparam("max_bytes", value=json.dumps(_MAX_BYTES)),
+    )
 
     @classmethod
     async def search(
@@ -739,7 +453,7 @@ class KnowledgeRealtimeSearchService:
                         sort_keys=True,
                     ),
                     latency_ms=latency_ms,
-                    created_at=datetime.now(timezone.utc),
+                    created_at=datetime.now(UTC),
                 )
             )
             await db.commit()
@@ -831,6 +545,22 @@ async def _knowledge_profile(
     return profile
 
 
+def _public_version():
+    version = AiCallKnowledgeVersionModel
+    return version.byte_size.between(1, case(_MAX_BYTES, value=version.extension))
+
+
+def _public_item_versions():
+    item = AiCallKnowledgeItemModel
+    version = AiCallKnowledgeVersionModel
+    return select(version.extension).where(
+        version.tenant_id == item.tenant_id,
+        version.knowledge_item_id == item.id,
+        version.status != "UPLOADING",
+        _public_version(),
+    ).correlate(item)
+
+
 async def scene_knowledge_items(
     db: AsyncSession, *, tenant_id: str, user_id: int, profile_id: int,
     item_ids: list[int] | None = None, expected_item_ids: Collection[int] = (),
@@ -842,9 +572,14 @@ async def scene_knowledge_items(
     scene = (binding.tenant_id == tenant_id, binding.prompt_profile_id == profile_id)
     owned = (item.tenant_id == tenant_id, item.created_by == user_id, item.deleted_at.is_(None))
     linked = select(binding.knowledge_item_id).where(*scene)
-    current_query = (
-        select(item.id, item.display_name).where(*owned, item.id.in_(linked)).order_by(item.id)
-    )
+    version = AiCallKnowledgeVersionModel
+    public_versions = _public_item_versions()
+    current_query = select(item.id, item.display_name).where(
+        *owned, item.id.in_(linked), public_versions.exists(),
+        or_(item.current_ready_version_id.is_(None), public_versions.where(
+            version.id == item.current_ready_version_id, version.status == "READY",
+        ).exists()),
+    ).order_by(item.id)
     if item_ids is not None:
         desired = set(item_ids)
         # 与旧入口保持相同的加锁顺序，先锁场景，再按 ID 锁资料。
@@ -856,16 +591,16 @@ async def scene_knowledge_items(
             raise CustomException(msg="场景知识资料已变化，请重新打开选择器", status_code=409)
         added = desired - current
         if added:
-            version = AiCallKnowledgeVersionModel
             ready = await db.scalars(
                 select(item.id).join(version, version.id == item.current_ready_version_id).where(
                     *owned, item.id.in_(added), version.tenant_id == tenant_id,
                     version.knowledge_item_id == item.id, version.status == "READY",
+                    _public_version(),
                 )
             )
             if set(ready) != added:
                 raise CustomException(msg="选择的资料不可用，请选择自己已就绪的知识资料", status_code=409)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             db.add_all([binding(
                 id=generate_snowflake_id(), tenant_id=tenant_id, prompt_profile_id=profile_id,
                 knowledge_item_id=item_id, created_by=user_id, created_at=now,
@@ -918,6 +653,7 @@ async def load_current_ready_knowledge_versions(
                         AiCallPromptProfileModel.deleted_at.is_(None),
                     ).exists(),
                     AiCallKnowledgeVersionModel.status == "READY",
+                    _public_version(),
                     AiCallKnowledgeItemModel.tenant_id == tenant_id,
                     AiCallKnowledgeItemModel.created_by == user_id,
                     AiCallKnowledgeItemModel.deleted_at.is_(None),
@@ -1290,7 +1026,7 @@ class KnowledgeProductInfoService:
                 sort_keys=True,
             ),
             latency_ms=latency_ms,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
 
 
@@ -1342,6 +1078,8 @@ class KnowledgeObjectStore(Protocol):
 
     async def delete(self, logical_key: str) -> None: ...
 
+    async def presigned_get_url(self, logical_key: str, *, expires_seconds: int) -> str: ...
+
 
 @dataclass(frozen=True)
 class KnowledgeDownload:
@@ -1368,7 +1106,7 @@ class _HashingReader:
             raise TypeError("对象存储上传流必须返回 bytes")
         self.byte_size += len(chunk)
         if self.byte_size > self.max_bytes:
-            raise ValueError("文件正文不能超过 100 MB")
+            raise ValueError("文件正文超过声明大小")
         self.digest.update(chunk)
         return chunk
 
@@ -1408,7 +1146,7 @@ class CosKnowledgeStore:
         content_type: str,
         expected_size: int,
     ) -> StoredUpload:
-        reader = _HashingReader(source, MAX_UPLOAD_BYTES)
+        reader = _HashingReader(source, expected_size)
         await asyncio.to_thread(
             self.client.put_object,
             Bucket=self.bucket,
@@ -1465,6 +1203,15 @@ class CosKnowledgeStore:
             Key=self.physical_key(logical_key),
         )
 
+    async def presigned_get_url(self, logical_key: str, *, expires_seconds: int) -> str:
+        return await asyncio.to_thread(
+            self.client.get_presigned_url,
+            Method="GET",
+            Bucket=self.bucket,
+            Key=self.physical_key(logical_key),
+            Expired=expires_seconds,
+        )
+
 
 class PlatformOssKnowledgeStore:
     """通过平台当前启用的 sys_oss_config 访问 S3 兼容对象存储。"""
@@ -1506,7 +1253,7 @@ class PlatformOssKnowledgeStore:
     ) -> StoredUpload:
         from app.utils.minio_util import MinioUtil
 
-        reader = _HashingReader(source, MAX_UPLOAD_BYTES)
+        reader = _HashingReader(source, expected_size)
 
         def read_payload() -> bytes:
             payload = bytearray()
@@ -1571,6 +1318,13 @@ class PlatformOssKnowledgeStore:
         await MinioUtil.delete_object(
             self.config,
             self.physical_key(logical_key),
+        )
+
+    async def presigned_get_url(self, logical_key: str, *, expires_seconds: int) -> str:
+        from app.utils.minio_util import MinioUtil
+
+        return MinioUtil.presigned_get_url(
+            self.config, self.physical_key(logical_key), expires_seconds=expires_seconds
         )
 
 
@@ -1653,14 +1407,8 @@ class _ValidatedUpload:
 
 
 class KnowledgeService:
-    def __init__(
-        self,
-        store: KnowledgeObjectStore,
-        *,
-        binary_parser_enabled: bool = False,
-    ) -> None:
+    def __init__(self, store: KnowledgeObjectStore) -> None:
         self.store = store
-        self.binary_parser_enabled = binary_parser_enabled
 
     async def accept_upload(
         self,
@@ -1682,21 +1430,17 @@ class KnowledgeService:
             raise CustomException(msg="租户上下文缺失", status_code=401)
         if not key or len(key) > 128:
             raise CustomException(msg="缺少或无效的 Idempotency-Key", status_code=400)
-        upload = _validate_upload(
-            file,
-            file_sha256,
-            content_category,
-            note,
-            binary_parser_enabled=self.binary_parser_enabled,
-        )
+        upload = _validate_upload(file, file_sha256, content_category, note)
         operation = "CREATE_VERSION" if item_id is not None else "CREATE_ITEM"
-        fingerprint = _upload_fingerprint(operation, item_id, upload)
+        fingerprint = _upload_fingerprint(operation, item_id, upload, clear_note=(
+            item_id is not None and note is not None and upload.note is None
+        ))
 
         replay = await self._find_replay(db, tenant_id, user_id, operation, key, fingerprint)
         if replay is not None:
             return replay
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if item_id is None:
             item_id = generate_snowflake_id()
             version_no = 1
@@ -1712,18 +1456,7 @@ class KnowledgeService:
             )
             db.add(item)
         else:
-            item = await db.scalar(
-                select(AiCallKnowledgeItemModel)
-                .where(
-                    AiCallKnowledgeItemModel.id == item_id,
-                    AiCallKnowledgeItemModel.tenant_id == tenant_id,
-                    AiCallKnowledgeItemModel.created_by == user_id,
-                    AiCallKnowledgeItemModel.deleted_at.is_(None),
-                )
-                .with_for_update()
-            )
-            if item is None:
-                raise CustomException(msg="知识条目不存在", status_code=404)
+            item = await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
             version_no = (
                 await db.scalar(
                     select(func.max(AiCallKnowledgeVersionModel.version_no)).where(
@@ -1734,7 +1467,8 @@ class KnowledgeService:
                 or 0
             ) + 1
             item.content_category = upload.content_category
-            item.note = upload.note
+            if note is not None:
+                item.note = upload.note
             item.updated_at = now
 
         version_id = generate_snowflake_id()
@@ -1915,6 +1649,7 @@ class KnowledgeService:
         page_num: int,
         page_size: int,
         content_category: str | None = None,
+        carrier_type: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         tenant_id = tenant_id.strip()
         user_id = _require_knowledge_user(user_id)
@@ -1927,21 +1662,20 @@ class KnowledgeService:
             if content_category not in _CONTENT_CATEGORIES:
                 raise CustomException(msg="内容分类不合法", status_code=400)
 
-        visible_version = (
-            select(AiCallKnowledgeVersionModel.id)
-            .where(
-                AiCallKnowledgeVersionModel.tenant_id == tenant_id,
-                AiCallKnowledgeVersionModel.knowledge_item_id == AiCallKnowledgeItemModel.id,
-                AiCallKnowledgeVersionModel.status != "UPLOADING",
-            )
-            .exists()
-        )
         conditions = [
             AiCallKnowledgeItemModel.tenant_id == tenant_id,
             AiCallKnowledgeItemModel.created_by == user_id,
             AiCallKnowledgeItemModel.deleted_at.is_(None),
-            visible_version,
         ]
+        public_versions = _public_item_versions()
+        if carrier_type is None:
+            conditions.append(public_versions.exists())
+        else:
+            extensions = [ext for ext, fmt in _FORMATS.items() if fmt["carrierType"] == carrier_type]
+            if not extensions:
+                raise CustomException(msg="文件类型不合法", status_code=400)
+            latest = public_versions.order_by(AiCallKnowledgeVersionModel.version_no.desc()).limit(1)
+            conditions.append(latest.scalar_subquery().in_(extensions))
         if content_category is not None:
             conditions.append(
                 AiCallKnowledgeItemModel.content_category == content_category
@@ -1978,6 +1712,7 @@ class KnowledgeService:
                         AiCallKnowledgeVersionModel.tenant_id == tenant_id,
                         AiCallKnowledgeVersionModel.knowledge_item_id.in_(item_ids),
                         AiCallKnowledgeVersionModel.status != "UPLOADING",
+                        _public_version(),
                     )
                     .order_by(
                         AiCallKnowledgeVersionModel.knowledge_item_id,
@@ -1986,13 +1721,9 @@ class KnowledgeService:
                 )
             ).all()
         )
-        latest_versions: dict[int, AiCallKnowledgeVersionModel] = {}
-        version_counts: dict[int, int] = {}
+        versions_by_item: dict[int, list[AiCallKnowledgeVersionModel]] = {}
         for version in versions:
-            version_counts[version.knowledge_item_id] = (
-                version_counts.get(version.knowledge_item_id, 0) + 1
-            )
-            latest_versions.setdefault(version.knowledge_item_id, version)
+            versions_by_item.setdefault(version.knowledge_item_id, []).append(version)
         binding_rows = (
             await db.execute(
                 select(
@@ -2036,8 +1767,7 @@ class KnowledgeService:
         return [
             self._item_to_dict(
                 item,
-                latest_version=latest_versions.get(item.id),
-                version_count=version_counts.get(item.id, 0),
+                versions=versions_by_item[item.id],
                 binding_count=len(bindings_by_item.get(item.id, [])),
                 scene_bindings=bindings_by_item.get(item.id, []),
             )
@@ -2057,8 +1787,7 @@ class KnowledgeService:
         bindings = await self._scene_bindings(db, tenant_id, item_id)
         return self._item_to_dict(
             item,
-            latest_version=versions[0],
-            version_count=len(versions),
+            versions=versions,
             binding_count=len(bindings),
             scene_bindings=bindings,
         )
@@ -2090,7 +1819,7 @@ class KnowledgeService:
         item = await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
         for field, value in values.items():
             setattr(item, field, value)
-        item.updated_at = datetime.now(timezone.utc)
+        item.updated_at = datetime.now(UTC)
         await db.commit()
         return await self.get_item(db, tenant_id=tenant_id, user_id=user_id, item_id=item_id)
 
@@ -2131,7 +1860,7 @@ class KnowledgeService:
                 AiCallPromptKnowledgeBindingModel.knowledge_item_id == item_id,
             )
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         db.add_all([
             AiCallPromptKnowledgeBindingModel(
                 id=generate_snowflake_id(),
@@ -2155,7 +1884,7 @@ class KnowledgeService:
         item_id: int,
     ) -> dict[str, Any]:
         item = await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         item.deleted_at = now
         item.updated_at = now
         await db.execute(
@@ -2178,21 +1907,12 @@ class KnowledgeService:
     ) -> AiCallKnowledgeItemModel:
         tenant_id = tenant_id.strip()
         user_id = _require_knowledge_user(user_id)
-        visible_version = (
-            select(AiCallKnowledgeVersionModel.id)
-            .where(
-                AiCallKnowledgeVersionModel.tenant_id == tenant_id,
-                AiCallKnowledgeVersionModel.knowledge_item_id == AiCallKnowledgeItemModel.id,
-                AiCallKnowledgeVersionModel.status != "UPLOADING",
-            )
-            .exists()
-        )
         statement = select(AiCallKnowledgeItemModel).where(
             AiCallKnowledgeItemModel.id == item_id,
             AiCallKnowledgeItemModel.tenant_id == tenant_id,
             AiCallKnowledgeItemModel.created_by == user_id,
             AiCallKnowledgeItemModel.deleted_at.is_(None),
-            visible_version,
+            _public_item_versions().exists(),
         )
         if for_update:
             statement = statement.with_for_update()
@@ -2215,6 +1935,7 @@ class KnowledgeService:
                         AiCallKnowledgeVersionModel.tenant_id == tenant_id,
                         AiCallKnowledgeVersionModel.knowledge_item_id == item_id,
                         AiCallKnowledgeVersionModel.status != "UPLOADING",
+                        _public_version(),
                     )
                     .order_by(AiCallKnowledgeVersionModel.version_no.desc())
                 )
@@ -2266,23 +1987,24 @@ class KnowledgeService:
     def _item_to_dict(
         item: AiCallKnowledgeItemModel,
         *,
-        latest_version: AiCallKnowledgeVersionModel,
-        version_count: int,
+        versions: list[AiCallKnowledgeVersionModel],
         binding_count: int,
         scene_bindings: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        latest_version = versions[0]
         result = {
             "id": str(item.id),
             "displayName": item.display_name,
+            "carrierType": _FORMATS[latest_version.extension]["carrierType"],
             "contentCategory": item.content_category,
             "note": item.note,
             "currentReadyVersionId": (
                 str(item.current_ready_version_id)
-                if item.current_ready_version_id is not None
+                if any(v.id == item.current_ready_version_id and v.status == "READY" for v in versions)
                 else None
             ),
             "latestVersion": KnowledgeService._version_to_dict(latest_version),
-            "versionCount": version_count,
+            "versionCount": len(versions),
             "bindingCount": binding_count,
             "createdBy": str(item.created_by) if item.created_by is not None else None,
             "createdAt": item.created_at,
@@ -2396,11 +2118,19 @@ class KnowledgeService:
         if version.status != "FAILED" or not version.failure_retryable:
             raise CustomException(msg="当前失败不可重试，请上传新版本", status_code=409)
         version.status = "PROCESSING"
+        version.attempt_count = 0
+        if version.provider_job_id:
+            # 已受理的任务继续轮询同一个编号，并重新计算本轮等待时限。
+            version.provider_started_at = datetime.now(UTC)
+        else:
+            version.provider_run_no += 1
+            version.provider_name = version.provider_request_key = version.provider_started_at = None
         version.next_attempt_at = None
         version.lease_owner = None
         version.lease_expires_at = None
         version.failure_code = None
         version.failure_message = None
+        version.failure_retryable = False
         await db.commit()
         return await self.get_processing(
             db, tenant_id=tenant_id, user_id=user_id, version_id=version_id,
@@ -2427,6 +2157,7 @@ class KnowledgeService:
                 AiCallKnowledgeVersionModel.id == version_id,
                 AiCallKnowledgeVersionModel.tenant_id == tenant_id,
                 AiCallKnowledgeItemModel.created_by == user_id,
+                _public_version(),
                 AiCallKnowledgeItemModel.deleted_at.is_(None),
             )
         )
@@ -2471,40 +2202,22 @@ def _validate_upload(
     file_sha256: str,
     content_category: str,
     note: str | None,
-    *,
-    binary_parser_enabled: bool = False,
 ) -> _ValidatedUpload:
-    filename = unicodedata.normalize("NFKC", (file.filename or "").strip())
-    if (
-        not filename
-        or len(filename) > 255
-        or "/" in filename
-        or "\\" in filename
-        or any(ord(char) < 32 for char in filename)
-        or "." not in filename
-    ):
-        raise CustomException(msg="文件名不合法", status_code=400)
-    extension = filename.rsplit(".", 1)[1].lower()
-    text_extension = extension in {"txt", "md", "markdown"}
-    binary_extension = extension in _BINARY_MIME_TYPES
-    if not text_extension and not binary_extension:
-        raise CustomException(
-            msg="当前只支持 TXT、Markdown、PPTX、DOCX 和文本型 PDF",
-            status_code=400,
-        )
-    if binary_extension and not binary_parser_enabled:
-        raise CustomException(
-            msg="文档解析服务未启用，暂时无法上传 PPTX、DOCX 或 PDF，请联系管理员",
-            status_code=503,
-        )
-    mime_type = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
-    supported_mime_types = (
-        _SUPPORTED_MIME_TYPES
-        if text_extension
-        else _BINARY_MIME_TYPES[extension]
-    )
-    if mime_type not in supported_mime_types:
-        raise CustomException(msg="文件 MIME 类型不支持", status_code=400)
+    source = file.file
+    source.seek(0, 2)
+    byte_size = source.tell()
+    source.seek(0)
+    try:
+        filename = validate_filename(file.filename or "")
+        fmt = classify(filename)
+        validate_size(byte_size, maximum=fmt.max_bytes)
+        # 公共组件用前 4096 字节校验文件头，完整大小已用同一份公共规则校验。
+        validate_file(filename, source.read(4096), file.content_type)
+    except KnowledgeError as exc:
+        raise CustomException(msg=str(exc), status_code=413 if exc.code == "FILE_TOO_LARGE" else 400) from exc
+    finally:
+        source.seek(0)
+
     sha256 = file_sha256.strip().lower()
     if not _SHA256_RE.fullmatch(sha256):
         raise CustomException(msg="fileSha256 必须是 64 位十六进制", status_code=400)
@@ -2514,32 +2227,10 @@ def _validate_upload(
     normalized_note = (note or "").strip() or None
     if normalized_note is not None and len(normalized_note) > 1000:
         raise CustomException(msg="备注不能超过 1000 个字符", status_code=400)
-
-    source = file.file
-    source.seek(0, 2)
-    byte_size = source.tell()
-    source.seek(0)
-    if byte_size <= 0:
-        raise CustomException(msg="文件不能为空", status_code=400)
-    if byte_size > MAX_UPLOAD_BYTES:
-        raise CustomException(msg="文件正文不能超过 100 MB", status_code=413)
-    prefix = source.read(min(512, byte_size))
-    source.seek(0)
-    if text_extension:
-        if b"\x00" in prefix:
-            raise CustomException(msg="文本文件包含 NUL 字节", status_code=400)
-        try:
-            codecs.getincrementaldecoder("utf-8-sig")().decode(prefix, final=False)
-        except UnicodeDecodeError as exc:
-            raise CustomException(msg="文本文件必须是 UTF-8 编码", status_code=400) from exc
-    elif extension in {"pptx", "docx"} and not prefix.startswith(b"PK\x03\x04"):
-        raise CustomException(msg=f"{extension.upper()} 文件头不合法", status_code=400)
-    elif extension == "pdf" and not prefix.startswith(b"%PDF-"):
-        raise CustomException(msg="PDF 文件头不合法", status_code=400)
     return _ValidatedUpload(
         filename,
-        extension,
-        mime_type,
+        Path(filename).suffix[1:].lower(),
+        fmt.mime_type,
         byte_size,
         sha256,
         category,
@@ -2551,6 +2242,8 @@ def _upload_fingerprint(
     operation: str,
     item_id: int | None,
     upload: _ValidatedUpload,
+    *,
+    clear_note: bool,
 ) -> str:
     payload = json.dumps(
         {
@@ -2560,26 +2253,13 @@ def _upload_fingerprint(
             "byteSize": upload.byte_size,
             "sha256": upload.sha256,
             "contentCategory": upload.content_category,
-            "note": upload.note,
+            "note": "" if clear_note else upload.note,
         },
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class _ClaimedVersion:
-    id: int
-    tenant_id: str
-    item_id: int
-    version_no: int
-    object_key: str
-    extension: str
-    byte_size: int
-    sha256: str
-    attempt_count: int
 
 
 @dataclass(frozen=True)
@@ -2600,6 +2280,7 @@ class KnowledgeWorker:
         lease_seconds: int = 300,
         upload_reconcile_after_seconds: int = 3600,
         binary_parser: KnowledgeBinaryParserClient | None = None,
+        providers: Mapping[MediaType, MediaProvider] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.store = store
@@ -2607,7 +2288,11 @@ class KnowledgeWorker:
         self.poll_interval_seconds = poll_interval_seconds
         self.lease_seconds = lease_seconds
         self.upload_reconcile_after_seconds = max(0, upload_reconcile_after_seconds)
-        self.binary_parser = binary_parser
+        self.processor = KnowledgeVersionProcessor(
+            session_factory, store, providers=providers, binary_parser=binary_parser,
+            lease_seconds=lease_seconds, poll_interval=poll_interval_seconds,
+            public_extensions=tuple(_FORMATS),
+        )
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -2629,9 +2314,11 @@ class KnowledgeWorker:
 
     async def _run(self) -> None:
         while not self._stop.is_set():
-            worked = await self.run_once()
-            if worked:
-                continue
+            try:
+                if await self.run_once():
+                    continue
+            except SQLAlchemyError as exc:
+                log.warning("知识库任务数据库暂不可用 error={}", type(exc).__name__)
             try:
                 await asyncio.wait_for(
                     self._stop.wait(),
@@ -2642,46 +2329,7 @@ class KnowledgeWorker:
 
     async def run_once(self) -> bool:
         reconciled = await self._reconcile_stale_upload()
-        claimed = await self._claim()
-        if claimed is None:
-            return reconciled
-        try:
-            parsed = await self._download_and_parse(claimed)
-            await self._complete(claimed, parsed)
-        except KnowledgeTextParseError:
-            await self._fail(
-                claimed,
-                code="TEXT_PARSE_FAILED",
-                message="文件不是可用的 UTF-8 TXT/Markdown",
-                retryable=False,
-            )
-        except KnowledgeBinaryParseError:
-            await self._fail(
-                claimed,
-                code="BINARY_PARSE_FAILED",
-                message="二进制文档不满足安全解析合同或没有可用正文",
-                retryable=False,
-            )
-        except _SourceChecksumMismatch:
-            await self._fail(
-                claimed,
-                code="SOURCE_CHECKSUM_MISMATCH",
-                message="对象存储原文件校验失败",
-                retryable=False,
-            )
-        except Exception as exc:
-            log.warning(
-                "AI Call 知识处理失败：version_id={}, error_type={}",
-                claimed.id,
-                type(exc).__name__,
-            )
-            await self._fail(
-                claimed,
-                code="SOURCE_READ_FAILED",
-                message="读取或处理原文件失败",
-                retryable=True,
-            )
-        return True
+        return await self.processor.run_once() or reconciled
 
     async def _reconcile_stale_upload(self) -> bool:
         claimed = await self._claim_stale_upload()
@@ -2706,11 +2354,12 @@ class KnowledgeWorker:
 
     async def _claim_stale_upload(self) -> _ClaimedUpload | None:
         async with self.session_factory() as db, db.begin():
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             version = await db.scalar(
                 select(AiCallKnowledgeVersionModel)
                 .where(
                     AiCallKnowledgeVersionModel.status == "UPLOADING",
+                    _public_version(),
                     AiCallKnowledgeVersionModel.created_at
                     <= now - timedelta(seconds=self.upload_reconcile_after_seconds),
                     or_(
@@ -2762,191 +2411,3 @@ class KnowledgeWorker:
                 version.failure_code = "UPLOAD_INCOMPLETE"
                 version.failure_message = "上传未完成，请重新上传文件"
                 version.failure_retryable = False
-
-    async def _claim(self) -> _ClaimedVersion | None:
-        async with self.session_factory() as db, db.begin():
-            now = datetime.now(timezone.utc)
-            version = await db.scalar(
-                select(AiCallKnowledgeVersionModel)
-                .where(
-                    AiCallKnowledgeVersionModel.status == "PROCESSING",
-                    or_(
-                        AiCallKnowledgeVersionModel.next_attempt_at.is_(None),
-                        AiCallKnowledgeVersionModel.next_attempt_at <= now,
-                    ),
-                    or_(
-                        AiCallKnowledgeVersionModel.lease_expires_at.is_(None),
-                        AiCallKnowledgeVersionModel.lease_expires_at <= now,
-                    ),
-                )
-                .order_by(AiCallKnowledgeVersionModel.created_at)
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-            if version is None:
-                return None
-            version.attempt_count += 1
-            version.lease_owner = self.worker_id
-            version.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
-            return _ClaimedVersion(
-                version.id,
-                version.tenant_id,
-                version.knowledge_item_id,
-                version.version_no,
-                version.source_object_key,
-                version.extension,
-                version.byte_size,
-                version.sha256,
-                version.attempt_count,
-            )
-
-    async def _download_and_parse(self, claimed: _ClaimedVersion) -> ParsedKnowledge:
-        remote = await self.store.stat(claimed.object_key)
-        if remote.byte_size != claimed.byte_size:
-            raise _SourceChecksumMismatch
-        opened = await self.store.open(claimed.object_key)
-        with TemporaryDirectory(prefix="ai-call-knowledge-") as directory:
-            path = Path(directory) / f"source.{claimed.extension}"
-            digest = hashlib.sha256()
-            byte_size = 0
-            with path.open("wb") as destination:
-                async for chunk in opened.body:
-                    byte_size += len(chunk)
-                    if byte_size > MAX_UPLOAD_BYTES:
-                        raise _SourceChecksumMismatch
-                    digest.update(chunk)
-                    destination.write(chunk)
-            if byte_size != claimed.byte_size or digest.hexdigest() != claimed.sha256:
-                raise _SourceChecksumMismatch
-            if claimed.extension in {"txt", "md", "markdown"}:
-                return parse_text_knowledge(path.read_bytes(), extension=claimed.extension)
-            if claimed.extension in _BINARY_MIME_TYPES and self.binary_parser is not None:
-                payload = await asyncio.to_thread(
-                    self.binary_parser.parse,
-                    path,
-                    extension=claimed.extension,
-                )
-                return _parse_binary_result(payload)
-            raise KnowledgeBinaryParseError("二进制解析器未配置")
-
-    async def _complete(
-        self,
-        claimed: _ClaimedVersion,
-        parsed: ParsedKnowledge,
-    ) -> None:
-        async with self.session_factory() as db, db.begin():
-            version = await db.scalar(
-                select(AiCallKnowledgeVersionModel)
-                .where(
-                    AiCallKnowledgeVersionModel.id == claimed.id,
-                    AiCallKnowledgeVersionModel.status == "PROCESSING",
-                    AiCallKnowledgeVersionModel.lease_owner == self.worker_id,
-                    AiCallKnowledgeVersionModel.attempt_count == claimed.attempt_count,
-                )
-                .with_for_update()
-            )
-            if version is None:
-                return
-            await db.execute(
-                delete(AiCallKnowledgeChunkModel).where(
-                    AiCallKnowledgeChunkModel.tenant_id == claimed.tenant_id,
-                    AiCallKnowledgeChunkModel.knowledge_version_id == claimed.id,
-                )
-            )
-            now = datetime.now(timezone.utc)
-            db.add_all([
-                AiCallKnowledgeChunkModel(
-                    id=generate_snowflake_id(),
-                    tenant_id=claimed.tenant_id,
-                    knowledge_version_id=claimed.id,
-                    chunk_index=chunk.chunk_index,
-                    content=chunk.content,
-                    content_checksum=chunk.content_checksum,
-                    content_type=chunk.content_type,
-                    source_type=chunk.source_type,
-                    page_no=chunk.page_no,
-                    section_path=chunk.section_path,
-                    source_path=chunk.source_path,
-                    start_ms=chunk.start_ms,
-                    end_ms=chunk.end_ms,
-                    created_at=now,
-                )
-                for chunk in parsed.chunks
-            ])
-            version.status = "READY"
-            version.parser_name = parsed.parser_name
-            version.parser_version = parsed.parser_version
-            version.chunk_strategy_version = parsed.chunk_strategy_version
-            version.chunk_count = len(parsed.chunks)
-            version.chunk_set_sha256 = parsed.chunk_set_sha256
-            version.ready_at = now
-            version.next_attempt_at = None
-            version.lease_owner = None
-            version.lease_expires_at = None
-            version.failure_code = None
-            version.failure_message = None
-            version.failure_retryable = False
-
-            item = await db.scalar(
-                select(AiCallKnowledgeItemModel)
-                .where(
-                    AiCallKnowledgeItemModel.id == claimed.item_id,
-                    AiCallKnowledgeItemModel.tenant_id == claimed.tenant_id,
-                )
-                .with_for_update()
-            )
-            if item is None:
-                raise RuntimeError("知识条目不存在")
-            current_version_no = 0
-            if item.current_ready_version_id is not None:
-                current_version_no = (
-                    await db.scalar(
-                        select(AiCallKnowledgeVersionModel.version_no).where(
-                            AiCallKnowledgeVersionModel.id == item.current_ready_version_id,
-                            AiCallKnowledgeVersionModel.tenant_id == claimed.tenant_id,
-                        )
-                    )
-                    or 0
-                )
-            if claimed.version_no > current_version_no:
-                item.current_ready_version_id = claimed.id
-                item.updated_at = now
-
-    async def _fail(
-        self,
-        claimed: _ClaimedVersion,
-        *,
-        code: str,
-        message: str,
-        retryable: bool,
-    ) -> None:
-        async with self.session_factory() as db, db.begin():
-            version = await db.scalar(
-                select(AiCallKnowledgeVersionModel)
-                .where(
-                    AiCallKnowledgeVersionModel.id == claimed.id,
-                    AiCallKnowledgeVersionModel.status == "PROCESSING",
-                    AiCallKnowledgeVersionModel.lease_owner == self.worker_id,
-                    AiCallKnowledgeVersionModel.attempt_count == claimed.attempt_count,
-                )
-                .with_for_update()
-            )
-            if version is None:
-                return
-            should_retry = retryable and claimed.attempt_count < 3
-            version.status = "PROCESSING" if should_retry else "FAILED"
-            version.next_attempt_at = (
-                datetime.now(timezone.utc)
-                + timedelta(seconds=5 * (2 ** (claimed.attempt_count - 1)))
-                if should_retry
-                else None
-            )
-            version.lease_owner = None
-            version.lease_expires_at = None
-            version.failure_code = code
-            version.failure_message = message
-            version.failure_retryable = retryable
-
-
-class _SourceChecksumMismatch(ValueError):
-    pass
