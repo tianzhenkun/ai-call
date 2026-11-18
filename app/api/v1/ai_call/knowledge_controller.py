@@ -14,7 +14,7 @@ from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, StreamResponse, SuccessResponse, TableResponse
 from app.config.setting import settings
 from app.core.database import async_db_session
-from app.core.dependencies import get_knowledge_manager, get_knowledge_viewer
+from app.core.dependencies import get_knowledge_manager, get_knowledge_viewer, get_prompt_manager
 from app.core.exceptions import CustomException
 
 from .schema import ProductInfoExtractOut
@@ -48,6 +48,14 @@ class KnowledgeSceneBindingsRequest(BaseModel):
         alias="promptProfileIds",
         max_length=100,
     )
+
+
+KnowledgeItemId = Annotated[int, Field(gt=0, le=2**63 - 1)]
+
+
+class SceneKnowledgeItemsRequest(BaseModel):
+    item_ids: list[KnowledgeItemId] = Field(alias="itemIds")
+    expected_item_ids: list[KnowledgeItemId] = Field(alias="expectedItemIds")
 
 
 async def get_knowledge_db() -> AsyncGenerator[AsyncSession, None]:
@@ -434,6 +442,46 @@ async def retry_knowledge_version_controller(
         version_id=version_id,
     )
     return SuccessResponse(data=result, msg="已重新进入处理队列")
+
+
+@KnowledgePromptRouter.get(
+    "/prompt-profiles/{profileId}/knowledge-items",
+    summary="读取场景关联的个人知识资料",
+    response_model=ResponseSchema[list[dict[str, str]]],
+    dependencies=[Depends(get_prompt_manager)],
+)
+async def get_scene_knowledge_controller(
+    profile_id: Annotated[int, Path(alias="profileId", gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_knowledge_viewer)],
+    db: Annotated[AsyncSession, Depends(get_knowledge_db)],
+) -> SuccessResponse:
+    from app.services.ai_call.knowledge import scene_knowledge_items
+
+    tenant_id, user_id = _identity(auth)
+    return SuccessResponse(data=await scene_knowledge_items(
+        db, tenant_id=tenant_id, user_id=user_id, profile_id=profile_id,
+    ))
+
+
+@KnowledgePromptRouter.put(
+    "/prompt-profiles/{profileId}/knowledge-items",
+    summary="保存场景关联的个人知识资料",
+    response_model=ResponseSchema[list[dict[str, str]]],
+    dependencies=[Depends(get_prompt_manager)],
+)
+async def save_scene_knowledge_controller(
+    profile_id: Annotated[int, Path(alias="profileId", gt=0)],
+    request: SceneKnowledgeItemsRequest,
+    auth: Annotated[AuthSchema, Depends(get_knowledge_manager)],
+    db: Annotated[AsyncSession, Depends(get_knowledge_db)],
+) -> SuccessResponse:
+    from app.services.ai_call.knowledge import scene_knowledge_items
+
+    tenant_id, user_id = _identity(auth)
+    return SuccessResponse(data=await scene_knowledge_items(
+        db, tenant_id=tenant_id, user_id=user_id, profile_id=profile_id,
+        item_ids=request.item_ids, expected_item_ids=request.expected_item_ids,
+    ))
 
 
 @KnowledgePromptRouter.post(

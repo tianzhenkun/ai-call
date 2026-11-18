@@ -36,6 +36,7 @@ from app.services.ai_call.knowledge import (
     KnowledgeRealtimeSearchService,
     KnowledgeSearchService,
     KnowledgeService,
+    KnowledgeWorker,
     knowledge_version_snapshot_hash,
 )
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
@@ -133,13 +134,13 @@ async def knowledge_scope():
     await engine.dispose()
 
 
-def app_for(scope, user_id, *, superuser=False):
+def app_for(scope, user_id, *, superuser=False, permissions=None):
     app = FastAPI()
     app.include_router(KnowledgeRouter)
     app.include_router(KnowledgePromptRouter)
     handle_exception(app)
     auth = SimpleNamespace(
-        db=scope.db, permissions={"*:*:*", "ai_call:agent:manage"},
+        db=scope.db, permissions={"*:*:*", "ai_call:agent:manage"} if permissions is None else permissions,
         user=SimpleNamespace(tenant_id="tenant-a", user_id=user_id, is_superuser=superuser),
     )
     app.dependency_overrides[get_current_user] = lambda: auth
@@ -147,6 +148,82 @@ def app_for(scope, user_id, *, superuser=False):
     app.dependency_overrides[get_knowledge_service] = lambda: scope.service
     app.dependency_overrides[get_knowledge_product_info_service] = lambda: scope.product
     return app
+
+
+@pytest.mark.anyio
+async def test_scene_picker_reads_legacy_links_and_extracts_only_the_saved_selection(knowledge_scope):
+    scope = knowledge_scope
+    path = "/prompt-profiles/101/knowledge-items"
+    extract = "/prompt-profiles/101/product-info:extract"
+    scope.db.add(AiCallPromptProfileModel(
+        id=102, tenant_id="tenant-a", scene_code="other", name="其他场景",
+        provider_key="static_profile", product_info="", variables_json="[]",
+        created_at=NOW, updated_at=NOW,
+    ))
+    await scope.db.commit()
+    await scope.service.replace_scene_bindings(
+        scope.db, tenant_id="tenant-a", user_id=7, item_id=1, prompt_profile_ids=[101, 102],
+    )
+    payload = "新产品支持按月结算".encode()
+    upload = await scope.service.accept_upload(
+        scope.db, tenant_id="tenant-a", user_id=7, idempotency_key="scene-picker",
+        file=_upload(payload), file_sha256=hashlib.sha256(payload).hexdigest(),
+        content_category="FAQ", note=None,
+    )
+    selected = str(upload.item_id)
+    async with AsyncClient(transport=ASGITransport(app_for(scope, 7)), base_url="http://test") as client:
+        original = [{"id": "1", "displayName": "1.md"}]
+        assert (await client.get(path)).json()["data"] == original
+        assert (await client.get("/prompt-profiles/201/knowledge-items")).status_code == 404
+        for invalid_id in ("2", "3", "4", selected):
+            rejected = await client.put(path, json={"expectedItemIds": ["1"], "itemIds": [invalid_id]})
+            assert rejected.status_code == 409
+            assert (await client.get(path)).json()["data"] == original
+        worker = KnowledgeWorker(scope.sessions, scope.service.store, worker_id="picker-test")
+        assert await worker.run_once()
+        body = {"expectedItemIds": ["1"], "itemIds": [selected]}
+        saved = await client.put(path, json=body)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["data"] == [{"id": selected, "displayName": "faq.md"}]
+        assert (await client.put(path, json=body)).json()["data"] == saved.json()["data"]
+        assert (await client.get(path)).json()["data"] == saved.json()["data"]
+        assert (await client.get("/prompt-profiles/102/knowledge-items")).json()["data"] == original
+        assert (await client.put(path, json={"expectedItemIds": ["1"], "itemIds": []})).status_code == 409
+        draft = (await client.post(extract)).json()["data"]
+        assert draft["sourceVersionIds"] == [str(upload.version_id)]
+        assert "按月结算" in draft["draftText"]
+        assert (await client.put(path, json={"expectedItemIds": [selected], "itemIds": []})).json()["data"] == []
+        assert (await client.post(extract)).status_code == 409
+    async with AsyncClient(transport=ASGITransport(app_for(scope, 8)), base_url="http://test") as other:
+        assert (await other.get(path)).json()["data"] == [{"id": "2", "displayName": "2.md"}]
+
+
+@pytest.mark.anyio
+async def test_existing_unready_binding_remains_visible_and_removable(knowledge_scope):
+    item = await knowledge_scope.db.get(AiCallKnowledgeItemModel, 1)
+    item.current_ready_version_id = None
+    await knowledge_scope.db.commit()
+    path = "/prompt-profiles/101/knowledge-items"
+    async with AsyncClient(transport=ASGITransport(app_for(knowledge_scope, 7)), base_url="http://test") as client:
+        original = (await client.get(path)).json()["data"]
+        assert original == [{"id": "1", "displayName": "1.md"}]
+        assert (await client.put(path, json={"expectedItemIds": ["1"], "itemIds": ["1"]})).json()["data"] == original
+        assert (await client.put(path, json={"expectedItemIds": ["1"], "itemIds": []})).json()["data"] == []
+        assert (await client.put(path, json={"expectedItemIds": [], "itemIds": ["1"]})).status_code == 409
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("permissions,read_status", [
+    ({"ai_call:knowledge:manage"}, 403),
+    ({"ai_call:prompt:manage"}, 403),
+    ({"ai_call:prompt:manage", "ai_call:knowledge:view"}, 200),
+])
+async def test_scene_knowledge_requires_both_permissions(knowledge_scope, permissions, read_status):
+    app = app_for(knowledge_scope, 7, permissions=permissions)
+    path = "/prompt-profiles/101/knowledge-items"
+    async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+        assert (await client.get(path)).status_code == read_status
+        assert (await client.put(path, json={"itemIds": [], "expectedItemIds": ["1"]})).status_code == 403
 
 
 @pytest.mark.anyio

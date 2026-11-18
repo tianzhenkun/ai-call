@@ -990,6 +990,19 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
     ])
     await repository.db.flush()
     snapshot_hash = knowledge_version_snapshot_hash([version])
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_prompt_manager] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id=TEST_TENANT_ID, user_id=7),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        applied = await client.patch(f"/ai-call/prompt-profiles/{created['id']}", json={
+            "module": "productInfo", "expectedRevision": created["editRevision"],
+            "productInfo": "采用知识草稿", "knowledgeVersionSnapshotHash": snapshot_hash,
+        })
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["data"]["productInfo"] == "采用知识草稿"
     values = {
         "scene_code": created["sceneCode"],
         "name": created["name"],

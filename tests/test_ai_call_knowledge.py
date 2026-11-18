@@ -343,6 +343,18 @@ async def test_office_preview_is_rejected() -> None:
     assert exc_info.value.status_code == 415
 
 
+def test_product_draft_sections_render_as_text_and_keep_their_sources() -> None:
+    source = {"claim": "登记到店人数", "chunkId": "12"}
+    result = {"draftText": {
+        "核心能力": ["登记到店人数", "导出确认单"], "关键边界": "营业时段受理", "产品定位": "预约登记工具",
+    }, "sources": [source], "conflicts": []}
+    draft = KnowledgeProductInfoService._normalize_model_result(result, {"12"})
+    assert draft["draftText"] == "产品定位\n预约登记工具\n\n核心能力\n- 登记到店人数\n- 导出确认单\n\n关键边界\n营业时段受理"
+    assert draft["sources"] == [source]
+    with pytest.raises(ValueError):
+        KnowledgeProductInfoService._normalize_model_result({**result, "draftText": {"未知": {}}}, {"12"})
+
+
 def test_text_parser_rejects_unsupported_or_unsafe_input() -> None:
     unsafe_inputs = (
         (b"hello", ".pdf"),

@@ -582,9 +582,10 @@ async def save_prompt_module_controller(
     auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     return SuccessResponse(data=PromptProfileOut.model_validate(await service.save_prompt_profile_module(
         tenant_id=tenant_id, profile_id=profile_id, values=request.model_dump(exclude_unset=True),
+        created_by=user_id,
     )))
 
 

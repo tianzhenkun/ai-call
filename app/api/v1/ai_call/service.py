@@ -834,7 +834,7 @@ class AiCallService:
             "name": values.get("name"), "creation_key": values.get("creation_key"), **fields,
         })
 
-    async def save_prompt_profile_module(self, *, tenant_id, profile_id, values):
+    async def save_prompt_profile_module(self, *, tenant_id, profile_id, values, created_by: int | None = None):
         profile = await self._editable_prompt_profile(tenant_id, profile_id, for_update=True)
         self._check_prompt_revision(profile, values.get("expected_revision"))
         if "name" in values or "creation_key" in values:
@@ -845,7 +845,7 @@ class AiCallService:
         saved.pop("variables_json")
         return await self.update_prompt_profile(
             tenant_id=tenant_id, profile_id=profile_id, module=values["module"],
-            knowledge_version_snapshot_hash=knowledge_hash,
+            knowledge_version_snapshot_hash=knowledge_hash, created_by=created_by,
             values={**saved, **fields, "expected_revision": values.get("expected_revision")},
         )
 

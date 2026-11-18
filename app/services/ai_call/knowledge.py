@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -814,6 +814,72 @@ class KnowledgeRealtimeSearchService:
         }
 
 
+async def _knowledge_profile(
+    db: AsyncSession, tenant_id: str, profile_id: int, *, lock: bool = False,
+) -> AiCallPromptProfileModel:
+    query = select(AiCallPromptProfileModel).where(
+        AiCallPromptProfileModel.tenant_id == tenant_id,
+        AiCallPromptProfileModel.id == profile_id,
+    )
+    if lock:
+        query = query.with_for_update()
+    profile = await db.scalar(query.execution_options(populate_existing=True))
+    if profile is None:
+        raise CustomException(msg="提示词配置不存在", status_code=404)
+    if profile.deleted_at is not None:
+        raise CustomException(msg="该场景已删除", status_code=410)
+    return profile
+
+
+async def scene_knowledge_items(
+    db: AsyncSession, *, tenant_id: str, user_id: int, profile_id: int,
+    item_ids: list[int] | None = None, expected_item_ids: Collection[int] = (),
+) -> list[dict[str, str]]:
+    user_id = _require_knowledge_user(user_id)
+    await _knowledge_profile(db, tenant_id, profile_id, lock=item_ids is not None)
+    item = AiCallKnowledgeItemModel
+    binding = AiCallPromptKnowledgeBindingModel
+    scene = (binding.tenant_id == tenant_id, binding.prompt_profile_id == profile_id)
+    owned = (item.tenant_id == tenant_id, item.created_by == user_id, item.deleted_at.is_(None))
+    linked = select(binding.knowledge_item_id).where(*scene)
+    current_query = (
+        select(item.id, item.display_name).where(*owned, item.id.in_(linked)).order_by(item.id)
+    )
+    if item_ids is not None:
+        desired = set(item_ids)
+        # 与旧入口保持相同的加锁顺序，先锁场景，再按 ID 锁资料。
+        await db.execute(select(item.id).where(
+            *owned, or_(item.id.in_(desired), item.id.in_(linked)),
+        ).order_by(item.id).with_for_update())
+        current = set(await db.scalars(current_query))
+        if current != desired and current != set(expected_item_ids):
+            raise CustomException(msg="场景知识资料已变化，请重新打开选择器", status_code=409)
+        added = desired - current
+        if added:
+            version = AiCallKnowledgeVersionModel
+            ready = await db.scalars(
+                select(item.id).join(version, version.id == item.current_ready_version_id).where(
+                    *owned, item.id.in_(added), version.tenant_id == tenant_id,
+                    version.knowledge_item_id == item.id, version.status == "READY",
+                )
+            )
+            if set(ready) != added:
+                raise CustomException(msg="选择的资料不可用，请选择自己已就绪的知识资料", status_code=409)
+            now = datetime.now(timezone.utc)
+            db.add_all([binding(
+                id=generate_snowflake_id(), tenant_id=tenant_id, prompt_profile_id=profile_id,
+                knowledge_item_id=item_id, created_by=user_id, created_at=now,
+            ) for item_id in sorted(added)])
+            await db.flush()
+        removed = current - desired
+        if removed:
+            await db.execute(delete(binding).where(*scene, binding.knowledge_item_id.in_(removed)))
+    rows = (await db.execute(current_query)).all()
+    if item_ids is not None:
+        await db.commit()
+    return [{"id": str(row.id), "displayName": row.display_name} for row in rows]
+
+
 async def load_current_ready_knowledge_versions(
     db: AsyncSession,
     *,
@@ -907,16 +973,7 @@ class KnowledgeProductInfoService:
     ) -> dict[str, Any]:
         if self.extractor is None:
             raise CustomException(msg="产品信息提取服务未配置", status_code=503)
-        profile = await db.scalar(
-            select(AiCallPromptProfileModel).where(
-                AiCallPromptProfileModel.id == prompt_profile_id,
-                AiCallPromptProfileModel.tenant_id == tenant_id,
-            )
-        )
-        if profile is None:
-            raise CustomException(msg="提示词配置不存在", status_code=404)
-        if profile.deleted_at is not None:
-            raise CustomException(msg="该场景已删除", status_code=410)
+        profile = await _knowledge_profile(db, tenant_id, prompt_profile_id)
         versions = await load_current_ready_knowledge_versions(
             db,
             tenant_id=tenant_id,
@@ -1094,7 +1151,22 @@ class KnowledgeProductInfoService:
     ) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise ValueError("提取响应不是 JSON 对象")
-        draft_text = str(result.get("draftText") or "").strip()
+        draft_text = result.get("draftText")
+        headings = ("产品定位", "核心能力", "关键边界")
+        if isinstance(draft_text, dict) and draft_text.keys() == set(headings):
+            sections = []
+            for heading in headings:
+                body = draft_text[heading]
+                if isinstance(body, list) and all(isinstance(line, str) for line in body):
+                    body = "\n".join(f"- {line.strip()}" for line in body if line.strip())
+                if not isinstance(body, str):
+                    raise ValueError("产品信息草稿段落格式错误")
+                if body.strip():
+                    sections.append(f"{heading}\n{body.strip()}")
+            draft_text = "\n\n".join(sections)
+        if not isinstance(draft_text, str):
+            raise ValueError("产品信息草稿格式错误")
+        draft_text = draft_text.strip()
         if not draft_text or len(draft_text) > 20_000:
             raise ValueError("产品信息草稿为空或超过 20000 字符")
 
