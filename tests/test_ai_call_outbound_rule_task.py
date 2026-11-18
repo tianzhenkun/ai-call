@@ -388,6 +388,7 @@ async def _seed_ready_knowledge(
     prompt_id: int,
     chunk_count: int,
     tenant_id: str = "tenant-a",
+    user_id: int = 10,
     bound: bool = True,
 ) -> tuple[int, int, str, str]:
     item_id = generate_snowflake_id()
@@ -403,7 +404,7 @@ async def _seed_ready_knowledge(
                 display_name=f"知识-{item_id}.md",
                 content_category="FAQ",
                 current_ready_version_id=version_id,
-                created_by=10,
+                created_by=user_id,
                 created_at=now,
                 updated_at=now,
             ),
@@ -425,7 +426,7 @@ async def _seed_ready_knowledge(
                 chunk_count=chunk_count,
                 chunk_set_sha256=chunk_set_sha256,
                 attempt_count=1,
-                created_by=10,
+                created_by=user_id,
                 created_at=now,
                 ready_at=now,
             ),
@@ -437,7 +438,7 @@ async def _seed_ready_knowledge(
                     tenant_id=tenant_id,
                     prompt_profile_id=prompt_id,
                     knowledge_item_id=item_id,
-                    created_by=10,
+                    created_by=user_id,
                     created_at=now,
                 )
             )
@@ -1665,6 +1666,7 @@ async def test_task_creation_freezes_current_ready_knowledge_versions(database) 
         prompt_id=prompt_id,
         chunk_count=5,
     )
+    await _seed_ready_knowledge(database, prompt_id=prompt_id, chunk_count=600, user_id=20)
     service = OutboundRuleTaskService(database)
     async with database() as session:
         rule = await service.create_rule(session, "tenant-a", 10, _rule_payload())

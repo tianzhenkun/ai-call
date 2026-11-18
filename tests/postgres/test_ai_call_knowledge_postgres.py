@@ -20,6 +20,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
 )
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.ai_call.outbound.rule_task_service import OutboundRuleTaskService
 from app.core.base_model import MappedBase
 from app.core.exceptions import CustomException
@@ -73,6 +74,7 @@ def _reset_schema() -> None:
         drop table if exists ai_call_knowledge_version cascade;
         drop table if exists ai_call_knowledge_item cascade;
         drop table if exists ai_call_prompt_profile cascade;
+        drop table if exists ai_call_outbound_task cascade;
         drop function if exists ai_call_knowledge_ngram_tsquery(text);
         drop function if exists ai_call_knowledge_ngram_tsvector(text);
         drop function if exists ai_call_knowledge_ngrams(text, integer);
@@ -93,6 +95,7 @@ def _create_portable_schema() -> None:
                 AiCallKnowledgeChunkModel.__table__,
                 AiCallPromptKnowledgeBindingModel.__table__,
                 AiCallKnowledgeUsageModel.__table__,
+                AiCallOutboundTaskModel.__table__,
             ],
         )
     finally:
@@ -162,10 +165,12 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
     _execute(
         """
         insert into ai_call_knowledge_item (
-            id, tenant_id, display_name, content_category, created_at, updated_at
+            id, tenant_id, display_name, content_category, created_by, created_at, updated_at
         ) values
-            (1, 'tenant-a', 'A资料', 'PRODUCT_SERVICE', now(), now()),
-            (2, 'tenant-b', 'B资料', 'PRODUCT_SERVICE', now(), now());
+            (1, 'tenant-a', 'A资料', 'PRODUCT_SERVICE', 7, now(), now()),
+            (2, 'tenant-b', 'B资料', 'PRODUCT_SERVICE', 7, now(), now()),
+            (3, 'tenant-a', '其他账号资料', 'PRODUCT_SERVICE', 8, now(), now()),
+            (4, 'tenant-a', '无主资料', 'PRODUCT_SERVICE', null, now(), now());
 
         insert into ai_call_prompt_profile (
             id, tenant_id, scene_code, name, provider_key, product_info,
@@ -194,6 +199,12 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
              repeat('c', 64), now(), null),
             (21, 'tenant-b', 2, 1, 'READY', 'b/21', 'b.md', 'md',
              'text/markdown', 10, repeat('4', 64), 'text', 'v1', 'c1', 1,
+             repeat('d', 64), now(), now()),
+            (31, 'tenant-a', 3, 1, 'READY', 'a/31', 'other.md', 'md',
+             'text/markdown', 10, repeat('5', 64), 'text', 'v1', 'c1', 1,
+             repeat('d', 64), now(), now()),
+            (41, 'tenant-a', 4, 1, 'READY', 'a/41', 'unowned.md', 'md',
+             'text/markdown', 10, repeat('6', 64), 'text', 'v1', 'c1', 1,
              repeat('d', 64), now(), now());
 
         insert into ai_call_knowledge_chunk (
@@ -205,7 +216,11 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
             (103, 'tenant-a', 13, 0, '退款将在失败版本中立即到账。',
              repeat('3', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now()),
             (201, 'tenant-b', 21, 0, '退款将在另一个租户中当天到账。',
-             repeat('4', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now());
+             repeat('4', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now()),
+            (301, 'tenant-a', 31, 0, '退款将在其他账号中一个工作日内原路退回。',
+             repeat('5', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now()),
+            (401, 'tenant-a', 41, 0, '退款将在无主资料中两个工作日内原路退回。',
+             repeat('6', 64), 'TEXT', 'MARKDOWN', 'lines:1-1', now());
         """
     )
     parsed_chunk_set_sha256 = _insert_parsed_version_content()
@@ -217,18 +232,30 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
             hits = await KnowledgeSearchService.search(
                 session,
                 tenant_id="tenant-a",
-                frozen_version_ids=[11, 13, 21],
+                user_id=7,
+                frozen_version_ids=[11, 13, 21, 31, 41],
                 query="退款审核后多久原路退回",
             )
+            other_hits = await KnowledgeSearchService.search(
+                session, tenant_id="tenant-a", user_id=8,
+                frozen_version_ids=[11, 31, 41], query="退款原路退回",
+            )
+            assert [hit.version_id for hit in other_hits] == [31]
+            assert await KnowledgeSearchService.search(
+                session, tenant_id="tenant-a", user_id=9,
+                frozen_version_ids=[11, 31, 41], query="退款原路退回",
+            ) == []
             no_hit = await KnowledgeSearchService.search(
                 session,
                 tenant_id="tenant-a",
+                user_id=7,
                 frozen_version_ids=[11],
                 query="完全不相关的天气预报",
             )
             short_query = await KnowledgeSearchService.search(
                 session,
                 tenant_id="tenant-a",
+                user_id=7,
                 frozen_version_ids=[11],
                 query="退",
             )
@@ -236,6 +263,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
                 await KnowledgeSearchService.search(
                     session,
                     tenant_id="tenant-a",
+                    user_id=7,
                     frozen_version_ids=[11],
                     query="x" * 501,
                 )
@@ -243,6 +271,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
                 await KnowledgeSearchService.search(
                     session,
                     tenant_id="tenant-a",
+                    user_id=7,
                     frozen_version_ids=[11],
                     query="退款",
                     limit=6,
@@ -254,6 +283,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
             items, total = await service.list_items(
                 session,
                 tenant_id="tenant-a",
+                user_id=7,
                 page_num=1,
                 page_size=20,
             )
@@ -292,6 +322,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
             frozen = await OutboundRuleTaskService._freeze_knowledge(
                 session,
                 tenant_id="tenant-a",
+                user_id=7,
                 prompt_profile_id=101,
                 frozen_at=frozen_at,
             )
@@ -321,6 +352,16 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
                 timeout_seconds=1,
                 model_name="qwen-realtime-test",
             )
+            session.add(AiCallOutboundTaskModel(
+                id=701, tenant_id="tenant-a", validation_id=1,
+                idempotency_key="knowledge-task", request_fingerprint="a" * 64,
+                task_name="知识检索验证", task_mode="ai", status="COMPLETED",
+                execution_mode="immediate", prompt_name="场景", scene_code="intro_contract",
+                voice="test", rule_id=1, rule_name="test", rule_summary="test",
+                config_snapshot_json="{}", created_by=7,
+                created_at=frozen_at, updated_at=frozen_at,
+            ))
+            await session.commit()
             runtime_result = await runtime_service.search(
                 context=KnowledgeRuntimeContext(
                     tenant_id="tenant-a",

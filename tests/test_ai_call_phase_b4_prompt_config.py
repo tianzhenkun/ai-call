@@ -956,6 +956,7 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
         display_name="产品资料.md",
         content_category="PRODUCT_SERVICE",
         current_ready_version_id=11,
+        created_by=7,
         created_at=now,
         updated_at=now,
     )
@@ -999,11 +1000,21 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
         "variables": created["variables"],
     }
 
+    with pytest.raises(CustomException, match="知识资料已变化"):
+        await service.update_prompt_profile(
+            tenant_id=TEST_TENANT_ID,
+            profile_id=int(created["id"]),
+            values=values,
+            knowledge_version_snapshot_hash=snapshot_hash,
+            created_by=8,
+        )
+
     saved = await service.update_prompt_profile(
         tenant_id=TEST_TENANT_ID,
         profile_id=int(created["id"]),
         values=values,
         knowledge_version_snapshot_hash=snapshot_hash,
+        created_by=7,
     )
     assert saved["productInfo"] == "已确认草稿"
 
@@ -1035,6 +1046,7 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
             profile_id=int(created["id"]),
             values={**values, "product_info": "过期草稿"},
             knowledge_version_snapshot_hash=snapshot_hash,
+            created_by=7,
         )
     assert stale.value.status_code == 409
     current = await service.get_prompt_profile(

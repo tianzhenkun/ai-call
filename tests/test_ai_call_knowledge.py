@@ -618,6 +618,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         processing = await service.get_processing(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             version_id=accepted.version_id,
         )
         assert version is not None and version.status == "READY"
@@ -628,6 +629,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         download = await service.open_download(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             version_id=accepted.version_id,
             range_header="bytes=0-5",
         )
@@ -639,6 +641,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         await service.update_item(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             item_id=accepted.item_id,
             changes={"display_name": "售后知识"},
         )
@@ -1005,6 +1008,7 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         rows, total = await service.list_items(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             page_num=1,
             page_size=20,
             content_category="FAQ",
@@ -1014,6 +1018,7 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
             await service.list_items(
                 db,
                 tenant_id="tenant-a",
+                user_id=7,
                 page_num=1,
                 page_size=20,
                 content_category="UNKNOWN",
@@ -1022,6 +1027,7 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         rows, total = await service.list_items(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             page_num=1,
             page_size=20,
             content_category="PRODUCT_SERVICE",
@@ -1035,6 +1041,7 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         updated = await service.update_item(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             item_id=1,
             changes={"display_name": "正式合同知识", "note": "已审核"},
         )
@@ -1058,6 +1065,7 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
         rows, _ = await service.list_items(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             page_num=1,
             page_size=20,
         )
@@ -1072,27 +1080,28 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
             )
         assert cross_tenant.value.status_code == 400
 
-        versions = await service.list_versions(db, tenant_id="tenant-a", item_id=1)
+        versions = await service.list_versions(db, tenant_id="tenant-a", user_id=7, item_id=1)
         assert [version["id"] for version in versions] == ["12", "11"]
         with pytest.raises(CustomException) as hidden_tenant:
-            await service.get_item(db, tenant_id="tenant-a", item_id=3)
+            await service.get_item(db, tenant_id="tenant-a", user_id=7, item_id=3)
         assert hidden_tenant.value.status_code == 404
 
         # 删除场景保留资料与绑定原记录，但从正常关联展示中移除。
         profile = await db.get(AiCallPromptProfileModel, 101)
         profile.deleted_at = now
         await db.commit()
-        remaining = await service.get_item(db, tenant_id="tenant-a", item_id=1)
+        remaining = await service.get_item(db, tenant_id="tenant-a", user_id=7, item_id=1)
         assert remaining["sceneBindings"] == []
         assert await db.scalar(select(func.count()).select_from(AiCallPromptKnowledgeBindingModel)) == 1
         with pytest.raises(CustomException, match="不存在或无权管理"):
             await service.replace_scene_bindings(db, tenant_id="tenant-a", item_id=1,
                                                 prompt_profile_ids=[101], user_id=7)
 
-        await service.delete_item(db, tenant_id="tenant-a", item_id=1)
+        await service.delete_item(db, tenant_id="tenant-a", user_id=7, item_id=1)
         rows, total = await service.list_items(
             db,
             tenant_id="tenant-a",
+            user_id=7,
             page_num=1,
             page_size=20,
         )
