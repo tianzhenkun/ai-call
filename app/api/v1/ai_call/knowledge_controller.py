@@ -79,19 +79,13 @@ def get_knowledge_service() -> Any:
 
 @lru_cache(maxsize=1)
 def get_knowledge_product_info_service() -> Any:
-    from app.services.ai_call.knowledge import KnowledgeProductInfoService
-    from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
-    from app.services.ai_call.knowledge_processing import parse_stored_document, version_original
+    from app.services.ai_call.knowledge import KnowledgeProductInfoService, read_legacy_word
     from app.services.ai_call.prompt_optimization import (
         build_knowledge_product_extractor,
     )
 
     async def read_legacy_docx(version):
-        path = settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
-        if not path:
-            raise CustomException(msg="历史 Word 资料需要连接原件解析器以核对正文", status_code=503)
-        parser = KnowledgeBinaryParserClient(path, timeout_seconds=settings.AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS)
-        return await parse_stored_document(get_knowledge_service().store, version_original(version), parser)
+        return await read_legacy_word(version, store=get_knowledge_service().store)
 
     return KnowledgeProductInfoService(
         build_knowledge_product_extractor(

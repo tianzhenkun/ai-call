@@ -39,7 +39,12 @@ from app.api.v1.ai_call.model import (
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
-from app.services.ai_call.knowledge_processing import KnowledgeVersionProcessor, chunks_with_heading
+from app.services.ai_call.knowledge_processing import (
+    KnowledgeVersionProcessor,
+    chunks_with_heading,
+    parse_stored_document,
+    version_original,
+)
 from app.services.ai_call.prompt_optimization import KnowledgeProductExtractorProtocol
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
@@ -87,42 +92,52 @@ class KnowledgeSearchService:
     retriever_version = RETRIEVER_VERSION
     _SEARCH_SQL = text(
         """
-        with query_features as (
+        with query_features as materialized (
             select ai_call_knowledge_ngram_tsquery(:query) as query_value
+        ), scoped_versions as (
+            select version.id, version.extension, version.source_filename
+            from ai_call_knowledge_version as version
+            join ai_call_knowledge_item as item
+              on item.id = version.knowledge_item_id and item.tenant_id = version.tenant_id
+            where version.tenant_id = :tenant_id and item.created_by = :user_id
+              and version.id = any(:frozen_version_ids) and version.status = 'READY'
+              and version.byte_size between 1 and cast(cast(:max_bytes as jsonb) ->> version.extension as bigint)
+        ), legacy_parts as materialized (
+            select * from jsonb_to_recordset(cast(:legacy_parts as jsonb))
+                as part(chunk_id bigint, position integer, body text, heading text, checksum text)
+        ), passages as not materialized (
+            select chunk.*, version.extension, version.source_filename, legacy.position,
+                coalesce(legacy.body, chunk.content) as quote,
+                coalesce(legacy.checksum, chunk.content_checksum) as quote_checksum,
+                case when legacy.chunk_id is null then chunk.section_path else legacy.heading end as section,
+                case when legacy.body is null then chunk.ngram_tsv
+                     when chunk.ngram_tsv @@ query_value then ai_call_knowledge_ngram_tsvector(legacy.body)
+                     else ''::tsvector end as body_terms
+            from scoped_versions as version
+            join ai_call_knowledge_chunk as chunk
+              on chunk.knowledge_version_id = version.id and chunk.tenant_id = :tenant_id
+            cross join query_features
+            left join legacy_parts as legacy on legacy.chunk_id = chunk.id
+            where version.extension <> 'docx' or chunk.content_type = 'DOCX_BODY' or legacy.chunk_id is not null
+        ), heading_scores as materialized (
+            select section, ts_rank_cd(
+                array[0.05, 0.20, 0.50, 1.00]::real[], ai_call_knowledge_ngram_tsvector(section), query_value, 32
+            ) as score
+            from (select distinct section from passages where extension = 'docx' and section is not null) as headings
+            cross join query_features
         )
         select
-            chunk.id as chunk_id,
-            chunk.knowledge_version_id as version_id,
-            chunk.chunk_index,
-            chunk.content,
-            chunk.content_checksum,
-            version.source_filename,
-            chunk.page_no,
-            chunk.section_path,
-            chunk.source_path,
-            chunk.start_ms,
-            chunk.end_ms,
-            ts_rank_cd(
-                array[0.05, 0.20, 0.50, 1.00]::real[],
-                chunk.ngram_tsv,
-                query_features.query_value,
-                32
-            )::double precision as score
-        from ai_call_knowledge_chunk as chunk
-        join ai_call_knowledge_version as version
-          on version.id = chunk.knowledge_version_id
-         and version.tenant_id = chunk.tenant_id
-        join ai_call_knowledge_item as item
-          on item.id = version.knowledge_item_id
-         and item.tenant_id = version.tenant_id
+            p.id as chunk_id, p.knowledge_version_id as version_id, p.chunk_index,
+            p.quote as content, p.quote_checksum as content_checksum, p.source_filename,
+            p.page_no, p.section as section_path, p.source_path, p.start_ms, p.end_ms,
+            case when p.body_terms @@ query_value then ts_rank_cd(
+                array[0.05, 0.20, 0.50, 1.00]::real[], p.body_terms, query_value, 32
+            ) else h.score end as score
+        from passages as p
         cross join query_features
-        where chunk.tenant_id = :tenant_id
-          and item.created_by = :user_id
-          and chunk.knowledge_version_id = any(:frozen_version_ids)
-          and version.status = 'READY'
-          and version.byte_size between 1 and cast(cast(:max_bytes as jsonb) ->> version.extension as bigint)
-          and chunk.ngram_tsv @@ query_features.query_value
-        order by score desc, chunk.knowledge_version_id, chunk.chunk_index, chunk.id
+        left join heading_scores as h on p.extension = 'docx' and h.section = p.section
+        where p.body_terms @@ query_value or h.score > 0
+        order by (p.body_terms @@ query_value) desc, score desc, version_id, p.chunk_index, p.id, p.position
         limit :result_limit
         """
     ).bindparams(
@@ -154,6 +169,7 @@ class KnowledgeSearchService:
         if not version_ids:
             return []
 
+        legacy_parts = await _legacy_search_parts(session, tenant_id, user_id, version_ids, query)
         rows = (
             await session.execute(
                 cls._SEARCH_SQL,
@@ -163,6 +179,7 @@ class KnowledgeSearchService:
                     "frozen_version_ids": version_ids,
                     "query": query,
                     "result_limit": limit,
+                    "legacy_parts": json.dumps(legacy_parts, ensure_ascii=False),
                 },
             )
         ).mappings()
@@ -698,6 +715,54 @@ def knowledge_version_snapshot_hash(
         sort_keys=True,
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+async def read_legacy_word(
+    version: AiCallKnowledgeVersionModel, *, store: KnowledgeObjectStore | None = None,
+) -> Content:
+    from app.config.setting import settings
+
+    path = settings.AI_CALL_KNOWLEDGE_PARSER_SOCKET.strip()
+    if not path:
+        raise CustomException(msg="历史 Word 资料需要连接原件解析器以核对正文", status_code=503)
+    if store is None:
+        store = build_knowledge_store(settings)
+    parser = KnowledgeBinaryParserClient(path, timeout_seconds=settings.AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS)
+    return await parse_stored_document(store, version_original(version), parser)
+
+
+async def _legacy_search_parts(
+    db: AsyncSession, tenant_id: str, user_id: int, version_ids: list[int], query: str,
+) -> list[dict[str, int | str | None]]:
+    version, item, chunk = AiCallKnowledgeVersionModel, AiCallKnowledgeItemModel, AiCallKnowledgeChunkModel
+    # 仅在授权的旧版 Word 切片命中时读取原件。混排切片按原件拆出正文，保留冻结的版本和切片 ID。
+    matched = select(chunk.knowledge_version_id).where(
+        chunk.tenant_id == tenant_id, chunk.knowledge_version_id.in_(version_ids),
+        chunk.content_type.not_in(("DOCX_HEADING", "DOCX_BODY")),
+        text("ngram_tsv @@ ai_call_knowledge_ngram_tsquery(:query)"),
+    ).distinct().cte("matched_legacy").prefix_with("MATERIALIZED")
+    rows = await db.execute(
+        select(version, chunk)
+        .join(matched, matched.c.knowledge_version_id == version.id)
+        .join(item, and_(item.tenant_id == version.tenant_id, item.id == version.knowledge_item_id))
+        .join(chunk, and_(chunk.tenant_id == version.tenant_id, chunk.knowledge_version_id == version.id))
+        .where(
+            version.tenant_id == tenant_id, item.created_by == user_id, version.extension == "docx",
+            version.status == "READY", _public_version(),
+        )
+        .order_by(version.id, chunk.chunk_index, chunk.id),
+        {"query": query},
+    )
+    parts = []
+    for old_version, group in groupby(rows, key=lambda row: row[0]):
+        stored = [row[1] for row in group]
+        parsed = await read_legacy_word(old_version)
+        for position, (source, quote, heading) in enumerate(_legacy_docx_body(stored, parsed)):
+            part = {"chunk_id": source.id, "position": position, "heading": heading}
+            if quote != source.content:
+                part.update(body=quote, checksum=hashlib.sha256(quote.encode()).hexdigest())
+            parts.append(part)
+    return parts
 
 
 def _legacy_docx_body(

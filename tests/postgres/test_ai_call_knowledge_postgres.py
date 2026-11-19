@@ -529,3 +529,85 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
         "postgres-ngram-tsvector-v1",
         "qwen-realtime-test",
     )
+
+
+async def test_word_search_uses_the_heading_to_locate_only_its_body(monkeypatch) -> None:
+    from lingchen_knowledge.models import Block, Parsed
+
+    from app.services.ai_call import knowledge
+
+    _reset_schema()
+    _create_portable_schema()
+    _execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+    engine = create_async_engine(_dsn())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC)
+    heading = "蓝桥接待名额"
+    body = "每场上限八人。"
+    second_heading = "交通路线"
+    second_body = "请在东门集合。"
+    originals = {
+        11: build_content(Parsed("docx-xml-v2", (Block(heading, role="heading"),))),
+        12: build_content(Parsed("docx-xml-v2", (
+            Block(heading, role="heading"), Block(body, role="body"),
+            Block(second_heading, role="heading"), Block(second_body, role="body"),
+        ))),
+    }
+    originals[13] = originals[12]
+    originals[14] = originals[11]
+
+    reads = []
+
+    async def read_old(version):
+        assert version.id in {13, 14}
+        reads.append(version.id)
+        return originals[version.id]
+
+    try:
+        async with sessions.begin() as db:
+            for vid, content in originals.items():
+                db.add(AiCallKnowledgeItemModel(
+                    id=vid, tenant_id="local", display_name=f"{vid}.docx", content_category="FAQ",
+                    created_by=7, created_at=now, updated_at=now,
+                ))
+                chunks = list(version_chunks(vid, "local", "docx", content, now))
+                if vid in {13, 14}:
+                    # 老版本可能把标题和多段正文存为同一个不可变切片。
+                    chunks = chunks[:1]
+                    chunks[0].content_type = "TEXT"
+                    chunks[0].content = content.text
+                    chunks[0].content_checksum = hashlib.sha256(content.text.encode()).hexdigest()
+                db.add(AiCallKnowledgeVersionModel(
+                    id=vid, tenant_id="local", knowledge_item_id=vid, version_no=1, status="READY",
+                    source_object_key=f"word/{vid}", source_filename=f"{vid}.docx", extension="docx",
+                    mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    byte_size=100, sha256="a" * 64, chunk_count=len(chunks), chunk_set_sha256="b" * 64,
+                    created_at=now, ready_at=now,
+                ))
+                db.add_all(chunks)
+        async with sessions() as db:
+            async def search(vid, question, limit=5):
+                return await KnowledgeSearchService.search(
+                    db, tenant_id="local", user_id=7, frozen_version_ids=[vid], query=question, limit=limit,
+                )
+
+            assert await search(11, heading) == []
+            monkeypatch.setattr(knowledge, "read_legacy_word", read_old)
+            assert await search(14, heading) == []
+            for vid in (12, 13):
+                hits = await search(vid, heading)
+                assert [(h.section_path, h.content) for h in hits] == [(heading, body)]
+                assert hits[0].content_checksum == hashlib.sha256(body.encode()).hexdigest()
+                assert [h.content for h in await search(vid, second_heading)] == [second_body]
+                assert [h.content for h in await search(vid, "八人", limit=1)] == [body]
+                assert [h.content for h in await search(vid, heading + "东门", limit=1)] == [second_body]
+                before = len(reads)
+                assert await search(vid, "秋天落叶") == []
+                assert len(reads) == before
+            before = len(reads)
+            assert await KnowledgeSearchService.search(
+                db, tenant_id="local", user_id=8, frozen_version_ids=[13], query=heading,
+            ) == []
+            assert len(reads) == before
+    finally:
+        await engine.dispose()
