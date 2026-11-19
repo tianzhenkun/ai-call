@@ -5,9 +5,11 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import AsyncIterator, Collection, Mapping
+from bisect import bisect_left, bisect_right
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import accumulate, groupby
 from pathlib import Path
 from time import perf_counter
 from typing import Any, BinaryIO, Protocol
@@ -20,7 +22,7 @@ from lingchen_knowledge.formats import (
     validate_filename,
     validate_size,
 )
-from lingchen_knowledge.models import KnowledgeError, MediaProvider, MediaType
+from lingchen_knowledge.models import Content, KnowledgeError, MediaProvider, MediaType
 from sqlalchemy import BigInteger, and_, bindparam, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -37,7 +39,7 @@ from app.api.v1.ai_call.model import (
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
-from app.services.ai_call.knowledge_processing import KnowledgeVersionProcessor
+from app.services.ai_call.knowledge_processing import KnowledgeVersionProcessor, chunks_with_heading
 from app.services.ai_call.prompt_optimization import KnowledgeProductExtractorProtocol
 from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
@@ -698,15 +700,62 @@ def knowledge_version_snapshot_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _legacy_docx_body(
+    stored: list[AiCallKnowledgeChunkModel], parsed: Content,
+) -> Iterator[tuple[AiCallKnowledgeChunkModel, str, str | None]]:
+    if any(chunk.locator.get("role") not in ("body", "heading") for chunk in parsed.chunks):
+        raise CustomException(msg="Word 解析器尚未提供段落样式，无法核对正文", status_code=503)
+    if len(stored) == len(parsed.chunks) and all(
+        row.content == part.text for row, part in zip(stored, parsed.chunks, strict=True)
+    ):
+        for row, (part, heading) in zip(stored, chunks_with_heading(parsed), strict=True):
+            if part.locator["role"] == "body":
+                yield row, part.text, heading
+        return
+
+    # 早期版本将多个 Word 段落合为一个切片。按原文顺序对齐，只用归一化文本定位，
+    # 草稿仍取原件中的正文；不改旧切片 ID，也不把同名标题错配到另一处正文。
+    def comparable(char: str) -> str:
+        return "".join(c for c in unicodedata.normalize("NFKC", char) if not c.isspace() and c != "|")
+
+    pieces = ["".join(map(comparable, row.content)) for row in stored]
+    original = "".join(pieces)
+    ends = list(accumulate(map(len, pieces)))
+    offset = 0
+    mismatch = "历史 Word 切片与原件无法对齐，请重新解析该资料"
+    for part, heading in chunks_with_heading(parsed):
+        chars = [comparable(c) for c in part.text]
+        text = "".join(chars)
+        if not original.startswith(text, offset):
+            raise CustomException(msg=mismatch, status_code=409)
+        stop = offset + len(text)
+        if part.locator["role"] == "body" and text:
+            boundaries = list(accumulate(map(len, chars), initial=0))
+            i, start = bisect_right(ends, offset), 0
+            while offset + boundaries[start] < stop:
+                end = len(chars) if ends[i] >= stop else bisect_left(boundaries, ends[i] - offset)
+                if offset + boundaries[end] > ends[i]:
+                    raise CustomException(msg=mismatch, status_code=409)
+                quote = part.text[start:end].strip()
+                if quote:
+                    yield stored[i], quote, heading
+                i, start = i + 1, end
+        offset = stop
+    if offset != len(original):
+        raise CustomException(msg=mismatch, status_code=409)
+
+
 class KnowledgeProductInfoService:
     def __init__(
         self,
         extractor: KnowledgeProductExtractorProtocol | None,
         *,
         max_batch_chars: int = 30_000,
+        read_legacy_docx: Callable[[AiCallKnowledgeVersionModel], Awaitable[Content]] | None = None,
     ) -> None:
         self.extractor = extractor
         self.max_batch_chars = max(1, max_batch_chars)
+        self.read_legacy_docx = read_legacy_docx
 
     async def extract(
         self,
@@ -749,29 +798,13 @@ class KnowledgeProductInfoService:
             raise CustomException(msg="知识切片状态不一致，请稍后重试", status_code=409)
 
         version_by_id = {version.id: version for version in versions}
-        chunk_payloads = [
-            {
-                "chunkId": str(chunk.id),
-                "versionId": str(chunk.knowledge_version_id),
-                "versionNo": version_by_id[chunk.knowledge_version_id].version_no,
-                "sourceFilename": version_by_id[
-                    chunk.knowledge_version_id
-                ].source_filename,
-                "pageNo": chunk.page_no,
-                "sectionPath": chunk.section_path,
-                "startMs": chunk.start_ms,
-                "endMs": chunk.end_ms,
-                "content": chunk.content,
-            }
-            for chunk in chunks
-        ]
         snapshot_hash = knowledge_version_snapshot_hash(versions)
         started = perf_counter()
         try:
             result = await self._extract_batches(
                 scene_code=profile.scene_code,
                 scene_name=profile.name,
-                chunks=chunk_payloads,
+                chunks=await self._body_passages(chunks, version_by_id),
             )
         except Exception as exc:
             latency_ms = int((perf_counter() - started) * 1000)
@@ -828,6 +861,32 @@ class KnowledgeProductInfoService:
         await db.commit()
         return response
 
+    async def _body_passages(
+        self, chunks: list[AiCallKnowledgeChunkModel], versions: dict[int, AiCallKnowledgeVersionModel],
+    ) -> list[dict[str, Any]]:
+        result = []
+        for version_id, group in groupby(chunks, key=lambda c: c.knowledge_version_id):
+            version = versions[version_id]
+            rows = list(group)
+            if version.extension == "docx" and any(
+                row.content_type not in ("DOCX_BODY", "DOCX_HEADING") for row in rows
+            ):
+                if self.read_legacy_docx is None:
+                    raise CustomException(msg="历史 Word 资料需要连接原件解析器以核对正文", status_code=503)
+                passages = _legacy_docx_body(rows, await self.read_legacy_docx(version))
+            else:
+                passages = (
+                    (row, row.content, row.section_path)
+                    for row in rows if row.content_type != "DOCX_HEADING"
+                )
+            for row, quote, section in passages:
+                result.append({
+                    "chunkId": str(row.id), "versionId": str(version_id), "versionNo": version.version_no,
+                    "sourceFilename": version.source_filename, "pageNo": row.page_no,
+                    "sectionPath": section, "startMs": row.start_ms, "endMs": row.end_ms, "content": quote,
+                })
+        return result
+
     async def _extract_batches(
         self,
         *,
@@ -847,11 +906,12 @@ class KnowledgeProductInfoService:
                 ref = f"r{len(passages) + 1}"
                 passage = {**chunk, "ref": ref, "content": content}
                 passages[ref] = passage
-                if not batches or batch_chars + len(content) > self.max_batch_chars:
+                input_chars = len(content) + len(chunk.get("sectionPath") or "")
+                if not batches or batch_chars + input_chars > self.max_batch_chars:
                     batches.append([])
                     batch_chars = 0
                 batches[-1].append(passage)
-                batch_chars += len(content)
+                batch_chars += input_chars
 
         conflicts: dict[tuple[str, ...], None] = {}
 

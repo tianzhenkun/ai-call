@@ -14,6 +14,7 @@ from uuid import uuid4
 from lingchen_knowledge.documents import PdfNeedsOcr
 from lingchen_knowledge.formats import classify, validate_size
 from lingchen_knowledge.models import (
+    Chunk,
     Claim,
     Content,
     Item,
@@ -45,11 +46,20 @@ def chunk_set_hash(content: Content) -> str:
     ).hexdigest()
 
 
+def chunks_with_heading(content: Content) -> Iterator[tuple[Chunk, str | None]]:
+    heading = None
+    for chunk in content.chunks:
+        if chunk.locator.get("role") == "heading" and not chunk.locator.get("offset"):
+            heading = chunk.text
+        yield chunk, heading
+
+
 def version_chunks(
     version_id: int, tenant_id: str, extension: str, content: Content, now: datetime
 ) -> Iterator[VersionChunk]:
-    for chunk in content.chunks:
+    for chunk, heading in chunks_with_heading(content):
         locator = chunk.locator
+        role = locator.get("role")
         if "page" in locator:
             source_path = f"pages/{locator['page']}"
         elif "paragraph" in locator:
@@ -65,15 +75,49 @@ def version_chunks(
             chunk_index=chunk.ordinal - 1,
             content=chunk.text,
             content_checksum=chunk.sha256,
-            content_type="TEXT",
+            content_type={"body": "DOCX_BODY", "heading": "DOCX_HEADING"}.get(role, "TEXT"),
             source_type=extension.upper(),
             source_path=source_path,
+            section_path=heading if role == "body" else None,
             page_no=locator.get("page"),
             start_ms=locator.get("startMs"),
             end_ms=locator.get("endMs"),
             speaker_id=locator.get("speaker"),
             created_at=now,
         )
+
+
+def version_original(version: Version) -> Original:
+    return Original(version.source_object_key, version.source_filename, version.mime_type,
+                    version.byte_size, version.sha256)
+
+
+async def read_original(store: KnowledgeObjectStore, original: Original) -> bytes:
+    validate_size(original.size_bytes, maximum=classify(original.filename).max_bytes)
+    try:
+        opened = await store.open(original.ref)
+        with BytesIO() as result:
+            async for part in opened.body:
+                if result.tell() + len(part) > original.size_bytes:
+                    raise KnowledgeError("ORIGINAL_CHECKSUM_MISMATCH", "原件校验失败")
+                result.write(part)
+            return result.getvalue()
+    except KnowledgeError:
+        raise
+    except Exception as exc:
+        raise KnowledgeError("ORIGINAL_UNAVAILABLE", "暂时无法读取原件", retryable=True) from exc
+
+
+async def parse_stored_document(
+    store: KnowledgeObjectStore, original: Original, parser: KnowledgeBinaryParserClient,
+) -> Content:
+    raw = await read_original(store, original)
+    if len(raw) != original.size_bytes or hashlib.sha256(raw).hexdigest() != original.sha256:
+        raise KnowledgeError("ORIGINAL_CHECKSUM_MISMATCH", "原件校验失败")
+    with TemporaryDirectory(prefix="ai-call-knowledge-") as directory:
+        path = Path(directory) / "source"
+        await asyncio.to_thread(path.write_bytes, raw)
+        return await asyncio.to_thread(parser.parse, path, extension=Path(original.filename).suffix)
 
 
 class KnowledgeVersionProcessor:
@@ -191,13 +235,7 @@ class KnowledgeVersionProcessor:
                     status="processing",
                     created_at=version.created_at,
                     updated_at=item.updated_at,
-                    original=Original(
-                        version.source_object_key,
-                        version.source_filename,
-                        version.mime_type,
-                        version.byte_size,
-                        version.sha256,
-                    ),
+                    original=version_original(version),
                 ),
                 run_no=version.provider_run_no,
                 token=version.lease_owner,
@@ -228,21 +266,7 @@ class KnowledgeVersionProcessor:
         )
 
     async def read(self, tenant_id: str, original: Original) -> bytes:
-        validate_size(original.size_bytes, maximum=classify(original.filename).max_bytes)
-        try:
-            opened = await self.store.open(original.ref)
-            with BytesIO() as result:
-                async for part in opened.body:
-                    if result.tell() + len(part) > original.size_bytes:
-                        raise KnowledgeError("ORIGINAL_CHECKSUM_MISMATCH", "原件校验失败")
-                    result.write(part)
-                return result.getvalue()
-        except KnowledgeError:
-            raise
-        except Exception as exc:
-            raise KnowledgeError(
-                "ORIGINAL_UNAVAILABLE", "暂时无法读取原件", retryable=True
-            ) from exc
+        return await read_original(self.store, original)
 
     async def _parse_isolated(self, claim: Claim, parser: KnowledgeBinaryParserClient) -> None:
         try:
@@ -251,19 +275,7 @@ class KnowledgeVersionProcessor:
                     "PARSE_INTERRUPTED", "文档解析多次中断，可重新解析", retryable=True
                 )
             async with asyncio.timeout(self.processor.step_timeout):
-                original = claim.item.original
-                raw = await self.read(claim.item.tenant_id, original)
-                if (
-                    len(raw) != original.size_bytes
-                    or hashlib.sha256(raw).hexdigest() != original.sha256
-                ):
-                    raise KnowledgeError("ORIGINAL_CHECKSUM_MISMATCH", "原件校验失败")
-                with TemporaryDirectory(prefix="ai-call-knowledge-") as directory:
-                    path = Path(directory) / "source"
-                    await asyncio.to_thread(path.write_bytes, raw)
-                    content = await asyncio.to_thread(
-                        parser.parse, path, extension=Path(original.filename).suffix
-                    )
+                content = await parse_stored_document(self.store, claim.item.original, parser)
         except PdfNeedsOcr:
             ocr = self.providers.get("document")
             if ocr is not None:

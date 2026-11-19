@@ -96,10 +96,13 @@ class KnowledgeBinaryParserClient:
             if not isinstance(version, str) or not 0 < len(version) <= 64:
                 raise KnowledgeBinaryParseError("解析器版本不合法")
             blocks = tuple(
-                Block(text=block["text"], page=block.get("page"), paragraph=block.get("paragraph"))
+                Block(text=block["text"], page=block.get("page"), paragraph=block.get("paragraph"),
+                      role=block.get("role"))
                 for block in response["blocks"]
             )
             for block in blocks:
+                if extension.lower().lstrip(".") == "docx" and block.role not in ("heading", "body"):
+                    raise KnowledgeBinaryParseError("Word 解析器未返回标题和正文标记，请同步解析器版本")
                 if not isinstance(block.text, str) or any(
                     pos is not None and (type(pos) is not int or not 0 < pos <= 2_147_483_647)
                     for pos in (block.page, block.paragraph)

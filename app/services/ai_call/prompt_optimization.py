@@ -206,6 +206,7 @@ class OpenAICompatibleKnowledgeProductExtractor(OpenAICompatiblePromptOptimizer)
                 '{"sections":{"产品定位":[],"核心能力":[],"关键边界":[]},"conflicts":[]}。'
                 "各数组只填本次 chunks 内的 ref 字符串，由服务端按 ref 展示原文。"
                 "围绕 sceneName 选择能说明产品用途、能力、适用条件或限制的段落。"
+                "sectionPath 中的章节标题仅用于理解正文；每条结论及冲突双方都必须由 content 本身支持。"
                 "不选仅有标题、目录、问题或指令的段落，不从标题或场景名称推断服务。"
                 "不要把能做某事归为排他性限制。相互依赖的事实和条件必须一起选，缺失上下文就舍弃。"
                 "包含必要条件后以 300～600 字为参考，资料少就少选，没有事实就返回空数组。"

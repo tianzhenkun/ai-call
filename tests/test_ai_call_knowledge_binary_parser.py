@@ -84,7 +84,7 @@ def test_sidecar_rejects_pptx() -> None:
 
 def test_docx_preserves_paragraphs_and_rejects_unsafe_parts() -> None:
     parsed = parse_document(_docx("产品能力", "交付周期"), extension="docx")
-    assert parsed.parser_version == "docx-xml-v1"
+    assert parsed.parser_version == "docx-xml-v2"
     assert [(b.paragraph, b.text) for b in parsed.blocks] == [(1, "产品能力"), (2, "交付周期")]
     with pytest.raises(KnowledgeError, match="不安全"):
         parse_document(

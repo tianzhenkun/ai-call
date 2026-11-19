@@ -16,6 +16,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import httpx
 import pytest
 from fastapi import UploadFile
+from lingchen_knowledge.content import build_content
 from lingchen_knowledge.models import Block, KnowledgeError, Parsed
 from sqlalchemy import UniqueConstraint, func, inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -52,6 +53,7 @@ from app.services.ai_call.knowledge_binary_parser import (
 from app.services.ai_call.knowledge_binary_parser import (
     serve as serve_binary_parser,
 )
+from app.services.ai_call.knowledge_processing import version_chunks
 from app.services.ai_call.prompt_optimization import (
     OpenAICompatibleKnowledgeProductExtractor,
 )
@@ -383,6 +385,66 @@ async def test_product_draft_preserves_qualifiers_and_unresolved_conflicts_acros
     assert {s["excerpt"] for s in result["sources"]} == {c["content"] for c in chunks}
 
 
+@pytest.mark.anyio
+async def test_word_headings_only_supply_context_across_extraction_batches() -> None:
+    content = build_content(Parsed("docx-xml-v2", (
+        Block("无需预约。", role="body"), Block("适用条件", role="heading"),
+        Block("仅限门店。", role="body"), Block("联系方式", role="heading"),
+        Block("门店会发送邮件。", role="body"),
+    )))
+    rows = list(version_chunks(1, "tenant", "docx", content, datetime.now(UTC)))
+    version = AiCallKnowledgeVersionModel(id=1, extension="docx", source_filename="服务.docx", version_no=1)
+    calls = []
+
+    class Extractor:
+        async def extract(self, payload):
+            calls.append(payload)
+            return {"sections": {"核心能力": [p["ref"] for p in payload["chunks"]]}, "conflicts": []}
+
+    service = KnowledgeProductInfoService(Extractor(), max_batch_chars=13)
+    passages = await service._body_passages(rows, {1: version})
+    result = await service._extract_batches(scene_code="demo", scene_name="服务", chunks=passages)
+    expected = [
+        (str(rows[0].id), "无需预约。", None), (str(rows[2].id), "仅限门店。", "适用条件"),
+        (str(rows[4].id), "门店会发送邮件。", "联系方式"),
+    ]
+    assert [(s["chunkId"], s["claim"], s["sectionPath"]) for s in result["sources"]] == expected
+    assert [c["mode"] for c in calls] == ["extract", "extract", "extract", "merge"]
+    assert [(p["chunkId"], p["content"], p["sectionPath"]) for p in calls[-1]["chunks"]] == expected
+    only_headings = await service._body_passages([rows[1], rows[3]], {1: version})
+    with pytest.raises(CustomException, match="有原文依据"):
+        await service._extract_batches(scene_code="demo", scene_name="服务", chunks=only_headings)
+    assert len(calls) == 4
+
+
+@pytest.mark.anyio
+async def test_legacy_word_quotes_follow_body_positions_in_the_immutable_original() -> None:
+    title, body = "门店服务", "每场最多接待六人。"
+    content = build_content(Parsed("docx-xml-v2", (
+        Block(title, role="heading"), Block(body, role="body"),
+        Block("仅限会员", role="heading"), Block(title, role="body"),
+    )))
+    version = AiCallKnowledgeVersionModel(id=8, extension="docx", source_filename="旧资料.docx", version_no=1)
+    rows = [
+        AiCallKnowledgeChunkModel(id=11, knowledge_version_id=8, content_type="TEXT", content=title + "\n" + body),
+        AiCallKnowledgeChunkModel(id=12, knowledge_version_id=8, content_type="TEXT", content="仅限会员\n" + title),
+    ]
+
+    async def read_original(v):
+        assert v is version
+        return content
+
+    service = KnowledgeProductInfoService(None, read_legacy_docx=read_original)
+    passages = await service._body_passages(rows, {8: version})
+    assert [(p["chunkId"], p["content"], p["sectionPath"]) for p in passages] == [
+        ("11", body, title), ("12", title, "仅限会员"),
+    ]
+    rows[1].content += "原件中没有的文字"
+    with pytest.raises(CustomException, match="原件无法对齐") as error:
+        await service._body_passages(rows, {8: version})
+    assert error.value.status_code == 409
+
+
 class _Body:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
@@ -688,7 +750,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
             _docx_payload("产品能力", "交付周期"),
             "产品资料.docx",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "docx-xml-v1",
+            "docx-xml-v2",
             [None, None],
             ["paragraphs/1", "paragraphs/2"],
         ),
