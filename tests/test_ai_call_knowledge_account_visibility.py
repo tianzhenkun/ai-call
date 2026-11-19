@@ -57,8 +57,7 @@ class Extractor:
         self.inputs.append(payload)
         chunk = payload["chunks"][0]
         return {
-            "draftText": chunk["content"],
-            "sources": [{"claim": chunk["content"], "chunkId": chunk["chunkId"]}],
+            "sections": {"核心能力": [chunk["ref"]]},
             "conflicts": [],
         }
 

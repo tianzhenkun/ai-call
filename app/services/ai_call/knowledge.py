@@ -43,6 +43,7 @@ from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
 
 RETRIEVER_VERSION = "postgres-ngram-tsvector-v1"
+_PRODUCT_INFO_SECTIONS = ("产品定位", "核心能力", "关键边界")
 
 _STREAM_CHUNK_BYTES = 64 * 1024
 _CONTENT_CATEGORIES = {
@@ -767,15 +768,10 @@ class KnowledgeProductInfoService:
         snapshot_hash = knowledge_version_snapshot_hash(versions)
         started = perf_counter()
         try:
-            raw_result = await self._extract_batches(
+            result = await self._extract_batches(
                 scene_code=profile.scene_code,
                 scene_name=profile.name,
                 chunks=chunk_payloads,
-            )
-            result = self._enrich_result(
-                raw_result,
-                chunks=chunks,
-                versions=version_by_id,
             )
         except Exception as exc:
             latency_ms = int((perf_counter() - started) * 1000)
@@ -796,6 +792,8 @@ class KnowledgeProductInfoService:
                 f"tenantId={tenant_id}, profileId={prompt_profile_id}, "
                 f"errorType={type(exc).__name__}"
             )
+            if isinstance(exc, CustomException):
+                raise
             raise CustomException(msg="产品信息提取失败，请稍后重试", status_code=502) from exc
 
         latency_ms = int((perf_counter() - started) * 1000)
@@ -837,160 +835,110 @@ class KnowledgeProductInfoService:
         scene_name: str,
         chunks: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        assert self.extractor is not None
+        passages: dict[str, dict[str, Any]] = {}
         batches: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        current_chars = 0
+        batch_chars = 0
         for chunk in chunks:
-            content_chars = len(chunk["content"])
-            if current and current_chars + content_chars > self.max_batch_chars:
-                batches.append(current)
-                current = []
-                current_chars = 0
-            current.append(chunk)
-            current_chars += content_chars
-        if current:
-            batches.append(current)
+            # 保留同段内的换行、否定和限定条件，模型只能选取完整原文。
+            for paragraph in re.split(r"\n[ \t\r]*\n", chunk["content"]):
+                content = paragraph.strip()
+                if not content:
+                    continue
+                ref = f"r{len(passages) + 1}"
+                passage = {**chunk, "ref": ref, "content": content}
+                passages[ref] = passage
+                if not batches or batch_chars + len(content) > self.max_batch_chars:
+                    batches.append([])
+                    batch_chars = 0
+                batches[-1].append(passage)
+                batch_chars += len(content)
 
-        allowed_chunk_ids = {chunk["chunkId"] for chunk in chunks}
-        partials = [
-            self._normalize_model_result(
-                await self.extractor.extract({
-                    "mode": "extract",
-                    "sceneCode": scene_code,
-                    "sceneName": scene_name,
-                    "chunks": batch,
-                }),
-                allowed_chunk_ids,
-            )
-            for batch in batches
-        ]
+        conflicts: dict[tuple[str, ...], None] = {}
+
+        async def select(batch: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+            assert self.extractor is not None
+            result = await self.extractor.extract({
+                "mode": mode, "sceneCode": scene_code, "sceneName": scene_name, "chunks": batch,
+            })
+            by_ref = {passage["ref"]: passage for passage in batch}
+
+            def checked_refs(value: Any) -> list[str]:
+                if not isinstance(value, list) or len(value) > 200 or any(
+                    not isinstance(ref, str) or ref not in by_ref for ref in value
+                ):
+                    raise ValueError("提取结果引用了本批原文以外的内容")
+                return list(dict.fromkeys(value))
+
+            sections = result.get("sections")
+            if not isinstance(sections, dict) or sections.keys() - set(_PRODUCT_INFO_SECTIONS):
+                raise ValueError("产品信息草稿分组错误")
+            selected: dict[str, dict[str, Any]] = {}
+            for section in _PRODUCT_INFO_SECTIONS:
+                for ref in checked_refs(sections.get(section, [])):
+                    selected.setdefault(ref, {**by_ref[ref], "section": section})
+            groups = result.get("conflicts")
+            if not isinstance(groups, list) or len(groups) > 100:
+                raise ValueError("冲突列表格式错误")
+            for group in groups:
+                refs = checked_refs(group)
+                if len(refs) < 2:
+                    raise ValueError("冲突需要至少两条不同的原文")
+                conflicts[tuple(sorted(refs))] = None
+                for ref in refs:
+                    selected[ref] = passages[ref]
+            return list(selected.values())
+
+        partials = [selected for batch in batches if (selected := await select(batch, "extract"))]
         while len(partials) > 1:
-            merged: list[dict[str, Any]] = []
+            merged = []
             for offset in range(0, len(partials), 4):
                 group = partials[offset : offset + 4]
-                if len(group) == 1:
-                    merged.append(group[0])
-                    continue
-                merged.append(
-                    self._normalize_model_result(
-                        await self.extractor.extract({
-                            "mode": "merge",
-                            "sceneCode": scene_code,
-                            "sceneName": scene_name,
-                            "partials": group,
-                        }),
-                        allowed_chunk_ids,
-                    )
+                selected = group[0] if len(group) == 1 else await select(
+                    [passage for part in group for passage in part], "merge"
                 )
+                if selected:
+                    merged.append(selected)
             partials = merged
-        if not partials:
-            raise ValueError("没有可提取的知识切片")
-        return partials[0]
 
-    @staticmethod
-    def _normalize_model_result(
-        result: dict[str, Any],
-        allowed_chunk_ids: set[str],
-    ) -> dict[str, Any]:
-        if not isinstance(result, dict):
-            raise ValueError("提取响应不是 JSON 对象")
-        draft_text = result.get("draftText")
-        headings = ("产品定位", "核心能力", "关键边界")
-        if isinstance(draft_text, dict) and draft_text.keys() == set(headings):
-            sections = []
-            for heading in headings:
-                body = draft_text[heading]
-                if isinstance(body, list) and all(isinstance(line, str) for line in body):
-                    body = "\n".join(f"- {line.strip()}" for line in body if line.strip())
-                if not isinstance(body, str):
-                    raise ValueError("产品信息草稿段落格式错误")
-                if body.strip():
-                    sections.append(f"{heading}\n{body.strip()}")
-            draft_text = "\n\n".join(sections)
-        if not isinstance(draft_text, str):
-            raise ValueError("产品信息草稿格式错误")
-        draft_text = draft_text.strip()
-        if not draft_text or len(draft_text) > 20_000:
-            raise ValueError("产品信息草稿为空或超过 20000 字符")
-
-        raw_sources = result.get("sources")
-        if not isinstance(raw_sources, list) or not raw_sources or len(raw_sources) > 200:
-            raise ValueError("产品信息草稿缺少有效来源")
-        sources: list[dict[str, str]] = []
-        seen_sources: set[tuple[str, str]] = set()
-        for source in raw_sources:
-            if not isinstance(source, dict):
-                raise ValueError("来源格式错误")
-            claim = str(source.get("claim") or "").strip()
-            chunk_id = str(source.get("chunkId") or "").strip()
-            if not claim or len(claim) > 1000 or chunk_id not in allowed_chunk_ids:
-                raise ValueError("来源引用了不存在的知识切片")
-            key = (claim, chunk_id)
-            if key not in seen_sources:
-                sources.append({"claim": claim, "chunkId": chunk_id})
-                seen_sources.add(key)
-
-        raw_conflicts = result.get("conflicts") or []
-        if not isinstance(raw_conflicts, list) or len(raw_conflicts) > 100:
-            raise ValueError("冲突列表格式错误")
-        conflicts: list[dict[str, Any]] = []
-        for conflict in raw_conflicts:
-            if not isinstance(conflict, dict):
-                raise ValueError("冲突格式错误")
-            topic = str(conflict.get("topic") or "").strip()
-            description = str(conflict.get("description") or "").strip()
-            source_chunk_ids = [
-                str(chunk_id) for chunk_id in conflict.get("sourceChunkIds") or []
-            ]
-            if (
-                not topic
-                or len(topic) > 500
-                or not description
-                or len(description) > 2000
-                or not source_chunk_ids
-                or any(chunk_id not in allowed_chunk_ids for chunk_id in source_chunk_ids)
-            ):
-                raise ValueError("冲突引用了不存在的知识切片")
-            conflicts.append({
+        # 正文、结论和引用都从同一条已验证原文生成，保留每个批次发现的冲突。
+        conflicted_refs = {ref for group in conflicts for ref in group}
+        by_section: dict[str, list[str]] = {section: [] for section in _PRODUCT_INFO_SECTIONS}
+        cited_refs = []
+        for passage in partials[0] if partials else []:
+            ref = passage["ref"]
+            if ref not in conflicted_refs:
+                by_section[passage["section"]].append(passage["content"])
+                cited_refs.append(ref)
+        sections = [
+            heading + "\n" + "\n".join("- " + quote for quote in dict.fromkeys(quotes))
+            for heading, quotes in by_section.items() if quotes
+        ]
+        conflict_details = []
+        for number, group in enumerate(conflicts, start=1):
+            alternatives = [passages[ref] for ref in group]
+            cited_refs.extend(group)
+            description = "\n".join(f"- {p['sourceFilename']}：{p['content']}" for p in alternatives)
+            topic = f"资料表述待核对（{number}）"
+            sections.append(f"{topic}\n{description}")
+            conflict_details.append({
                 "topic": topic,
                 "description": description,
-                "sourceChunkIds": source_chunk_ids,
+                "sourceChunkIds": list(dict.fromkeys(p["chunkId"] for p in alternatives)),
             })
-        return {
-            "draftText": draft_text,
-            "sources": sources,
-            "conflicts": conflicts,
-        }
-
-    @staticmethod
-    def _enrich_result(
-        result: dict[str, Any],
-        *,
-        chunks: list[AiCallKnowledgeChunkModel],
-        versions: dict[int, AiCallKnowledgeVersionModel],
-    ) -> dict[str, Any]:
-        chunk_by_id = {str(chunk.id): chunk for chunk in chunks}
+        draft_text = "\n\n".join(sections)
+        if not draft_text:
+            raise CustomException(msg="关联资料中未提取到有原文依据的产品或服务信息", status_code=422)
+        if len(draft_text) > 20_000:
+            raise ValueError("产品信息草稿超过 20000 字符")
         sources = []
-        for source in result["sources"]:
-            chunk = chunk_by_id[source["chunkId"]]
-            version = versions[chunk.knowledge_version_id]
+        for ref in dict.fromkeys(cited_refs):
+            passage = passages[ref]
             sources.append({
-                **source,
-                "versionId": str(version.id),
-                "versionNo": version.version_no,
-                "sourceFilename": version.source_filename,
-                "pageNo": chunk.page_no,
-                "sectionPath": chunk.section_path,
-                "startMs": chunk.start_ms,
-                "endMs": chunk.end_ms,
-                "excerpt": chunk.content[:200],
+                **{key: value for key, value in passage.items() if key not in ("ref", "content")},
+                "claim": passage["content"],
+                "excerpt": passage["content"],
             })
-        return {
-            "draftText": result["draftText"],
-            "sources": sources,
-            "conflicts": result["conflicts"],
-        }
+        return {"draftText": draft_text, "sources": sources, "conflicts": conflict_details}
 
     def _usage(
         self,
