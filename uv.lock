@@ -1286,7 +1286,7 @@ requires-dist = [
     { name = "greenlet", specifier = "==3.1.1" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "itsdangerous", specifier = "==2.2.0" },
-    { name = "lingchen-knowledge", extras = ["media"], path = "vendor/lingchen_knowledge-0.8.2-py3-none-any.whl" },
+    { name = "lingchen-knowledge", extras = ["media"], path = "vendor/lingchen_knowledge-0.8.3-py3-none-any.whl" },
     { name = "lingchen-platform-sdk", extras = ["nacos"], git = "ssh://git@github.com/tianzhenkun/lingchen-python-sdk.git?subdirectory=packages%2Flingchen-platform-sdk&rev=485b8a77e203bc769c9d24e4109fea723ef1c9b9" },
     { name = "livekit", specifier = ">=1.1,<2.0" },
     { name = "livekit-api", specifier = ">=1.0,<2.0" },
@@ -1320,13 +1320,13 @@ dev = [{ name = "ruff", specifier = ">=0.14.13" }]
 
 [[package]]
 name = "lingchen-knowledge"
-version = "0.8.2"
-source = { path = "vendor/lingchen_knowledge-0.8.2-py3-none-any.whl" }
+version = "0.8.3"
+source = { path = "vendor/lingchen_knowledge-0.8.3-py3-none-any.whl" }
 dependencies = [
     { name = "pypdf" },
 ]
 wheels = [
-    { filename = "lingchen_knowledge-0.8.2-py3-none-any.whl", hash = "sha256:911b3e09b2acc1b09ae7ffd33996ce32c4702d6e0ad989e1cdb6243d48c04750" },
+    { filename = "lingchen_knowledge-0.8.3-py3-none-any.whl", hash = "sha256:ac5e8f53120bccc5796215ecf9647a53aa12e3b01098f641545ee05e3f9694ad" },
 ]
 
 [package.optional-dependencies]
