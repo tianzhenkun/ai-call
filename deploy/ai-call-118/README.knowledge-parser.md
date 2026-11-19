@@ -7,7 +7,7 @@
 ```bash
 docker build --platform linux/amd64 \
   -f deploy/ai-call-118/Dockerfile.knowledge-parser \
-  -t ai-call-transfer/knowledge-parser:lingchen-knowledge-0.8.0 .
+  -t ai-call-transfer/knowledge-parser:lingchen-knowledge-0.8.1 .
 ```
 
 部署前先备份数据库，并将

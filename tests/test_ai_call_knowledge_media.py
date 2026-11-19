@@ -120,7 +120,8 @@ async def test_audio_sends_only_the_signed_transcoded_track_then_cleans_up(monke
 
 
 @pytest.mark.anyio
-async def test_ocr_handles_images_and_scan_pages_with_shared_adapter():
+@pytest.mark.parametrize("bucket", [2, 4])
+async def test_ocr_handles_images_and_scan_pages_with_shared_adapter(bucket):
     image = BytesIO()
     Image.new("RGB", (12, 12)).save(image, format="JPEG")
     pdf = BytesIO()
@@ -138,7 +139,7 @@ async def test_ocr_handles_images_and_scan_pages_with_shared_adapter():
                     "data": {
                         "state": "done",
                         "resultUrl": {
-                            "jsonUrl": "https://paddleocr-store-4.bj.bcebos.com/result.jsonl"
+                            "jsonUrl": f"https://paddleocr-store-{bucket}.bj.bcebos.com/result.jsonl"
                         },
                     }
                 },
