@@ -550,6 +550,14 @@ def _public_version():
     return version.byte_size.between(1, case(_MAX_BYTES, value=version.extension))
 
 
+def _version_retryable(version: AiCallKnowledgeVersionModel) -> bool:
+    # 老版本把结果地址被拒记为不可重试。已有 OCR 任务号可以安全续查。
+    return version.failure_retryable or (
+        version.status == "FAILED" and version.failure_code == "PROVIDER_URL_INVALID"
+        and version.provider_name == "paddleocr" and bool(version.provider_job_id)
+    )
+
+
 def _public_item_versions():
     item = AiCallKnowledgeItemModel
     version = AiCallKnowledgeVersionModel
@@ -2033,7 +2041,7 @@ class KnowledgeService:
             "attemptCount": version.attempt_count,
             "failureCode": version.failure_code,
             "failureMessage": version.failure_message,
-            "failureRetryable": version.failure_retryable,
+            "failureRetryable": _version_retryable(version),
             "createdBy": (str(version.created_by) if version.created_by is not None else None),
             "createdAt": version.created_at,
             "readyAt": version.ready_at,
@@ -2059,7 +2067,7 @@ class KnowledgeService:
             else None,
             "failureCode": version.failure_code,
             "failureMessage": version.failure_message,
-            "failureRetryable": version.failure_retryable,
+            "failureRetryable": _version_retryable(version),
         }
 
     async def open_download(
@@ -2115,7 +2123,7 @@ class KnowledgeService:
         version = await self._get_version(
             db, tenant_id, user_id, version_id, for_update=True,
         )
-        if version.status != "FAILED" or not version.failure_retryable:
+        if version.status != "FAILED" or not _version_retryable(version):
             raise CustomException(msg="当前失败不可重试，请上传新版本", status_code=409)
         version.status = "PROCESSING"
         version.attempt_count = 0

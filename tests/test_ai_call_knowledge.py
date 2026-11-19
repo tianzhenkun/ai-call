@@ -949,6 +949,40 @@ async def test_unknown_provider_submission_is_held_without_resubmitting(shared_p
 
 
 @pytest.mark.anyio
+async def test_retry_resumes_legacy_ocr_result_with_the_existing_job(shared_processing):
+    sessions, store = shared_processing
+    service = KnowledgeService(store)
+    accepted = await _accept_media(sessions, store, "资料.png", "image/png", b"\x89PNG\r\n\x1a\n")
+    args = {"tenant_id": "tenant-a", "user_id": 7, "version_id": accepted.version_id}
+    async with sessions() as db:
+        row = await db.get(AiCallKnowledgeVersionModel, accepted.version_id)
+        row.status, row.failure_code, row.failure_retryable = "FAILED", "PROVIDER_URL_INVALID", False
+        row.provider_name = "paddleocr"
+        await db.commit()
+        assert not (await service.get_processing(db, **args))["failureRetryable"]
+        with pytest.raises(CustomException):
+            await service.retry(db, **args)
+        row.provider_job_id = "stored-job"
+        await db.commit()
+        assert service._version_to_dict(row)["failureRetryable"]
+        assert (await service.get_processing(db, **args))["failureRetryable"]
+        assert (await service.retry(db, **args))["status"] == "PROCESSING"
+
+    class ExistingJob:
+        name = "paddleocr"
+
+        async def poll(self, job_id):
+            assert job_id == "stored-job"
+            return Parsed("paddleocr:test", (Block("已取回的文字", page=1),))
+
+    worker = KnowledgeWorker(sessions, store, worker_id="ocr-retry", providers={"image": ExistingJob()})
+    assert await worker.run_once()
+    async with sessions() as db:
+        row = await db.get(AiCallKnowledgeVersionModel, accepted.version_id)
+        assert (row.status, row.provider_job_id, row.chunk_count) == ("READY", "stored-job", 1)
+
+
+@pytest.mark.anyio
 async def test_retry_continues_known_job_and_expired_job_creates_a_new_run(
     shared_processing,
 ) -> None:

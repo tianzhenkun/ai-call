@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+from lingchen_knowledge import links
 from lingchen_knowledge.models import Claim, Item, KnowledgeError, Original
 from PIL import Image
 
@@ -120,8 +121,8 @@ async def test_audio_sends_only_the_signed_transcoded_track_then_cleans_up(monke
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("bucket", [2, 4])
-async def test_ocr_handles_images_and_scan_pages_with_shared_adapter(bucket):
+@pytest.mark.parametrize("bucket", [2, 27])
+async def test_ocr_handles_images_and_scan_pages_with_shared_adapter(bucket, monkeypatch):
     image = BytesIO()
     Image.new("RGB", (12, 12)).save(image, format="JPEG")
     pdf = BytesIO()
@@ -144,18 +145,18 @@ async def test_ocr_handles_images_and_scan_pages_with_shared_adapter(bucket):
                     }
                 },
             )
-        assert "Authorization" not in request.headers
-        return httpx.Response(
-            200,
-            json={
-                "result": {
-                    "layoutParsingResults": [
-                        {"markdown": {"text": "第一页"}},
-                        {"markdown": {"text": "第二页"}},
-                    ]
-                }
-            },
-        )
+        pytest.fail("任务客户端只应调用百度 OCR 接口")
+
+    async def result(request):
+        assert urlsplit(request.url).hostname == f"paddleocr-store-{bucket}.bj.bcebos.com"
+        assert request.address == "8.8.8.8"
+        body = {"result": {"layoutParsingResults": [
+            {"markdown": {"text": "第一页"}}, {"markdown": {"text": "第二页"}},
+        ]}}
+        return links.LinkResponse(200, {}, json.dumps(body).encode())
+
+    monkeypatch.setattr(links, "_default_dns", AsyncMock(return_value=[("8.8.8.8", 4)]))
+    monkeypatch.setattr(links, "_default_transport", result)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         settings = Settings(
