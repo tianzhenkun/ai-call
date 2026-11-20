@@ -23,14 +23,18 @@ from app.core.exceptions import CustomException
 from app.services.ai_call.call_outcome import business_call_result, detect_answer_type
 from app.services.ai_call.credit_metering import (
     CreditMeteringClient,
+    CreditMeteringRejected,
+    CreditMeteringUnavailable,
+    prepare_outbound_credit_resume,
     require_credit_eligible_for_request,
 )
 from app.services.ai_call.livekit_sip import (
     SipOutboundConfig,
     validate_sip_outbound_preflight,
 )
-from app.services.ai_call.realtime_model import validate_realtime_model
+from app.services.ai_call.realtime_model import REACH_REALTIME_MODEL, validate_realtime_model
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
+from app.services.ai_call.task_billing import query_task_billing
 from app.utils.id_util import generate_snowflake_id
 
 from .attempt_projection import complete_exception_batch_if_done, refresh_task_counters
@@ -54,6 +58,7 @@ from .rule_task_schema import (
     OutboundTaskOut,
     RetryableResultMeta,
     SingleValidationRequest,
+    TaskBillingSummaryOut,
     UpdateTaskScheduleRequest,
 )
 from .service import PHONE_PATTERN
@@ -281,7 +286,7 @@ class OutboundRuleTaskService:
                 msg="手机号格式错误",
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        await self._resolve_references(db, tenant_id, request)
+        await self._resolve_references(db, tenant_id, request, user_id=user_id)
         line = (
             await self.line_service.resolve_default(db, tenant_id)
             if request.answer_mode == "linphone"
@@ -363,7 +368,8 @@ class OutboundRuleTaskService:
         )
         if existing is not None:
             if (
-                existing.validation_id != validation_id
+                existing.created_by != user_id
+                or existing.validation_id != validation_id
                 or existing.request_fingerprint != fingerprint
             ):
                 raise CustomException(
@@ -383,6 +389,7 @@ class OutboundRuleTaskService:
             select(AiCallOutboundValidationModel).where(
                 AiCallOutboundValidationModel.tenant_id == tenant_id,
                 AiCallOutboundValidationModel.id == validation_id,
+                AiCallOutboundValidationModel.created_by == user_id,
             )
         )
         if validation is None:
@@ -416,6 +423,7 @@ class OutboundRuleTaskService:
             db,
             tenant_id,
             request,
+            user_id=user_id,
             lock_tenant_voice=True,
         )
         now = _now()
@@ -437,6 +445,7 @@ class OutboundRuleTaskService:
         knowledge_snapshot = await self._freeze_knowledge(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             prompt_profile_id=prompt.id,
             frozen_at=now,
         )
@@ -538,6 +547,7 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         prompt_profile_id: int,
         frozen_at: datetime,
     ) -> dict[str, object]:
@@ -550,6 +560,7 @@ class OutboundRuleTaskService:
         versions = await load_current_ready_knowledge_versions(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             prompt_profile_id=prompt_profile_id,
         )
         chunk_count = sum(version.chunk_count for version in versions)
@@ -687,6 +698,7 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         tenant_id: str,
         *,
+        user_id: int | None = None,
         page_num: int,
         page_size: int,
         task_name: str | None,
@@ -696,6 +708,8 @@ class OutboundRuleTaskService:
         scene_code: str | None = None,
     ) -> tuple[list[OutboundTaskOut], int]:
         conditions = [AiCallOutboundTaskModel.tenant_id == tenant_id]
+        if user_id is not None:
+            conditions.append(AiCallOutboundTaskModel.created_by == user_id)
         if task_name and task_name.strip():
             conditions.append(AiCallOutboundTaskModel.task_name.contains(task_name.strip()))
         if task_status and task_status.strip():
@@ -746,6 +760,15 @@ class OutboundRuleTaskService:
             )
             for task in tasks
         ], total
+
+    async def get_task_billing(
+        self, db: AsyncSession, tenant_id: str, task_id: int,
+    ) -> TaskBillingSummaryOut:
+        task = await self._get_task(db, tenant_id, task_id)
+        try:
+            return await query_task_billing(db, task=task, client=self.credit_metering_client)
+        except (CreditMeteringUnavailable, CreditMeteringRejected) as exc:
+            raise CustomException(msg=f"任务费用核对失败：{exc}", status_code=503) from exc
 
     async def get_task(
         self,
@@ -832,8 +855,16 @@ class OutboundRuleTaskService:
                 "PAUSING" if await self._active_target_count(db, tenant_id, task_id) else "PAUSED"
             )
         elif action == "resume":
+            if task.answer_mode == "linphone" and self.credit_metering_client is not None:
+                await prepare_outbound_credit_resume(
+                    db,
+                    client=self.credit_metering_client,
+                    tenant_id=task.tenant_id,
+                    owner_id=str(task.created_by),
+                )
             task.status = "RUNNING"
             task.next_dispatch_at = None
+            task.error_message = None
         else:
             await db.execute(
                 update(AiCallOutboundTargetModel)
@@ -866,7 +897,7 @@ class OutboundRuleTaskService:
                     .where(
                         AiCallOutboundExceptionBatchModel.tenant_id == tenant_id,
                         AiCallOutboundExceptionBatchModel.id == batch_id,
-                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                        AiCallOutboundExceptionBatchModel.status.in_({"RUNNING", "PAUSED"}),
                     )
                     .with_for_update()
                 )
@@ -964,9 +995,9 @@ class OutboundRuleTaskService:
             dialer_type, status_code, provider_reason, hangup_cause, answer_type = (
                 latest_attempts.get(target.id) or (None, None, None, None, None)
             )
-            active_call_id, active_call_status = active_call_ids.get(
+            active_call_id, active_call_status, active_attempt_status = active_call_ids.get(
                 target.id,
-                (None, None),
+                (None, None, None),
             )
             outputs.append(
                 self.target_out(
@@ -978,6 +1009,7 @@ class OutboundRuleTaskService:
                     hangup_cause=hangup_cause,
                     active_call_id=active_call_id,
                     active_call_status=active_call_status,
+                    active_attempt_status=active_attempt_status,
                 )
             )
         return outputs, total
@@ -988,15 +1020,17 @@ class OutboundRuleTaskService:
         tenant_id: str,
         request: SingleValidationRequest | CreateTaskRequest,
         *,
+        user_id: int,
         lock_tenant_voice: bool = False,
     ) -> tuple[
         AiCallOutboundRuleModel,
         AiCallPromptProfileModel,
         AiCallVoiceProfileModel | AiCallTenantVoiceProfileModel,
     ]:
+        model = request.model or REACH_REALTIME_MODEL
         try:
             validate_realtime_model(
-                request.model,
+                model,
                 entry_type=request.answer_mode,
                 configured_model=settings.QWEN_REALTIME_MODEL,
                 vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
@@ -1047,9 +1081,10 @@ class OutboundRuleTaskService:
         voice = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             voice=request.voice,
             lock_tenant_voice=lock_tenant_voice,
-            target_model=request.model,
+            target_model=model,
         )
         return rule, prompt, voice
 
@@ -1058,6 +1093,7 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         voice: str,
         lock_tenant_voice: bool,
         target_model: str | None = None,
@@ -1065,7 +1101,8 @@ class OutboundRuleTaskService:
         builtin_voice = await db.scalar(
             select(AiCallVoiceProfileModel)
             .where(
-                AiCallVoiceProfileModel.target_model == (target_model or settings.QWEN_REALTIME_MODEL),
+                AiCallVoiceProfileModel.target_model == (target_model or REACH_REALTIME_MODEL),
+                AiCallVoiceProfileModel.voice_type == "内置",
                 AiCallVoiceProfileModel.voice == voice,
             )
             .order_by(AiCallVoiceProfileModel.sort_order, AiCallVoiceProfileModel.id)
@@ -1076,7 +1113,8 @@ class OutboundRuleTaskService:
 
         tenant_statement = select(AiCallTenantVoiceProfileModel).where(
             AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
-            AiCallTenantVoiceProfileModel.target_model == (target_model or settings.QWEN_REALTIME_MODEL),
+            AiCallTenantVoiceProfileModel.created_by == user_id,
+            AiCallTenantVoiceProfileModel.target_model == (target_model or REACH_REALTIME_MODEL),
             AiCallTenantVoiceProfileModel.voice == voice,
         )
         if lock_tenant_voice:
@@ -1085,7 +1123,7 @@ class OutboundRuleTaskService:
         if tenant_voice is not None:
             if tenant_voice.status != "ENABLED":
                 raise CustomException(
-                    msg="租户音色当前不可用",
+                    msg="自定义音色当前不可用",
                     status_code=status.HTTP_409_CONFLICT,
                 )
             return tenant_voice
@@ -1133,6 +1171,33 @@ class OutboundRuleTaskService:
                 status_code=status.HTTP_404_NOT_FOUND,
             )
         return task
+
+    async def get_browser_call(
+        self, db: AsyncSession, tenant_id: str, task_id: int, call_id: str,
+    ) -> AiCallRecordModel:
+        task = await self._get_task(db, tenant_id, task_id)
+        row = (await db.execute(
+            select(AiCallRecordModel, AiCallOutboundAttemptModel.id).join(
+                AiCallOutboundAttemptModel,
+                AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id,
+            ).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.call_id == call_id,
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.task_id == task_id,
+            )
+        )).first()
+        if row is None:
+            raise CustomException(msg="任务通话不存在", status_code=404)
+        record, attempt_id = row
+        owner = record.runtime_control_mode == "owner_command_v1"
+        if (record.business_type, record.business_id) != (
+            ("outbound_attempt", str(attempt_id)) if owner else ("outbound_task", str(task_id))
+        ):
+            raise CustomException(msg="任务通话不存在", status_code=404)
+        if task.answer_mode != "web" or record.entry_type != "web":
+            raise CustomException(msg="该任务通话不支持浏览器接听", status_code=409)
+        return record
 
     @staticmethod
     async def _get_task_for_update(
@@ -1253,6 +1318,7 @@ class OutboundRuleTaskService:
         hangup_cause: str | None = None,
         active_call_id: str | None = None,
         active_call_status: str | None = None,
+        active_attempt_status: str | None = None,
     ) -> OutboundTargetOut:
         return OutboundTargetOut(
             target_id=str(target.id),
@@ -1269,6 +1335,7 @@ class OutboundRuleTaskService:
             hangup_cause=hangup_cause,
             active_call_id=active_call_id,
             active_call_status=active_call_status,
+            active_attempt_status=active_attempt_status,
             updated_at=OutboundRuleTaskService._format_datetime(target.updated_at) or "",
         )
 
@@ -1453,7 +1520,7 @@ class OutboundRuleTaskService:
         db: AsyncSession,
         tenant_id: str,
         target_ids: list[int],
-    ) -> dict[int, tuple[str, str | None]]:
+    ) -> dict[int, tuple[str, str | None, str]]:
         if not target_ids:
             return {}
         rows = (
@@ -1462,6 +1529,7 @@ class OutboundRuleTaskService:
                     AiCallOutboundAttemptModel.target_id,
                     AiCallOutboundAttemptModel.call_id,
                     AiCallRecordModel.status,
+                    AiCallOutboundAttemptModel.status,
                 )
                 .outerjoin(
                     AiCallRecordModel,
@@ -1486,9 +1554,9 @@ class OutboundRuleTaskService:
                 )
             )
         ).all()
-        result: dict[int, tuple[str, str | None]] = {}
-        for target_id, call_id, call_status in rows:
-            result.setdefault(target_id, (call_id, call_status))
+        result: dict[int, tuple[str, str | None, str]] = {}
+        for target_id, call_id, call_status, attempt_status in rows:
+            result.setdefault(target_id, (call_id, call_status, attempt_status))
         return result
 
     @staticmethod

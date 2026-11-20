@@ -399,8 +399,12 @@ class KnowledgeSearchService:
         join ai_call_knowledge_version as version
           on version.id = chunk.knowledge_version_id
          and version.tenant_id = chunk.tenant_id
+        join ai_call_knowledge_item as item
+          on item.id = version.knowledge_item_id
+         and item.tenant_id = version.tenant_id
         cross join query_features
         where chunk.tenant_id = :tenant_id
+          and item.created_by = :user_id
           and chunk.knowledge_version_id = any(:frozen_version_ids)
           and version.status = 'READY'
           and chunk.ngram_tsv @@ query_features.query_value
@@ -415,12 +419,14 @@ class KnowledgeSearchService:
         session: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         frozen_version_ids: list[int] | tuple[int, ...],
         query: str,
         limit: int = 5,
     ) -> list[KnowledgeSearchHit]:
         if not tenant_id.strip():
             raise ValueError("tenant_id 不能为空")
+        user_id = _require_knowledge_user(user_id)
         if not query.strip():
             return []
         if len(query) > 500:
@@ -436,6 +442,7 @@ class KnowledgeSearchService:
                 cls._SEARCH_SQL,
                 {
                     "tenant_id": tenant_id,
+                    "user_id": user_id,
                     "frozen_version_ids": version_ids,
                     "query": query,
                     "result_limit": limit,
@@ -531,6 +538,17 @@ def _canonical_positive_id(value: Any) -> int | None:
     return parsed if parsed > 0 and str(parsed) == value else None
 
 
+def _require_knowledge_user(user_id: int | None) -> int:
+    owner_id = _canonical_positive_id(user_id)
+    if owner_id is None:
+        raise CustomException(msg="账号上下文缺失", status_code=401)
+    return owner_id
+
+
+def _account_upload_key(user_id: int, key: str) -> str:
+    return f"account:{user_id}:{hashlib.sha256(key.encode()).hexdigest()}"
+
+
 def _normalize_knowledge_query(value: str) -> str:
     return "".join(
         char
@@ -623,15 +641,34 @@ class KnowledgeRealtimeSearchService:
         context: KnowledgeRuntimeContext,
         query: str,
     ) -> list[KnowledgeSearchHit]:
+        from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
+
         if context.retriever_version != RETRIEVER_VERSION:
             raise ValueError("不支持的知识检索器版本")
         async with self.session_factory() as db:
+            user_id = await db.scalar(
+                select(AiCallOutboundTaskModel.created_by).where(
+                    AiCallOutboundTaskModel.id == context.task_id,
+                    AiCallOutboundTaskModel.tenant_id == context.tenant_id,
+                )
+            )
+            user_id = _require_knowledge_user(user_id)
             versions = list(
                 (
                     await db.scalars(
                         select(AiCallKnowledgeVersionModel)
+                        .join(
+                            AiCallKnowledgeItemModel,
+                            and_(
+                                AiCallKnowledgeItemModel.id
+                                == AiCallKnowledgeVersionModel.knowledge_item_id,
+                                AiCallKnowledgeItemModel.tenant_id
+                                == AiCallKnowledgeVersionModel.tenant_id,
+                            ),
+                        )
                         .where(
                             AiCallKnowledgeVersionModel.tenant_id == context.tenant_id,
+                            AiCallKnowledgeItemModel.created_by == user_id,
                             AiCallKnowledgeVersionModel.id.in_(context.version_ids),
                             AiCallKnowledgeVersionModel.status == "READY",
                         )
@@ -648,6 +685,7 @@ class KnowledgeRealtimeSearchService:
             return await KnowledgeSearchService.search(
                 db,
                 tenant_id=context.tenant_id,
+                user_id=user_id,
                 frozen_version_ids=context.version_ids,
                 query=query,
             )
@@ -780,8 +818,10 @@ async def load_current_ready_knowledge_versions(
     db: AsyncSession,
     *,
     tenant_id: str,
+    user_id: int | None,
     prompt_profile_id: int,
 ) -> list[AiCallKnowledgeVersionModel]:
+    user_id = _require_knowledge_user(user_id)
     return list(
         (
             await db.scalars(
@@ -813,6 +853,7 @@ async def load_current_ready_knowledge_versions(
                     ).exists(),
                     AiCallKnowledgeVersionModel.status == "READY",
                     AiCallKnowledgeItemModel.tenant_id == tenant_id,
+                    AiCallKnowledgeItemModel.created_by == user_id,
                     AiCallKnowledgeItemModel.deleted_at.is_(None),
                     AiCallKnowledgeItemModel.current_ready_version_id
                     == AiCallKnowledgeVersionModel.id,
@@ -864,7 +905,6 @@ class KnowledgeProductInfoService:
         prompt_profile_id: int,
         user_id: int,
     ) -> dict[str, Any]:
-        del user_id
         if self.extractor is None:
             raise CustomException(msg="产品信息提取服务未配置", status_code=503)
         profile = await db.scalar(
@@ -880,6 +920,7 @@ class KnowledgeProductInfoService:
         versions = await load_current_ready_knowledge_versions(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             prompt_profile_id=prompt_profile_id,
         )
         if not versions:
@@ -1563,6 +1604,7 @@ class KnowledgeService:
         item_id: int | None = None,
     ) -> KnowledgeUploadResult:
         tenant_id = tenant_id.strip()
+        user_id = _require_knowledge_user(user_id)
         key = idempotency_key.strip()
         if not tenant_id:
             raise CustomException(msg="租户上下文缺失", status_code=401)
@@ -1578,7 +1620,7 @@ class KnowledgeService:
         operation = "CREATE_VERSION" if item_id is not None else "CREATE_ITEM"
         fingerprint = _upload_fingerprint(operation, item_id, upload)
 
-        replay = await self._find_replay(db, tenant_id, operation, key, fingerprint)
+        replay = await self._find_replay(db, tenant_id, user_id, operation, key, fingerprint)
         if replay is not None:
             return replay
 
@@ -1603,6 +1645,7 @@ class KnowledgeService:
                 .where(
                     AiCallKnowledgeItemModel.id == item_id,
                     AiCallKnowledgeItemModel.tenant_id == tenant_id,
+                    AiCallKnowledgeItemModel.created_by == user_id,
                     AiCallKnowledgeItemModel.deleted_at.is_(None),
                 )
                 .with_for_update()
@@ -1637,7 +1680,7 @@ class KnowledgeService:
             byte_size=upload.byte_size,
             sha256=upload.sha256,
             upload_operation=operation,
-            upload_idempotency_key=key,
+            upload_idempotency_key=_account_upload_key(user_id, key),
             upload_request_fingerprint=fingerprint,
             created_by=user_id,
             created_at=now,
@@ -1650,6 +1693,7 @@ class KnowledgeService:
             replay = await self._find_replay(
                 db,
                 tenant_id,
+                user_id,
                 operation,
                 key,
                 fingerprint,
@@ -1726,15 +1770,26 @@ class KnowledgeService:
         self,
         db: AsyncSession,
         tenant_id: str,
+        user_id: int,
         operation: str,
         key: str,
         fingerprint: str,
     ) -> KnowledgeUploadResult | None:
         version = await db.scalar(
-            select(AiCallKnowledgeVersionModel).where(
+            select(AiCallKnowledgeVersionModel).join(
+                AiCallKnowledgeItemModel,
+                and_(
+                    AiCallKnowledgeItemModel.id == AiCallKnowledgeVersionModel.knowledge_item_id,
+                    AiCallKnowledgeItemModel.tenant_id == AiCallKnowledgeVersionModel.tenant_id,
+                ),
+            ).where(
                 AiCallKnowledgeVersionModel.tenant_id == tenant_id,
+                AiCallKnowledgeItemModel.created_by == user_id,
+                AiCallKnowledgeVersionModel.created_by == user_id,
                 AiCallKnowledgeVersionModel.upload_operation == operation,
-                AiCallKnowledgeVersionModel.upload_idempotency_key == key,
+                AiCallKnowledgeVersionModel.upload_idempotency_key.in_(
+                    [_account_upload_key(user_id, key), key]
+                ),
             )
         )
         if version is None:
@@ -1784,11 +1839,13 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         page_num: int,
         page_size: int,
         content_category: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         tenant_id = tenant_id.strip()
+        user_id = _require_knowledge_user(user_id)
         if not tenant_id:
             raise CustomException(msg="租户上下文缺失", status_code=401)
         if page_num < 1 or not 1 <= page_size <= 100:
@@ -1809,6 +1866,7 @@ class KnowledgeService:
         )
         conditions = [
             AiCallKnowledgeItemModel.tenant_id == tenant_id,
+            AiCallKnowledgeItemModel.created_by == user_id,
             AiCallKnowledgeItemModel.deleted_at.is_(None),
             visible_version,
         ]
@@ -1919,9 +1977,10 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         item_id: int,
     ) -> dict[str, Any]:
-        item = await self._get_item_record(db, tenant_id, item_id)
+        item = await self._get_item_record(db, tenant_id, user_id, item_id)
         versions = await self._list_version_models(db, tenant_id, item_id)
         bindings = await self._scene_bindings(db, tenant_id, item_id)
         return self._item_to_dict(
@@ -1937,9 +1996,10 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         item_id: int,
     ) -> list[dict[str, Any]]:
-        await self._get_item_record(db, tenant_id, item_id)
+        await self._get_item_record(db, tenant_id, user_id, item_id)
         return [
             self._version_to_dict(version)
             for version in await self._list_version_models(db, tenant_id, item_id)
@@ -1950,16 +2010,17 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         item_id: int,
         changes: dict[str, Any],
     ) -> dict[str, Any]:
         values = _normalize_item_changes(changes)
-        item = await self._get_item_record(db, tenant_id, item_id, for_update=True)
+        item = await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
         for field, value in values.items():
             setattr(item, field, value)
         item.updated_at = datetime.now(timezone.utc)
         await db.commit()
-        return await self.get_item(db, tenant_id=tenant_id, item_id=item_id)
+        return await self.get_item(db, tenant_id=tenant_id, user_id=user_id, item_id=item_id)
 
     async def replace_scene_bindings(
         self,
@@ -1990,7 +2051,7 @@ class KnowledgeService:
         )
         if {profile.id for profile in profiles} != set(profile_ids):
             raise CustomException(msg="提示词配置不存在或无权管理", status_code=400)
-        await self._get_item_record(db, tenant_id, item_id, for_update=True)
+        await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
 
         await db.execute(
             delete(AiCallPromptKnowledgeBindingModel).where(
@@ -2018,9 +2079,10 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         item_id: int,
     ) -> dict[str, Any]:
-        item = await self._get_item_record(db, tenant_id, item_id, for_update=True)
+        item = await self._get_item_record(db, tenant_id, user_id, item_id, for_update=True)
         now = datetime.now(timezone.utc)
         item.deleted_at = now
         item.updated_at = now
@@ -2037,11 +2099,13 @@ class KnowledgeService:
     async def _get_item_record(
         db: AsyncSession,
         tenant_id: str,
+        user_id: int,
         item_id: int,
         *,
         for_update: bool = False,
     ) -> AiCallKnowledgeItemModel:
         tenant_id = tenant_id.strip()
+        user_id = _require_knowledge_user(user_id)
         visible_version = (
             select(AiCallKnowledgeVersionModel.id)
             .where(
@@ -2054,6 +2118,7 @@ class KnowledgeService:
         statement = select(AiCallKnowledgeItemModel).where(
             AiCallKnowledgeItemModel.id == item_id,
             AiCallKnowledgeItemModel.tenant_id == tenant_id,
+            AiCallKnowledgeItemModel.created_by == user_id,
             AiCallKnowledgeItemModel.deleted_at.is_(None),
             visible_version,
         )
@@ -2185,9 +2250,10 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         version_id: int,
     ) -> dict[str, Any]:
-        version = await self._get_version(db, tenant_id, version_id)
+        version = await self._get_version(db, tenant_id, user_id, version_id)
         return {
             "itemId": str(version.knowledge_item_id),
             "versionId": str(version.id),
@@ -2207,10 +2273,11 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         version_id: int,
         range_header: str | None,
     ) -> KnowledgeDownload:
-        version = await self._get_version(db, tenant_id, version_id)
+        version = await self._get_version(db, tenant_id, user_id, version_id)
         if version.status == "UPLOADING":
             raise CustomException(msg="文件仍在上传中", status_code=409)
         try:
@@ -2248,18 +2315,12 @@ class KnowledgeService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         version_id: int,
     ) -> dict[str, Any]:
-        version = await db.scalar(
-            select(AiCallKnowledgeVersionModel)
-            .where(
-                AiCallKnowledgeVersionModel.id == version_id,
-                AiCallKnowledgeVersionModel.tenant_id == tenant_id,
-            )
-            .with_for_update()
+        version = await self._get_version(
+            db, tenant_id, user_id, version_id, for_update=True,
         )
-        if version is None:
-            raise CustomException(msg="知识版本不存在", status_code=404)
         if version.status != "FAILED" or not version.failure_retryable:
             raise CustomException(msg="当前失败不可重试，请上传新版本", status_code=409)
         version.status = "PROCESSING"
@@ -2269,20 +2330,37 @@ class KnowledgeService:
         version.failure_code = None
         version.failure_message = None
         await db.commit()
-        return await self.get_processing(db, tenant_id=tenant_id, version_id=version_id)
+        return await self.get_processing(
+            db, tenant_id=tenant_id, user_id=user_id, version_id=version_id,
+        )
 
     @staticmethod
     async def _get_version(
         db: AsyncSession,
         tenant_id: str,
+        user_id: int,
         version_id: int,
+        *,
+        for_update: bool = False,
     ) -> AiCallKnowledgeVersionModel:
-        version = await db.scalar(
-            select(AiCallKnowledgeVersionModel).where(
+        user_id = _require_knowledge_user(user_id)
+        statement = (
+            select(AiCallKnowledgeVersionModel).join(
+                AiCallKnowledgeItemModel,
+                and_(
+                    AiCallKnowledgeItemModel.id == AiCallKnowledgeVersionModel.knowledge_item_id,
+                    AiCallKnowledgeItemModel.tenant_id == AiCallKnowledgeVersionModel.tenant_id,
+                ),
+            ).where(
                 AiCallKnowledgeVersionModel.id == version_id,
                 AiCallKnowledgeVersionModel.tenant_id == tenant_id,
+                AiCallKnowledgeItemModel.created_by == user_id,
+                AiCallKnowledgeItemModel.deleted_at.is_(None),
             )
         )
+        if for_update:
+            statement = statement.with_for_update()
+        version = await db.scalar(statement)
         if version is None:
             raise CustomException(msg="知识版本不存在", status_code=404)
         return version

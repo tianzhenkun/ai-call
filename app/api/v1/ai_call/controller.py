@@ -31,6 +31,16 @@ from app.config.setting import settings
 from app.core.dependencies import get_current_user, get_prompt_manager
 from app.core.exceptions import CustomException
 from app.core.security import OAuth2Schema
+from app.services.ai_call.billing_read import (
+    CallBillingQuery,
+    get_billing_client,
+    query_call_billing,
+)
+from app.services.ai_call.credit_metering import (
+    CreditMeteringClient,
+    CreditMeteringRejected,
+    CreditMeteringUnavailable,
+)
 from app.services.ai_call.runtime_control.command_repository import (
     IdempotencyConflictError,
     RuntimeCommandRepository,
@@ -252,6 +262,7 @@ async def create_session_controller(
     ).strip()
     if not tenant_id:
         raise HTTPException(status_code=401, detail="租户上下文缺失")
+    user_id = getattr(auth.user, "user_id", None)
     if runtime_control_mode_for_entry(settings, "web") == "owner_command_v1":
         normalized_idempotency_key = str(idempotency_key or "").strip()
         if not normalized_idempotency_key:
@@ -270,6 +281,7 @@ async def create_session_controller(
                     entry_type="web",
                     idempotency_key=normalized_idempotency_key,
                     payload={
+                        "voice_user_id": user_id,
                         **({"model": request.model} if request.model is not None else {}),
                         "voice": request.voice,
                         "business_id": request.business_id,
@@ -316,6 +328,7 @@ async def create_session_controller(
         scene_code=request.scene_code,
         business_params=request.business_params,
         tenant_id=tenant_id,
+        user_id=user_id,
     )
     return SuccessResponse(
         data=CreateSessionOut.model_validate(result),
@@ -357,6 +370,8 @@ async def create_sip_session_controller(
         Header(alias="Idempotency-Key"),
     ] = None,
 ) -> JSONResponse:
+    user_id = getattr(getattr(auth, "user", None), "user_id", None)
+    tenant_id = str(getattr(getattr(auth, "user", None), "tenant_id", "") or "").strip()
     if runtime_control_mode_for_entry(settings, "direct_sip") == "owner_command_v1":
         tenant_id = str(
             getattr(getattr(auth, "user", None), "tenant_id", "") or ""
@@ -381,6 +396,7 @@ async def create_sip_session_controller(
                     entry_type="direct_sip",
                     idempotency_key=normalized_idempotency_key,
                     payload={
+                        "voice_user_id": user_id,
                         **({"model": request.model} if request.model is not None else {}),
                         "voice": request.voice,
                         "business_id": request.business_id,
@@ -429,6 +445,8 @@ async def create_sip_session_controller(
 
     try:
         result = await service.create_sip_session(
+            tenant_id=tenant_id or None,
+            user_id=user_id,
             **({"model": request.model} if request.model is not None else {}),
             callee_phone_number=request.callee_phone_number,
             voice=request.voice,
@@ -455,14 +473,17 @@ async def _commit_ai_call_record_audit(service: AiCallService) -> None:
 
 
 async def _require_record_for_current_tenant(
+    request: Request,
     call_id: Annotated[str, Path(alias="callId")],
     auth: Annotated[AuthSchema, Depends(get_current_user)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> None:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     await service.require_record_for_tenant(
         tenant_id=tenant_id,
         call_id=call_id,
+        user_id=user_id,
+        allow_assigned_follow_up=request.method == "GET",
     )
 
 
@@ -933,9 +954,10 @@ async def list_records_controller(
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=1000)] = 10,
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.list_records(
         tenant_id=tenant_id,
+        user_id=user_id,
         call_id=call_id,
         task_id=task_id,
         target_id=target_id,
@@ -962,6 +984,22 @@ async def list_records_controller(
         page_size=page_size,
     )
     return TableResponse(rows=result["rows"], total=result["total"], msg="查询成功")
+
+
+@AiCallRouter.post("/records/billing/query", summary="按通话记录批量查询费用")
+async def query_record_billing_controller(
+    data: CallBillingQuery,
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    client: Annotated[CreditMeteringClient, Depends(get_billing_client)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    try:
+        items = await query_call_billing(
+            auth.db, tenant_id=tenant_id, user_id=user_id, call_ids=data.call_ids, client=client,
+        )
+    except (CreditMeteringUnavailable, CreditMeteringRejected) as exc:
+        raise CustomException(msg=f"通话费用核对失败：{exc}", status_code=503) from exc
+    return SuccessResponse(data={"items": items})
 
 
 @AiCallRouter.get(
@@ -1087,6 +1125,7 @@ async def review_record_classification_controller(
     "/records/{callId}/quality",
     summary="查询通话质检评分",
     response_model=ResponseSchema[QualityDetailOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def get_record_quality_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -1102,6 +1141,7 @@ async def get_record_quality_controller(
     "/records/{callId}/quality/score",
     summary="立即生成通话质检评分",
     response_model=ResponseSchema[QualityDetailOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def score_record_quality_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -1117,6 +1157,7 @@ async def score_record_quality_controller(
     "/records/{callId}/quality-review",
     summary="保存通话人工质检结果",
     response_model=ResponseSchema[QualityReviewOut],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def save_record_quality_review_controller(
     call_id: Annotated[str, Path(alias="callId")],
@@ -1147,6 +1188,7 @@ async def save_record_quality_review_controller(
     "/records/{callId}/recording",
     summary="查询通话录音",
     response_model=ResponseSchema[RecordingOut | None],
+    dependencies=[Depends(_require_record_for_current_tenant)],
 )
 async def get_recording_controller(
     call_id: Annotated[str, Path(alias="callId")],

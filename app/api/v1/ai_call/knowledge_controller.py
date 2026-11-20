@@ -211,10 +211,11 @@ async def list_knowledge_items_controller(
         Query(alias="contentCategory", max_length=20),
     ] = None,
 ) -> TableResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     rows, total = await service.list_items(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         page_num=page_num,
         page_size=page_size,
         content_category=content_category,
@@ -233,8 +234,8 @@ async def get_knowledge_item_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
-    result = await service.get_item(db, tenant_id=tenant_id, item_id=item_id)
+    tenant_id, user_id = _identity(auth)
+    result = await service.get_item(db, tenant_id=tenant_id, user_id=user_id, item_id=item_id)
     return SuccessResponse(data=result, msg="查询成功")
 
 
@@ -250,10 +251,11 @@ async def update_knowledge_item_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.update_item(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         item_id=item_id,
         changes=request.model_dump(exclude_unset=True),
     )
@@ -294,8 +296,8 @@ async def delete_knowledge_item_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
-    result = await service.delete_item(db, tenant_id=tenant_id, item_id=item_id)
+    tenant_id, user_id = _identity(auth)
+    result = await service.delete_item(db, tenant_id=tenant_id, user_id=user_id, item_id=item_id)
     return SuccessResponse(data=result, msg="删除成功")
 
 
@@ -310,8 +312,8 @@ async def list_knowledge_versions_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
-    versions = await service.list_versions(db, tenant_id=tenant_id, item_id=item_id)
+    tenant_id, user_id = _identity(auth)
+    versions = await service.list_versions(db, tenant_id=tenant_id, user_id=user_id, item_id=item_id)
     return SuccessResponse(data=versions, msg="查询成功")
 
 
@@ -326,10 +328,11 @@ async def get_knowledge_processing_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.get_processing(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         version_id=version_id,
     )
     return SuccessResponse(data=result, msg="查询成功")
@@ -346,10 +349,11 @@ async def download_knowledge_version_controller(
     service: Annotated[Any, Depends(get_knowledge_service)],
     range_header: Annotated[str | None, Header(alias="Range")] = None,
 ) -> StreamResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     download = await service.open_download(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         version_id=version_id,
         range_header=range_header,
     )
@@ -367,10 +371,11 @@ async def preview_knowledge_version_controller(
     service: Annotated[Any, Depends(get_knowledge_service)],
     range_header: Annotated[str | None, Header(alias="Range")] = None,
 ) -> StreamResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     preview = await service.open_download(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         version_id=version_id,
         range_header=range_header,
     )
@@ -421,10 +426,11 @@ async def retry_knowledge_version_controller(
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.retry(
         db,
         tenant_id=tenant_id,
+        user_id=user_id,
         version_id=version_id,
     )
     return SuccessResponse(data=result, msg="已重新进入处理队列")

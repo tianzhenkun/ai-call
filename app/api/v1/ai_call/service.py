@@ -165,7 +165,11 @@ class AiCallService:
         scene_code: str | None = None,
         business_params: dict | None = None,
         tenant_id: str | None = None,
+        user_id: int | None = None,
         model: str | None = None,
+        call_id: str | None = None,
+        business_type: str | None = None,
+        prompt_snapshot: dict | None = None,
     ) -> CreateSessionResult:
         self._ensure_legacy_entry_allowed("web")
         if model is not None:
@@ -186,7 +190,8 @@ class AiCallService:
 
             voice = voice or self.orchestrator.config.qwen_realtime_voice
             await VoiceRepository(self._ensure_prompt_repository().db).require_call_voice(
-                tenant_id=tenant_id, voice=voice, target_model=model,
+                tenant_id=tenant_id, user_id=user_id, voice=voice, target_model=model,
+                business_type=business_type, business_id=business_id,
             )
         if self.record_service is None:
             try:
@@ -203,14 +208,18 @@ class AiCallService:
                     status_code=400,
                 )
 
-        resolved_voice = await self._resolve_voice(voice, tenant_id=tenant_id, target_model=model)
-        call_id = f"call_{generate_snowflake_id()}"
+        resolved_voice = await self._resolve_voice(
+            voice, tenant_id=tenant_id, user_id=user_id, target_model=model,
+            business_type=business_type, business_id=business_id,
+        )
+        call_id = call_id or f"call_{generate_snowflake_id()}"
         if scene_code and self.prompt_repository is not None:
             from app.services.ai_call.prompt_editor import require_available_profile
             await require_available_profile(self.prompt_repository.db, tenant_id=tenant_id, scene_code=scene_code)
         room_name = f"ai-call-{call_id}"
         participant_identity = f"browser-{call_id}"
         await self.record_service.create_web_record(
+            **({"business_type": business_type} if business_type is not None else {}),
             tenant_id=tenant_id,
             call_id=call_id,
             business_id=business_id,
@@ -220,6 +229,7 @@ class AiCallService:
         try:
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=call_id,
+                user_id=user_id,
                 tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
@@ -227,6 +237,8 @@ class AiCallService:
                 debug_prompt=None,
                 voice=resolved_voice,
                 target_model=model,
+                prompt_snapshot=prompt_snapshot,
+                business_type=business_type,
             )
             await self.record_service.update_prompt_context(
                 call_id,
@@ -237,7 +249,13 @@ class AiCallService:
                     else None
                 ),
             )
+            knowledge_context = await self._resolve_legacy_knowledge_context(
+                tenant_id=tenant_id,
+                business_type=business_type,
+                business_id=business_id,
+            )
             result = await self.orchestrator.create_web_session(
+                **({"knowledge_context": knowledge_context} if knowledge_context is not None else {}),
                 voice=resolved_voice,
                 prompt=None,
                 call_id=call_id,
@@ -276,6 +294,7 @@ class AiCallService:
         ringing_timeout_seconds: int | None = None,
         before_sip_invite: Callable[[], Awaitable[None]] | None = None,
         tenant_id: str | None = None,
+        user_id: int | None = None,
         prompt_snapshot: dict | None = None,
         model: str | None = None,
     ) -> CreateSipSessionResult:
@@ -313,7 +332,8 @@ class AiCallService:
 
         resolved_voice = await self._resolve_voice(
             (voice or self.orchestrator.config.qwen_realtime_voice) if model is not None else voice,
-            tenant_id=tenant_id, target_model=model,
+            tenant_id=tenant_id, user_id=user_id, target_model=model,
+            business_type=business_type, business_id=business_id,
         )
         resolved_call_id = call_id or f"call_{generate_snowflake_id()}"
         if scene_code and self.prompt_repository is not None:
@@ -339,6 +359,7 @@ class AiCallService:
             )
             prompt_effective_config = await self._resolve_prompt_effective_config(
                 call_id=resolved_call_id,
+                user_id=user_id,
                 tenant_id=tenant_id,
                 business_id=business_id,
                 scene_code=scene_code,
@@ -400,7 +421,7 @@ class AiCallService:
             cleanup_error: Exception | None = None
             if sip_invite_sent:
                 try:
-                    await self._cleanup_sip_resources(
+                    await self._cleanup_call_resources(
                         call_id=resolved_call_id,
                         room_name=room_name,
                     )
@@ -672,6 +693,7 @@ class AiCallService:
             current_versions = await load_current_ready_knowledge_versions(
                 repository.db,
                 tenant_id=tenant_id,
+                user_id=created_by,
                 prompt_profile_id=profile_id,
             )
             if (
@@ -1182,7 +1204,7 @@ class AiCallService:
                 )
             owner_mode = record.runtime_control_mode == "owner_command_v1"
             if (
-                event_type == "browser_disconnect"
+                event_type in {"browser_disconnect", "browser_connection_failed"}
                 and self.recording_service is not None
                 and not owner_mode
             ):
@@ -1272,17 +1294,18 @@ class AiCallService:
                     )
                 )
             elif (
-                event_type == "browser_disconnect"
+                event_type in {"browser_disconnect", "browser_connection_failed"}
                 and result.payload.get("terminalSessionStatus") is None
+                and not result.payload.get("endInProgress")
             ):
                 await self.record_service.complete_session(
                     call_id,
-                    end_reason="browser_disconnect",
+                    end_reason=event_type,
                     ended_at=result.timestamp,
                 )
                 await self._finalize_handoffs_for_call(
                     call_id,
-                    end_reason="browser_disconnect",
+                    end_reason=event_type,
                 )
                 await self._enqueue_offline_asr_if_recordings_closed(
                     call_id,
@@ -1300,6 +1323,27 @@ class AiCallService:
     ) -> dict:
         if event_type not in {"participant_left", "track_published"}:
             return {"handled": False, "reason": "unsupported_event"}
+        if event_type == "participant_left" and str(participant_identity or "").startswith("browser-"):
+            call_id = participant_identity.removeprefix("browser-")
+            record = await self.record_service.get_record(call_id) if self.record_service else None
+            if (
+                record is None or record.entry_type != "web"
+                or record.runtime_control_mode != "legacy_local"
+                or record.room_name != room_name or record.participant_identity != participant_identity
+            ):
+                return {"handled": False, "reason": "browser_record_mismatch"}
+            if record.status in {"completed", "failed"}:
+                return {"handled": False, "reason": "record_terminal"}
+            try:
+                await self.orchestrator.get_session(call_id)
+            except AiCallError as exc:
+                if exc.error_id != "session_not_found":
+                    raise
+                await self.terminate_web_session(call_id, tenant_id=record.tenant_id,
+                                                 end_reason="browser_disconnect")
+            else:
+                await self.end_session(call_id, end_reason="browser_disconnect")
+            return {"handled": True, "action": "end_browser_session", "callId": call_id}
         call_id = self._call_id_from_sip_participant(participant_identity)
         if call_id is None:
             return {"handled": False, "reason": "non_sip_participant"}
@@ -1383,10 +1427,12 @@ class AiCallService:
         end_reason = sip_disconnect_end_reason(payload)
         if end_reason == "sip_participant_left":
             end_reason = "remote_hangup"
+        ended_at = hangup_event.timestamp if hangup_event is not None else datetime.now(timezone.utc)
+        end_reason = await self._sip_end_reason_at_deadline(call_id, ended_at, end_reason)
         await self.end_session(
             call_id,
             end_reason=end_reason,
-            ended_at=hangup_event.timestamp if hangup_event is not None else None,
+            ended_at=ended_at,
         )
         return {
             "handled": True,
@@ -1419,8 +1465,9 @@ class AiCallService:
                 payload=payload,
             ),
         )
+        end_reason = await self._sip_end_reason_at_deadline(call_id, hangup_event.timestamp, end_reason)
         await self.record_service.mirror_runtime_events([hangup_event])
-        await self._cleanup_sip_resources(
+        await self._cleanup_call_resources(
             call_id=call_id,
             room_name=room_name,
         )
@@ -1448,6 +1495,18 @@ class AiCallService:
             "endReason": end_reason,
         }
 
+    async def _sip_end_reason_at_deadline(
+        self, call_id: str, ended_at: datetime, end_reason: str,
+    ) -> str:
+        if self.record_service is None:
+            return end_reason
+        record = await self.record_service.get_record(call_id)
+        deadline = getattr(record, "total_call_deadline_at", None)
+        if deadline is None:
+            return end_reason
+        deadline = deadline.replace(tzinfo=timezone.utc) if deadline.tzinfo is None else deadline
+        return "max_total_call_duration" if ended_at >= deadline else end_reason
+
     async def terminate_sip_session(
         self,
         call_id: str,
@@ -1459,26 +1518,57 @@ class AiCallService:
             record = await self.record_service.get_record(call_id)
             if record is not None and record.room_name:
                 room_name = record.room_name
-        await self._cleanup_sip_resources(
+        await self._cleanup_call_resources(
             call_id=call_id,
             room_name=room_name,
         )
         if self.record_service is not None:
+            if end_reason == "max_total_call_duration":
+                await self.record_service.complete_session(
+                    call_id,
+                    end_reason=end_reason,
+                )
+                await self._finalize_handoffs_for_call(call_id, end_reason=end_reason)
+            else:
+                await self.record_service.fail_session(
+                    call_id,
+                    end_reason=end_reason,
+                    failure_stage="reconciliation",
+                    failure_message="SIP 通话状态对账超时并已终止资源",
+                )
+
+    async def terminate_web_session(self, call_id: str, *, tenant_id: str, end_reason: str) -> None:
+        room_name = f"ai-call-{call_id}"
+        preserve_terminal = False
+        if self.record_service is not None:
+            record = await self.record_service.get_record(call_id)
+            if record is not None:
+                if (record.tenant_id != tenant_id or record.entry_type != "web"
+                        or record.runtime_control_mode != "legacy_local"):
+                    raise CustomException(msg="只能清理 Legacy Web 会话", status_code=409)
+                room_name = record.room_name or room_name
+                preserve_terminal = record.status in {"completed", "failed"}
+        await self._cleanup_call_resources(
+            call_id=call_id, room_name=room_name, recording_tenant_id=tenant_id,
+        )
+        if self.record_service is not None and not preserve_terminal:
             await self.record_service.fail_session(
-                call_id,
-                end_reason=end_reason,
-                failure_stage="reconciliation",
-                failure_message="SIP 通话状态对账超时并已终止资源",
+                call_id, end_reason=end_reason, failure_stage="reconciliation",
+                failure_message="Web 任务异常终止，通话资源已清理",
             )
 
-    async def _cleanup_sip_resources(
+    async def _cleanup_call_resources(
         self,
         *,
         call_id: str,
         room_name: str,
+        recording_tenant_id: str | None = None,
     ) -> None:
-        await self.orchestrator.livekit_room_manager.delete_room(room_name)
         cleanup_errors: list[str] = []
+        try:
+            await self.orchestrator.livekit_room_manager.delete_room(room_name)
+        except Exception as exc:
+            cleanup_errors.append(f"delete_room: {type(exc).__name__}: {str(exc)[:160]}")
         try:
             await self.orchestrator.agent_runner.stop(call_id)
         except Exception as exc:
@@ -1488,7 +1578,7 @@ class AiCallService:
         if self.recording_service is not None:
             try:
                 await self.recording_service.stop_for_session(
-                    tenant_id=await self._recording_tenant_for_call(call_id),
+                    tenant_id=recording_tenant_id or await self._recording_tenant_for_call(call_id),
                     call_id=call_id,
                 )
             except Exception as exc:
@@ -1498,8 +1588,8 @@ class AiCallService:
                 )
         if cleanup_errors:
             raise AiCallError(
-                error_id="sip_cleanup_incomplete",
-                msg="SIP 房间已终止，但本地资源清理未完成",
+                error_id="session_cleanup_incomplete",
+                msg="通话资源清理未完成",
                 details={"cleanupErrors": cleanup_errors},
             )
         try:
@@ -1558,6 +1648,7 @@ class AiCallService:
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         call_id: str | None = None,
         task_id: int | None = None,
         target_id: int | None = None,
@@ -1582,6 +1673,7 @@ class AiCallService:
         self._ensure_record_service()
         rows, total = await self.record_service.list_records(
             tenant_id=tenant_id,
+            user_id=user_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,
@@ -1613,13 +1705,22 @@ class AiCallService:
         *,
         tenant_id: str,
         call_id: str,
+        user_id: int | None = None,
+        allow_assigned_follow_up: bool = False,
     ) -> None:
         self._ensure_record_service()
         if await self.record_service.get_record_for_tenant(
             tenant_id=tenant_id,
             call_id=call_id,
-        ) is None:
-            raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
+            user_id=user_id,
+        ) is not None:
+            return
+        if allow_assigned_follow_up and user_id is not None:
+            if await self.record_service.repository.has_assigned_follow_up_record(
+                tenant_id=tenant_id, call_id=call_id, user_id=user_id,
+            ):
+                return
+        raise CustomException(msg="通话记录不存在", code=RET.ERROR.code, status_code=404)
 
     async def get_record_detail(self, call_id: str) -> dict:
         self._ensure_record_service()
@@ -2681,7 +2782,10 @@ class AiCallService:
         voice: str | None,
         *,
         tenant_id: str | None = None,
+        user_id: int | None = None,
         target_model: str | None = None,
+        business_type: str | None = None,
+        business_id: str | None = None,
     ) -> str | None:
         normalized_voice = _strip_or_none(voice)
         if not normalized_voice:
@@ -2693,9 +2797,18 @@ class AiCallService:
             voice=normalized_voice,
             target_model=target_model,
         )
+        if profile is not None and profile.voice_type != "内置":
+            profile = None
         if profile is None and tenant_id:
+            from app.api.v1.ai_call.voice.repository import VoiceRepository
+
+            owner_id = await VoiceRepository(repository.db).resolve_call_user_id(
+                tenant_id=tenant_id, user_id=user_id,
+                business_type=business_type, business_id=business_id,
+            )
             profile = await repository.get_enabled_tenant_voice_profile_by_voice(
                 tenant_id=tenant_id,
+                user_id=owner_id,
                 voice=normalized_voice,
                 target_model=target_model,
             )
@@ -2755,6 +2868,7 @@ class AiCallService:
         *,
         call_id: str,
         tenant_id: str | None,
+        user_id: int | None = None,
         business_id: str | None,
         scene_code: str | None,
         business_params: dict,
@@ -2793,6 +2907,7 @@ class AiCallService:
 
         style = await VoiceRepository(self._ensure_prompt_repository().db).resolve_call_speaking_style(
             tenant_id=tenant_id,
+            user_id=user_id,
             voice=voice or self.orchestrator.config.qwen_realtime_voice,
             target_model=target_model or self.orchestrator.config.qwen_realtime_model,
             business_type=business_type,

@@ -526,6 +526,7 @@ def _build_ai_call_voice_runtime(
     from app.services.ai_call.providers.qwen_voice_enrollment import (
         QwenVoiceEnrollmentProvider,
     )
+    from app.services.ai_call.realtime_model import REACH_REALTIME_MODEL
     from app.services.ai_call.voice_enrollment_worker import VoiceEnrollmentWorker
     from app.services.ai_call.voice_sample import MinioVoiceSampleStorage
 
@@ -533,9 +534,9 @@ def _build_ai_call_voice_runtime(
     if not api_key:
         raise RuntimeError("AI Call 音色任务已启用，但服务端 DASHSCOPE_API_KEY 未配置")
     endpoint = settings.AI_CALL_VOICE_ENROLLMENT_ENDPOINT.strip()
-    target_model = settings.QWEN_REALTIME_MODEL.strip()
+    target_model = REACH_REALTIME_MODEL
     sample_prefix = settings.AI_CALL_VOICE_SAMPLE_OBJECT_PREFIX.strip().strip("/")
-    if not endpoint or not target_model or not sample_prefix:
+    if not endpoint or not sample_prefix:
         raise RuntimeError("AI Call 音色任务配置不完整")
 
     required_minio_fields = ("endpoint", "bucket_name", "access_key", "secret_key")
@@ -667,7 +668,21 @@ async def _start_ai_call_outbound_task_worker():
     )
     owner_runtime_start = None
     owner_executor_options = {}
-    if owner_mode:
+    web_dialer = None
+    if settings.AI_CALL_OUTBOUND_DIALER_MODE == "web":
+        environment = str(getattr(settings.ENVIRONMENT, "value", settings.ENVIRONMENT)).lower()
+        if (
+            environment == "prod" or owner_mode
+            or runtime_control_mode_for_entry(settings, OwnerCommandEntry.WEB) != "legacy_local"
+        ):
+            raise RuntimeError("Web 任务评估只允许非正式环境的 Legacy 运行链路")
+        from app.api.v1.ai_call.outbound.web_outbound_dialer import WebOutboundDialer
+
+        dialer = WebOutboundDialer(
+            async_db_session,
+            timeout_seconds=settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS + 60,
+        )
+    elif owner_mode:
         from app.api.v1.ai_call.outbound.owner_runtime_start import (
             OwnerRuntimeOutboundStart,
         )
@@ -690,6 +705,16 @@ async def _start_ai_call_outbound_task_worker():
         )
 
         dialer = SipOutboundDialer(async_db_session)
+        if (
+            str(getattr(settings.ENVIRONMENT, "value", settings.ENVIRONMENT)).lower() != "prod"
+            and runtime_control_mode_for_entry(settings, OwnerCommandEntry.WEB) == "legacy_local"
+        ):
+            from app.api.v1.ai_call.outbound.web_outbound_dialer import WebOutboundDialer
+
+            web_dialer = WebOutboundDialer(
+                async_db_session,
+                timeout_seconds=settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS + 60,
+            )
     else:
         dialer = MockOutboundDialer(settings.AI_CALL_OUTBOUND_MOCK_RESULT)
 
@@ -702,10 +727,11 @@ async def _start_ai_call_outbound_task_worker():
         dialing_timeout_seconds=settings.AI_CALL_OUTBOUND_DIALING_TIMEOUT_SECONDS,
         managed_attempt_timeout_seconds=(
             settings.AI_CALL_SIP_MAX_RINGING_TIMEOUT_SECONDS
-            + settings.AI_CALL_SIP_MAX_CALL_DURATION_SECONDS
+            + 1800
             + 60
         ),
         owner_runtime_start=owner_runtime_start,
+        web_dialer=web_dialer,
         credit_metering_client=CreditMeteringClient.from_settings(),
         **owner_executor_options,
     )

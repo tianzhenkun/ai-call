@@ -51,6 +51,7 @@ class AiCallRecordModel(MappedBase):
             "started_at",
         ),
         Index("idx_ai_call_record_room_name", "room_name"),
+        Index("idx_ai_call_record_total_deadline", "entry_type", "total_call_deadline_at"),
         Index(
             "idx_ai_call_record_runtime_owner_lease",
             "runtime_owner_id",
@@ -204,6 +205,18 @@ class AiCallRecordModel(MappedBase):
         DateTime(timezone=True),
         nullable=True,
         comment="用户侧进入可通话状态时间",
+    )
+    max_total_call_duration_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1800,
+        server_default=text("1800"),
+        comment="整通电话时长上限快照，秒",
+    )
+    total_call_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="客户接通后整通电话的绝对截止时间",
     )
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

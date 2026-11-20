@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     TOKEN_TYPE: str = "bearer"  # token类型
     TOKEN_REQUEST_PATH_EXCLUDE: list[str] = ["reach-api/v1/auth/login"]  # JWT路由白名单
 
-    # 信用点计费由平台产品状态统一控制；此处只有连接与签名配置，没有业务启停开关。
+    # 通话计费由平台产品状态控制；邮件待平台退信调整入口接通后单独启用。
     REACH_CREDIT_GATEWAY_BASE_URL: str = ""
     REACH_CREDIT_METERING_CLIENT_ID: str = "reach"
     REACH_CREDIT_METERING_SECRET: str = ""
@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     REACH_CREDIT_VERIFY_TLS: bool = True
     REACH_CREDIT_USAGE_POLL_INTERVAL_SECONDS: float = 1.0
     REACH_CREDIT_USAGE_LEASE_SECONDS: int = 60
+    REACH_EMAIL_CREDIT_ENABLED: bool = False
 
     # ================================================= #
     # ******************** 数据库配置 ******************* #
@@ -246,7 +247,7 @@ class Settings(BaseSettings):
     AI_CALL_KNOWLEDGE_PARSER_SOCKET: str = ""
     AI_CALL_KNOWLEDGE_PARSER_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_OUTBOUND_EXECUTOR_ENABLED: bool = False
-    AI_CALL_OUTBOUND_DIALER_MODE: Literal["mock", "sip"] = "mock"
+    AI_CALL_OUTBOUND_DIALER_MODE: Literal["mock", "sip", "web"] = "mock"
     AI_CALL_OUTBOUND_EXECUTOR_POLL_INTERVAL_SECONDS: float = 2.0
     AI_CALL_OUTBOUND_EXECUTOR_TASK_BATCH_SIZE: int = 10
     AI_CALL_OUTBOUND_EXECUTOR_TARGET_BATCH_SIZE: int = 20
@@ -370,6 +371,10 @@ class Settings(BaseSettings):
     REACH_EMAIL_LLM_API_KEY_FILE: str = ""
     REACH_EMAIL_ENCRYPTION_KEY: str = ""
     REACH_EMAIL_ENCRYPTION_KEY_FILE: str = ""
+    REACH_EMAIL_OUTLOOK_CLIENT_ID: str = ""
+    REACH_EMAIL_OUTLOOK_CLIENT_SECRET: str = ""
+    REACH_EMAIL_OUTLOOK_CLIENT_SECRET_FILE: str = ""
+    REACH_EMAIL_OUTLOOK_REDIRECT_URI: str = ""
 
     TTS_PROVIDER: str = ""
     TTS_MODEL: str = ""
@@ -449,6 +454,7 @@ class Settings(BaseSettings):
         """获取项目根目录"""
         # 中间件列表
         MIDDLEWARES: list[str | None] = [
+            "app.core.middlewares.ReachHttpConnectionMiddleware",
             "app.core.middlewares.CustomCORSMiddleware" if self.CORS_ORIGIN_ENABLE else None,
             "app.core.middlewares.RequestLogMiddleware" if self.OPERATION_LOG_RECORD else None,
             "app.core.middlewares.CustomGZipMiddleware" if self.GZIP_ENABLE else None,
