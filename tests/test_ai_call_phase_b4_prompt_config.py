@@ -1170,20 +1170,39 @@ async def test_prompt_optimizer_retries_once_with_validation_feedback() -> None:
 
 
 @pytest.mark.parametrize(
-    "candidate",
+    ("target_type", "candidate"),
     [
-        "我已经添加您微信了。",
-        "资料已经发给您了。",
-        "已经为您预约成功。",
-        "我先记录，稍后会有顾问联系您。",
+        ("opening", "我已经添加您微信了。"),
+        ("opening", "资料已经发给您了。"),
+        ("opening", "已经为您预约成功。"),
+        ("opening", "我先记录，稍后会有顾问联系您。"),
+        ("opening", "禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "稍后会有顾问联系您"),
+        ("scenePrompt", "请对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "禁止对客户说‘稍后会有顾问联系您’，改说“资料已经发给您了”。"),
+        ("scenePrompt", "稍后会有顾问联系您。禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "不必禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "禁止对客户说‘您好。请对客户说‘稍后会有顾问联系您’"),
     ],
 )
-def test_prompt_optimizer_rejects_unavailable_follow_up_promises(candidate: str) -> None:
+def test_prompt_optimizer_rejects_unavailable_follow_up_promises(target_type: str, candidate: str) -> None:
     with pytest.raises(ValueError, match="系统未支持的动作承诺"):
         OpenAICompatiblePromptOptimizer._validate_result(
-            {"currentContent": "", "allowedVariables": []},
+            {"targetType": target_type},
             {"candidateContent": candidate},
         )
+
+
+@pytest.mark.parametrize("candidate", [
+    "禁止对客户说‘稍后会有顾问联系您’",
+    "沟通规则：不得向客户承诺：“稍后会有顾问联系您。”",
+    "1. 不要说「资料已经发给您了」。\n2. 禁止说‘已经为您预约成功’。",
+])
+def test_scene_prompt_accepts_explicitly_forbidden_speech_examples(candidate: str) -> None:
+    result = OpenAICompatiblePromptOptimizer._validate_result(
+        {"targetType": "scenePrompt"}, {"candidateContent": candidate},
+    )
+    assert result["candidateContent"] == candidate
 
 
 @pytest.mark.parametrize(

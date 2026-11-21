@@ -15,6 +15,11 @@ UNSUPPORTED_PROMISE_RE = re.compile(
     r"(?:已(?:经)?安排|会有|将有).{0,8}(?:顾问|工作人员).{0,8}联系|"
     r"(?:我|我们|这边).{0,4}(?:会|将).{0,4}安排.{0,8}(?:顾问|工作人员).{0,8}联系)"
 )
+PROHIBITED_SPEECH_EXAMPLE_RE = re.compile(
+    r"(?:^|[\r\n。！？；，：、.!?;,:])[ \t]*(?:[-*][ \t]*)?请?(?:禁止|严禁|不要|不得|不能|切勿)"
+    r"(?:[对向]客户)?(?:说|承诺|声称|保证)[ \t]*[:：]?[ \t]*"
+    r"""(?:‘[^‘’\r\n]*’|“[^“”\r\n]*”|「[^「」\r\n]*」|『[^『』\r\n]*』|'[^'\r\n]*'|"[^"\r\n]*")"""
+)
 
 
 class PromptOptimizerProtocol(Protocol):
@@ -187,7 +192,11 @@ class OpenAICompatiblePromptOptimizer:
             raise ValueError("AI 优化删除或修改了原有变量")
         if payload.get("targetType") == "opening" and "[停顿" in candidate:
             raise ValueError("开场白暂不支持精确停顿")
-        if UNSUPPORTED_PROMISE_RE.search(candidate):
+        promise_text = candidate
+        if payload.get("targetType") == "scenePrompt":
+            # 只排除明确禁止说出的完整引文，引文前后的话术仍分别校验。
+            promise_text = PROHIBITED_SPEECH_EXAMPLE_RE.sub("\n", candidate)
+        if UNSUPPORTED_PROMISE_RE.search(promise_text):
             raise ValueError("AI 优化生成了系统未支持的动作承诺")
         warnings = result.get("warnings")
         return {
