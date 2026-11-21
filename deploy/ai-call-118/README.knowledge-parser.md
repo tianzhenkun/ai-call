@@ -10,9 +10,7 @@ docker build --platform linux/amd64 \
   -t ai-call-transfer/knowledge-parser:lingchen-knowledge-0.8.4 .
 ```
 
-部署前先备份数据库，并将
-`docs/livekit-ai-outbound/sql/phase-j1-knowledge-lexical-postgres.sql`
-上传到运行目录后执行：
+部署前先备份数据库，将 `docs/livekit-ai-outbound/sql/` 下的基础脚本和资料统计增量脚本上传到运行目录，依次执行。
 
 ```bash
 docker compose -f compose.yml exec -T postgres sh -lc \
@@ -20,6 +18,9 @@ docker compose -f compose.yml exec -T postgres sh -lc \
 docker compose -f compose.yml exec -T postgres sh -lc \
   'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
   < phase-j1-knowledge-lexical-postgres.sql
+docker compose -f compose.yml exec -T postgres sh -lc \
+  'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < knowledge-library-metrics-postgres.sql
 ```
 
 随后验证配置，只重建解析器和 API，不重启现有媒体服务：

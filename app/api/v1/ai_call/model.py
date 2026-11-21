@@ -2199,6 +2199,7 @@ class AiCallKnowledgeVersionModel(MappedBase):
     parser_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chunk_strategy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     chunk_count: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

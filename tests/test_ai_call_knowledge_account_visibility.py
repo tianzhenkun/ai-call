@@ -1,6 +1,7 @@
 """账号隔离回归：真实路由与临时数据库，对象存储和模型只使用测试替身。"""
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from tempfile import TemporaryFile
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI, UploadFile
 from httpx import ASGITransport, AsyncClient
+from lingchen_knowledge.content import content_chars
 from lingchen_knowledge.formats import policy as public_upload_policy
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -313,6 +315,182 @@ async def test_existing_unready_binding_remains_visible_and_removable(knowledge_
         assert (await client.put(path, json={"expectedItemIds": ["1"], "itemIds": ["1"]})).json()["data"] == original
         assert (await client.put(path, json={"expectedItemIds": ["1"], "itemIds": []})).json()["data"] == []
         assert (await client.put(path, json={"expectedItemIds": [], "itemIds": ["1"]})).status_code == 409
+
+
+@pytest.mark.anyio
+async def test_item_metrics_use_visible_version_and_only_its_actual_citations(knowledge_scope):
+    db = knowledge_scope.db
+    version = await db.get(AiCallKnowledgeVersionModel, 11)
+    version.parser_version = "txt-markdown-utf8-v1"
+    version.chunk_count = 2
+    chunk = await db.scalar(
+        select(AiCallKnowledgeChunkModel).where(
+            AiCallKnowledgeChunkModel.knowledge_version_id == 11
+        )
+    )
+    chunk.section_path, chunk.content = "同一节", "同一节\n真实 A\u00a0文"
+    db.add(
+        AiCallKnowledgeChunkModel(
+            id=502,
+            tenant_id="tenant-a",
+            knowledge_version_id=11,
+            chunk_index=1,
+            content="同一节\n又\u3000一段",
+            content_checksum="c" * 64,
+            source_type="MARKDOWN",
+            section_path="同一节",
+            content_type="TEXT",
+            created_at=NOW,
+        )
+    )
+    for audit_id, (tenant, purpose, status, evidence) in enumerate(
+        (
+            (
+                "tenant-a",
+                "PRODUCT_SUMMARY",
+                "OK",
+                {"sources": [{"versionId": "11"}, {"versionId": "11"}]},
+            ),
+            ("tenant-a", "REALTIME_ANSWER", "OK", [{"versionId": 11}, {"versionId": "11"}]),
+            ("tenant-a", "REALTIME_ANSWER", "OK", [{"versionId": "21"}]),
+            ("tenant-b", "REALTIME_ANSWER", "OK", [{"versionId": "11"}]),
+            ("tenant-a", "PRODUCT_SUMMARY", "FAILED", {"sources": [{"versionId": "11"}]}),
+            (
+                "tenant-a",
+                "PRODUCT_SUMMARY",
+                "OK",
+                {"sourceDocuments": [{"versionId": "11"}], "sources": []},
+            ),
+            ("tenant-a", "REALTIME_ANSWER", "NO_HIT", []),
+        ),
+        start=1000,
+    ):
+        db.add(
+            AiCallKnowledgeUsageModel(
+                id=audit_id,
+                tenant_id=tenant,
+                prompt_profile_id=101,
+                purpose=purpose,
+                status=status,
+                knowledge_version_ids='["11","21"]',
+                version_snapshot_hash="a" * 64,
+                retriever_version="test",
+                evidence_json=json.dumps(evidence),
+                created_at=NOW,
+            )
+        )
+    await db.commit()
+    async with AsyncClient(
+        transport=ASGITransport(app_for(knowledge_scope, 7)), base_url="http://test"
+    ) as client:
+
+        async def assert_metrics(chars, calls):
+            page = (await client.get("/knowledge/items")).json()["rows"]
+            detail = (await client.get("/knowledge/items/1")).json()["data"]
+            assert [(row["contentCharCount"], row["callCount"]) for row in (page[0], detail)] == [
+                (chars, calls)
+            ] * 2
+
+        await assert_metrics(content_chars("真实 A 文又一段"), 2)
+        next_version = AiCallKnowledgeVersionModel(
+            id=12,
+            tenant_id="tenant-a",
+            knowledge_item_id=1,
+            version_no=2,
+            status="PROCESSING",
+            source_object_key="new",
+            source_filename="版本二.md",
+            extension="md",
+            mime_type="text/markdown",
+            byte_size=10,
+            sha256="d" * 64,
+            created_by=7,
+            created_at=NOW,
+        )
+        db.add(next_version)
+        await db.commit()
+        await assert_metrics(None, 2)
+        next_version.status = "READY"
+        next_version.ready_at, next_version.chunk_count, next_version.chunk_set_sha256 = (
+            NOW,
+            1,
+            "d" * 64,
+        )
+        db.add(
+            AiCallKnowledgeChunkModel(
+                id=503,
+                tenant_id="tenant-a",
+                knowledge_version_id=12,
+                chunk_index=0,
+                content="原文标题\n新 文！",
+                content_checksum="e" * 64,
+                source_type="MD",
+                content_type="TEXT",
+                created_at=NOW,
+            )
+        )
+        audit = await db.get(AiCallKnowledgeUsageModel, 1000)
+        audit.evidence_json = json.dumps({"sources": [{"versionId": "11"}, {"versionId": "12"}]})
+        await db.commit()
+        await assert_metrics(content_chars("原文标题新 文！"), 2)
+    async with AsyncClient(
+        transport=ASGITransport(app_for(knowledge_scope, 8)), base_url="http://test"
+    ) as client:
+        rows = (await client.get("/knowledge/items")).json()["rows"]
+        assert [(row["id"], row["callCount"]) for row in rows] == [("2", 1)]
+        assert (await client.get("/knowledge/items/1")).status_code == 404
+
+
+@pytest.mark.anyio
+async def test_viewer_edits_only_own_notes_and_category(knowledge_scope):
+    transport = ASGITransport(app_for(knowledge_scope, 7, permissions={"ai_call:knowledge:view"}))
+    path = "/knowledge/items/1"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.patch(path, json={"note": "回访前阅读"})).status_code == 200
+        assert (await client.get("/knowledge/items")).json()["rows"][0]["note"] == "回访前阅读"
+        assert (await client.patch(path, json={"contentCategory": "OTHER"})).status_code == 200
+        assert (await client.patch(path, json={"note": "一起改", "contentCategory": "INDUSTRY"})).status_code == 200
+        assert (await client.patch(path, json={"note": "改名时的备注", "displayName": "另一个名字"})).status_code == 403
+        item = (await client.get(path)).json()["data"]
+        assert (item["note"], item["contentCategory"], item["displayName"]) == ("一起改", "INDUSTRY", "1.md")
+        for foreign in (2, 3, 4):
+            assert (await client.patch(f"/knowledge/items/{foreign}", json={"note": "其他资料", "contentCategory": "OTHER"})).status_code == 404
+        assert (await client.patch(path, json={"note": ""})).status_code == 200
+        assert (await client.get(path)).json()["data"]["note"] is None
+
+    transport = ASGITransport(app_for(knowledge_scope, 7, permissions={"ai_call:knowledge:manage"}))
+    async with AsyncClient(transport=transport, base_url="http://test") as manager:
+        response = await manager.patch(path, json={"note": "已核对", "contentCategory": "OTHER"})
+        assert response.status_code == 200
+        assert response.json()["data"]["contentCategory"] == "OTHER"
+
+
+@pytest.mark.anyio
+async def test_viewer_retries_only_own_recoverable_failed_versions(knowledge_scope):
+    for version_id in (11, 21, 31, 41):
+        version = await knowledge_scope.db.get(AiCallKnowledgeVersionModel, version_id)
+        version.status, version.failure_retryable = "FAILED", True
+    await knowledge_scope.db.commit()
+
+    transport = ASGITransport(app_for(knowledge_scope, 7, permissions=set()))
+    async with AsyncClient(transport=transport, base_url="http://test") as outsider:
+        assert (await outsider.patch("/knowledge/items/1", json={"note": "备注"})).status_code == 403
+        assert (await outsider.post("/knowledge/versions/11/retry")).status_code == 403
+
+    path = "/knowledge/versions/11/retry"
+    transport = ASGITransport(app_for(knowledge_scope, 7, permissions={"ai_call:knowledge:view"}))
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for foreign in (21, 31, 41):
+            assert (await client.post(f"/knowledge/versions/{foreign}/retry")).status_code == 404
+        response = await client.post(path)
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "PROCESSING"
+        assert (await client.post(path)).status_code == 409
+        version = await knowledge_scope.db.get(AiCallKnowledgeVersionModel, 11)
+        for status, retryable in (("FAILED", False), ("READY", True)):
+            version.status, version.failure_retryable = status, retryable
+            await knowledge_scope.db.commit()
+            assert (await client.post(path)).status_code == 409
 
 
 @pytest.mark.anyio

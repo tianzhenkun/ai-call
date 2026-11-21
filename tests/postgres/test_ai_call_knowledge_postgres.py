@@ -233,6 +233,7 @@ async def test_knowledge_migration_and_search_enforce_all_frozen_scope() -> None
     )
     _execute(migration)
     _execute(migration)
+    _execute(MIGRATION_PATH.with_name("knowledge-library-metrics-postgres.sql").read_text())
     with psycopg.connect(_psycopg_dsn()) as connection:
         assert connection.execute(
             "select status, provider_run_no, provider_name, provider_job_id, provider_request_key, "
@@ -609,5 +610,66 @@ async def test_word_search_uses_the_heading_to_locate_only_its_body(monkeypatch)
                 db, tenant_id="local", user_id=8, frozen_version_ids=[13], query=heading,
             ) == []
             assert len(reads) == before
+    finally:
+        await engine.dispose()
+
+
+async def test_library_metrics_backfill_and_cited_versions_index() -> None:
+    _reset_schema()
+    _create_portable_schema()
+    _execute("""
+        alter table ai_call_knowledge_version drop column content_char_count;
+        insert into ai_call_knowledge_item
+            (id, tenant_id, display_name, content_category, created_by, created_at, updated_at)
+        values (1, 'aa', '手册', 'FAQ', 7, now(), now()), (2, 'aa', '其他账号', 'FAQ', 8, now(), now());
+        insert into ai_call_knowledge_version (
+            id, tenant_id, knowledge_item_id, version_no, status, source_object_key, source_filename,
+            extension, mime_type, byte_size, sha256, parser_version, chunk_count, chunk_set_sha256, ready_at, created_at
+        ) select id, 'aa', item, no, 'READY', 'test', '手册.md', 'md', 'text/markdown', 300,
+            repeat('a',64), parser, 2, repeat('b',64), now(), now()
+          from (values (11,1,1,'markdown-v1'), (12,1,2,'txt-markdown-utf8-v1'), (21,2,1,'markdown-v1'))
+            as source(id,item,no,parser);
+        insert into ai_call_knowledge_chunk (
+            id, tenant_id, knowledge_version_id, chunk_index, content, content_checksum, content_type,
+            source_type, section_path, created_at
+        ) values (111, 'aa', 11, 0, '缺失后一段', repeat('a',64), 'TEXT', 'MD', null, now()),
+                 (121, 'aa', 12, 0, '章节' || chr(10) || '有效' || chr(160) || '😀', repeat('a',64), 'TEXT','MARKDOWN','章节', now()),
+                 (122, 'aa', 12, 1, '章节' || chr(10) || '又' || chr(28) || '一' || chr(12288) || '段', repeat('a',64), 'TEXT','MARKDOWN','章节', now());
+        insert into ai_call_knowledge_usage (
+            id, tenant_id, prompt_profile_id, purpose, status, evidence_json,
+            knowledge_version_ids, version_snapshot_hash, retriever_version, created_at
+        ) select id, tenant, 101, kind, status, evidence, '["11","12","21"]', repeat('a',64), 'test', now()
+          from (values
+              (1,'aa','PRODUCT_SUMMARY','OK','{"sources":[{"versionId":"11"},{"versionId":"12"}]}'),
+              (2,'aa','REALTIME_ANSWER','OK','[{"versionId":"12"},{"versionId":12}]'),
+              (3,'aa','REALTIME_ANSWER','NO_HIT','[{"versionId":"12"}]'),
+              (4,'aa','PRODUCT_SUMMARY','FAILED','{"sources":[{"versionId":"12"}]}'),
+              (5,'aa','PRODUCT_SUMMARY','OK','{"sourceDocuments":[{"versionId":"12"}],"sources":[]}'),
+              (6,'bb','REALTIME_ANSWER','OK','[{"versionId":"12"}]'),
+              (7,'aa','REALTIME_ANSWER','OK','invalid'),
+              (8,'aa','REALTIME_ANSWER','OK','[{"versionId":"21"}]')
+          ) as audit(id,tenant,kind,status,evidence)
+    """)
+    migration = MIGRATION_PATH.with_name("knowledge-library-metrics-postgres.sql").read_text()
+    _execute(migration)
+    _execute(migration)
+    with psycopg.connect(_psycopg_dsn()) as connection:
+        assert connection.execute(
+            "select id, content_char_count from ai_call_knowledge_version order by id"
+        ).fetchall() == [(11, None), (12, 6), (21, None)]
+        connection.execute("set local enable_seqscan = off")
+        plan = connection.execute("""
+            explain select id from ai_call_knowledge_usage where status = 'OK'
+                and ai_call_knowledge_cited_versions(purpose, evidence_json) @> array['12']
+        """).fetchall()
+        assert "idx_ai_call_knowledge_usage_cited_versions" in "\n".join(line for line, in plan)
+    engine = create_async_engine(_dsn())
+    try:
+        async with async_sessionmaker(engine)() as db:
+            service = KnowledgeService(CosKnowledgeStore(client=object(), bucket="test"))
+            owner = await service.get_item(db, tenant_id="aa", user_id=7, item_id=1)
+            assert (owner["contentCharCount"], owner["callCount"]) == (6, 2)
+            others, total = await service.list_items(db, tenant_id="aa", user_id=8, page_num=1, page_size=20)
+            assert total == 1 and (others[0]["contentCharCount"], others[0]["callCount"]) == (None, 1)
     finally:
         await engine.dispose()

@@ -262,10 +262,12 @@ async def get_knowledge_item_controller(
 async def update_knowledge_item_controller(
     item_id: Annotated[int, Path(alias="itemId", gt=0)],
     request: KnowledgeItemPatchRequest,
-    auth: Annotated[AuthSchema, Depends(get_knowledge_manager)],
+    auth: Annotated[AuthSchema, Depends(get_knowledge_viewer)],
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:
+    if not request.model_fields_set <= {"note", "content_category"}:
+        await get_knowledge_manager(auth)
     tenant_id, user_id = _identity(auth)
     result = await service.update_item(
         db,
@@ -435,7 +437,7 @@ def _knowledge_file_response(
 )
 async def retry_knowledge_version_controller(
     version_id: Annotated[int, Path(alias="versionId", gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_knowledge_manager)],
+    auth: Annotated[AuthSchema, Depends(get_knowledge_viewer)],
     db: Annotated[AsyncSession, Depends(get_knowledge_db)],
     service: Annotated[Any, Depends(get_knowledge_service)],
 ) -> SuccessResponse:

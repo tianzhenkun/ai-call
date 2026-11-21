@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from lingchen_knowledge.content import content_chars
 from lingchen_knowledge.documents import PdfNeedsOcr
 from lingchen_knowledge.formats import classify, validate_size
 from lingchen_knowledge.models import (
@@ -389,6 +390,7 @@ class KnowledgeVersionProcessor:
             version.parser_version = content.parser_version
             version.chunk_strategy_version = content.chunker_version
             version.chunk_count = len(content.chunks)
+            version.content_char_count = content_chars(content.text)
             version.chunk_set_sha256 = chunk_set_hash(content)
             version.ready_at = now
             version.next_attempt_at = version.lease_owner = version.lease_expires_at = None

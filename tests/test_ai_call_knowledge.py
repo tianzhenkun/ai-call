@@ -229,10 +229,12 @@ def test_knowledge_routes_use_explicit_view_and_manage_permissions() -> None:
     for method, path in (
         ("GET", "/ai-call/knowledge/items"),
         ("GET", "/ai-call/knowledge/items/{itemId}"),
+        ("PATCH", "/ai-call/knowledge/items/{itemId}"),
         ("GET", "/ai-call/knowledge/items/{itemId}/versions"),
         ("GET", "/ai-call/knowledge/versions/{versionId}/processing"),
         ("GET", "/ai-call/knowledge/versions/{versionId}/download"),
         ("GET", "/ai-call/knowledge/versions/{versionId}/preview"),
+        ("POST", "/ai-call/knowledge/versions/{versionId}/retry"),
     ):
         calls = dependency_calls(method, path)
         assert get_knowledge_viewer in calls
@@ -241,10 +243,8 @@ def test_knowledge_routes_use_explicit_view_and_manage_permissions() -> None:
     for method, path in (
         ("POST", "/ai-call/knowledge/items/upload"),
         ("POST", "/ai-call/knowledge/items/{itemId}/versions/upload"),
-        ("PATCH", "/ai-call/knowledge/items/{itemId}"),
         ("PUT", "/ai-call/knowledge/items/{itemId}/scene-bindings"),
         ("DELETE", "/ai-call/knowledge/items/{itemId}"),
-        ("POST", "/ai-call/knowledge/versions/{versionId}/retry"),
         ("POST", "/ai-call/prompt-profiles/{profileId}/product-info:extract"),
     ):
         calls = dependency_calls(method, path)
@@ -624,6 +624,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         await connection.run_sync(AiCallKnowledgeVersionModel.__table__.create)
         await connection.run_sync(AiCallKnowledgeChunkModel.__table__.create)
         await connection.run_sync(AiCallPromptKnowledgeBindingModel.__table__.create)
+        await connection.run_sync(AiCallKnowledgeUsageModel.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     service = KnowledgeService(store)
 
@@ -692,6 +693,7 @@ async def test_cos_upload_replay_worker_and_range_download_form_one_closed_loop(
         assert version is not None and version.status == "READY"
         assert item is not None and item.current_ready_version_id == version.id
         assert len(chunks) == version.chunk_count == 2
+        assert version.content_char_count == sum(not ch.isspace() for ch in payload.decode())
         assert version.parser_version == "markdown-v1"
         assert {chunk.source_path for chunk in chunks} == {"paragraphs/1", "paragraphs/3"}
         assert processing["status"] == "READY"
@@ -1329,6 +1331,8 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
             AiCallKnowledgeItemModel.__table__,
             AiCallKnowledgeVersionModel.__table__,
             AiCallPromptKnowledgeBindingModel.__table__,
+            AiCallKnowledgeChunkModel.__table__,
+            AiCallKnowledgeUsageModel.__table__,
         ):
             await connection.run_sync(table.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)

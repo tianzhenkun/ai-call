@@ -39,6 +39,7 @@ from app.api.v1.ai_call.model import (
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
+from app.services.ai_call.knowledge_metrics import item_metrics
 from app.services.ai_call.knowledge_processing import (
     KnowledgeVersionProcessor,
     chunks_with_heading,
@@ -1845,10 +1846,12 @@ class KnowledgeService:
                     "name": name,
                 }
             )
+        metrics = await item_metrics(db, tenant_id, [versions_by_item[item.id][0] for item in items])
         return [
             self._item_to_dict(
                 item,
                 versions=versions_by_item[item.id],
+                metrics=metrics[item.id],
                 binding_count=len(bindings_by_item.get(item.id, [])),
                 scene_bindings=bindings_by_item.get(item.id, []),
             )
@@ -1866,9 +1869,11 @@ class KnowledgeService:
         item = await self._get_item_record(db, tenant_id, user_id, item_id)
         versions = await self._list_version_models(db, tenant_id, item_id)
         bindings = await self._scene_bindings(db, tenant_id, item_id)
+        metrics = await item_metrics(db, tenant_id, versions[:1])
         return self._item_to_dict(
             item,
             versions=versions,
+            metrics=metrics[item_id],
             binding_count=len(bindings),
             scene_bindings=bindings,
         )
@@ -2069,10 +2074,12 @@ class KnowledgeService:
         item: AiCallKnowledgeItemModel,
         *,
         versions: list[AiCallKnowledgeVersionModel],
+        metrics: tuple[int | None, int],
         binding_count: int,
         scene_bindings: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         latest_version = versions[0]
+        content_char_count, call_count = metrics
         result = {
             "id": str(item.id),
             "displayName": item.display_name,
@@ -2087,6 +2094,8 @@ class KnowledgeService:
             "latestVersion": KnowledgeService._version_to_dict(latest_version),
             "versionCount": len(versions),
             "bindingCount": binding_count,
+            "contentCharCount": content_char_count,
+            "callCount": call_count,
             "createdBy": str(item.created_by) if item.created_by is not None else None,
             "createdAt": item.created_at,
             "updatedAt": item.updated_at,
