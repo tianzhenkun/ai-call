@@ -25,6 +25,7 @@ from starlette.datastructures import Headers
 from app.api.v1.ai_call import AiCallRouter
 from app.api.v1.ai_call.knowledge_controller import (
     get_knowledge_db,
+    get_knowledge_product_info_service,
     preview_knowledge_version_controller,
 )
 from app.api.v1.ai_call.model import (
@@ -35,6 +36,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
 )
+from app.config.setting import settings
 from app.core.dependencies import get_knowledge_manager, get_knowledge_viewer
 from app.core.exceptions import CustomException
 from app.services.ai_call.knowledge import (
@@ -54,9 +56,6 @@ from app.services.ai_call.knowledge_binary_parser import (
     serve as serve_binary_parser,
 )
 from app.services.ai_call.knowledge_processing import version_chunks
-from app.services.ai_call.prompt_optimization import (
-    OpenAICompatibleKnowledgeProductExtractor,
-)
 
 
 def _unique_column_sets(model: type) -> set[tuple[str, ...]]:
@@ -298,43 +297,237 @@ async def test_safe_preview_is_inline_and_cannot_be_sniffed_as_active_content(
     assert response.headers["content-security-policy"] == "sandbox"
 
 
+def _product_quote(passage):
+    return {"ref": passage["ref"], "excerpt": passage["content"]}
+
+
+def _product_claim(passage):
+    return {"claim": passage["content"], "needsReview": False, "sources": [_product_quote(passage)]}
+
+
+_UNNAMED_PRODUCT = {"status": "use", "product": ""}
+
+
+class _AcceptProductReview:
+    async def identify_product(self, scene_name, filenames):
+        return ""
+
+    async def review(self, payload):
+        return {"results": [{"id": item["id"], "supported": True} for item in payload["items"]]}
+
+
 @pytest.mark.anyio
-async def test_product_draft_renders_only_selected_original_passages() -> None:
+@pytest.mark.parametrize("scene", ["甲产品介绍", "客户回访"])
+async def test_mixed_product_sources_are_scoped_before_merge(scene) -> None:
     chunks = [
-        {"chunkId": "12", "sourceFilename": "产品信息卡.png", "pageNo": 1,
-         "content": "产品信息卡\n\n演示服务提供普通话讲解。"},
-        {"chunkId": "13", "sourceFilename": "产品手册.pdf", "pageNo": 1,
-         "content": "产品手册\n\n演示预约指南"},
-        {"chunkId": "14", "sourceFilename": "产品手册.pdf", "pageNo": 2,
-         "content": "演示时长\n\n每次产品演示持续二十分钟。"},
+        {"versionId": str(i), "chunkId": str(i), "sourceFilename": name + ".pdf", "pageNo": 1, "content": body}
+        for i, (name, body) in enumerate([
+            ("甲产品", "甲产品提供班表。"), ("乙产品", "乙产品盘点仓库。"), ("补充", "甲产品可按门店展示班表。"),
+        ])
     ]
 
     class Extractor:
+        async def identify_product(self, scene_name, filenames):
+            return "甲产品" if scene_name == "甲产品介绍" else ""
+
         async def extract(self, payload):
-            passages = {p["content"]: p["ref"] for p in payload["chunks"]}
+            batch = payload["chunks"]
+            if payload["mode"] == "extract":
+                assert len({p["versionId"] for p in batch}) == 1
+            else:
+                assert {p["versionId"] for p in batch} == {"0", "2"}
+            product = "乙产品" if "乙产品" in batch[0]["content"] else "甲产品"
+            status = "outside" if scene == "甲产品介绍" and product == "乙产品" else "use"
+            return {"scope": {"status": status, "product": product},
+                    "sections": {"核心能力": [_product_claim(p) for p in batch]}, "conflicts": []}
+
+        async def review(self, payload):
+            return {"results": [{"id": item["id"], "supported": True} for item in payload["items"]]}
+
+    draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="demo", scene_name=scene, chunks=chunks,
+    )
+    assert "乙产品" in " ".join(draft["reviewNotes"])
+    if scene == "客户回访":
+        assert draft["draftText"] == "" and draft["sources"] == []
+    else:
+        assert "班表" in draft["draftText"] and "盘点" not in draft["draftText"]
+        assert {s["versionId"] for s in draft["sources"]} == {"0", "2"}
+
+
+@pytest.mark.anyio
+async def test_shared_product_prefix_does_not_merge_distinct_products() -> None:
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            assert payload["mode"] == "extract"
+            row = payload["chunks"][0]
+            return {"scope": {"status": "use", "product": row["sourceFilename"][:-4]},
+                    "sections": {"核心能力": [_product_claim(row)]}, "conflicts": []}
+
+    chunks = [
+        {"versionId": str(i), "chunkId": str(i), "sourceFilename": name + ".pdf", "content": fact}
+        for i, (name, fact) in enumerate([("Max Stock", "清点库存。"), ("Max Desk", "整理班表。")])
+    ]
+    draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="demo", scene_name="Max 产品介绍", chunks=chunks,
+    )
+    assert not draft["draftText"] and not draft["sources"]
+    assert any("Max Stock" in note and "Max Desk" in note for note in draft["reviewNotes"])
+
+
+@pytest.mark.anyio
+async def test_portfolio_uses_product_chapter_and_omits_recurring_footer_and_rollout_advice() -> None:
+    footer = "云杉有限公司 · www.example.com · 未经书面授权不得分发"
+    text = "云杉有限公司提供排班服务。"
+    rule = "正式启用前必须完成试点验收。"
+    pages = [
+        "产品矩阵\nOrbit：排班；Fern：库存。",
+        f"O R B I T · 01\n{text}\n建议先从小范围试点。\n{rule}",
+        "F E R N · 01\n仓库使用条码清点库存。",
+    ]
+    chunks = [{"chunkId": str(i), "versionId": "1", "sourceFilename": "产品合集.pdf", "pageNo": i,
+               "content": f"{body}\n{footer}"} for i, body in enumerate(pages, 1)]
+    calls = []
+
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            batch = payload["chunks"]
+            seen_pages = [p["pageNo"] for p in batch]
+            calls.append(seen_pages)
+            assert all(footer not in p["content"] for p in batch)
+            ref = next(p["ref"] for p in batch if p["pageNo"] == 2)
+            facts = [{"claim": claim, "sources": [{"ref": ref, "excerpt": claim}]} for claim in (text, "建议先从小范围试点。", rule)]
+            return {"scope": {"status": "partial", "product": "Orbit"},
+                    "sections": {"核心能力": facts[:1], "关键边界": facts[1:]}, "conflicts": []}
+
+    draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="intro", scene_name="Orbit 产品介绍", chunks=chunks,
+    )
+    assert calls == [[1, 2, 3], [2]]
+    assert text in draft["draftText"] and rule in draft["draftText"]
+    assert "建议" not in draft["draftText"] and "库存" not in draft["draftText"]
+    assert {s["pageNo"] for s in draft["sources"]} == {2}
+    assert all(footer in row["content"] for row in chunks)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("results", [[], [{"id": "1", "supported": "true"}], [{"id": "9", "supported": True}]])
+async def test_invalid_review_cannot_approve_a_commitment(results) -> None:
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            return {"scope": _UNNAMED_PRODUCT, "sections": {"关键边界": [_product_claim(payload["chunks"][0])]},
+                    "conflicts": []}
+
+        async def review(self, payload):
+            return {"results": results}
+
+    with pytest.raises(ValueError, match="承诺复核"):
+        await KnowledgeProductInfoService(Extractor())._extract_batches(
+            scene_code="demo", scene_name="产品咨询", chunks=[{"chunkId": "1", "content": "基础版仅限联网使用。"}],
+        )
+
+
+@pytest.mark.anyio
+async def test_commitments_use_surrounding_source_and_rejected_claim_stays_pending() -> None:
+    class Extractor:
+        async def extract(self, payload):
+            return {"scope": {"status": "use", "product": "蓝桥"},
+                    "sections": {"核心能力": [
+                        {"claim": "蓝桥整理班表。", "needsReview": False, "sources": [{"ref": "r1", "excerpt": "蓝桥整理班表。"}]},
+                        {"claim": "支持离线导出。", "needsReview": False, "sources": [{"ref": "r1", "excerpt": "支持离线导出。"}]},
+                    ]}, "conflicts": []}
+
+        async def review(self, payload):
+            assert [item["claim"] for item in payload["items"]] == ["支持离线导出。"]
+            assert "暂不支持离线导出" in str(payload["passages"])
+            return {"results": [{"id": payload["items"][0]["id"], "supported": False, "reason": "原文写的是暂不支持。"}]}
+
+    draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_name="蓝桥", scene_code="demo",
+        chunks=[{"chunkId": "1", "sourceFilename": "蓝桥.pdf", "pageNo": 1, "content": "蓝桥整理班表。基础版暂不支持离线导出。"}],
+    )
+    assert draft["draftText"] == "核心能力\n- 蓝桥整理班表。"
+    assert "暂不支持" in " ".join(draft["reviewNotes"])
+
+
+@pytest.mark.anyio
+async def test_product_draft_summarizes_facts_and_keeps_short_original_quotes() -> None:
+    ability = "演示服务提供普通话讲解。"
+    footer = "上海灵宸智能科技有限公司 · www.lingchen-ai.com · 未经书面授权不得分发"
+    limit = "每次产品演示持续二十分钟。"
+    chunks = [
+        {"chunkId": "12", "sourceFilename": "产品信息卡.png", "pageNo": 1,
+         "content": f"产品信息卡 {ability} {footer}"},
+        {"chunkId": "13", "sourceFilename": "产品手册.pdf", "pageNo": 1,
+         "content": "产品手册\n\n演示预约指南"},
+        {"chunkId": "14", "sourceFilename": "产品手册.pdf", "pageNo": 2,
+         "content": f"演示时长\n\n{limit}\n仅限工作日预约。"},
+    ]
+
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            refs = {p["chunkId"]: p["ref"] for p in payload["chunks"]}
             return {
+                "scope": _UNNAMED_PRODUCT,
                 "draftText": "仅支持普通话讲解，可以锁定演示时间。",
                 "sources": [{"claim": "配备专业人员", "chunkId": "12"}],
-                "sections": {"核心能力": [passages["演示服务提供普通话讲解。"]] * 2,
-                             "关键边界": [passages["每次产品演示持续二十分钟。"]]},
+                "sections": {
+                    "产品定位补充": [],
+                    "核心能力": [{
+                        "claim": "提供普通话产品演示。",
+                        "sources": [{"ref": refs["12"], "excerpt": ability}],
+                    }] * 2,
+                    "关键边界": [{
+                        "claim": "每场演示 20 分钟，仅限工作日预约。",
+                        "sources": [
+                            {"ref": refs["14"], "excerpt": limit},
+                            {"ref": refs["14"], "excerpt": "仅限工作日预约。"},
+                        ],
+                    }],
+                },
                 "conflicts": [],
             }
 
     result = await KnowledgeProductInfoService(Extractor())._extract_batches(
         scene_code="demo", scene_name="演示预约", chunks=chunks,
     )
-    assert result["draftText"] == "核心能力\n- 演示服务提供普通话讲解。\n\n关键边界\n- 每次产品演示持续二十分钟。"
+    assert result["draftText"] == "核心能力\n- 提供普通话产品演示。\n\n关键边界\n- 每场演示 20 分钟，仅限工作日预约。"
     assert [(s["claim"], s["excerpt"], s["sourceFilename"], s["pageNo"]) for s in result["sources"]] == [
-        ("演示服务提供普通话讲解。", "演示服务提供普通话讲解。", "产品信息卡.png", 1),
-        ("每次产品演示持续二十分钟。", "每次产品演示持续二十分钟。", "产品手册.pdf", 2),
+        ("提供普通话产品演示。", ability, "产品信息卡.png", 1),
+        ("每场演示 20 分钟，仅限工作日预约。", limit, "产品手册.pdf", 2),
+        ("每场演示 20 分钟，仅限工作日预约。", "仅限工作日预约。", "产品手册.pdf", 2),
     ]
 
 
 @pytest.mark.anyio
-async def test_product_draft_without_selected_evidence_cannot_apply_free_text() -> None:
-    class Extractor:
+async def test_product_draft_keeps_five_verified_abilities_in_order() -> None:
+    facts = ["整理班表。", "生成周报。", "保存审批记录。", "发送提醒。", "生成交接单。", "整理请假记录。", "清点库存。"]
+
+    class Extractor(_AcceptProductReview):
         async def extract(self, payload):
-            return {"sections": {}, "conflicts": [], "draftText": "支持锁定演示时间。"}
+            return {"scope": _UNNAMED_PRODUCT, "conflicts": [], "sections": {"核心能力": [
+                {"claim": fact, "needsReview": True, "sources": [{"ref": "r1", "excerpt": fact}]} for fact in facts
+            ]}}
+
+        async def review(self, payload):
+            return {"results": [
+                {"id": item["id"], "supported": item["claim"] != facts[0], "reason": "主体待核对"}
+                for item in payload["items"]
+            ]}
+
+    result = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="demo", scene_name="产品咨询", chunks=[{"chunkId": "1", "content": "".join(facts)}],
+    )
+    assert result["draftText"].splitlines() == ["核心能力", *["- " + fact for fact in facts[1:6]]]
+    assert any(facts[0] in note for note in result["reviewNotes"])
+    assert all(row["claim"] != facts[-1] for row in result["sources"])
+
+
+@pytest.mark.anyio
+async def test_product_draft_without_selected_evidence_cannot_apply_free_text() -> None:
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            return {"scope": _UNNAMED_PRODUCT, "sections": {}, "conflicts": [], "draftText": "支持锁定演示时间。"}
 
     with pytest.raises(CustomException, match="有原文依据") as error:
         await KnowledgeProductInfoService(Extractor())._extract_batches(
@@ -346,13 +539,12 @@ async def test_product_draft_without_selected_evidence_cannot_apply_free_text() 
 @pytest.mark.anyio
 @pytest.mark.parametrize("invalid_at", ["extract", "merge"])
 async def test_product_draft_rejects_refs_outside_this_model_input(invalid_at) -> None:
-    class Extractor:
+    class Extractor(_AcceptProductReview):
         async def extract(self, payload):
+            claim = _product_claim(payload["chunks"][0])
             if payload["mode"] == invalid_at:
-                refs = ["r3"] if invalid_at == "extract" else ["r2"]
-            else:
-                refs = [payload["chunks"][0]["ref"]]
-            return {"sections": {"核心能力": refs}, "conflicts": []}
+                claim["sources"][0]["ref"] = "r3" if invalid_at == "extract" else "r2"
+            return {"scope": _UNNAMED_PRODUCT, "sections": {"核心能力": [claim]}, "conflicts": []}
 
     chunks = [{"chunkId": str(i), "content": content} for i, content in enumerate(["甲\n\n乙", "较长的第三段"])]
     with pytest.raises(ValueError, match="本批原文"):
@@ -362,27 +554,71 @@ async def test_product_draft_rejects_refs_outside_this_model_input(invalid_at) -
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("sources", [[], [{"ref": "r1", "excerpt": "提供终身免费服务。"}]])
+async def test_product_draft_holds_missing_or_fabricated_quote_and_keeps_verified_fact(sources) -> None:
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            return {
+                "scope": _UNNAMED_PRODUCT,
+                "sections": {"核心能力": [_product_claim(payload["chunks"][0]), {"claim": "提供终身免费服务。", "sources": sources}]},
+                "conflicts": [],
+            }
+
+    draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="demo", scene_name="演示",
+        chunks=[{"chunkId": "1", "content": "每次产品演示收费。"}],
+    )
+    assert draft["draftText"] == "核心能力\n- 每次产品演示收费。"
+    assert [s["excerpt"] for s in draft["sources"]] == ["每次产品演示收费。"]
+    assert "提供终身免费服务。" in " ".join(draft["reviewNotes"])
+
+
+@pytest.mark.anyio
 async def test_product_draft_preserves_qualifiers_and_unresolved_conflicts_across_batches() -> None:
     chunks = [
         {"chunkId": str(i), "sourceFilename": f"{i}.txt", "content": text}
         for i, text in enumerate(["不能预约。", "可以预约。", "仅限会员：\n可到店办理。"])
     ]
 
-    class Extractor:
+    class Extractor(_AcceptProductReview):
         async def extract(self, payload):
-            refs = [p["ref"] for p in payload["chunks"]]
-            if payload["mode"] == "extract" and len(refs) == 2:
-                return {"sections": {}, "conflicts": [refs]}
-            return {"sections": {"核心能力": refs}, "conflicts": []}
+            passages = payload["chunks"]
+            if payload["mode"] == "extract" and len(passages) == 2:
+                return {"scope": _UNNAMED_PRODUCT, "sections": {}, "conflicts": [[_product_quote(p) for p in passages]]}
+            return {"scope": _UNNAMED_PRODUCT, "sections": {"核心能力": [_product_claim(p) for p in passages]}, "conflicts": []}
 
     result = await KnowledgeProductInfoService(Extractor(), max_batch_chars=10)._extract_batches(
         scene_code="demo", scene_name="预约", chunks=chunks,
     )
-    supported, pending = result["draftText"].split("\n\n")
-    assert supported == "核心能力\n- 仅限会员：\n可到店办理。"
+    assert result["draftText"] == "核心能力\n- 仅限会员：\n可到店办理。"
+    pending = result["conflicts"][0]["description"]
     assert "不能预约。" in pending and "可以预约。" in pending
     assert result["conflicts"][0]["sourceChunkIds"] == ["0", "1"]
     assert {s["excerpt"] for s in result["sources"]} == {c["content"] for c in chunks}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("include_supported_fact", [True, False])
+async def test_conflicts_stay_out_of_draft_even_when_they_share_the_same_page(include_supported_fact) -> None:
+    class Extractor(_AcceptProductReview):
+        async def extract(self, payload):
+            ref = payload["chunks"][0]["ref"]
+            claims = [{"claim": "可以在周末预约。", "sources": [{"ref": ref, "excerpt": "周末可以预约。"}]}]
+            if include_supported_fact:
+                claims.append({"claim": "每场 20 分钟。", "sources": [{"ref": ref, "excerpt": "每场持续 20 分钟。"}]})
+            return {
+                "scope": _UNNAMED_PRODUCT,
+                "sections": {"核心能力": claims},
+                "conflicts": [[{"ref": ref, "excerpt": text} for text in ("周末可以预约。", "周末不接受预约。")]],
+            }
+
+    result = await KnowledgeProductInfoService(Extractor())._extract_batches(
+        scene_code="demo", scene_name="演示",
+        chunks=[{"chunkId": "1", "sourceFilename": "演示.pdf", "pageNo": 2,
+                 "content": "每场持续 20 分钟。 周末可以预约。 周末不接受预约。"}],
+    )
+    assert result["draftText"] == ("核心能力\n- 每场 20 分钟。" if include_supported_fact else "")
+    assert "演示.pdf · 第 2 页：周末不接受预约。" in result["conflicts"][0]["description"]
 
 
 @pytest.mark.anyio
@@ -396,10 +632,10 @@ async def test_word_headings_only_supply_context_across_extraction_batches() -> 
     version = AiCallKnowledgeVersionModel(id=1, extension="docx", source_filename="服务.docx", version_no=1)
     calls = []
 
-    class Extractor:
+    class Extractor(_AcceptProductReview):
         async def extract(self, payload):
             calls.append(payload)
-            return {"sections": {"核心能力": [p["ref"] for p in payload["chunks"]]}, "conflicts": []}
+            return {"scope": _UNNAMED_PRODUCT, "sections": {"核心能力": [_product_claim(p) for p in payload["chunks"]]}, "conflicts": []}
 
     service = KnowledgeProductInfoService(Extractor(), max_batch_chars=13)
     passages = await service._body_passages(rows, {1: version})
@@ -962,14 +1198,15 @@ async def test_media_worker_resumes_and_extraction_cites_the_source(
             assert job_id == "job-7"
             return Parsed("test-parser-v1", (block,))
 
-    class Extractor:
+    class Extractor(_AcceptProductReview):
         model_name = "test-extractor"
 
         async def extract(self, request):
             chunk = request["chunks"][0]
             assert chunk["content"] == block.text
             return {
-                "sections": {"核心能力": [chunk["ref"]]},
+                "scope": _UNNAMED_PRODUCT,
+                "sections": {"核心能力": [_product_claim(chunk)]},
                 "conflicts": [],
             }
 
@@ -1572,17 +1809,31 @@ async def test_knowledge_management_is_tenant_scoped_and_preserves_history() -> 
 
 
 @pytest.mark.anyio
-async def test_product_info_extractor_marks_knowledge_as_untrusted_json_input() -> None:
+async def test_product_info_extractor_sends_untrusted_json_to_deepseek(monkeypatch, tmp_path) -> None:
+    claim = _product_claim({"ref": "r1", "content": "提供合同审查。"})
+    requests = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
         payload = json.loads(request.content)
-        assert payload["model"] == "qwen3.7-plus"
+        assert str(request.url) == "https://api.deepseek.com/chat/completions"
+        assert request.headers["Authorization"] == "Bearer knowledge-test-key"
+        assert payload["model"] == "deepseek-flash"
+        assert payload["thinking"] == {"type": "disabled"}
+        assert "enable_thinking" not in payload
+        assert payload["response_format"] == {"type": "json_object"}
         instructions = payload["messages"][0]["content"]
         assert "不可信资料" in instructions
         assert all(section in instructions for section in ("产品定位", "核心能力", "关键边界"))
         assert "300～600" in instructions
+        assert "页眉页脚" in instructions and "逐字连续的短引" in instructions
         assert "价格、政策、案例、周期和具体参数" in instructions
         assert "合并时保留" in instructions
         assert json.loads(payload["messages"][1]["content"])["mode"] == "extract"
+        if requests == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"sections": {'}}]})
+        assert "重新输出合法且完整的 JSON" in instructions
         return httpx.Response(
             200,
             json={
@@ -1591,7 +1842,8 @@ async def test_product_info_extractor_marks_knowledge_as_untrusted_json_input() 
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "sections": {"核心能力": ["r1"]},
+                                    "scope": _UNNAMED_PRODUCT,
+                                    "sections": {"核心能力": [claim]},
                                     "conflicts": [],
                                 },
                                 ensure_ascii=False,
@@ -1602,16 +1854,30 @@ async def test_product_info_extractor_marks_knowledge_as_untrusted_json_input() 
             },
         )
 
-    extractor = OpenAICompatibleKnowledgeProductExtractor(
-        base_url="https://dashscope.test/v1",
-        api_key="test-key",
-        model="qwen3.7-plus",
-        transport=httpx.MockTransport(handler),
-    )
+    key_file = tmp_path / "deepseek-api-key"
+    key_file.write_text("knowledge-test-key\n")
+    monkeypatch.setattr(settings, "AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY", "")
+    monkeypatch.setattr(settings, "AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE", str(key_file))
+    extractor = get_knowledge_product_info_service.__wrapped__().extractor
+    assert extractor is not None
+    assert extractor.model_name == "deepseek-flash"
+    extractor.transport = httpx.MockTransport(handler)
 
     result = await extractor.extract({"mode": "extract", "chunks": [{"ref": "r1", "content": "提供合同审查。"}]})
 
-    assert result["sections"] == {"核心能力": ["r1"]}
+    assert result["sections"] == {"核心能力": [claim]}
+    assert requests == 2
+
+
+def test_product_info_extractor_requires_knowledge_deepseek_credentials(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY", "")
+    monkeypatch.setattr(settings, "AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE", "")
+    monkeypatch.setattr(settings, "LLM_API_KEY", "qwen-test-key")
+    monkeypatch.setattr(settings, "REACH_EMAIL_LLM_API_KEY", "email-test-key")
+
+    with pytest.raises(CustomException, match="知识库提取未配置 DeepSeek API Key") as error:
+        get_knowledge_product_info_service.__wrapped__()
+    assert error.value.status_code == 503
 
 
 @pytest.mark.anyio
@@ -1707,7 +1973,7 @@ async def test_product_info_extraction_uses_all_current_chunks_and_keeps_audit()
         ])
         await db.commit()
 
-    class _Extractor:
+    class _Extractor(_AcceptProductReview):
         model_name = "test-summary-model"
 
         def __init__(self) -> None:
@@ -1716,7 +1982,8 @@ async def test_product_info_extraction_uses_all_current_chunks_and_keeps_audit()
         async def extract(self, payload):
             self.modes.append(payload["mode"])
             return {
-                "sections": {"核心能力": [p["ref"] for p in payload["chunks"]]},
+                "scope": _UNNAMED_PRODUCT,
+                "sections": {"核心能力": [_product_claim(p) for p in payload["chunks"]]},
                 "conflicts": [],
             }
 

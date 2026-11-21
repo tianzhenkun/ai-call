@@ -964,5 +964,6 @@ class ProductInfoExtractOut(AiCallBaseSchema):
     source_documents: list[ProductInfoSourceDocumentOut]
     sources: list[ProductInfoSourceOut]
     conflicts: list[ProductInfoConflictOut]
+    review_notes: list[str] = Field(default_factory=list)
     source_version_ids: list[str]
     version_snapshot_hash: str

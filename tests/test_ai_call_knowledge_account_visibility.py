@@ -13,7 +13,13 @@ from lingchen_knowledge.content import content_chars
 from lingchen_knowledge.formats import policy as public_upload_policy
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from test_ai_call_knowledge import _FakeCosClient, _upload
+from test_ai_call_knowledge import (
+    _UNNAMED_PRODUCT,
+    _AcceptProductReview,
+    _FakeCosClient,
+    _product_claim,
+    _upload,
+)
 
 from app.api.v1.ai_call.knowledge_controller import (
     KnowledgePromptRouter,
@@ -49,7 +55,7 @@ from app.services.ai_call.session_registry import KnowledgeRuntimeContext
 NOW = datetime(2026, 10, 24, tzinfo=UTC)
 
 
-class Extractor:
+class Extractor(_AcceptProductReview):
     model_name = "isolated-test-model"
 
     def __init__(self):
@@ -59,7 +65,8 @@ class Extractor:
         self.inputs.append(payload)
         chunk = payload["chunks"][0]
         return {
-            "sections": {"核心能力": [chunk["ref"]]},
+            "scope": _UNNAMED_PRODUCT,
+            "sections": {"核心能力": [_product_claim(chunk)]},
             "conflicts": [],
         }
 

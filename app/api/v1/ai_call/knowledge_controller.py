@@ -83,19 +83,27 @@ def get_knowledge_product_info_service() -> Any:
     from app.services.ai_call.prompt_optimization import (
         build_knowledge_product_extractor,
     )
+    from app.services.reach_email.security import configured_secret
+
+    try:
+        api_key = configured_secret(
+            settings.AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY,
+            settings.AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE,
+            "知识库提取 DeepSeek API Key",
+        )
+    except ValueError as exc:
+        raise CustomException(msg=str(exc), status_code=503) from exc
+    extractor = build_knowledge_product_extractor(
+        api_key=api_key,
+        timeout_seconds=settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS,
+    )
+    if extractor is None:
+        raise CustomException(msg="知识库提取未配置 DeepSeek API Key", status_code=503)
 
     async def read_legacy_docx(version):
         return await read_legacy_word(version, store=get_knowledge_service().store)
 
-    return KnowledgeProductInfoService(
-        build_knowledge_product_extractor(
-            base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
-            api_key=settings.EFFECTIVE_LLM_API_KEY,
-            model=settings.AI_CALL_PROMPT_OPTIMIZE_MODEL,
-            timeout_seconds=settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS,
-        ),
-        read_legacy_docx=read_legacy_docx,
-    )
+    return KnowledgeProductInfoService(extractor, read_legacy_docx=read_legacy_docx)
 
 
 def _upload_response(result: Any) -> SuccessResponse:

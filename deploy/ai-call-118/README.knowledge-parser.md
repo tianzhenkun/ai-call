@@ -41,4 +41,6 @@ docker compose --env-file .env \
 
 在运行知识库任务的服务上配置 `AI_CALL_KNOWLEDGE_OCR_API_KEY` 用于图片和扫描 PDF 的 PaddleOCR 识别。音视频转写使用 `ASR_API_KEY`，也可以复用 `DASHSCOPE_API_KEY`。FFmpeg 提取的临时音轨需要使用 DashScope 可访问的 HTTPS 对象存储地址。
 
+场景提示词页的「从知识库一键提取」调用 `deepseek-flash`。在运行 Reach API 的服务上设置 `AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE` 指向只读密钥文件，或设置 `AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY`，两者选其一。
+
 生产环境默认使用 `/run/ai-call-parser/parser.sock`，可通过 `AI_CALL_KNOWLEDGE_PARSER_SOCKET` 指定实际挂载路径。开发环境未配置该路径时，公共组件在有超时限制的本机子进程中解析文档。
