@@ -28,7 +28,7 @@ from app.api.v1.ai_call.model import (
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
 from app.config.setting import settings
-from app.core.dependencies import get_current_user, get_prompt_manager
+from app.core.dependencies import get_current_user, get_knowledge_manager, get_prompt_manager
 from app.core.exceptions import CustomException
 from app.core.security import OAuth2Schema
 from app.services.ai_call.billing_read import (
@@ -569,9 +569,11 @@ async def create_prompt_draft_controller(
     auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    if request.knowledge_item_ids is not None or request.knowledge_version_snapshot_hash is not None:
+        await get_knowledge_manager(auth)
+    tenant_id, user_id = _identity(auth)
     return SuccessResponse(data=PromptProfileOut.model_validate(await service.create_prompt_profile_draft(
-        tenant_id=tenant_id, values=request.model_dump(exclude_unset=True),
+        tenant_id=tenant_id, values=request.model_dump(exclude_unset=True), created_by=user_id,
     )))
 
 
@@ -638,6 +640,8 @@ async def create_prompt_profile_controller(
     auth: Annotated[AuthSchema, Depends(get_prompt_manager)],
     service: Annotated[AiCallService, Depends(get_ai_call_service)],
 ) -> JSONResponse:
+    if request.knowledge_item_ids is not None or request.knowledge_version_snapshot_hash is not None:
+        await get_knowledge_manager(auth)
     tenant_id, user_id = _identity(auth)
     user = auth.user
     result = await service.create_prompt_profile(

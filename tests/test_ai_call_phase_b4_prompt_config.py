@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter
@@ -31,7 +32,7 @@ from app.api.v1.ai_call.schema import (
 from app.api.v1.ai_call.service import AiCallService
 from app.core.base_model import MappedBase
 from app.core.dependencies import get_current_user, get_prompt_manager
-from app.core.exceptions import CustomException
+from app.core.exceptions import CustomException, handle_exception
 from app.services.ai_call.event_store import InMemoryEventStore
 from app.services.ai_call.knowledge import knowledge_version_snapshot_hash
 from app.services.ai_call.livekit_room import BrowserRoomToken
@@ -44,7 +45,10 @@ from app.services.ai_call.prompt_config import (
     DefaultPromptProvider,
     PromptComposer,
 )
-from app.services.ai_call.prompt_optimization import OpenAICompatiblePromptOptimizer
+from app.services.ai_call.prompt_optimization import (
+    OpenAICompatiblePromptOptimizer,
+    build_prompt_optimizer,
+)
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recov_collection_prompt import RecovCollectionPostgresPromptStore
 from app.services.ai_call.session_registry import (
@@ -994,13 +998,42 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
     app.include_router(AiCallRouter)
     app.dependency_overrides[get_ai_call_service] = lambda: service
     app.dependency_overrides[get_prompt_manager] = lambda: SimpleNamespace(
-        user=SimpleNamespace(tenant_id=TEST_TENANT_ID, user_id=7),
+        user=SimpleNamespace(tenant_id=TEST_TENANT_ID, user_id=7, is_superuser=False),
+        permissions={"ai_call:knowledge:manage", "ai_call:prompt:manage"},
     )
+    handle_exception(app)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
         applied = await client.patch(f"/ai-call/prompt-profiles/{created['id']}", json={
             "module": "productInfo", "expectedRevision": created["editRevision"],
             "productInfo": "采用知识草稿", "knowledgeVersionSnapshotHash": snapshot_hash,
         })
+        for path, text_fields in (
+            ("/ai-call/prompt-profiles", {"openingMessage": "你好", "promptText": "你是预约顾问。"}),
+            ("/ai-call/prompt-profiles/drafts", {"module": "productInfo"}),
+        ):
+            payload = {
+                "name": "摘要新场景" + path,
+                "creationKey": "new-summary" + path,
+                "productInfo": "采用知识草稿",
+                "knowledgeItemIds": ["101"],
+                **text_fields,
+            }
+            stale = await client.post(path, json={**payload, "knowledgeVersionSnapshotHash": "0" * 64})
+            assert stale.status_code == 409
+            assert stale.json()["data"]["errorCode"] == "PROMPT_KNOWLEDGE_CHANGED"
+            assert (await service.check_prompt_profile_name(
+                tenant_id=TEST_TENANT_ID, name=payload["name"],
+            ))["available"]
+            valid = {**payload, "knowledgeVersionSnapshotHash": snapshot_hash}
+            response = await client.post(path, json=valid)
+            assert response.status_code == 200, response.text
+            saved = response.json()["data"]
+            assert saved["productInfo"] == "采用知识草稿"
+            assert (await client.post(path, json=valid)).json()["data"]["id"] == saved["id"]
+            rows = list(await repository.db.scalars(select(AiCallPromptKnowledgeBindingModel).where(
+                AiCallPromptKnowledgeBindingModel.prompt_profile_id == int(saved["id"]),
+            )))
+            assert [row.knowledge_item_id for row in rows] == [101]
     assert applied.status_code == 200, applied.text
     assert applied.json()["data"]["productInfo"] == "采用知识草稿"
     values = {
@@ -1073,7 +1106,10 @@ async def test_product_info_draft_rejects_changed_knowledge_snapshot(b4_service)
 async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
-        assert payload["model"] == "qwen3.7-plus"
+        assert str(request.url) == "https://api.deepseek.com/chat/completions"
+        assert payload["model"] == "deepseek-flash"
+        assert payload["thinking"] == {"type": "disabled"}
+        assert "enable_thinking" not in payload
         system_prompt = payload["messages"][0]["content"]
         assert "允许询问并记录微信等联系方式" in system_prompt
         assert "不得声称已经添加微信、发送资料、完成预约" in system_prompt
@@ -1096,12 +1132,9 @@ async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
             },
         )
 
-    optimizer = OpenAICompatiblePromptOptimizer(
-        base_url="https://dashscope.test/v1",
-        api_key="test-key",
-        model="qwen3.7-plus",
-        transport=httpx.MockTransport(handler),
-    )
+    optimizer = build_prompt_optimizer(api_key="test-key")
+    assert optimizer is not None
+    optimizer.transport = httpx.MockTransport(handler)
     result = await optimizer.optimize(
         {
             "targetType": "opening",
@@ -1203,6 +1236,18 @@ def test_prompt_optimizer_allows_contact_collection_and_conditional_follow_up(
     )
 
     assert result["candidateContent"] == candidate
+
+
+def test_scene_prompt_allows_explicit_prohibitions_but_rejects_separate_spoken_promises() -> None:
+    payload = {"targetType": "scenePrompt", "currentContent": "", "allowedVariables": []}
+    rule = "不承诺未确认的效果、价格或上线时间；不声称已添加微信、已发送资料或已完成预约。"
+    assert OpenAICompatiblePromptOptimizer._validate_result(
+        payload, {"candidateContent": rule},
+    )["candidateContent"] == rule
+    with pytest.raises(ValueError, match="系统未支持的动作承诺"):
+        OpenAICompatiblePromptOptimizer._validate_result(
+            payload, {"candidateContent": rule + "示例：稍后会有顾问联系您。"},
+        )
 
 
 def test_prompt_optimizer_rejects_unchanged_candidate() -> None:

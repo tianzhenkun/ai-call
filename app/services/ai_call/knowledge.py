@@ -37,6 +37,7 @@ from app.api.v1.ai_call.model import (
     AiCallPromptKnowledgeBindingModel,
     AiCallPromptProfileModel,
 )
+from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.knowledge_binary_parser import KnowledgeBinaryParserClient
@@ -47,12 +48,13 @@ from app.services.ai_call.knowledge_processing import (
     parse_stored_document,
     version_original,
 )
+from app.services.ai_call.knowledge_spoken import ProductClarification, index_next_version, named_products, search_spoken
 from app.services.ai_call.prompt_optimization import KnowledgeProductExtractorProtocol
-from app.services.ai_call.session_registry import KnowledgeRuntimeContext
+from app.services.ai_call.session_registry import SPOKEN_VERSION, KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
 
 RETRIEVER_VERSION = "postgres-ngram-tsvector-v1"
-_PRODUCT_INFO_SECTIONS = {"产品定位": 1, "核心能力": 5, "关键边界": 3}
+_PRODUCT_INFO_SECTIONS = ("产品定位", "核心能力", "关键边界")
 _PRODUCT_PROMISE = re.compile(
     r"\d|[¥￥$%％]|价格|报价|费用|免费|收费|工作日|时限|交付|套餐|仅限|只限|必须|不含|不支持|不得|"
     r"保障|保证|离线|接入|对接|回写|导出|推送|部署|接管|权限|试点|集成|API|Webhook", re.I
@@ -63,6 +65,16 @@ _OPTIONAL_ROLLOUT = re.compile(
     r"(?:试点|小范围|试用|POC|试行|验证|推广)", re.I,
 )
 _QUALIFIER = re.compile(r"不(?:可|能|含|支持|允许|提供|包括|保证)|暂不|不得|无法|仅(?:限|供|在|当)|除非|须先|unless|except", re.I)
+_DEPENDENCY = re.compile(r"依赖|取决于|不可或缺|缺一不可|\b(?:depend(?:s)? on|relies on)\b", re.I)
+_NEED = re.compile(r"(?<![无不按供所])需(?!求|方)")
+_REQUIREMENT = re.compile(
+    _DEPENDENCY.pattern + r"|必须|务必|必需|必备|必要条件|前提|需(?:要)?先|(?<![无不])须(?!知)|"
+    r"仅限|只有|方可|才(?:可|能)|否则|不得|无法|不能|\b(?:must|required|mandatory|prerequisite|only if|cannot)\b", re.I,
+)
+_RECOMMENDED_STEP = re.compile(
+    r"(?:建议|推荐)(?:先|从|优先|选择|采用|考虑)|(?:实施|落地|试点)建议|优先(?:选择|从|落地|考虑)|"
+    r"可(?:以)?先|宜先|先(?:选择|从|考虑)|\b(?:recommended|preferably|we suggest|start by)\b", re.I,
+)
 
 _STREAM_CHUNK_BYTES = 64 * 1024
 _CONTENT_CATEGORIES = {
@@ -260,16 +272,25 @@ def parse_knowledge_runtime_context(
         not isinstance(snapshot_hash, str)
         or snapshot_hash != snapshot_hash.lower()
         or _SHA256_RE.fullmatch(snapshot_hash) is None
-        or knowledge.get("retrieverVersion") != RETRIEVER_VERSION
+        or knowledge.get("retrieverVersion") not in (RETRIEVER_VERSION, SPOKEN_VERSION)
     ):
         return None
+    scene_name = str(prompt.get("name") or "")[:200]
+    positioning = str(prompt.get("productInfo") or "").strip().split("\n\n", 1)[0][:500]
+    names = knowledge.get("products", [])
+    if not isinstance(names, list) or not all(isinstance(p, str) for p in names):
+        return None
+    named = named_products(scene_name, names) or named_products(positioning, names)
     return KnowledgeRuntimeContext(
         tenant_id=tenant_id,
         task_id=task_id,
         prompt_profile_id=prompt_profile_id,
         version_ids=parsed_version_ids,
         version_snapshot_hash=snapshot_hash,
-        retriever_version=RETRIEVER_VERSION,
+        retriever_version=knowledge["retrieverVersion"],
+        scene_name=scene_name,
+        positioning=positioning,
+        product_choices=tuple(names) if len(names) > 1 and len(named) != 1 else (),
     )
 
 
@@ -324,21 +345,26 @@ class KnowledgeRealtimeSearchService:
         tool_call_id: str,
         query: Any,
         model_name: str | None = None,
+        topic: str = "",
+        focus: str = "",
     ) -> KnowledgeRealtimeSearchResult:
         started = perf_counter()
         hits: list[KnowledgeSearchHit] = []
         status = "FAILED"
+        clarification = None
         if isinstance(query, str):
             try:
                 if len(query) > 500:
                     raise ValueError("query 不能超过 500 个字符")
                 hits = await asyncio.wait_for(
-                    self._search(context, query),
+                    self._search(context, query, topic[:160], focus) if topic or focus else self._search(context, query),
                     timeout=self.timeout_seconds,
                 )
                 status = "OK" if hits else "NO_HIT"
             except TimeoutError:
                 status = "TIMEOUT"
+            except ProductClarification as exc:
+                status, clarification = "NO_HIT", str(exc)
             except Exception as exc:
                 log.warning(
                     "AI Call 实时知识检索失败: tenantId={}, taskId={}, "
@@ -376,20 +402,25 @@ class KnowledgeRealtimeSearchService:
                 status="failed",
                 output=self._tool_output("FAILED", []),
             )
+        output = self._tool_output(status, hits)
+        if clarification:
+            output["message"] = clarification
         return KnowledgeRealtimeSearchResult(
             audit_id=audit_id,
             status=status.lower(),
-            output=self._tool_output(status, hits),
+            output=output,
         )
 
     async def _search(
         self,
         context: KnowledgeRuntimeContext,
         query: str,
+        topic: str = "",
+        focus: str = "",
     ) -> list[KnowledgeSearchHit]:
         from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 
-        if context.retriever_version != RETRIEVER_VERSION:
+        if context.retriever_version not in (RETRIEVER_VERSION, SPOKEN_VERSION):
             raise ValueError("不支持的知识检索器版本")
         async with self.session_factory() as db:
             user_id = await db.scalar(
@@ -428,6 +459,8 @@ class KnowledgeRealtimeSearchService:
                 != context.version_snapshot_hash
             ):
                 raise ValueError("任务冻结知识快照与数据库不一致")
+            if context.retriever_version == SPOKEN_VERSION:
+                return await search_spoken(db, versions, context, query, topic, focus)
             return await KnowledgeSearchService.search(
                 db,
                 tenant_id=context.tenant_id,
@@ -602,8 +635,9 @@ def _public_item_versions():
 
 
 async def scene_knowledge_items(
-    db: AsyncSession, *, tenant_id: str, user_id: int, profile_id: int,
+    db: AsyncSession, *, tenant_id: str, user_id: int | None, profile_id: int,
     item_ids: list[int] | None = None, expected_item_ids: Collection[int] = (),
+    commit: bool = True,
 ) -> list[dict[str, str]]:
     user_id = _require_knowledge_user(user_id)
     await _knowledge_profile(db, tenant_id, profile_id, lock=item_ids is not None)
@@ -631,15 +665,7 @@ async def scene_knowledge_items(
             raise CustomException(msg="场景知识资料已变化，请重新打开选择器", status_code=409)
         added = desired - current
         if added:
-            ready = await db.scalars(
-                select(item.id).join(version, version.id == item.current_ready_version_id).where(
-                    *owned, item.id.in_(added), version.tenant_id == tenant_id,
-                    version.knowledge_item_id == item.id, version.status == "READY",
-                    _public_version(),
-                )
-            )
-            if set(ready) != added:
-                raise CustomException(msg="选择的资料不可用，请选择自己已就绪的知识资料", status_code=409)
+            await load_selected_ready_knowledge_versions(db, tenant_id=tenant_id, user_id=user_id, item_ids=added)
             now = datetime.now(UTC)
             db.add_all([binding(
                 id=generate_snowflake_id(), tenant_id=tenant_id, prompt_profile_id=profile_id,
@@ -650,9 +676,36 @@ async def scene_knowledge_items(
         if removed:
             await db.execute(delete(binding).where(*scene, binding.knowledge_item_id.in_(removed)))
     rows = (await db.execute(current_query)).all()
-    if item_ids is not None:
+    if item_ids is not None and commit:
         await db.commit()
     return [{"id": str(row.id), "displayName": row.display_name} for row in rows]
+
+
+def _ready_knowledge_versions(tenant_id: str, user_id: int | None):
+    item = AiCallKnowledgeItemModel
+    version = AiCallKnowledgeVersionModel
+    return (
+        select(version)
+        .join(item, and_(item.id == version.knowledge_item_id, item.tenant_id == version.tenant_id))
+        .where(
+            version.tenant_id == tenant_id, version.status == "READY", _public_version(),
+            item.created_by == _require_knowledge_user(user_id), item.deleted_at.is_(None),
+            item.current_ready_version_id == version.id,
+        )
+        .order_by(version.id)
+    )
+
+
+async def load_selected_ready_knowledge_versions(
+    db: AsyncSession, *, tenant_id: str, user_id: int, item_ids: Collection[int],
+) -> list[AiCallKnowledgeVersionModel]:
+    desired = set(item_ids)
+    versions = list((await db.scalars(_ready_knowledge_versions(tenant_id, user_id).where(
+        AiCallKnowledgeItemModel.id.in_(desired),
+    ))).all())
+    if {version.knowledge_item_id for version in versions} != desired:
+        raise CustomException(msg="选择的资料不可用，请选择自己已就绪的知识资料", status_code=409)
+    return versions
 
 
 async def load_current_ready_knowledge_versions(
@@ -662,51 +715,17 @@ async def load_current_ready_knowledge_versions(
     user_id: int | None,
     prompt_profile_id: int,
 ) -> list[AiCallKnowledgeVersionModel]:
-    user_id = _require_knowledge_user(user_id)
-    return list(
-        (
-            await db.scalars(
-                select(AiCallKnowledgeVersionModel)
-                .join(
-                    AiCallKnowledgeItemModel,
-                    and_(
-                        AiCallKnowledgeItemModel.id
-                        == AiCallKnowledgeVersionModel.knowledge_item_id,
-                        AiCallKnowledgeItemModel.tenant_id
-                        == AiCallKnowledgeVersionModel.tenant_id,
-                    ),
-                )
-                .join(
-                    AiCallPromptKnowledgeBindingModel,
-                    and_(
-                        AiCallPromptKnowledgeBindingModel.knowledge_item_id
-                        == AiCallKnowledgeItemModel.id,
-                        AiCallPromptKnowledgeBindingModel.tenant_id
-                        == AiCallKnowledgeItemModel.tenant_id,
-                    ),
-                )
-                .where(
-                    AiCallKnowledgeVersionModel.tenant_id == tenant_id,
-                    select(AiCallPromptProfileModel.id).where(
-                        AiCallPromptProfileModel.id == prompt_profile_id,
-                        AiCallPromptProfileModel.tenant_id == tenant_id,
-                        AiCallPromptProfileModel.deleted_at.is_(None),
-                    ).exists(),
-                    AiCallKnowledgeVersionModel.status == "READY",
-                    _public_version(),
-                    AiCallKnowledgeItemModel.tenant_id == tenant_id,
-                    AiCallKnowledgeItemModel.created_by == user_id,
-                    AiCallKnowledgeItemModel.deleted_at.is_(None),
-                    AiCallKnowledgeItemModel.current_ready_version_id
-                    == AiCallKnowledgeVersionModel.id,
-                    AiCallPromptKnowledgeBindingModel.tenant_id == tenant_id,
-                    AiCallPromptKnowledgeBindingModel.prompt_profile_id
-                    == prompt_profile_id,
-                )
-                .order_by(AiCallKnowledgeVersionModel.id)
-            )
-        ).all()
+    binding = AiCallPromptKnowledgeBindingModel
+    profile = AiCallPromptProfileModel
+    stmt = _ready_knowledge_versions(tenant_id, user_id).where(
+        AiCallKnowledgeItemModel.id.in_(select(binding.knowledge_item_id).where(
+            binding.tenant_id == tenant_id, binding.prompt_profile_id == prompt_profile_id,
+        )),
+        select(profile.id).where(
+            profile.id == prompt_profile_id, profile.tenant_id == tenant_id, profile.deleted_at.is_(None),
+        ).exists(),
     )
+    return list((await db.scalars(stmt)).all())
 
 
 def knowledge_version_snapshot_hash(
@@ -830,6 +849,21 @@ class _ProductInfoQuote:
     end: int
 
 
+def _quote_context(quote: _ProductInfoQuote, passage: str) -> str:
+    text = "".join(passage.split())
+    before = re.split(r"[。！？；.!?;]", text[max(0, quote.start - 20):quote.start])[-1]
+    after = re.split(r"[。！？；.!?;]", text[quote.end:quote.end + 20])[0]
+    excerpt = text[quote.start:quote.end]
+    return before + excerpt + ("" if excerpt[-1] in "。！？；.!?;" else after)
+
+
+def _condition_check(claim: str) -> str | None:
+    if _REQUIREMENT.search(claim):
+        return "required"
+    # “需要”也可以描述客户的业务需求，要结合主体和上下文判定。
+    return "context" if _NEED.search(claim) else None
+
+
 class _UnverifiedProductQuote(ValueError):
     """原文不足以核对这一条结论，其他有依据的结论仍可采用。"""
 
@@ -907,18 +941,24 @@ class KnowledgeProductInfoService:
         db: AsyncSession,
         *,
         tenant_id: str,
-        prompt_profile_id: int,
         user_id: int,
+        prompt_profile_id: int | None = None,
+        scene_name: str = "",
+        knowledge_item_ids: Collection[int] = (),
     ) -> dict[str, Any]:
         if self.extractor is None:
             raise CustomException(msg="产品信息提取服务未配置", status_code=503)
-        profile = await _knowledge_profile(db, tenant_id, prompt_profile_id)
-        versions = await load_current_ready_knowledge_versions(
-            db,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            prompt_profile_id=prompt_profile_id,
-        )
+        scene_code = ""
+        if prompt_profile_id is None:
+            versions = await load_selected_ready_knowledge_versions(
+                db, tenant_id=tenant_id, user_id=user_id, item_ids=knowledge_item_ids,
+            )
+        else:
+            profile = await _knowledge_profile(db, tenant_id, prompt_profile_id)
+            scene_code, scene_name = profile.scene_code, profile.name
+            versions = await load_current_ready_knowledge_versions(
+                db, tenant_id=tenant_id, user_id=user_id, prompt_profile_id=prompt_profile_id,
+            )
         if not versions:
             raise CustomException(msg="请先关联至少一份已就绪知识", status_code=409)
 
@@ -947,8 +987,8 @@ class KnowledgeProductInfoService:
         started = perf_counter()
         try:
             result = await self._extract_batches(
-                scene_code=profile.scene_code,
-                scene_name=profile.name,
+                scene_code=scene_code,
+                scene_name=scene_name,
                 chunks=await self._body_passages(chunks, version_by_id),
             )
         except Exception as exc:
@@ -1139,6 +1179,11 @@ class KnowledgeProductInfoService:
             if product:
                 products.setdefault(key, product)
             by_ref = {passage["ref"]: "".join(passage["content"].split()) for passage in batch}
+            lines_by_ref = {}
+            for passage in batch:
+                lines = passage["content"].splitlines()
+                starts = accumulate((len("".join(line.split())) for line in lines), initial=0)
+                lines_by_ref[passage["ref"]] = list(zip(lines, starts, strict=False))
             selected_refs: set[str] = set()
 
             def checked_quotes(value: Any) -> list[_ProductInfoQuote]:
@@ -1153,13 +1198,27 @@ class KnowledgeProductInfoService:
                     ref, excerpt = item.get("ref"), item.get("excerpt")
                     if not isinstance(ref, str) or ref not in by_ref:
                         raise ValueError("提取结果引用了本批原文以外的内容")
+                    source_text, offset = by_ref[ref], 0
+                    if "line" in item:
+                        number = item["line"]
+                        lines = lines_by_ref[ref]
+                        if type(number) is not int or not 1 <= number <= len(lines):
+                            raise _UnverifiedProductQuote("引文行号在对应原文中不存在。")
+                        original, offset = lines[number - 1]
+                        line_text = original.strip()
+                        if excerpt is None:
+                            if not line_text or len(line_text) > 300:
+                                raise _UnverifiedProductQuote("该行无法作为短引，需引用其中直接支持结论的原句。")
+                            excerpt = line_text
+                        source_text = "".join(line_text.split())
                     excerpt = excerpt.strip() if isinstance(excerpt, str) else ""
                     if not excerpt or len(excerpt) > 300:
                         raise ValueError("原文短引为空或超过 300 字")
                     compact = "".join(excerpt.split())
-                    start = by_ref[ref].find(compact)
+                    start = source_text.find(compact)
                     if start < 0:
                         raise _UnverifiedProductQuote("所引文字无法在对应原文中逐字找到。")
+                    start += offset
                     end = start + len(compact)
                     quotes.setdefault((ref, start, end), _ProductInfoQuote(ref, excerpt, start, end))
                 return list(quotes.values())
@@ -1172,7 +1231,7 @@ class KnowledgeProductInfoService:
             claims: dict[str, tuple[str, list[_ProductInfoQuote]]] = {}
             for section in _PRODUCT_INFO_SECTIONS:
                 entries = sections.get(section, [])
-                if not isinstance(entries, list) or len(entries) > 200:
+                if not isinstance(entries, list):
                     raise ValueError("产品信息草稿结论列表格式错误")
                 for entry in entries:
                     if not isinstance(entry, dict):
@@ -1184,13 +1243,13 @@ class KnowledgeProductInfoService:
                     review = entry.get("needsReview", True)
                     if not isinstance(review, bool):
                         raise ValueError("结论复核标记格式错误")
-                    if review or status == "partial" or in_product_section:
-                        needs_review.add(claim)
                     try:
                         verified = checked_quotes(entry.get("sources"))
                     except _UnverifiedProductQuote as exc:
                         unverified[claim] = str(exc)
                         continue
+                    if review or status == "partial" or in_product_section or any("line" in src for src in entry["sources"]):
+                        needs_review.add(claim)
                     _, quotes = claims.setdefault(claim, (section, []))
                     quotes.extend(verified)
                     selected_refs.update(q.ref for q in verified)
@@ -1207,7 +1266,7 @@ class KnowledgeProductInfoService:
             return claims, [passage for passage in batch if passage["ref"] in selected_refs]
 
         assert self.extractor is not None
-        requested = _brand_in_title(scene_name, source_names, chunks)
+        requested = _brand_in_title(scene_name, source_names, chunks) if scene_name else ""
         named_intro = re.fullmatch(r".+?(?:产品|服务)介绍", scene_name.strip())
         if requested is None and batches and (len(batches) > 1 or named_intro):
             requested = await self.extractor.identify_product(scene_name, source_names)
@@ -1255,27 +1314,18 @@ class KnowledgeProductInfoService:
                 needs_review.add(claim)
             remaining[claim] = (section, list(dict.fromkeys(quotes)))
 
-        def needs_context_check(quote: _ProductInfoQuote) -> bool:
-            if _PRODUCT_PROMISE.search(quote.excerpt):
-                return True
-            text = "".join(passages[quote.ref]["content"].split())
-            before = re.split(r"[。！？；.!?;]", text[max(0, quote.start - 20):quote.start])[-1]
-            after = re.split(r"[。！？；.!?;]", text[quote.end:quote.end + 20])[0]
-            excerpt = text[quote.start:quote.end]
-            return bool(_QUALIFIER.search(before + excerpt + ("" if excerpt[-1] in "。！？；.!?;" else after)))
-
         to_review = {
             claim: (section, quotes) for claim, (section, quotes) in remaining.items()
             if len(documents) > 1 or section == "关键边界" or claim in needs_review
-            or _PRODUCT_PROMISE.search(claim) or any(needs_context_check(q) for q in quotes)
+            or _condition_check(claim) or _PRODUCT_PROMISE.search(claim)
+            or any(_PRODUCT_PROMISE.search(q.excerpt) or _QUALIFIER.search(_quote_context(q, passages[q.ref]["content"]))
+                   for q in quotes)
         }
         rejected = await self._review_commitments(scene_name, target, to_review, passages) if to_review else {}
         for claim, (section, quotes) in remaining.items():
             if claim in rejected:
                 notes[f"“{claim}”待确认。{rejected[claim]}"] = None
                 cited.extend((f"待确认：{claim}", quote) for quote in quotes)
-                continue
-            if len(by_section[section]) >= _PRODUCT_INFO_SECTIONS[section]:
                 continue
             by_section[section].append(claim)
             cited.extend((claim, quote) for quote in quotes)
@@ -1300,7 +1350,7 @@ class KnowledgeProductInfoService:
         if not draft_text and not conflict_details and not notes:
             raise CustomException(msg="关联资料中未提取到有原文依据的产品或服务信息", status_code=422)
         if len(draft_text) > 20_000:
-            raise ValueError("产品信息草稿超过 20000 字符")
+            raise CustomException(msg="产品与服务总结超过编辑框的 20000 字符容量，请缩小资料范围后重新提取", status_code=422)
         sources = []
         for claim, quote in dict.fromkeys(cited):
             passage = passages[quote.ref]
@@ -1320,13 +1370,14 @@ class KnowledgeProductInfoService:
         context = {}
         for index, (claim, (section, quotes)) in enumerate(claims.items(), 1):
             items.append({"id": str(index), "claim": claim, "section": section,
+                          "conditionCheck": _condition_check(claim),
                           "sources": [{"ref": q.ref, "excerpt": q.excerpt} for q in quotes]})
             for q in quotes:
                 context[q.ref] = passages[q.ref]
         result = await self.extractor.review({
             "sceneName": scene, "targetProduct": product, "items": items, "passages": list(context.values()),
         })
-        expected = {item["id"]: item["claim"] for item in items}
+        expected = {item["id"]: item for item in items}
         rejected = {}
         decisions = result.get("results")
         if not isinstance(decisions, list):
@@ -1334,14 +1385,30 @@ class KnowledgeProductInfoService:
         for decision in decisions:
             if not isinstance(decision, dict) or not isinstance(decision.get("id"), str):
                 raise ValueError("承诺复核格式错误")
-            claim = expected.pop(decision["id"], None)
-            if claim is None or not isinstance(decision.get("supported"), bool):
+            item = expected.pop(decision["id"], None)
+            if item is None or not isinstance(decision.get("supported"), bool):
                 raise ValueError("承诺复核返回了重复、未知或无效的结果")
+            claim = item["claim"]
             if not decision["supported"]:
                 reason = decision.get("reason")
                 if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
                     raise ValueError("承诺复核未说明证据缺口")
                 rejected[claim] = reason.strip()
+            elif item["conditionCheck"]:
+                # 必要条件必须有本条引文内的直接依据，同页其他要求不能替它作证。
+                evidence = decision.get("conditionEvidence", "")
+                if evidence is None and item["conditionCheck"] == "context":
+                    continue
+                compact = "".join(evidence.split()) if isinstance(evidence, str) else ""
+                matching = [q for q in claims[claim][1] if compact and compact in "".join(q.excerpt.split())]
+                if not matching:
+                    rejected[claim] = "本条引文中没有可核对的限制依据。"
+                elif not (_REQUIREMENT.search(evidence) or _REQUIREMENT.search(compact) or _NEED.search(compact)):
+                    if _DEPENDENCY.search(claim) or all(
+                        _RECOMMENDED_STEP.search(q.excerpt)
+                        or _RECOMMENDED_STEP.search(_quote_context(q, passages[q.ref]["content"])) for q in matching
+                    ):
+                        rejected[claim] = "引文描述了做法或优先顺序，未说明这是必要条件。"
         if expected:
             raise ValueError("承诺复核遗漏了待核对的结论")
         return rejected
@@ -1350,7 +1417,7 @@ class KnowledgeProductInfoService:
         self,
         *,
         tenant_id: str,
-        prompt_profile_id: int,
+        prompt_profile_id: int | None,
         version_ids: list[int],
         snapshot_hash: str,
         status: str,
@@ -2699,7 +2766,9 @@ class KnowledgeWorker:
 
     async def run_once(self) -> bool:
         reconciled = await self._reconcile_stale_upload()
-        return await self.processor.run_once() or reconciled
+        parsed = await self.processor.run_once()
+        indexed = bool(settings.AI_CALL_KNOWLEDGE_EMBEDDING_DIR) and await index_next_version(self.session_factory)
+        return parsed or indexed or reconciled
 
     async def _reconcile_stale_upload(self) -> bool:
         claimed = await self._claim_stale_upload()

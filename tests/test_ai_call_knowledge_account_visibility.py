@@ -311,6 +311,23 @@ async def test_scene_picker_reads_legacy_links_and_extracts_only_the_saved_selec
 
 
 @pytest.mark.anyio
+async def test_unsaved_scene_extracts_only_ready_owned_selection_without_creating_a_scene(knowledge_scope):
+    scope = knowledge_scope
+    path = "/prompt-profiles/product-info:extract"
+    async with AsyncClient(transport=ASGITransport(app_for(scope, 7)), base_url="http://test") as client:
+        for item in ("2", "3", "4"):
+            assert (await client.post(path, json={"sceneName": "演示", "knowledgeItemIds": ["1", item]})).status_code == 409
+        assert scope.extractor.inputs == []
+        result = await client.post(path, json={"sceneName": "", "knowledgeItemIds": ["1"]})
+        assert result.status_code == 200, result.text
+        assert result.json()["data"]["sourceVersionIds"] == ["11"]
+        assert "账号 7 的私有资料 1" in result.json()["data"]["draftText"]
+    assert set(await scope.db.scalars(select(AiCallPromptProfileModel.id))) == {101, 201}
+    usage = await scope.db.scalar(select(AiCallKnowledgeUsageModel))
+    assert usage.prompt_profile_id is None and usage.status == "OK"
+
+
+@pytest.mark.anyio
 async def test_existing_unready_binding_remains_visible_and_removable(knowledge_scope):
     item = await knowledge_scope.db.get(AiCallKnowledgeItemModel, 1)
     item.current_ready_version_id = None
@@ -606,6 +623,63 @@ async def test_upload_replay_is_per_account_and_keeps_legacy_own_keys(knowledge_
     assert replay.replayed and replay.version_id == own.version_id
     assert other.version_id != own.version_id and other.item_id != own.item_id
     assert other_replay.replayed and other_replay.version_id == other.version_id
+
+
+@pytest.mark.anyio
+async def test_spoken_index_freeze_retry_and_original_evidence(knowledge_scope, monkeypatch):
+    import numpy as np
+
+    from app.services.ai_call import knowledge_spoken as spoken
+    from app.services.ai_call.knowledge import parse_knowledge_runtime_context
+
+    scope = knowledge_scope
+    monkeypatch.setattr(spoken.settings, "AI_CALL_KNOWLEDGE_EMBEDDING_DIR", "test-model")
+    monkeypatch.setattr(spoken, "_embed", lambda texts: np.array([[1., 0.]] * len(texts), dtype="f4"))
+    monkeypatch.setattr(spoken, "scene_editor_deepseek_key", lambda: "test")
+
+    class Extractor:
+        broken = True
+
+        async def index_chapters(self, filename, titles):
+            return {"kind": "general", "product": "", "chapters": []}
+
+        async def index_passages(self, payload):
+            return {"pages": [{"ref": r["ref"], "section": "索引标题", "product": "",
+                               "facts": [{"first": 1, "last": 999 if self.broken else 1, "focus": "职责分工",
+                                          "questions": ["测试口头问法"]}]} for r in payload["chunks"]]}
+
+    extractor = Extractor()
+    monkeypatch.setattr(spoken, "build_knowledge_product_extractor", lambda **_: extractor)
+    freeze = dict(tenant_id="tenant-a", user_id=7, prompt_profile_id=101, frozen_at=NOW)
+    with pytest.raises(CustomException) as pending:
+        await OutboundRuleTaskService._freeze_knowledge(scope.db, **freeze)
+    assert pending.value.status_code == 409
+    await scope.db.commit()
+    assert await spoken.index_next_version(scope.sessions)
+    version = await scope.db.get(AiCallKnowledgeVersionModel, 11)
+    await scope.db.refresh(version)
+    assert version.retrieval_version is None and version.retrieval_retry_at and version.retrieval_lease is None
+    version.retrieval_retry_at = None
+    await scope.db.commit()
+    extractor.broken = False
+    assert await spoken.index_next_version(scope.sessions)
+    await scope.db.refresh(version)
+    frozen = await OutboundRuleTaskService._freeze_knowledge(scope.db, **freeze)
+    assert frozen["retrieverVersion"] == spoken.SPOKEN_VERSION
+    ctx = parse_knowledge_runtime_context({"prompt": {"id": "101", "name": "回访"}, "knowledge": frozen},
+                                          tenant_id="tenant-a", task_id=701)
+    await scope.db.commit()
+    service = KnowledgeRealtimeSearchService(scope.sessions)
+    result = await service.search(context=ctx, call_id="s1", customer_transcript_event_id=None,
+                                  tool_call_id="t1", query="客户怎么问", topic="私有资料")
+    assert result.status == "ok" and result.audit_id
+    evidence, = result.output["evidence"]
+    assert evidence["content"] == "账号 7 的私有资料 1"
+    assert "测试口头问法" not in json.dumps(result.output, ensure_ascii=False)
+    foreign = await scope.db.get(AiCallKnowledgeVersionModel, 21)
+    ctx = KnowledgeRuntimeContext("tenant-a", 701, 101, (21,), knowledge_version_snapshot_hash([foreign]), spoken.SPOKEN_VERSION)
+    with pytest.raises(ValueError, match="冻结知识快照"):
+        await service._search(ctx, "私有资料")
 
 
 @pytest.mark.anyio

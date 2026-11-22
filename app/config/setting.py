@@ -206,7 +206,6 @@ class Settings(BaseSettings):
     QWEN_REALTIME_VAD_SILENCE_DURATION_MS: int = 800
 
     AI_CALL_DEFAULT_PROMPT: str = "你是一个电话外呼助手，回答要简短自然。"
-    AI_CALL_PROMPT_OPTIMIZE_MODEL: str = "qwen3.7-plus"
     AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS: float = 30.0
     AI_CALL_STANDALONE_ENABLE: bool = False
     AI_CALL_PROCESS_ROLES: str = "api,legacy_runtime,outbound,jobs"
@@ -243,6 +242,7 @@ class Settings(BaseSettings):
     AI_CALL_KNOWLEDGE_OCR_API_KEY: str = ""
     AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY: str = ""
     AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE: str = ""
+    AI_CALL_KNOWLEDGE_EMBEDDING_DIR: str = ""
     AI_CALL_KNOWLEDGE_WORKER_ENABLED: bool = False
     AI_CALL_KNOWLEDGE_WORKER_POLL_INTERVAL_SECONDS: float = 2.0
     AI_CALL_KNOWLEDGE_WORKER_LEASE_SECONDS: int = 300

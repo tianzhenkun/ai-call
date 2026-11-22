@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -2230,6 +2231,11 @@ class AiCallKnowledgeVersionModel(MappedBase):
         nullable=True,
     )
     processing_warning_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retrieval_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    retrieval_metadata: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    retrieval_vectors: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
+    retrieval_lease: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    retrieval_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     failure_retryable: Mapped[bool] = mapped_column(
@@ -2341,7 +2347,7 @@ class AiCallKnowledgeUsageModel(MappedBase):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     tenant_id: Mapped[str] = mapped_column(String(20), nullable=False)
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
-    prompt_profile_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    prompt_profile_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     customer_transcript_event_id: Mapped[str | None] = mapped_column(

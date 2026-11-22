@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from copy import deepcopy
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,6 +85,38 @@ def test_runtime_dialogue_instructions_answer_repeated_questions_naturally() -> 
 
     assert "自然业务语言" in output["message"]
     assert "转业务顾问" not in output["message"]
+
+
+def test_spoken_portfolio_uses_only_anchored_chapters_and_numbered_continuations() -> None:
+    from app.services.ai_call.knowledge_spoken import _chapter_owners
+
+    chapters = [
+        "产品矩阵\n工具甲、工具乙都在这份总览里",
+        "业务专章 · 01\n工具甲：独立产品的介绍",
+        "业务专章 · 02\n核心流程",
+        "综合方案\n工具甲与工具乙共同提供服务",
+        "工具乙 · 01\n另一款产品的核心能力",
+    ]
+    rows = [{"ref": n, "heading": "", "body": body} for n, body in enumerate(chapters)]
+    plan = {"kind": "portfolio", "product": "", "chapters": [
+        {"product": "工具甲", "first": 1, "last": 3},
+        {"product": "工具乙", "first": 4, "last": 4},
+    ]}
+    assert _chapter_owners(plan, rows, "产品总览.pdf") == {1: "工具甲", 2: "工具甲", 4: "工具乙"}
+
+
+def test_spoken_multi_product_snapshot_needs_clarification_only_without_a_target() -> None:
+    from app.services.ai_call.session_registry import SPOKEN_VERSION
+
+    snapshot = _snapshot()
+    snapshot["knowledge"].update(retrieverVersion=SPOKEN_VERSION, products=["Sales in", "Mine GEO"])
+    snapshot["prompt"]["name"] = "客户回访"
+    context = parse_knowledge_runtime_context(snapshot, tenant_id="tenant-a", task_id=7)
+    assert context is not None and context.product_choices == ("Sales in", "Mine GEO")
+
+    snapshot["prompt"]["productInfo"] = "产品定位\nSales in 帮助团队获客。"
+    context = parse_knowledge_runtime_context(snapshot, tenant_id="tenant-a", task_id=7)
+    assert context is not None and context.product_choices == ()
 
 
 def test_parse_knowledge_runtime_context_fails_closed_for_damaged_snapshot() -> None:
@@ -179,6 +213,46 @@ class _Provider:
 
     async def submit_tool_result(self, tool_call_id: str, output: str) -> None:
         self.results.append((tool_call_id, output))
+
+
+@pytest.mark.anyio
+async def test_spoken_summary_receives_final_words_once_and_keeps_operational_tools() -> None:
+    from app.services.ai_call.session_registry import SPOKEN_VERSION
+
+    snapshot = _snapshot()
+    snapshot["knowledge"]["retrieverVersion"] = SPOKEN_VERSION
+    registry = InMemorySessionRegistry()
+    provider = SimpleNamespace(create_response=AsyncMock())
+    runner = RealtimeCallAgentRunner(
+        provider_factory=lambda _: provider, registry=registry,
+        event_store=InMemoryEventStore(), knowledge_search_service=_KnowledgeService(),
+    )
+    session = CallSession(
+        call_id="summary", room_name="room", participant_identity="customer",
+        status=CallSessionStatus.CONNECTED, effective_config=SimpleNamespace(prompt="产品或服务信息：测试"),
+        knowledge_context=parse_knowledge_runtime_context(snapshot, tenant_id="tenant-a", task_id=7),
+    )
+    registry.add(session)
+    runner._providers[session.call_id] = provider
+    assert {"search_scene_knowledge", "request_handoff"} <= {
+        tool["function"]["name"] for tool in runner._session_config(session).tools
+    }
+    turn = runner._pending_turn(session.call_id)
+    turn.stopped_at = datetime.now(UTC)
+    turn.customer_transcript_event_id = "final-event"
+    turn.transcript_parts = ['客户说“复核完成后由谁决定？”']
+    try:
+        assert await runner._request_response(session.call_id, provider)
+        first = provider.create_response.await_args.args[0]
+        assert json.loads(first.removeprefix("本轮客户原话：")) == turn.transcript
+        runner._clear_response_lifecycle(session.call_id)
+        assert await runner._request_response(session.call_id, provider)
+        provider.create_response.assert_awaited_with(None)
+    finally:
+        runner._providers.pop(session.call_id)
+        watchdog = runner._response_watchdogs.pop(session.call_id)
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
 
 
 @pytest.mark.anyio

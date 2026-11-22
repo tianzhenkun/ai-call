@@ -392,6 +392,8 @@ class KnowledgeVersionProcessor:
             version.chunk_count = len(content.chunks)
             version.content_char_count = content_chars(content.text)
             version.chunk_set_sha256 = chunk_set_hash(content)
+            version.retrieval_version = version.retrieval_metadata = version.retrieval_vectors = None
+            version.retrieval_retry_at = version.retrieval_lease = None
             version.ready_at = now
             version.next_attempt_at = version.lease_owner = version.lease_expires_at = None
             version.failure_code = version.failure_message = None

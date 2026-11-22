@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 from app.services.ai_call.providers.base import ProviderEvent
 from app.services.ai_call.realtime_model import resolve_realtime_url
+from app.services.ai_call.session_registry import KNOWLEDGE_FOCUS
 
 
 class QwenWebSocketProtocol(Protocol):
@@ -127,6 +128,21 @@ SEARCH_SCENE_KNOWLEDGE_TOOL = {
 
 
 DEFAULT_REALTIME_TOOLS = [SCHEDULE_CALL_END_TOOL, REQUEST_HANDOFF_TOOL]
+SPOKEN_KNOWLEDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_scene_knowledge",
+        "description": "仅补查当前产品摘要未说明的事实。摘要已能回答时直接回复；即时转人工使用 request_handoff。",
+        "parameters": {
+            "type": "object", "additionalProperties": False, "required": ["query", "topic", "focus"],
+            "properties": {
+                "query": {"type": "string", "description": "保留客户的口头问法及明确说出的产品名。"},
+                "focus": {"type": "string", "enum": list(KNOWLEDGE_FOCUS), "description": "客户最关心哪类事实。问谁来做、机器会不会包办、什么时候要人出面，选职责分工。"},
+                "topic": {"type": "string", "description": "用业务术语重述客户要区分的角色、具体动作和条件。比如“东西删错还能捞回来吗”对应“误删除数据 恢复条件”。不要只写笼统的流程名称。"},
+            },
+        },
+    },
+}
 QWEN_WEBSOCKET_PING_INTERVAL_SECONDS = 20.0
 QWEN_WEBSOCKET_PING_TIMEOUT_SECONDS = 120.0
 # 转人工会等待模型连接关闭；握手超时后由 websockets 终止 TCP，避免阻塞业务提示。

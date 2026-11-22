@@ -101,6 +101,12 @@ def validate_reach_api_runtime_contract(config=None) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[Any, Any]:
     roles = validate_runtime_role_settings(settings)
+    if settings.AI_CALL_KNOWLEDGE_EMBEDDING_DIR and roles.intersection(
+        (ProcessRole.RUNTIME, ProcessRole.LEGACY_RUNTIME, ProcessRole.JOBS)
+    ):
+        from app.services.ai_call.knowledge_spoken import encoder
+
+        await asyncio.to_thread(encoder)
     if ProcessRole.JOBS in roles:
         await _init_ai_call_standalone_oss_config()
     role_handles = await _start_ai_call_role_workers(app, roles, start_voice=False)

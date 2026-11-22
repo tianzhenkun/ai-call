@@ -1,6 +1,6 @@
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
@@ -16,6 +16,9 @@ class AiCallBaseSchema(BaseModel):
         populate_by_name=True,
         use_enum_values=True,
     )
+
+
+KnowledgeItemId = Annotated[int, Field(gt=0, le=2**63 - 1)]
 
 
 class CreateWebSessionRequest(AiCallBaseSchema):
@@ -730,6 +733,8 @@ class PromptProfileBaseRequest(AiCallBaseSchema):
 
 class PromptProfileCreateRequest(PromptProfileBaseRequest):
     creation_key: str | None = Field(default=None, min_length=1, max_length=100)
+    knowledge_item_ids: list[KnowledgeItemId] | None = None
+    knowledge_version_snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class PromptProfileUpdateRequest(PromptProfileBaseRequest):
@@ -759,6 +764,7 @@ class PromptProfileDraftRequest(PromptProfileModuleRequest):
     expected_revision: int | None = None
     name: str = Field(min_length=1, max_length=100)
     creation_key: str = Field(min_length=1, max_length=100)
+    knowledge_item_ids: list[KnowledgeItemId] | None = None
 
 
 class PromptProfileRevisionRequest(AiCallBaseSchema):

@@ -9,6 +9,9 @@ from fastapi import status
 
 from app.services.ai_call.exceptions import AiCallError
 
+SPOKEN_VERSION = "deepseek-faq-bge-zh-v4"
+KNOWLEDGE_FOCUS = ("职责分工", "功能流程", "实施条件", "商业条款", "安全权限", "效果指标", "其他")
+
 
 class CallSessionStatus(str, Enum):
     CREATED = "created"
@@ -107,6 +110,10 @@ class KnowledgeRuntimeContext:
     version_ids: tuple[int, ...]
     version_snapshot_hash: str
     retriever_version: str
+    scene_name: str = ""
+    positioning: str = ""
+    product_choices: tuple[str, ...] = ()
+    selected_product: str = ""
 
 
 @dataclass(slots=True)

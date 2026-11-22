@@ -18,7 +18,7 @@ from app.core.database import async_db_session
 from app.core.dependencies import get_knowledge_manager, get_knowledge_viewer, get_prompt_manager
 from app.core.exceptions import CustomException
 
-from .schema import ProductInfoExtractOut
+from .schema import AiCallBaseSchema, KnowledgeItemId, ProductInfoExtractOut
 
 KnowledgeRouter = APIRouter(prefix="/knowledge", tags=["AI Call 知识库"])
 KnowledgePromptRouter = APIRouter(tags=["AI Call 知识库"])
@@ -51,12 +51,15 @@ class KnowledgeSceneBindingsRequest(BaseModel):
     )
 
 
-KnowledgeItemId = Annotated[int, Field(gt=0, le=2**63 - 1)]
-
-
 class SceneKnowledgeItemsRequest(BaseModel):
     item_ids: list[KnowledgeItemId] = Field(alias="itemIds")
     expected_item_ids: list[KnowledgeItemId] = Field(alias="expectedItemIds")
+
+
+class DraftProductInfoExtractRequest(AiCallBaseSchema):
+    model_config = ConfigDict(extra="forbid")
+    scene_name: str = Field(default="", max_length=100)
+    knowledge_item_ids: list[KnowledgeItemId] = Field(min_length=1)
 
 
 async def get_knowledge_db() -> AsyncGenerator[AsyncSession, None]:
@@ -82,15 +85,11 @@ def get_knowledge_product_info_service() -> Any:
     from app.services.ai_call.knowledge import KnowledgeProductInfoService, read_legacy_word
     from app.services.ai_call.prompt_optimization import (
         build_knowledge_product_extractor,
+        scene_editor_deepseek_key,
     )
-    from app.services.reach_email.security import configured_secret
 
     try:
-        api_key = configured_secret(
-            settings.AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY,
-            settings.AI_CALL_KNOWLEDGE_DEEPSEEK_API_KEY_FILE,
-            "知识库提取 DeepSeek API Key",
-        )
+        api_key = scene_editor_deepseek_key()
     except ValueError as exc:
         raise CustomException(msg=str(exc), status_code=503) from exc
     extractor = build_knowledge_product_extractor(
@@ -497,6 +496,29 @@ async def save_scene_knowledge_controller(
         db, tenant_id=tenant_id, user_id=user_id, profile_id=profile_id,
         item_ids=request.item_ids, expected_item_ids=request.expected_item_ids,
     ))
+
+
+@KnowledgePromptRouter.post(
+    "/prompt-profiles/product-info:extract",
+    summary="从新增场景临时选中的资料生成产品与服务草稿",
+    response_model=ResponseSchema[ProductInfoExtractOut],
+    dependencies=[Depends(get_prompt_manager)],
+)
+async def extract_draft_product_info_controller(
+    request: DraftProductInfoExtractRequest,
+    auth: Annotated[AuthSchema, Depends(get_knowledge_manager)],
+    db: Annotated[AsyncSession, Depends(get_knowledge_db)],
+    service: Annotated[Any, Depends(get_knowledge_product_info_service)],
+) -> SuccessResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.extract(
+        db, tenant_id=tenant_id, user_id=user_id,
+        scene_name=request.scene_name.strip(), knowledge_item_ids=request.knowledge_item_ids,
+    )
+    return SuccessResponse(
+        data=ProductInfoExtractOut.model_validate(result),
+        msg="草稿生成成功，请确认后再保存",
+    )
 
 
 @KnowledgePromptRouter.post(

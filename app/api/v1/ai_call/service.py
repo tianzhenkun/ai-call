@@ -76,6 +76,7 @@ from app.services.ai_call.prompt_editor import (
 from app.services.ai_call.prompt_optimization import (
     PromptOptimizerProtocol,
     build_prompt_optimizer,
+    scene_editor_deepseek_key,
 )
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
@@ -617,26 +618,39 @@ class AiCallService:
     ) -> dict:
         repository = self._ensure_prompt_repository()
         creation_key = values.get("creation_key")
-        if creation_key:
+        knowledge_item_ids = values.get("knowledge_item_ids")
+        knowledge_hash = values.get("knowledge_version_snapshot_hash")
+
+        async def replay():
+            if not creation_key:
+                return None
             existing = await repository.db.scalar(select(AiCallPromptProfileModel).where(
                 AiCallPromptProfileModel.tenant_id == tenant_id,
                 AiCallPromptProfileModel.creation_key == creation_key,
             ))
-            if existing is not None:
-                return await self.get_prompt_profile(tenant_id=tenant_id, profile_id=existing.id)
+            if existing is None:
+                return None
+            result = await self.get_prompt_profile(tenant_id=tenant_id, profile_id=existing.id)
+            if knowledge_item_ids is not None and existing.deleted_at is None:
+                from app.services.ai_call.knowledge import scene_knowledge_items
+
+                linked = await scene_knowledge_items(
+                    repository.db, tenant_id=tenant_id, user_id=created_by, profile_id=existing.id,
+                )
+                if {int(item["id"]) for item in linked} != set(knowledge_item_ids):
+                    raise CustomException(msg="此前保存的场景资料已变化，请打开该场景核对", status_code=409)
+            return result
+
+        if (existing := await replay()) is not None:
+            return existing
         values = self._normalize_prompt_profile_values({
             **values, "scene_code": values.get("scene_code") or f"scene_{uuid4().hex}",
         })
         try:
             await self._ensure_prompt_profile_unique(repository, tenant_id, values)
         except CustomException:
-            if creation_key:
-                existing = await repository.db.scalar(select(AiCallPromptProfileModel).where(
-                    AiCallPromptProfileModel.tenant_id == tenant_id,
-                    AiCallPromptProfileModel.creation_key == creation_key,
-                ))
-                if existing is not None:
-                    return await self.get_prompt_profile(tenant_id=tenant_id, profile_id=existing.id)
+            if (existing := await replay()) is not None:
+                return existing
             raise
         ready = module is None and not missing_fields(values)
         try:
@@ -645,6 +659,17 @@ class AiCallService:
                     **values, tenant_id=tenant_id, creation_key=creation_key,
                     lifecycle_status="READY" if ready else "DRAFT",
                 )
+                if knowledge_item_ids:
+                    from app.services.ai_call.knowledge import scene_knowledge_items
+
+                    await scene_knowledge_items(
+                        repository.db, tenant_id=tenant_id, user_id=created_by, profile_id=profile.id,
+                        item_ids=knowledge_item_ids, commit=False,
+                    )
+                if knowledge_hash is not None:
+                    await self._check_prompt_knowledge_snapshot(
+                        tenant_id, profile.id, created_by, knowledge_hash,
+                    )
                 if ready:
                     version = await self._append_prompt_profile_version(
                         repository, profile, creation_method="manual", created_by=created_by,
@@ -653,13 +678,8 @@ class AiCallService:
                     profile.current_version_id = version.id
                     await repository.db.flush()
         except IntegrityError as exc:
-            if creation_key:
-                existing = await repository.db.scalar(select(AiCallPromptProfileModel).where(
-                    AiCallPromptProfileModel.tenant_id == tenant_id,
-                    AiCallPromptProfileModel.creation_key == creation_key,
-                ))
-                if existing is not None:
-                    return await self.get_prompt_profile(tenant_id=tenant_id, profile_id=existing.id)
+            if (existing := await replay()) is not None:
+                return existing
             raise CustomException(msg="场景名称或编码已存在，请检查后保存", status_code=409,
                                   data={"errorCode": "PROMPT_NAME_DUPLICATE", "field": "name"}) from exc
         return await self._saved_prompt_result(profile, "version_created" if ready else "draft_saved")
@@ -683,29 +703,9 @@ class AiCallService:
         if values["scene_code"] != existing.scene_code:
             raise CustomException(msg="场景编码不能修改", status_code=400)
         if knowledge_version_snapshot_hash is not None:
-            from app.services.ai_call.knowledge import (
-                knowledge_version_snapshot_hash as calculate_snapshot_hash,
+            await self._check_prompt_knowledge_snapshot(
+                tenant_id, profile_id, created_by, knowledge_version_snapshot_hash,
             )
-            from app.services.ai_call.knowledge import (
-                load_current_ready_knowledge_versions,
-            )
-
-            current_versions = await load_current_ready_knowledge_versions(
-                repository.db,
-                tenant_id=tenant_id,
-                user_id=created_by,
-                prompt_profile_id=profile_id,
-            )
-            if (
-                knowledge_version_snapshot_hash
-                != calculate_snapshot_hash(current_versions)
-            ):
-                raise CustomException(
-                    msg="知识资料已变化，请重新生成产品与服务草稿",
-                    code=RET.CONFLICT.code,
-                    status_code=409,
-                    data={"errorCode": "PROMPT_KNOWLEDGE_CHANGED", "field": "productInfo"},
-                )
         await self._ensure_prompt_profile_unique(
             repository,
             tenant_id,
@@ -750,6 +750,25 @@ class AiCallService:
             "current_version_updated" if ready else "draft_saved"
         )
         return await self._saved_prompt_result(existing, outcome)
+
+    async def _check_prompt_knowledge_snapshot(
+        self, tenant_id: str, profile_id: int, user_id: int | None, snapshot_hash: str,
+    ) -> None:
+        from app.services.ai_call.knowledge import (
+            knowledge_version_snapshot_hash,
+            load_current_ready_knowledge_versions,
+        )
+
+        current_versions = await load_current_ready_knowledge_versions(
+            self._ensure_prompt_repository().db,
+            tenant_id=tenant_id, user_id=user_id, prompt_profile_id=profile_id,
+        )
+        if not current_versions or knowledge_version_snapshot_hash(current_versions) != snapshot_hash:
+            raise CustomException(
+                msg="知识资料已变化，请重新生成产品与服务草稿",
+                code=RET.CONFLICT.code, status_code=409,
+                data={"errorCode": "PROMPT_KNOWLEDGE_CHANGED", "field": "productInfo"},
+            )
 
     async def _editable_prompt_profile(self, tenant_id, profile_id, *, for_update=False):
         profile = await self._ensure_prompt_repository().get_prompt_profile(
@@ -824,14 +843,13 @@ class AiCallService:
                                   data={"errorCode": "PROMPT_CREATION_NOT_FOUND"})
         return await self.get_prompt_profile(tenant_id=tenant_id, profile_id=profile.id)
 
-    async def create_prompt_profile_draft(self, *, tenant_id, values):
-        fields = module_values(values)
-        if fields.pop("knowledge_version_snapshot_hash", None) is not None:
-            raise CustomException(msg="请先保存场景，再提取知识资料", status_code=400)
+    async def create_prompt_profile_draft(self, *, tenant_id, values, created_by: int | None = None):
+        fields = module_values({key: value for key, value in values.items() if key != "knowledge_item_ids"})
         common = await self.get_prompt_common_config(tenant_id=tenant_id)
-        return await self.create_prompt_profile(tenant_id=tenant_id, module=values["module"], values={
+        return await self.create_prompt_profile(tenant_id=tenant_id, module=values["module"], created_by=created_by, values={
             "prompt_text": default_scene_prompt(common["content"]), "opening_message": "",
-            "name": values.get("name"), "creation_key": values.get("creation_key"), **fields,
+            "name": values.get("name"), "creation_key": values.get("creation_key"),
+            "knowledge_item_ids": values.get("knowledge_item_ids"), **fields,
         })
 
     async def save_prompt_profile_module(self, *, tenant_id, profile_id, values, created_by: int | None = None):
@@ -1118,8 +1136,17 @@ class AiCallService:
     async def optimize_prompt(self, *, tenant_id: str, values: dict) -> dict:
         if values.get("profile_id"):
             await self._editable_prompt_profile(tenant_id, int(values["profile_id"]))
-        if self.prompt_optimizer is None:
-            raise CustomException(msg="提示词 AI 优化服务未配置", status_code=503)
+        optimizer = self.prompt_optimizer
+        if optimizer is None:
+            try:
+                optimizer = build_prompt_optimizer(
+                    api_key=scene_editor_deepseek_key(),
+                    timeout_seconds=settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS,
+                )
+            except ValueError as exc:
+                raise CustomException(msg=str(exc), status_code=503) from exc
+            if optimizer is None:
+                raise CustomException(msg="场景编辑未配置 DeepSeek API Key", status_code=503)
         scene_context = values.get("scene_context") or {}
         variables = scene_context.get("variables") or []
         payload = {
@@ -1134,7 +1161,7 @@ class AiCallService:
             payload.update(sceneName=scene_context.get("scene_name") or "",
                            productInfo=scene_context.get("product_info") or "")
         try:
-            return await self.prompt_optimizer.optimize(payload)
+            return await optimizer.optimize(payload)
         except Exception as exc:
             raise CustomException(msg=f"提示词 AI 优化失败：{exc}", status_code=502) from exc
 
@@ -3576,12 +3603,6 @@ def get_default_ai_call_service(
         prompt_resolver=_build_prompt_resolver(repository, _default_orchestrator),
         prompt_composer=_build_prompt_composer(_default_orchestrator),
         sip_client=_build_sip_client(config=sip_config),
-        prompt_optimizer=build_prompt_optimizer(
-            base_url=settings.LLM_BASE_URL or settings.DASHSCOPE_BASE_URL,
-            api_key=settings.EFFECTIVE_LLM_API_KEY,
-            model=settings.AI_CALL_PROMPT_OPTIMIZE_MODEL,
-            timeout_seconds=settings.AI_CALL_PROMPT_OPTIMIZE_TIMEOUT_SECONDS,
-        ),
     )
 
 

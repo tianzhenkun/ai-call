@@ -556,6 +556,8 @@ class OutboundRuleTaskService:
             knowledge_version_snapshot_hash,
             load_current_ready_knowledge_versions,
         )
+        from app.services.ai_call.session_registry import SPOKEN_VERSION
+        from app.services.ai_call.knowledge_spoken import indexed_products
 
         versions = await load_current_ready_knowledge_versions(
             db,
@@ -572,11 +574,19 @@ class OutboundRuleTaskService:
                 ),
                 status_code=status.HTTP_409_CONFLICT,
             )
+        retriever = RETRIEVER_VERSION
+        product_scope = {}
+        if versions and settings.AI_CALL_KNOWLEDGE_EMBEDDING_DIR:
+            if any(v.retrieval_version != SPOKEN_VERSION for v in versions):
+                raise CustomException(msg="所选知识资料正在整理产品章节和常见问法，请稍后创建任务", status_code=409)
+            retriever = SPOKEN_VERSION
+            product_scope["products"] = await indexed_products(db, tenant_id, versions)
         return {
+            **product_scope,
             "promptProfileId": str(prompt_profile_id),
             "versionIds": [str(version.id) for version in versions],
             "versionSnapshotHash": knowledge_version_snapshot_hash(versions),
-            "retrieverVersion": RETRIEVER_VERSION,
+            "retrieverVersion": retriever,
             "frozenAt": frozen_at.isoformat(),
         }
 
