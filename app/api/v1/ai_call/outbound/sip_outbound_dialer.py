@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Protocol
 
 from sqlalchemy import select
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.api.v1.ai_call.service import get_default_ai_call_service
 from app.config.setting import Settings, settings
-from app.services.ai_call.livekit_sip import SipOutboundConfig
+from app.services.ai_call.livekit_sip import MAX_TOTAL_CALL_DURATION_SECONDS, SipOutboundConfig
 
 from .attempt_projection import (
     BUSY_END_REASONS,
@@ -117,7 +118,7 @@ class SipOutboundDialer:
         config = self.build_sip_config(line)
         reconciliation_deadline = self.monotonic() + (
             line.originate_timeout_seconds
-            + config.max_call_duration_seconds
+            + MAX_TOTAL_CALL_DURATION_SECONDS
             + self.reconciliation_grace_seconds
         )
         create_error: Exception | None = None
@@ -194,6 +195,26 @@ class SipOutboundDialer:
                     connected_notified = True
                 if self._is_terminal(record):
                     return self._map_evidenced_terminal(record, media_connected)
+                deadline_at = record.total_call_deadline_at if record is not None else None
+                if deadline_at is not None:
+                    deadline_at = deadline_at.replace(tzinfo=deadline_at.tzinfo or timezone.utc)
+                    if datetime.now(timezone.utc) >= deadline_at:
+                        if not await self.terminate(
+                            request,
+                            call_id=call_id,
+                            end_reason="max_total_call_duration",
+                        ):
+                            return DialResult(
+                                call_result="call_failed",
+                                error_message="整通时长到期，通话资源清理待对账",
+                                retry_allowed=False,
+                                settle_attempt=False,
+                            )
+                        final_record, final_media_connected = await self._read_evidence(call_id)
+                        return replace(
+                            self._map_evidenced_terminal(final_record, final_media_connected),
+                            retry_allowed=False,
+                        )
                 if self.monotonic() >= reconciliation_deadline:
                     connected_before_deadline = self._is_connected(
                         record,

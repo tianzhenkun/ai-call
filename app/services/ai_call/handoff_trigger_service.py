@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
@@ -425,6 +425,7 @@ class PendingHandoffConfirmation:
     reason: str
     request_message: str
     tool_call_id: str | None = None
+    requires_explicit_transfer: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +443,21 @@ class TriggeredHandoff:
 
 
 class AiCallHandoffTriggerService:
+    DIALOGUE_CONFIRMATION_WINDOW_SECONDS = 30.0
+    HANDOFF_OFFER_PATTERN = re.compile(
+        r"(?:转接?|接通).{0,8}(?:人工|真人|客服|顾问|客户经理|负责人|专人)"
+        r"|(?:希望|想|愿意|需要).{0,4}(?:和|跟).{0,8}"
+        r"(?:顾问|客户经理|负责人|专人).{0,8}(?:聊|沟通|谈)"
+    )
+    HANDOFF_OFFER_EXCLUSION_PATTERN = re.compile(
+        r"不是|不需要|不能|无法|暂不|不用|不转|不想"
+    )
+    HUMAN_CONSULTATION_PATTERN = re.compile(
+        r"(?:和|跟).{0,8}(?:顾问|客户经理|负责人|专人).{0,8}(?:聊|沟通|谈|咨询)"
+    )
+    DEFERRED_HANDOFF_PATTERN = re.compile(
+        r"稍后|以后|后续|回头|改天|明天|后天|回访|回电|预约|等我|等会|待会|晚点|一会|下次|下周"
+    )
     RECENT_CONFIRMATION_WINDOW_SECONDS = 2.0
     RECENT_TRIGGER_DEDUP_WINDOW_SECONDS = 5.0
     CONFIRMATION_ACCEPT_PATTERNS = (
@@ -453,6 +469,7 @@ class AiCallHandoffTriggerService:
         "是",
         "是的",
         "确认",
+        "确定",
         "转吧",
         "帮我转",
         "给我转",
@@ -525,12 +542,84 @@ class AiCallHandoffTriggerService:
             str, RecentHandoffConfirmationCandidate
         ] = {}
 
+    @classmethod
+    def confirmed_dialogue_intent(
+        cls, *, call_id: str, transcript: str, event_store: InMemoryEventStore,
+        event_id: str | None = None,
+    ) -> HandoffIntentResult | None:
+        """工具和转写共用相邻轮次的确认依据，不把普通肯定或后续回访当作转接。"""
+        customer_event = None
+        for row in reversed(event_store.list_all(call_id)):
+            if customer_event is None:
+                if row.type != "user_transcript_done" or (event_id and row.event_id != event_id):
+                    continue
+                if (
+                    cls._normalize(cls._transcript_text(row)) != cls._normalize(transcript)
+                    or is_realtime_transcript_semantically_rejected(row.payload)
+                    or (event_id is None and not 0 <= (datetime.now(timezone.utc) - row.timestamp).total_seconds()
+                        <= cls.DIALOGUE_CONFIRMATION_WINDOW_SECONDS)
+                ):
+                    return None
+                customer_event = row
+                continue
+            if row.type in {
+                "user_transcript_done", "interrupt_confirmed", "response_generation_invalidated",
+                "session_completed", "session_failed", "handoff_confirmation_declined",
+            }:
+                return None
+            if row.type == "model_response_done" and row.payload.get("response", {}).get("status") == "cancelled":
+                return None
+            if row.type != "ai_transcript_done":
+                continue
+            age = (customer_event.timestamp - row.timestamp).total_seconds()
+            offer = cls._transcript_text(row)
+            if (
+                0 <= age <= cls.DIALOGUE_CONFIRMATION_WINDOW_SECONDS
+                and cls._accepts_dialogue_offer(offer, transcript)
+            ):
+                return HandoffIntentResult(
+                    matched=True, confidence=0.95, reason="customer_request",
+                    summary="客户确认上一轮人工顾问转接邀约", source="dialogue_confirmation",
+                )
+            return None
+        return None
+
+    @classmethod
+    def _accepts_dialogue_offer(cls, offer: str, transcript: str) -> bool:
+        if cls.HANDOFF_OFFER_EXCLUSION_PATTERN.search(offer) or cls.DEFERRED_HANDOFF_PATTERN.search(offer):
+            return False
+        alternatives = re.split(r"还是|或者", offer)
+        if len(alternatives) == 1 and cls._is_confirmation_accepted(transcript):
+            return bool(cls.HANDOFF_OFFER_PATTERN.search(offer))
+        # 二选一必须选中人工所在的选项；普通“好的”不能替客户作选择。
+        human_options = [part for part in alternatives if cls.HUMAN_CONSULTATION_PATTERN.search(part)]
+        normalized = cls._normalize(transcript)
+        if (
+            len(human_options) != 1
+            or cls._is_confirmation_declined(normalized)
+            or cls.DEFERRED_HANDOFF_PATTERN.search(normalized)
+            or re.search(r"(?:不|别).{0,3}(?:聊|谈|沟通|咨询)|但是|不过|如果|要是|等一下|等等", normalized)
+        ):
+            return False
+        selection = re.search(
+            r"(?:聊|谈|沟通|咨询).{0,6}(方案|报价|价格|费用|合作|合同|需求|演示)(?:呢|吗|么|吧|啊|呀)?$",
+            normalized,
+        )
+        return bool(
+            selection and selection[1] in human_options[0]
+            and not any(selection[1] in part for part in alternatives if part != human_options[0])
+        )
+
     async def handle_event(
         self,
         *,
         event: AiCallEvent,
         event_store: InMemoryEventStore,
     ) -> None:
+        if event.type in {"session_completed", "session_failed"}:
+            self._pending_confirmations.pop(event.call_id, None)
+            self._recent_confirmation_candidates.pop(event.call_id, None)
+            return
         if event.type == "handoff_tool_requested":
             await self._handle_tool_request(event=event, event_store=event_store)
             return
@@ -587,10 +676,15 @@ class AiCallHandoffTriggerService:
             return
         self._remember_confirmation_candidate(event, transcript)
         try:
-            result = await asyncio.wait_for(
-                self.classifier.classify(transcript=transcript),
-                timeout=self.timeout_seconds,
+            result = self.confirmed_dialogue_intent(
+                call_id=event.call_id, transcript=transcript,
+                event_store=event_store, event_id=event.event_id,
             )
+            if result is None:
+                result = await asyncio.wait_for(
+                    self.classifier.classify(transcript=transcript),
+                    timeout=self.timeout_seconds,
+                )
         except TimeoutError:
             self._append_ignored(
                 event_store, event.call_id, reason="classifier_timeout", transcript=transcript,
@@ -830,15 +924,21 @@ class AiCallHandoffTriggerService:
             )
             return
 
-        if not self._is_confirmation_accepted(normalized):
-            self._pending_confirmations.pop(event.call_id, None)
+        if not self._is_confirmation_accepted(transcript) or (
+            confirmation.requires_explicit_transfer
+            and not any(term in normalized for term in ("转", "人工", "客服"))
+        ):
+            # 保留请求上下文；话题已不明确时，后续普通“好的”不能追认为转接授权。
+            self._pending_confirmations[event.call_id] = replace(
+                confirmation, requires_explicit_transfer=True,
+            )
             self._recent_confirmation_candidates.pop(event.call_id, None)
             self._append_ignored(
                 event_store,
                 event.call_id,
                 reason="handoff_confirmation_unresolved",
                 transcript=transcript,
-                confidence=1.0,
+                confidence=0.0,
                 classifier_source="confirmation_gate",
                 tool_call_id=confirmation.tool_call_id,
             )
@@ -1099,7 +1199,7 @@ class AiCallHandoffTriggerService:
             self._recent_confirmation_candidates.pop(event.call_id, None)
             return
         # 工具请求到达前的普通“好的”可能在回答产品问题，不能追认为转接同意。
-        if self._is_confirmation_accepted(normalized) and any(
+        if self._is_confirmation_accepted(transcript) and any(
             term in normalized for term in ("转", "人工", "客服")
         ):
             self._recent_confirmation_candidates[event.call_id] = (
@@ -1145,9 +1245,21 @@ class AiCallHandoffTriggerService:
         )
 
     @classmethod
-    def _is_confirmation_accepted(cls, normalized: str) -> bool:
+    def _is_confirmation_accepted(cls, transcript: str) -> bool:
+        normalized = cls._normalize(transcript)
         if cls._is_confirmation_declined(normalized):
             return False
+        if (
+            re.search(r"[?？]|(?:但是|不过|如果|要是|等一下|等等)", transcript)
+            or cls.DEFERRED_HANDOFF_PATTERN.search(transcript)
+            or normalized.endswith(("吗", "么"))
+            or RuleBasedHandoffIntentClassifier.STATUS_QUERY_PATTERN.search(normalized)
+        ):
+            return False
+        # 在已发起确认的上下文中，允许“是的，……”这种独立肯定分句。
+        first_clause = cls._normalize(re.split(r"[，。！,!.；;]", transcript, maxsplit=1)[0])
+        if first_clause in {"是的", "是", "可以", "好的", "好", "确认", "确定", "行"}:
+            return True
         if normalized in cls.CONFIRMATION_ACCEPT_PATTERNS:
             return True
         if any(
@@ -1157,7 +1269,7 @@ class AiCallHandoffTriggerService:
             return True
         return any(
             normalized == f"{affirmation}{transfer}"
-            for affirmation in ("是", "是的", "确认", "可以", "好的", "好")
+            for affirmation in ("是", "是的", "确认", "确定", "可以", "好的", "好")
             for transfer in ("转人工", "转客服", "找人工", "找客服")
         )
 
@@ -1239,7 +1351,7 @@ class AiCallHandoffTriggerWorker:
         self._attached_stores.clear()
 
     def enqueue(self, event: AiCallEvent, event_store: InMemoryEventStore) -> None:
-        should_enqueue = event.type == "handoff_tool_requested" or (
+        should_enqueue = event.type in {"handoff_tool_requested", "session_completed", "session_failed"} or (
             self.transcript_trigger_enabled
             and event.type == "user_transcript_done"
         )

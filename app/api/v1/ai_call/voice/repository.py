@@ -8,7 +8,7 @@ from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.model import AiCallVoiceProfileModel
-from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundAttemptModel, AiCallOutboundTaskModel
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
 from app.api.v1.ai_call.voice.schema import VoiceProfileOut, VoiceStatus
 from app.core.exceptions import CustomException
@@ -34,26 +34,59 @@ class VoiceRepository:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    async def require_call_voice(self, *, tenant_id: str, voice: str, target_model: str) -> None:
+    async def require_call_voice(
+        self, *, tenant_id: str, user_id: int | None, voice: str, target_model: str,
+        business_type: str | None = None, business_id: str | None = None,
+    ) -> None:
         if not isinstance(voice, str) or not voice.strip():
             raise CustomException(msg="会话音色不能为空且必须为字符串", status_code=400)
         if any(profile["voice"] == voice for profile in builtin_voice_profile_values(target_model)):
             return
+        owner_id = await self.resolve_call_user_id(
+            tenant_id=tenant_id, user_id=user_id,
+            business_type=business_type, business_id=business_id,
+        )
         profile_id = await self.db.scalar(
             select(AiCallTenantVoiceProfileModel.id).where(
                 AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                AiCallTenantVoiceProfileModel.created_by == owner_id,
                 AiCallTenantVoiceProfileModel.voice == voice,
                 AiCallTenantVoiceProfileModel.target_model == target_model,
                 AiCallTenantVoiceProfileModel.status == "ENABLED",
             )
         )
         if profile_id is None:
-            raise CustomException(msg="音色不存在、未启用或不适用于当前租户及模型", status_code=400)
+            raise CustomException(msg="音色不存在、未启用或不适用于当前账号及模型", status_code=400)
+
+    async def resolve_call_user_id(
+        self, *, tenant_id: str, user_id: int | None,
+        business_type: str | None = None, business_id: str | None = None,
+    ) -> int | None:
+        # 后台执行任务时使用持久化的创建者，不能由请求参数指定其他账号。
+        if business_type not in {"outbound_task", "outbound_attempt"}:
+            return user_id
+        if not business_id or not business_id.isdecimal():
+            return None
+        statement = select(AiCallOutboundTaskModel.created_by).where(
+            AiCallOutboundTaskModel.tenant_id == tenant_id,
+        )
+        if business_type == "outbound_task":
+            statement = statement.where(AiCallOutboundTaskModel.id == int(business_id))
+        else:
+            statement = statement.join(
+                AiCallOutboundAttemptModel,
+                AiCallOutboundAttemptModel.task_id == AiCallOutboundTaskModel.id,
+            ).where(
+                AiCallOutboundAttemptModel.tenant_id == tenant_id,
+                AiCallOutboundAttemptModel.id == int(business_id),
+            )
+        return await self.db.scalar(statement)
 
     async def list_profiles(
         self,
         *,
         tenant_id: str,
+        user_id: int,
         target_model: str,
         voice_type: str | None = None,
         gender: str | None = None,
@@ -70,7 +103,8 @@ class VoiceRepository:
                 profiles=builtin_voice_profile_values(target_model),
             )
         global_statement = select(AiCallVoiceProfileModel).where(
-            AiCallVoiceProfileModel.target_model == target_model
+            AiCallVoiceProfileModel.target_model == target_model,
+            AiCallVoiceProfileModel.voice_type == "内置",
         )
         if voice_type is not None:
             global_statement = global_statement.where(
@@ -80,7 +114,6 @@ class VoiceRepository:
             global_statement = global_statement.where(AiCallVoiceProfileModel.gender == gender)
         if available_only:
             global_statement = global_statement.where(
-                AiCallVoiceProfileModel.voice_type == "内置",
                 AiCallVoiceProfileModel.voice != "",
             )
         if status is not None and status != "ENABLED":
@@ -88,6 +121,7 @@ class VoiceRepository:
 
         tenant_statement = select(AiCallTenantVoiceProfileModel).where(
             AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+            AiCallTenantVoiceProfileModel.created_by == user_id,
             AiCallTenantVoiceProfileModel.target_model == target_model,
         )
         if voice_type is not None:
@@ -179,11 +213,13 @@ class VoiceRepository:
         self,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
         for_update: bool = False,
     ) -> AiCallTenantVoiceProfileModel | None:
         statement = select(AiCallTenantVoiceProfileModel).where(
             AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+            AiCallTenantVoiceProfileModel.created_by == user_id,
             AiCallTenantVoiceProfileModel.id == profile_id,
         )
         if for_update:
@@ -194,6 +230,7 @@ class VoiceRepository:
         self,
         *,
         tenant_id: str | None,
+        user_id: int | None,
         voice: str | None,
         target_model: str,
         business_type: str | None = None,
@@ -236,6 +273,7 @@ class VoiceRepository:
             style = await self.db.scalar(
                 select(AiCallTenantVoiceProfileModel.speaking_style).where(
                     AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                    AiCallTenantVoiceProfileModel.created_by == user_id,
                     AiCallTenantVoiceProfileModel.voice == voice,
                     AiCallTenantVoiceProfileModel.target_model == target_model,
                     AiCallTenantVoiceProfileModel.status == "ENABLED",

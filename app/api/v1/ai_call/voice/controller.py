@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
-from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.dependencies import get_current_user, get_voice_manager
 from app.core.exceptions import CustomException
@@ -28,6 +27,7 @@ from app.services.ai_call.orchestrator import (
     CreateSessionResult,
     EndSessionResult,
 )
+from app.services.ai_call.realtime_model import REACH_REALTIME_MODEL
 
 from ..outbound.controller import _identity
 from ..schema import CreateSessionOut, EndSessionOut, EventOut
@@ -50,12 +50,13 @@ VoiceRouter = APIRouter(tags=["租户音色管理"])
 
 
 class VoiceLifecycleService(Protocol):
-    async def set_speaking_style(self, *, tenant_id: str, profile_id: int, speaking_style: str) -> Any: ...
+    async def set_speaking_style(self, *, tenant_id: str, user_id: int, profile_id: int, speaking_style: str) -> Any: ...
 
     async def get_enrollment(
         self,
         *,
         tenant_id: str,
+        user_id: int,
         enrollment_id: int,
     ) -> Any: ...
 
@@ -95,6 +96,7 @@ class VoiceLifecycleService(Protocol):
         self,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
     ) -> Any: ...
 
@@ -111,6 +113,7 @@ class VoiceLifecycleService(Protocol):
         self,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
         availability_status: str,
     ) -> Any: ...
@@ -312,7 +315,7 @@ async def list_voice_profiles_controller(
     target_model: Annotated[
         str,
         Query(alias="targetModel"),
-    ] = settings.QWEN_REALTIME_MODEL,
+    ] = REACH_REALTIME_MODEL,
     voice_status: Annotated[
         VoiceStatus | None,
         Query(alias="status"),
@@ -333,9 +336,10 @@ async def list_voice_profiles_controller(
 ) -> JSONResponse:
     if not available_only:
         await get_voice_manager(auth)
-    tenant_id, _user_id = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     rows, total = await VoiceRepository(auth.db).list_profiles(
         tenant_id=tenant_id,
+        user_id=user_id,
         target_model=target_model,
         voice_type=voice_type,
         gender=gender,
@@ -428,9 +432,10 @@ async def get_voice_enrollment_controller(
         Depends(get_voice_lifecycle_service),
     ],
 ) -> JSONResponse:
-    tenant_id, _user_id = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.get_enrollment(
         tenant_id=tenant_id,
+        user_id=user_id,
         enrollment_id=enrollment_id,
     )
     return SuccessResponse(data=result, msg="查询成功")
@@ -467,9 +472,10 @@ async def set_voice_speaking_style_controller(
     auth: Annotated[AuthSchema, Depends(get_voice_manager)],
     service: Annotated[VoiceLifecycleService, Depends(get_voice_deletion_lifecycle_service)],
 ) -> JSONResponse:
-    tenant_id, _user_id = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.set_speaking_style(
         tenant_id=tenant_id,
+        user_id=user_id,
         profile_id=profile_id,
         speaking_style=request.speaking_style,
     )
@@ -562,9 +568,10 @@ async def check_voice_deletion_controller(
         Depends(get_voice_deletion_lifecycle_service),
     ],
 ) -> JSONResponse:
-    tenant_id, _user_id = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.deletion_check(
         tenant_id=tenant_id,
+        user_id=user_id,
         profile_id=profile_id,
     )
     return SuccessResponse(data=result, msg="检查成功")
@@ -583,9 +590,10 @@ async def set_tenant_voice_availability_controller(
         Depends(get_voice_deletion_lifecycle_service),
     ],
 ) -> JSONResponse:
-    tenant_id, _user_id = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     result = await service.set_availability(
         tenant_id=tenant_id,
+        user_id=user_id,
         profile_id=profile_id,
         availability_status=request.status,
     )

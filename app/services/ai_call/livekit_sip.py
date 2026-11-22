@@ -12,6 +12,7 @@ from app.config.setting import Settings
 from app.services.ai_call.exceptions import AiCallError
 
 CreateParticipantCallable = Callable[["CreateSipParticipantPayload"], Awaitable[Any]]
+MAX_TOTAL_CALL_DURATION_SECONDS = 1800
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ class CreateSipParticipantPayload:
     destination_country: str
     wait_until_answered: bool
     ringing_timeout_seconds: int
+    max_call_duration_seconds: int = MAX_TOTAL_CALL_DURATION_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +223,8 @@ class LiveKitSipClient:
             ),
             wait_until_answered=wait_until_answered,
             ringing_timeout_seconds=timeout_seconds,
+            # LiveKit 的计时起点可能含振铃；绝对截止时间由本地接通记录执行。
+            max_call_duration_seconds=MAX_TOTAL_CALL_DURATION_SECONDS + timeout_seconds,
         )
         raw_result = await self._create(payload)
         return self._coerce_result(raw_result, payload)
@@ -391,6 +395,7 @@ def _build_official_create_sip_participant_request(payload: CreateSipParticipant
         sip_number=payload.sip_number,
         wait_until_answered=payload.wait_until_answered,
         ringing_timeout=Duration(seconds=payload.ringing_timeout_seconds),
+        max_call_duration=Duration(seconds=payload.max_call_duration_seconds),
     )
     if payload.sip_trunk_id:
         request.sip_trunk_id = payload.sip_trunk_id

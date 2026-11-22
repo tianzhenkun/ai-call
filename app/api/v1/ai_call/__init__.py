@@ -1,4 +1,8 @@
-from .agent_console_controller import AgentAdminRouter, AgentConsoleRouter
+from .agent_console_controller import (
+    AgentAdminRouter,
+    AgentConsoleRouter,
+    FollowUpOverviewRouter,
+)
 from .controller import AiCallRouter
 from .follow_up_data_controller import FollowUpDataRouter
 from .knowledge_controller import KnowledgePromptRouter, KnowledgeRouter
@@ -9,6 +13,7 @@ from .voice import VoiceRouter
 
 AiCallRouter.include_router(AgentConsoleRouter)
 AiCallRouter.include_router(AgentAdminRouter)
+AiCallRouter.include_router(FollowUpOverviewRouter)
 AiCallRouter.include_router(FollowUpDataRouter)
 AiCallRouter.include_router(KnowledgeRouter)
 AiCallRouter.include_router(KnowledgePromptRouter)

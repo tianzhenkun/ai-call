@@ -598,6 +598,10 @@ class RuntimeOwnerRepository:
 
         if record.answered_at is None:
             record.answered_at = now
+        if record.entry_type in {"outbound", "direct_sip"} and record.total_call_deadline_at is None:
+            record.total_call_deadline_at = record.answered_at + timedelta(
+                seconds=record.max_total_call_duration_seconds
+            )
         record.status = "connected"
 
         if existing_event is None:

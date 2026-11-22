@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
@@ -41,6 +41,7 @@ PERSISTED_EVENT_TYPES = frozenset({
     "audio_playout_queue_watermark",
     "audio_playout_response_failed",
     "browser_disconnect",
+    "browser_connection_failed",
     "browser_first_audio",
     "browser_audio_hold_completed",
     "browser_audio_hold_confirmed",
@@ -68,6 +69,9 @@ PERSISTED_EVENT_TYPES = frozenset({
     "call_end_tool_missing",
     "call_end_tool_ignored",
     "call_end_tool_requested",
+    "voicemail_detected",
+    "call_answer_verified",
+    "call_answer_unverified",
     "call_policy_customer_turn",
     "call_policy_end_requested",
     "call_policy_wrap_up_requested",
@@ -334,10 +338,17 @@ class AiCallRecordService:
         record = await self.repository.get_record(call_id)
         if record is None:
             return None
+        first_answered_at = record.answered_at or answered_at or utc_now()
+        deadline_at = record.total_call_deadline_at
+        if record.entry_type == "sip_outbound" and deadline_at is None:
+            deadline_at = first_answered_at + timedelta(
+                seconds=record.max_total_call_duration_seconds
+            )
         return await self.repository.update_record(
             call_id,
             status=CallSessionStatus.CONNECTED.value,
-            answered_at=record.answered_at or answered_at or utc_now(),
+            answered_at=first_answered_at,
+            total_call_deadline_at=deadline_at,
         )
 
     async def complete_session(
@@ -409,10 +420,12 @@ class AiCallRecordService:
         *,
         tenant_id: str,
         call_id: str,
+        user_id: int | None = None,
     ) -> AiCallRecordModel | None:
         return await self.repository.get_record_for_tenant(
             tenant_id=tenant_id,
             call_id=call_id,
+            user_id=user_id,
         )
 
     async def mark_owner_customer_ready(self, *, tenant_id: str, call_id: str) -> bool:
@@ -425,6 +438,7 @@ class AiCallRecordService:
         self,
         *,
         tenant_id: str | None = None,
+        user_id: int | None = None,
         call_id: str | None = None,
         task_id: int | None = None,
         target_id: int | None = None,
@@ -448,6 +462,7 @@ class AiCallRecordService:
     ) -> tuple[list[AiCallRecordModel], int]:
         return await self.repository.list_records(
             tenant_id=tenant_id,
+            user_id=user_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,

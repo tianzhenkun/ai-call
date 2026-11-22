@@ -50,6 +50,7 @@ BROWSER_READY_TIMEOUT_SECONDS = 90.0
 TERMINAL_BROWSER_EVENT_TYPES = frozenset(
     {
         "browser_disconnect",
+        "browser_connection_failed",
         "browser_first_audio",
         "browser_audio_input_diagnostics",
         "browser_user_speech_started",
@@ -393,6 +394,11 @@ class AiCallOrchestrator:
         from app.core.database import async_db_session
         from app.services.ai_call.knowledge import KnowledgeRealtimeSearchService
 
+        qwen_smart_turn_eval = self.config.qwen_realtime_model == "qwen-audio-3.1-realtime-plus"
+        if qwen_smart_turn_eval != (self.config.vad_type == "smart_turn"):
+            raise ValueError("Qwen Audio 3.1 评估必须同时配置对应模型和 smart_turn")
+        if qwen_smart_turn_eval and not self.config.customer_speech_review_enabled:
+            raise ValueError("Qwen Audio 3.1 评估需启用异步客户发言审核，以校验业务工具")
         if self.config.customer_speech_review_enabled and self._customer_speech_classifier is None:
             self._customer_speech_classifier = CustomerSpeechClassifier(
                 base_url=self.config.llm_base_url,
@@ -433,6 +439,7 @@ class AiCallOrchestrator:
             call_end_scheduler=self._schedule_auto_end_session,
             max_call_duration_seconds=self.config.max_call_duration_seconds,
             customer_speech_classifier=self._customer_speech_classifier,
+            qwen_smart_turn_eval=qwen_smart_turn_eval,
             knowledge_search_service=KnowledgeRealtimeSearchService(
                 async_db_session,
                 model_name=self.config.qwen_realtime_model,
@@ -490,6 +497,7 @@ class AiCallOrchestrator:
         call_id: str | None = None,
         prompt_effective_config: PromptEffectiveConfig | None = None,
         model: str | None = None,
+        knowledge_context: KnowledgeRuntimeContext | None = None,
     ) -> CreateSessionResult:
         self.config.ensure_ready()
         call_id = call_id or self._new_call_id()
@@ -508,6 +516,7 @@ class AiCallOrchestrator:
             status=CallSessionStatus.CREATED,
             effective_config=effective_config,
             entry_type="web",
+            knowledge_context=knowledge_context,
         )
         self.registry.add(session)
         self.metrics_by_call_id[call_id] = CallMetrics()
@@ -1353,11 +1362,18 @@ class AiCallOrchestrator:
         event_payload = dict(payload or {})
         event_payload["reportedAt"] = reported_at.isoformat()
         if session.status not in RUNNING_STATUSES:
-            if event_type in TERMINAL_BROWSER_EVENT_TYPES and session.status in {
+            terminal_event = event_type in TERMINAL_BROWSER_EVENT_TYPES and session.status in {
                 CallSessionStatus.COMPLETED,
                 CallSessionStatus.FAILED,
-            }:
-                event_payload["terminalSessionStatus"] = session.status.value
+            }
+            ending_event = session.status == CallSessionStatus.ENDING and event_type in {
+                "browser_disconnect", "browser_connection_failed",
+            }
+            if terminal_event or ending_event:
+                if ending_event:
+                    event_payload["endInProgress"] = True
+                else:
+                    event_payload["terminalSessionStatus"] = session.status.value
                 event = self.event_store.append(
                     call_id=call_id,
                     type=event_type,
@@ -1381,7 +1397,7 @@ class AiCallOrchestrator:
         should_start_opening = False
         should_record_browser_speech_candidate = False
         should_record_browser_speech_segment = False
-        if event_type == "browser_disconnect":
+        if event_type in {"browser_disconnect", "browser_connection_failed"}:
             event = self.event_store.append(
                 call_id=call_id,
                 type=event_type,
@@ -1389,7 +1405,7 @@ class AiCallOrchestrator:
                 payload=event_payload,
             )
             session.last_event_at = event.timestamp
-            await self.end_session(call_id, end_reason="browser_disconnect")
+            await self.end_session(call_id, end_reason=event_type)
             return BrowserEventReportResult(
                 event_id=event.event_id,
                 call_id=event.call_id,
@@ -1478,6 +1494,7 @@ class AiCallOrchestrator:
                 )
             },
         )
+        # 此入口由客户接通触发；模型连接就绪不能作为电话接通的计时起点。
         if session.answered_at is None:
             session.answered_at = opening_started_at
         metrics = self.metrics_by_call_id.setdefault(call_id, CallMetrics())
@@ -1563,6 +1580,16 @@ class AiCallOrchestrator:
             )
         except ValueError as exc:
             raise AiCallError(error_id="invalid_realtime_model", msg=str(exc), status_code=400) from exc
+        if self.config.vad_type == "smart_turn" and (
+            not self.config.barge_in_enabled
+            or (prompt_effective_config is not None
+                and not prompt_effective_config.opening_barge_in_enabled)
+        ):
+            raise AiCallError(
+                error_id="smart_turn_barge_in_required",
+                msg="Qwen Audio 3.1 评估需允许打断，且开场白需允许打断",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
         resolved_voice = voice or self.config.qwen_realtime_voice
         if prompt_effective_config is not None:
             if not prompt_effective_config.instructions.strip():

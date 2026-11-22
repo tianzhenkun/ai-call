@@ -37,6 +37,8 @@ class ExceptionPolicyOut(OutboundSchema):
 
 class ExceptionActiveBatchOut(OutboundSchema):
     batch_id: str
+    status: Literal["RUNNING", "PAUSED"]
+    error_message: str | None = None
     target_count: int
     completed_count: int
     created_by: str
@@ -64,7 +66,8 @@ class ExceptionBatchOut(OutboundSchema):
     accepted: bool = True
     batch_id: str
     category: ExceptionCategory
-    status: Literal["RUNNING", "COMPLETED"]
+    status: Literal["RUNNING", "PAUSED", "COMPLETED"]
+    error_message: str | None = None
     target_count: int
     interval_days: int
     max_retry_count: int

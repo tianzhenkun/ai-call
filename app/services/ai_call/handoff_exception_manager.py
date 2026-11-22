@@ -304,9 +304,9 @@ class AiCallHandoffExceptionManager:
             return
         self._waiting_tone_tasks[handoff.handoff_id] = task
         task.add_done_callback(
-            lambda done, current=task: self._forget_task(
+            lambda done, current=task, key=handoff.handoff_id: self._forget_task(
                 self._waiting_tone_tasks,
-                handoff.handoff_id,
+                key,
                 current,
                 done,
             )
@@ -391,8 +391,8 @@ class AiCallHandoffExceptionManager:
             return
         self._closure_tasks[handoff.handoff_id] = task
         task.add_done_callback(
-            lambda done, current=task: self._forget_task(
-                self._closure_tasks, handoff.handoff_id, current, done
+            lambda done, current=task, key=handoff.handoff_id: self._forget_task(
+                self._closure_tasks, key, current, done
             )
         )
 

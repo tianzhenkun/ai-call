@@ -5,20 +5,43 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from app.api.v1.ai_call.follow_up_data_schema import (
     FollowUpClassification,
     FollowUpDataClassificationIn,
     FollowUpDataScheduleIn,
 )
+from app.api.v1.ai_call.model import AiCallFollowUpDataModel
 from app.api.v1.ai_call.outbound.controller import _identity
+from app.api.v1.ai_call.outbound.rule_task_model import AiCallOutboundTaskModel
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
 from app.core.dependencies import get_ai_call_manager
+from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_reconciler import publish_agent_console_event
 from app.services.ai_call.follow_up_data_service import AiCallFollowUpDataService
 
 FollowUpDataRouter = APIRouter(tags=["跟进数据"])
+
+
+async def _get_owned_follow_up_auth(
+    follow_up_data_id: int,
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+) -> AuthSchema:
+    tenant_id, user_id = _identity(auth)
+    owned_id = await auth.db.scalar(select(AiCallFollowUpDataModel.id).join(
+        AiCallOutboundTaskModel,
+        (AiCallOutboundTaskModel.id == AiCallFollowUpDataModel.task_id)
+        & (AiCallOutboundTaskModel.tenant_id == AiCallFollowUpDataModel.tenant_id),
+    ).where(
+        AiCallFollowUpDataModel.tenant_id == tenant_id,
+        AiCallFollowUpDataModel.id == follow_up_data_id,
+        AiCallOutboundTaskModel.created_by == user_id,
+    ))
+    if owned_id is None:
+        raise CustomException(msg="跟进数据不存在", status_code=404)
+    return auth
 
 
 @FollowUpDataRouter.get("/follow-up-data", summary="分页查询跟进数据")
@@ -38,9 +61,10 @@ async def list_follow_up_data_controller(
     page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 20,
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     rows, total = await AiCallFollowUpDataService.from_session(auth.db).list_page(
         tenant_id=tenant_id,
+        user_id=user_id,
         classification=classification,
         customer_name=customer_name,
         task_id=task_id,
@@ -58,7 +82,7 @@ async def list_follow_up_data_controller(
 )
 async def get_follow_up_data_controller(
     follow_up_data_id: int,
-    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_follow_up_auth)],
 ) -> JSONResponse:
     tenant_id, _ = _identity(auth)
     result = await AiCallFollowUpDataService.from_session(auth.db).get_detail(
@@ -79,7 +103,7 @@ async def adjust_follow_up_data_classification_controller(
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=128),
     ],
-    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_follow_up_auth)],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
     user = auth.user
@@ -106,7 +130,7 @@ async def schedule_follow_up_data_controller(
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=128),
     ],
-    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_follow_up_auth)],
 ) -> JSONResponse:
     tenant_id, user_id = _identity(auth)
     user = auth.user

@@ -46,6 +46,7 @@ from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.config.setting import settings
+from app.core.dependencies import has_ai_call_tenant_management
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
 from app.services.ai_call.call_termination import sip_disconnect_end_reason
@@ -76,6 +77,99 @@ class FollowUpCallbackAccepted:
 
 class AiCallFollowUpService:
     """快速话后确认和负责人固定的人工跟进。"""
+
+    @staticmethod
+    def account_follow_up_scope(tenant_id: str, user_id: int):
+        owned_data = select(AiCallFollowUpDataModel.id).join(
+            AiCallOutboundTaskModel,
+            and_(AiCallOutboundTaskModel.tenant_id == AiCallFollowUpDataModel.tenant_id,
+                 AiCallOutboundTaskModel.id == AiCallFollowUpDataModel.task_id),
+        ).where(
+            AiCallFollowUpDataModel.tenant_id == tenant_id,
+            AiCallOutboundTaskModel.created_by == user_id,
+        ).correlate(None)
+        created_calls = AiCallRecordRepository._record_filters(
+            select(AiCallRecordModel.call_id), tenant_id=tenant_id, user_id=user_id,
+        ).correlate(None)
+        return and_(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id,
+            or_(
+                # 已有关联资料时以资料所属任务为准，不能用冲突的 source_call_id 绕过归属。
+                AiCallFollowUpTaskModel.follow_up_data_id.in_(owned_data),
+                and_(
+                    AiCallFollowUpTaskModel.follow_up_data_id.is_(None),
+                    AiCallFollowUpTaskModel.source_call_id.in_(created_calls),
+                ),
+                AiCallFollowUpService.account_handled_follow_up_scope(tenant_id, user_id),
+            ),
+        )
+
+    @staticmethod
+    def account_handled_follow_up_scope(tenant_id: str, user_id: int):
+        agents = AiCallAgentConsoleService.account_agent_identities(tenant_id, user_id)
+        return and_(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id,
+            or_(
+                AiCallFollowUpTaskModel.source_call_id.in_(
+                    AiCallAgentConsoleService.account_handled_call_ids(tenant_id, user_id)
+                ),
+                AiCallFollowUpTaskModel.owner_agent_identity.in_(agents),
+                AiCallFollowUpTaskModel.id.in_(select(AiCallFollowUpAttemptModel.follow_up_id).where(
+                    AiCallFollowUpAttemptModel.tenant_id == tenant_id,
+                    AiCallFollowUpAttemptModel.agent_identity.in_(agents),
+                ).correlate(None)),
+                AiCallFollowUpTaskModel.id.in_(select(AiCallFollowUpHandlingResultModel.follow_up_id).where(
+                    AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                    AiCallFollowUpHandlingResultModel.agent_identity.in_(agents),
+                ).correlate(None)),
+            ),
+        )
+
+    @staticmethod
+    def account_follow_up_data_scope(tenant_id: str, user_id: int):
+        agents = AiCallAgentConsoleService.account_agent_identities(tenant_id, user_id)
+        return and_(
+            AiCallFollowUpDataModel.tenant_id == tenant_id,
+            or_(
+                AiCallFollowUpDataModel.task_id.in_(select(AiCallOutboundTaskModel.id).where(
+                    AiCallOutboundTaskModel.tenant_id == tenant_id,
+                    AiCallOutboundTaskModel.created_by == user_id,
+                ).correlate(None)),
+                AiCallFollowUpDataModel.id.in_(select(AiCallFollowUpTaskModel.follow_up_data_id).where(
+                    AiCallFollowUpService.account_follow_up_scope(tenant_id, user_id)
+                ).correlate(None)),
+                AiCallFollowUpDataModel.id.in_(select(AiCallFollowUpHandlingResultModel.follow_up_data_id).where(
+                    AiCallFollowUpHandlingResultModel.tenant_id == tenant_id,
+                    AiCallFollowUpHandlingResultModel.agent_identity.in_(agents),
+                ).correlate(None)),
+                AiCallFollowUpDataModel.id.in_(select(AiCallAfterCallWorkModel.follow_up_data_id).where(
+                    AiCallAfterCallWorkModel.tenant_id == tenant_id,
+                    AiCallAfterCallWorkModel.agent_identity.in_(agents),
+                ).correlate(None)),
+                AiCallFollowUpDataModel.id.in_(select(AiCallRecordModel.follow_up_data_id).where(
+                    AiCallRecordModel.tenant_id == tenant_id,
+                    AiCallRecordModel.operator_agent_identity.in_(agents),
+                ).correlate(None)),
+            ),
+        )
+
+    async def _require_account_follow_up(self, auth: AuthSchema, follow_up_id: int) -> None:
+        if not has_ai_call_tenant_management(auth) and await self.db.scalar(
+            select(AiCallFollowUpTaskModel.id).where(
+                AiCallFollowUpTaskModel.id == follow_up_id,
+                self.account_follow_up_scope(str(auth.user.tenant_id), auth.user.id),
+            )
+        ) is None:
+            raise CustomException(msg="跟进任务不存在", status_code=404)
+
+    async def _require_account_follow_up_data(self, auth: AuthSchema, follow_up_data_id: int) -> None:
+        if not has_ai_call_tenant_management(auth) and await self.db.scalar(
+            select(AiCallFollowUpDataModel.id).where(
+                AiCallFollowUpDataModel.id == follow_up_data_id,
+                self.account_follow_up_data_scope(str(auth.user.tenant_id), auth.user.id),
+            )
+        ) is None:
+            raise CustomException(msg="跟进数据不存在", status_code=404)
 
     def __init__(
         self,
@@ -447,13 +541,8 @@ class AiCallFollowUpService:
         follow_up_id: int,
     ) -> AiCallFollowUpTaskModel:
         profile = await self.agent_service.require_current_agent(auth)
+        await self._require_account_follow_up(auth, follow_up_id)
         task = await self._required_task(profile.tenant_id, follow_up_id)
-        allowed = task.owner_agent_identity == profile.agent_identity or (
-            task.owner_agent_identity is None
-            and task.source_type in CLAIMABLE_UNASSIGNED_SOURCE_TYPES
-        )
-        if not allowed:
-            raise CustomException(msg="当前坐席无权查看该跟进任务", status_code=403)
         if task.owner_agent_identity is None:
             await self.agent_service.require_scene_access(auth, task.scene_code)
         await self._attach_follow_up_detail(task)
@@ -466,6 +555,7 @@ class AiCallFollowUpService:
         follow_up_id: int,
     ) -> AiCallFollowUpTaskModel:
         profile = await self.agent_service.require_current_agent(auth)
+        await self._require_account_follow_up(auth, follow_up_id)
         task = await self._required_task(profile.tenant_id, follow_up_id)
         if task.owner_agent_identity is not None:
             self._raise_conflict("跟进任务已被认领", "FOLLOW_UP_ALREADY_CLAIMED")
@@ -801,6 +891,7 @@ class AiCallFollowUpService:
         AiCallFollowUpHandlingResultModel,
     ]:
         profile = await self.agent_service.require_current_agent(auth)
+        await self._require_account_follow_up_data(auth, follow_up_data_id)
         normalized_key = idempotency_key.strip()
         if not normalized_key:
             raise CustomException(msg="Idempotency-Key 不能为空", status_code=422)
@@ -1098,6 +1189,7 @@ class AiCallFollowUpService:
         idempotency_key: str,
     ) -> tuple[FollowUpCallbackAccepted, AiCallFollowUpTaskModel | None]:
         profile = await self.agent_service.require_current_agent(auth)
+        await self._require_account_follow_up_data(auth, follow_up_data_id)
         normalized_key = idempotency_key.strip()
         if not normalized_key:
             raise CustomException(msg="Idempotency-Key 不能为空", status_code=422)
@@ -1752,6 +1844,8 @@ class AiCallFollowUpService:
         profile = await self.agent_service.require_current_agent(auth)
         scene_codes = await self._scene_codes(profile.tenant_id, profile.agent_identity)
         conditions = [AiCallFollowUpTaskModel.tenant_id == profile.tenant_id]
+        if not has_ai_call_tenant_management(auth):
+            conditions.append(self.account_follow_up_scope(profile.tenant_id, auth.user.id))
         if ownership == "mine":
             conditions.append(
                 AiCallFollowUpTaskModel.owner_agent_identity == profile.agent_identity

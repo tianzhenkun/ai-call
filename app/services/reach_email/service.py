@@ -7,7 +7,8 @@ from datetime import timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.services.reach_email.ai import PROMPT_VERSION
 from app.services.reach_email.content import (
@@ -27,14 +28,39 @@ from app.services.reach_email.models import (
     Import,
     Lead,
     Message,
+    SendRestriction,
     Suppression,
     Task,
     Version,
     new_id,
     now,
 )
+from app.services.reach_email.providers import mailbox_label, mailbox_service
+from app.services.reach_email.scheduling import (
+    TASK_WAIT_REASONS,
+    WAIT_LABELS,
+    account_send_time,
+    followup_send_time,
+    manual_reply,
+    task_send_time,
+)
 from app.services.reach_email.schema import Content, TaskSettings
 from app.services.reach_email.security import CredentialCipher
+from app.services.reach_email.send_limits import (
+    LIMIT_PAUSED,
+    LIMIT_WAIT,
+    pending_condition,
+    pending_due,
+    restriction_json,
+    restrictions,
+)
+
+CREDIT_WAIT_LABELS = {
+    'ARREARS_BLOCKED': '账户欠费，发送受阻',
+    'INSUFFICIENT_START_BALANCE': '可用算力点不足，发送受阻',
+    'INSUFFICIENT_BALANCE': '可用算力点不足，发送受阻',
+    'CREDIT_UNAVAILABLE': '计费服务暂不可用，发送受阻',
+}
 
 
 def dump(value):
@@ -122,36 +148,26 @@ class EmailService:
         return json.loads(row.report)
 
     async def account_json(self, row):
+        stamp = now()
+        available_at, code = await account_send_time(self.db, row, stamp)
         reason = ""
         if not row.enabled:
             reason = "已停用"
         elif row.smtp_status != "ok" or row.imap_status != "ok":
             reason = "请完成收发连接测试"
-        elif row.next_send_at and row.next_send_at > now():
-            reason = "等待发送间隔"
-        else:
-            for window, limit in [
-                (timedelta(hours=1), row.hourly_limit),
-                (timedelta(hours=24), row.daily_limit),
-            ]:
-                count = await self.db.scalar(
-                    select(func.count())
-                    .select_from(Attempt)
-                    .where(
-                        *scope(Attempt, self.tenant, self.owner),
-                        Attempt.account_id == row.id,
-                        Attempt.created_at >= now() - window,
-                    )
-                )
-                if count >= limit:
-                    reason = "已达发送上限"
-                    break
+        elif available_at is None or available_at > stamp:
+            reason = WAIT_LABELS[code]
         config = json.loads(row.config)
+        config.setdefault("send_transport", "smtp")
+        if config.get("provider_type") == "outlook_personal" and row.oauth_status != "connected":
+            reason = ("连接未完成，请重新连接微软账号" if row.oauth_status == "pending" else
+                      "微软授权已断开，请重新连接" if row.oauth_status == "disconnected" else "请重新连接微软账号")
         if "provider_type" not in config:
-            from app.services.reach_email.providers import PROVIDERS
+            from app.services.reach_email.providers import PROVIDERS, provider_settings
 
             config["provider_type"] = next((
-                key for key, preset in PROVIDERS.items()
+                key for key in PROVIDERS
+                for preset in (provider_settings(key, row.email),)
                 if all(config.get(f"{protocol}_{field}") == preset[f"{protocol}{field.title()}"]
                        for protocol in ("smtp", "imap") for field in ("host", "port", "security"))
                 and all(config.get(f"{protocol}_username") == row.email for protocol in ("smtp", "imap"))
@@ -172,39 +188,94 @@ class EmailService:
             intervalSeconds=row.interval_seconds,
             smtpStatus=row.smtp_status,
             imapStatus=row.imap_status,
+            oauthStatus=row.oauth_status,
+            smtpTestResult=json.loads(row.smtp_test_result) if row.smtp_test_result else None,
+            imapTestResult=json.loads(row.imap_test_result) if row.imap_test_result else None,
             lastSyncAt=row.last_sync_at,
             available=not reason,
             unavailableReason=reason,
+            nextSendAt=iso(available_at) if available_at and available_at > stamp else None,
+            sendRestrictions=[restriction_json(item) for item in
+                await restrictions(self.db, row, include_partial=True)],
             smtpSecretConfigured=bool(row.secret),
             imapSecretConfigured=bool(row.secret),
+            serviceKey=mailbox_service(config),
+            providerLabel=mailbox_label(config),
         )
 
-    async def save_account(self, data, identifier=None):
+    async def resume_send_restriction(self, account_id, restriction_id):
+        account = await self.owned(Account, account_id)
+        row = await self.owned(SendRestriction, restriction_id)
+        applicable = await restrictions(self.db, account, include_partial=True)
+        if row.id not in {item.id for item in applicable}:
+            raise ValueError("该发送限制不属于此邮箱")
+        if row.retry_at is not None:
+            raise ValueError("冷却等待尚未解除，请按预计时间重试")
+        condition = await pending_condition(self.db, row)
+        # 与发送回写保持 Message -> SendRestriction 顺序，避免恢复与领取互相等锁。
+        await self.db.execute(update(Message).where(condition,
+            Message.error_code.in_((LIMIT_WAIT, LIMIT_PAUSED)),
+        ).values(due_at=now(), error_code=None))
+        deleted = await self.db.execute(delete(SendRestriction).where(
+            *scope(SendRestriction, self.tenant, self.owner),
+            SendRestriction.id == restriction_id, SendRestriction.retry_at.is_(None),
+        ))
+        if not deleted.rowcount:
+            raise ValueError("发送限制已变更，请刷新后重试")
+        await self.db.flush()
+        # 恢复只解除本条暂停；worker 仍检查其他限制、任务节奏和邮箱限额。
+        return await self.account_json(account)
+
+    async def save_account(self, data, identifier=None, *, oauth_secret=None, oauth_pending=False):
         cipher = CredentialCipher(self.key)
         row = await self.owned(Account, identifier, lock=True) if identifier else None
         if row and row.email != data.email:
-            used = await self.db.scalar(
-                self.query(Message).where(Message.account_id == row.id).limit(1)
+            sending = await self.db.scalar(
+                self.query(Message).with_only_columns(Message.id).where(
+                    Message.account_id == row.id, Message.direction == 'outbound', Message.status == 'sending',
+                ).limit(1)
             )
-            if used:
-                raise ValueError("已用于收发的邮箱地址不能更改，请新增邮箱账号")
-        duplicate = await self.db.scalar(self.query(Account).where(Account.email == data.email))
+            if sending:
+                raise ValueError("该邮箱有邮件正在发送，请稍后再修改邮箱地址")
+        service_key = mailbox_service(data.model_dump())
+        duplicate = await self.db.scalar(self.query(Account).where(
+            Account.email == data.email, Account.service_key == service_key))
         if duplicate and (not row or duplicate.id != row.id):
             raise ValueError("此邮箱已添加")
         values = data.model_dump()
-        secrets = cipher.decrypt(row.secret) if row else {}
-        for key in ("smtp_password", "imap_password"):
-            if values[key]:
-                secrets[key] = values[key]
-        if not secrets.get("smtp_password") or not secrets.get("imap_password"):
-            raise ValueError("请填写 SMTP 和 IMAP 授权凭据")
+        old_config = json.loads(row.config) if row else {}
+        outlook = data.provider_type == "outlook_personal"
+        if row and (outlook or old_config.get("provider_type") == "outlook_personal") and (
+            row.email != data.email or old_config.get("provider_type") != data.provider_type
+        ):
+            raise ValueError("已连接的 Outlook 邮箱不能更换类型或地址，请新增邮箱并授权")
+        secrets = cipher.decrypt(row.secret) if row and row.secret else {}
+        if outlook:
+            if data.smtp_password or data.imap_password:
+                raise ValueError("Outlook 个人邮箱请使用微软授权连接，无需填写密码")
+            if not row and not oauth_secret and not oauth_pending:
+                raise ValueError("请先通过微软授权连接 Outlook 邮箱")
+            if oauth_pending:
+                # 失败条目只保留配置与诊断，不绑定本次尚未验证的授权，也不能进入发送池。
+                secrets, values["enabled"] = {}, False
+            elif data.enabled and not oauth_secret and (not row.secret or row.oauth_status != "connected"):
+                raise ValueError("请先重新连接微软账号，连接通过后才能启用邮箱")
+            if oauth_secret:
+                secrets = oauth_secret
+        else:
+            for key in ("smtp_password", "imap_password"):
+                if values[key]:
+                    secrets[key] = values[key]
+            if not secrets.get("smtp_password") or not secrets.get("imap_password"):
+                raise ValueError("请填写 SMTP 和 IMAP 授权凭据")
         config = {
             k: v
             for k, v in values.items()
             if k.startswith(("smtp_", "imap_")) and not k.endswith("_password")
         }
         config.update(provider_type=data.provider_type, from_name=data.from_name)
-        old_config = json.loads(row.config) if row else {}
+        if outlook:
+            config["send_transport"] = "graph" if oauth_pending else (oauth_secret or old_config).get("send_transport", "smtp")
         changed_protocols = {
             protocol: not row or row.email != data.email or bool(values[f"{protocol}_password"])
             or any(old_config.get(k) != v for k, v in config.items() if k.startswith(protocol + "_"))
@@ -229,6 +300,7 @@ class EmailService:
             dump(config),
             cipher.encrypt(secrets),
         )
+        row.service_key = service_key
         if row.weight != values["weight"]:
             row.current_weight = 0
         for key in ("enabled", "weight", "hourly_limit", "daily_limit", "interval_seconds"):
@@ -236,17 +308,71 @@ class EmailService:
         for protocol, changed in changed_protocols.items():
             if changed:
                 setattr(row, f"{protocol}_status", "untested")
+                setattr(row, f"{protocol}_test_result", None)
         row.version = (row.version or 0) + 1
-        await self.db.flush()
+        if outlook and oauth_secret:
+            row.oauth_status = "connected"
+        elif outlook and oauth_pending:
+            row.oauth_status = "pending"
+        if outlook and not secrets:
+            row.secret = ""
+        try:
+            await self.db.flush()
+        except IntegrityError as exc:
+            # 并发新增仍由唯一约束兜底；其余数据库错误保留原始异常。
+            detail = str(exc.orig)
+            if 'uq_reach_email_account_service' in detail or (
+                'UNIQUE constraint failed' in detail and 'reach_email_account.service_key' in detail
+            ):
+                raise ValueError('此邮箱已添加，请返回列表编辑已有账号') from None
+            raise
         return await self.account_json(row)
 
     async def delete_account(self, identifier):
+        # 先锁账号，再读取任务引用；配置任务时也锁账号，防止检查后出现新引用。
         row = await self.owned(Account, identifier, lock=True)
-        if await self.db.scalar(self.query(Message).where(Message.account_id == row.id).limit(1)):
-            raise ValueError("该邮箱已有邮件记录，请停用邮箱，保留会话回复关联")
+        unassociated_inbound = and_(
+            Message.direction == "inbound", Message.task_id.is_(None), Message.lead_id.is_(None)
+        )
+        if await self.db.scalar(self.query(Message).where(
+            Message.account_id == row.id, ~unassociated_inbound
+        ).limit(1)):
+            raise ValueError("该邮箱已有发信或业务关联邮件记录，请停用邮箱，保留会话回复关联")
+        # ponytail: 删除为低频操作，流式核对任务设置；任务量大时再建立账号引用索引。
+        tasks = await self.db.stream_scalars(self.query(Task).with_only_columns(Task.settings)
+                                           .execution_options(yield_per=200))
+        try:
+            async for settings in tasks:
+                if any(item["accountId"] == row.id for item in json.loads(settings).get("senderAccounts") or []):
+                    raise ValueError("该邮箱已被任务选择，请先从未启动任务中移除；已启动任务使用的邮箱请停用并保留配置")
+        finally:
+            await tasks.close()
+        # 仅清理本系统中的无关联收件记录，不操作邮箱服务器中的原邮件。
+        await self.db.execute(delete(Message).where(
+            *scope(Message, self.tenant, self.owner), Message.account_id == row.id,
+            unassociated_inbound,
+        ))
         await self.db.delete(row)
 
+    async def task_sender_accounts(self, settings, *, required=False):
+        pool = settings.get("senderAccounts") or []
+        if not pool:
+            if required:
+                raise ValueError("请先选择本任务的发件邮箱")
+            return []
+        accounts = (await self.db.scalars(self.query(Account).where(
+            Account.id.in_([item["accountId"] for item in pool])
+        ).order_by(Account.id).with_for_update())).all()
+        if len(accounts) != len(pool):
+            raise ValueError("本任务发件邮箱不存在或无权访问，请重新选择")
+        if required and any(not a.enabled or a.smtp_status != "ok" or a.imap_status != "ok" for a in accounts):
+            raise ValueError("本任务所选邮箱已停用或连接测试未通过，请检查发件邮箱")
+        return accounts
+
     async def create_task(self, data):
+        settings = data.settings.model_dump(by_alias=True)
+        settings["senderAccounts"] = settings["senderAccounts"] or []
+        await self.task_sender_accounts(settings)
         imp = await self.owned(Import, data.import_id, lock=True)
         report = json.loads(imp.report)
         if imp.consumed or not report["canCreate"]:
@@ -255,7 +381,7 @@ class EmailService:
             Task,
             name=data.name,
             import_id=imp.id,
-            settings=dump(data.settings.model_dump(by_alias=True)),
+            settings=dump(settings),
             content=dump(data.content.model_dump(by_alias=True)),
             daily_limit=data.settings.daily_limit,
             recipient_count=report["validCount"],
@@ -283,6 +409,7 @@ class EmailService:
             "scheduledAt": iso(row.scheduled_at),
             "endedReason": row.ended_reason,
             "recipientCount": row.recipient_count,
+            "sendIntervalSeconds": 86400 / row.daily_limit,
             "createdAt": iso(row.created_at),
             "updatedAt": iso(row.updated_at),
         }
@@ -297,6 +424,9 @@ class EmailService:
 
     async def update_task(self, identifier, data):
         task = await self.editable(identifier, data.version)
+        settings = data.settings.model_dump(by_alias=True)
+        settings["senderAccounts"] = settings["senderAccounts"] or []
+        await self.task_sender_accounts(settings)
         if task.import_id != data.import_id:
             imp = await self.owned(Import, data.import_id, lock=True)
             report = json.loads(imp.report)
@@ -317,7 +447,8 @@ class EmailService:
             task.recipient_count = report["validCount"]
         await self.attachments(data.content.attachment_ids)
         task.name = data.name
-        task.settings = dump(data.settings.model_dump(by_alias=True))
+        task.settings = dump(settings)
+        task.sender_allocation_state = "{}"
         task.daily_limit = data.settings.daily_limit
         task.content = dump(data.content.model_dump(by_alias=True))
         task.version += 1
@@ -342,14 +473,21 @@ class EmailService:
             raise ValueError("邮件设置已被更新，请关闭弹窗后重新打开再修改")
         settings = data.settings.model_dump(by_alias=True)
         previous = json.loads(task.settings)
+        if task.status == "unstarted":
+            settings["senderAccounts"] = settings["senderAccounts"] or []
+            await self.task_sender_accounts(settings)
+        elif previous.get("senderAccounts") != settings["senderAccounts"]:
+            raise ValueError("任务已安排或开始执行，不能修改发件邮箱和权重；定时任务请先撤回")
+        if previous.get("senderAccounts") != settings["senderAccounts"]:
+            task.sender_allocation_state = "{}"
         previous_limit = task.daily_limit
         task.settings = dump(settings)
         task.daily_limit = data.settings.daily_limit
         task.version += 1
-        if task.status == "running" and task.daily_limit > previous_limit:
+        if task.status == "running" and task.daily_limit != previous_limit:
             await self.db.execute(update(Message).where(
                 *scope(Message, self.tenant, self.owner), Message.task_id == task.id,
-                Message.status.in_(("queued", "retryable")), Message.error_code == "TASK_DAILY_LIMIT",
+                Message.status.in_(("queued", "retryable")), Message.error_code.in_(TASK_WAIT_REASONS),
             ).values(due_at=now(), error_code=None))
         if task.status in {"scheduled", "running"} and any(
             previous.get(key) != settings[key]
@@ -394,11 +532,13 @@ class EmailService:
                         ):
                             if due:
                                 # 排期变化不能缩短已发生失败的退避；尝试更新时间保留实际回写时间。
-                                retry_at = await self.db.scalar(self.query(Attempt).with_only_columns(Attempt.updated_at).where(
+                                retry_at, retries = (await self.db.execute(self.query(Attempt).with_only_columns(
+                                    func.max(Attempt.updated_at), func.count(),
+                                ).where(
                                     Attempt.message_id == pending.id, Attempt.status == "retryable",
-                                ).order_by(Attempt.created_at.desc()).limit(1)) if pending.attempt_count else None
+                                ))).one() if pending.attempt_count else (None, 0)
                                 pending.status = "retryable" if pending.attempt_count else "queued"
-                                pending.due_at = max(due, retry_at + timedelta(minutes=2 ** pending.attempt_count)) if retry_at else due
+                                pending.due_at = max(due, retry_at + timedelta(minutes=2 ** retries)) if retry_at else due
                                 pending.error_code = None
                             else:
                                 pending.status, pending.error_code = "cancelled", "FOLLOWUP_SETTINGS_CHANGED"
@@ -532,6 +672,7 @@ class EmailService:
         )
         if not content.subject.strip() or not has_email_content({"html": content.html}):
             raise ValueError("请先填写邮件主题和正文")
+        await self.task_sender_accounts(json.loads(task.settings), required=True)
         warnings = []
         offset = 0
         while True:
@@ -578,6 +719,11 @@ class EmailService:
             )
         ).all()
         totals = dict(counts)
+        pool = json.loads(row.settings).get("senderAccounts") or []
+        ready_count = await self.db.scalar(self.query(Account).where(
+            Account.id.in_([item["accountId"] for item in pool]), Account.enabled.is_(True),
+            Account.smtp_status == "ok", Account.imap_status == "ok",
+        ).with_only_columns(func.count(), maintain_column_froms=True)) if pool else 0
         content_updated_at = await self.db.scalar(self.query(Version).where(Version.task_id == row.id).with_only_columns(func.max(Version.created_at)))
         return dict(
             **self.task_json(row),
@@ -585,7 +731,78 @@ class EmailService:
             acceptedCount=totals.get("accepted", 0),
             failedCount=totals.get("failed", 0),
             unknownCount=totals.get("unknown", 0),
+            senderAccountReadyCount=ready_count,
+            **await self.send_schedule(row),
         )
+
+    async def send_schedule(self, task):
+        result = {"nextSendAt": None, "sendWaitReason": None}
+        if task.status not in {"running", "scheduled"}:
+            return result
+        stamp = now()
+        task_at, task_reason = await task_send_time(self.db, task, stamp)
+        if task.scheduled_at and task.scheduled_at > task_at:
+            task_at, task_reason = task.scheduled_at, 'SCHEDULED'
+        # 按邮箱和等待原因聚合，不加载整份收件名单；人工回复独立于任务节奏。
+        groups = (await self.db.execute(self.query(Message).where(
+            Message.task_id == task.id, Message.direction == "outbound",
+            Message.status.in_(("queued", "retryable")), ~manual_reply(),
+        ).with_only_columns(Message.account_id, Message.status, Message.error_code,
+            func.min(pending_due(Message, Message.due_at, Message.to_email)))
+            .group_by(Message.account_id, Message.status, Message.error_code))).all()
+        future = (await self.db.execute(self.query(Lead).where(
+            Lead.task_id == task.id, Lead.stopped_reason.is_(None), Lead.next_follow_up_at.is_not(None),
+        ).with_only_columns(Lead.account_id, func.min(pending_due(Lead, Lead.next_follow_up_at, Lead.email)))
+            .group_by(Lead.account_id))).all()
+        groups.extend((account_id, 'follow_up', None, due) for account_id, due in future)
+        if not groups:
+            return result
+        pool = json.loads(task.settings).get("senderAccounts")
+        selected = {item["accountId"] for item in pool} if pool is not None else None
+        fixed = {account_id for account_id, *_ in groups if account_id}
+        query = self.query(Account)
+        if selected is not None:
+            query = query.where(Account.id.in_(selected | fixed))
+        accounts = (await self.db.scalars(query)).all()
+        timings = {account.id: await account_send_time(self.db, account, stamp) for account in accounts}
+        pool_ids = selected if selected is not None else set(timings)
+        available_pool = [timings[key] for key in pool_ids if key in timings and timings[key][0] is not None]
+        if not pool_ids <= timings.keys():
+            available_pool = []
+        # 尚未完成权重分配时，不能把已绑定邮件或池中最快邮箱冒充为下一封。
+        if available_pool and any(not account_id for account_id, *_ in groups):
+            result['sendWaitReason'] = '等待分配发件邮箱'
+            return result
+        candidates = []
+        paused = False
+        for account_id, status, error, due in groups:
+            if not account_id:
+                continue
+            account_at, account_reason = timings.get(account_id, (None, 'TASK_SENDER_UNAVAILABLE'))
+            if due is None or account_reason == LIMIT_PAUSED:
+                paused = True
+                continue
+            if account_at is None:
+                continue
+            at = max(stamp, due)
+            reason = {"retryable": "等待失败重试", "follow_up": "等待自动跟进"}.get(status, "等待发送")
+            if error in WAIT_LABELS and due > stamp:
+                reason = WAIT_LABELS[error]
+            if task_at > stamp and task_at >= at:
+                at, reason = task_at, WAIT_LABELS.get(task_reason, "等待定时执行")
+            if account_at > stamp and account_at >= at:
+                at, reason = account_at, WAIT_LABELS[account_reason]
+            # 最近一次准入拦截不能被时间间隔覆盖；该时间仅表示下次检查机会。
+            code = error if status == 'retryable' and error in CREDIT_WAIT_LABELS else None
+            candidates.append((at, CREDIT_WAIT_LABELS.get(code, reason), code))
+        if candidates:
+            at, reason, code = min(candidates, key=lambda item: item[0])
+            result.update(nextSendAt=iso(at), sendWaitReason=reason)
+            if code:
+                result['sendWaitCode'] = code
+        else:
+            result['sendWaitReason'] = WAIT_LABELS[LIMIT_PAUSED if paused else 'TASK_SENDER_UNAVAILABLE']
+        return result
 
     async def start(self, identifier, data):
         task = await self.task(identifier, lock=True)
@@ -593,20 +810,18 @@ class EmailService:
             return self.task_json(task)
         task = await self.editable(identifier, data.version)
         TaskSettings.model_validate(json.loads(task.settings))
-        CredentialCipher(self.key)
         content = Content.model_validate(json.loads(task.content))
         if not content.subject.strip() or not has_email_content({"html": content.html}):
             raise ValueError("请先填写邮件主题和正文")
+        await self.task_sender_accounts(json.loads(task.settings), required=True)
         report = await self.import_report(task.import_id)
         combined = "\n".join((content.subject, content.html, content.signature))
         validate_variables(combined, report["columns"])
+        CredentialCipher(self.key)
         files = await self.attachments(content.attachment_ids)
         for file in files:
             if not self.store or (await self.store.stat(file.object_key)).byte_size != file.size:
                 raise ValueError("附件不可读取，请重新上传")
-        accounts = (await self.db.scalars(self.query(Account))).all()
-        if not any([(await self.account_json(a))["available"] for a in accounts]):
-            raise ValueError("没有可用邮箱，请配置并测试连接或等待额度恢复")
         due = now()
         if data.scheduled_at:
             if data.scheduled_at.tzinfo is None:
@@ -658,6 +873,7 @@ class EmailService:
         task.status = "scheduled" if data.scheduled_at else "running"
         task.scheduled_at = due if data.scheduled_at else None
         task.start_key = data.request_id
+        task.sender_allocation_state = "{}"
         task.version += 1
         await self.db.flush()
         return dict(**self.task_json(task), warnings=warnings)
@@ -688,6 +904,7 @@ class EmailService:
             task.status = "unstarted"
             task.start_key = None
             task.scheduled_at = None
+            task.sender_allocation_state = "{}"
         else:
             if task.status not in {"running", "scheduled"}:
                 raise ValueError("任务当前不能停止")
@@ -796,7 +1013,24 @@ class EmailService:
             "sourceVersion": row.source_version,
         }
 
-    def message_json(self, row):
+    async def message_json(self, row):
+        next_at, error = None, row.error_code
+        if row.direction == 'outbound' and row.status in ('queued', 'retryable') and row.account_id:
+            stamp = now()
+            account = await self.db.scalar(self.query(Account).where(Account.id == row.account_id))
+            task = await self.db.scalar(self.query(Task).where(Task.id == row.task_id))
+            manual = row.dedup_key.startswith('manual:')
+            if account and task and (manual or task.status in ('running', 'scheduled')):
+                account_at, reason = await account_send_time(self.db, account, stamp, row.to_email, row.id)
+                if reason in (LIMIT_WAIT, LIMIT_PAUSED):
+                    error = reason
+                if account_at is not None:
+                    next_at = max(stamp, row.due_at, account_at)
+                    if not (manual and row.kind == 'reply'):
+                        task_at, _ = await task_send_time(self.db, task, stamp)
+                        next_at = max(next_at, task_at, task.scheduled_at or stamp)
+                    if row.kind == 'follow_up' and not manual:
+                        next_at = max(next_at, await followup_send_time(self.db, row, json.loads(task.settings)) or stamp)
         return {
             "id": row.id,
             "taskId": row.task_id,
@@ -810,7 +1044,10 @@ class EmailService:
             "fromEmail": row.from_email,
             "toEmail": row.to_email,
             "attachmentIds": json.loads(row.attachment_ids),
-            "errorCode": row.error_code,
+            "errorCode": error,
+            "sendDiagnostic": json.loads(row.send_diagnostic) if row.send_diagnostic else None,
+            "nextAttemptAt": iso(next_at),
+            "deliveryReport": json.loads(row.delivery_report) if row.delivery_report else None,
             "resolutionNote": row.resolution_note,
             "resolvedAt": iso(row.resolved_at),
             "createdAt": iso(row.created_at),
@@ -818,15 +1055,19 @@ class EmailService:
         }
 
     async def lead_json(self, row):
+        from app.services.reach_email.reporting import delivery_evidence
+
         task = await self.task(row.task_id)
         values = json.loads(row.values)
-        last = await self.db.scalar(
+        messages = list((await self.db.scalars(
             self
             .query(Message)
             .where(Message.lead_id == row.id)
-            .order_by(Message.created_at.desc())
-            .limit(1)
-        )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+        )).all())
+        last = messages[0] if messages else None
+        sent = next((m for m in messages if m.direction == 'outbound' and m.attempt_count > 0), None)
+        delivered, failed, _ = delivery_evidence(messages)
         return {
             "id": row.id,
             "taskId": row.task_id,
@@ -837,6 +1078,9 @@ class EmailService:
             "position": values.get("职务", ""),
             "classification": row.classification,
             "latestStatus": last.status if last else "unstarted",
+            "deliveryStatus": ("failed" if sent.id in failed else "delivered" if sent.id in delivered
+                               else "unconfirmed") if sent else None,
+            "stoppedReason": row.stopped_reason,
             "lastSentAt": iso(row.last_sent_at),
             "lastReplyAt": iso(row.last_reply_at),
             "replyStatus": (
@@ -914,9 +1158,11 @@ class EmailService:
                 lead.next_follow_up_at = now() + timedelta(
                     days=settings.get("followUpIntervalDays", 2)
                 )
+        from app.services.reach_email.credit import record_email_outcome
+        await record_email_outcome(self.db, message)
         # Confirmation never resubmits mail or releases an uncertain attempt's quota.
         await self.db.flush()
-        return self.message_json(message)
+        return await self.message_json(message)
 
     async def manual_send_context(self, lead):
         first = await self.db.scalar(self.query(Message).where(
@@ -945,7 +1191,7 @@ class EmailService:
             self.query(Message).where(Message.dedup_key == f"manual:{lead.id}:{data.request_id}")
         )
         if existing:
-            return self.message_json(existing)
+            return await self.message_json(existing)
         first, reason = await self.manual_send_context(lead)
         if reason:
             raise ValueError(reason)
@@ -975,9 +1221,9 @@ class EmailService:
             html=content.html,
             attachment_ids=dump(data.attachment_ids),
             message_id=f"<{new_id()}@reach.local>",
-            in_reply_to=parent.message_id,
-            references=parent.references + " " + parent.message_id,
+            in_reply_to=parent.provider_message_id or parent.message_id,
+            references=parent.references + " " + (parent.provider_message_id or parent.message_id),
             dedup_key=f"manual:{lead.id}:{data.request_id}",
         )
         await self.db.flush()
-        return self.message_json(row)
+        return await self.message_json(row)

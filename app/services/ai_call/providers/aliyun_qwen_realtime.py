@@ -37,6 +37,8 @@ QWEN_SERVER_EVENT_MAPPING = {
     "conversation.item.input_audio_transcription.delta": "user_transcript_delta",
     "conversation.item.input_audio_transcription.completed": "user_transcript_done",
     "conversation.item.input_audio_transcription.failed": "user_transcript_failed",
+    "conversation.item.ambient_audio_transcription.delta": "ambient_transcript_delta",
+    "conversation.item.ambient_audio_transcription.completed": "ambient_transcript_done",
     "response.created": "model_response_started",
     "response.audio.delta": "model_audio_delta",
     "response.audio.done": "model_audio_done",
@@ -44,7 +46,6 @@ QWEN_SERVER_EVENT_MAPPING = {
     "response.audio_transcript.done": "ai_transcript_done",
     "response.text.delta": "model_text_delta",
     "response.text.done": "model_text_done",
-    "response.function_call_arguments.done": "tool_call_done",
     "response.done": "model_response_done",
     "error": "model_error",
 }
@@ -67,8 +68,13 @@ SCHEDULE_CALL_END_TOOL = {
                         "结束原因。customer_end 表示用户侧明确不再继续；"
                         "task_completed 表示当前业务目标已完成且无需继续追问；"
                         "policy_limit 表示已连续三个有效轮次偏离当前业务。"
+                        "voicemail 仅用于 REACH 外呼已听到明确的自动留言提示，必须同时提交 evidence_quote。"
                     ),
-                    "enum": ["customer_end", "task_completed", "policy_limit"],
+                    "enum": ["customer_end", "task_completed", "policy_limit", "voicemail"],
+                },
+                "evidence_quote": {
+                    "type": "string",
+                    "description": "判定语音信箱时听到的客户侧自动留言提示原话；其他结束原因不填写。",
                 },
             },
             "required": ["reason"],
@@ -121,6 +127,25 @@ SEARCH_SCENE_KNOWLEDGE_TOOL = {
                 },
             },
             "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+REPORT_CALL_ANSWER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "report_call_answer",
+        "description": "记录外呼接听依据。明确自动留言提示报 voicemail；客户针对本通对话作出明确回应报 human。仅内部记录，不向客户播报判断。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answer_type": {"type": "string", "enum": ["human", "voicemail"]},
+                "evidence_quote": {"type": "string", "description": "刚听到的完整客户回应或自动留言提示原话，最多200字。"},
+                "context_quote": {"type": "string", "description": "human 时引用该客户回应之前你实际说过的相关话语，最多200字；voicemail 时为空。"},
+            },
+            "required": ["answer_type", "evidence_quote", "context_quote"],
             "additionalProperties": False,
         },
     },
@@ -186,6 +211,9 @@ def build_session_update_event(config: QwenRealtimeSessionConfig) -> dict[str, A
     }
     if config.tools:
         session["tools"] = config.tools
+    if config.vad_type == "smart_turn":
+        # 智能轮次由供应商控制，不发送仅适用于 server_vad 的参数或关闭开关。
+        session["turn_detection"] = {"type": "smart_turn"}
 
     return {
         "type": "session.update",
@@ -338,14 +366,19 @@ class AliyunQwenRealtimeProvider:
                 key = "rawAudioDeltas" if raw_type == "response.audio.delta" else "rawTextDeltas"
                 self.response_diagnostics[key] = self.response_diagnostics.get(key, 0) + 1
                 self.response_diagnostics["lastRawOutputAt"] = received_at
+            if raw_type == "response.function_call_arguments.done":
+                # 参数生成完成不代表工具项已完成；取消的回复仍可能产生此事件。
+                continue
             event_type = map_qwen_server_event(payload)
             tool_payload: dict[str, Any] | None = None
-            if event_type == "tool_call_done":
-                tool_payload = payload
-            elif payload.get("type") == "response.output_item.done":
+            if raw_type == "response.output_item.done":
                 item = payload.get("item")
                 if isinstance(item, dict) and item.get("type") == "function_call":
-                    tool_payload = item
+                    if item.get("status") != "completed":
+                        continue
+                    tool_payload = {**item}
+                    if "response_id" in payload:
+                        tool_payload["response_id"] = payload["response_id"]
             if tool_payload is not None:
                 tool_call_id = tool_payload.get("call_id")
                 if isinstance(tool_call_id, str):

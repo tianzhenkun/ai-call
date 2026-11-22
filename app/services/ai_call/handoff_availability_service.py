@@ -7,11 +7,16 @@ from fastapi import status
 from sqlalchemy import and_, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallHandoffAgentModel,
     AiCallRecordModel,
+)
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundTargetModel,
+    AiCallOutboundTaskModel,
 )
 from app.core.exceptions import CustomException
 
@@ -50,10 +55,25 @@ class AiCallHandoffAvailabilityService:
                 status_code=status.HTTP_404_NOT_FOUND,
             )
 
+        tenant_id = record.tenant_id or self.tenant_id
+        owner_id = await self.db.scalar(
+            AiCallRecordRepository._join_record_outbound_context(
+                select(AiCallOutboundTaskModel.created_by).select_from(AiCallRecordModel)
+            ).where(
+                AiCallRecordModel.call_id == call_id,
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.id.is_not(None),
+            )
+        )
+        # 自动接待按任务账号匹配；管理员的菜单权限不代表参与其他账号的来电。
+        if owner_id is None:
+            return HandoffAgentAvailability(online_agent_count=0, available_agent_count=0)
+
         scene_code = (record.scene_code or "default").strip() or "default"
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_seconds)
         common_conditions = (
-            AiCallAgentProfileModel.tenant_id == self.tenant_id,
+            AiCallAgentProfileModel.tenant_id == tenant_id,
+            AiCallAgentProfileModel.user_id == owner_id,
             AiCallAgentProfileModel.enabled.is_(True),
             AiCallAgentSceneScopeModel.scene_code == scene_code,
             AiCallHandoffAgentModel.last_seen_at.is_not(None),

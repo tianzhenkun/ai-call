@@ -262,13 +262,31 @@ async def get_ai_call_manager(
     if auth.user and auth.user.is_superuser:
         return auth
 
-    allowed_permissions = {"ai_call:agent:manage", "*:*:*"}
+    allowed_permissions = {
+        "ai_call:agent:manage",
+        "ai_call:agent:tenant_manage",
+        "*:*:*",
+    }
     if settings.JWT_ENABLE and auth.permissions.isdisjoint(allowed_permissions):
         raise CustomException(
             msg="无权限操作",
             code=10403,
             status_code=403,
         )
+    return auth
+
+
+def has_ai_call_tenant_management(auth: AuthSchema) -> bool:
+    return bool(auth.user and auth.user.is_superuser) or not auth.permissions.isdisjoint(
+        {"ai_call:agent:tenant_manage", "*:*:*"}
+    )
+
+
+async def get_ai_call_agent_manager(
+    auth: AuthSchema = Depends(get_current_user),
+) -> AuthSchema:
+    if not has_ai_call_tenant_management(auth) and "ai_call:agent:console" not in auth.permissions:
+        raise CustomException(msg="无权限操作", code=10403, status_code=403)
     return auth
 
 

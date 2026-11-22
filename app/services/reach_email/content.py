@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from html import escape, unescape
+from html.parser import HTMLParser
 from io import BytesIO
 from zipfile import BadZipFile, ZipFile
 
@@ -105,9 +106,45 @@ async def validate_recipient_domains(report: dict) -> None:
     report["canCreate"] = bool(records) and not report["errorCount"]
 
 
+class _EmailHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.hidden_tag: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if self.hidden_tag:
+            return
+        if tag in ('style', 'script'):
+            self.hidden_tag = tag
+        else:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if self.hidden_tag == tag:
+            self.hidden_tag = None
+        elif not self.hidden_tag:
+            self.parts.append(f'</{tag}>')
+
+    def handle_data(self, data):
+        if not self.hidden_tag:
+            self.parts.append(escape(data, quote=False))
+
+
+def strip_non_content_html(value: str) -> str:
+    # Bleach 的 strip=True 只去掉标签，样式和脚本内容须先按 HTML 结构移除。
+    parser = _EmailHTMLParser()
+    parser.feed(value)
+    parser.close()
+    return ''.join(parser.parts)
+
+
 def clean_html(value: str) -> str:
     return bleach.clean(
-        value,
+        strip_non_content_html(value),
         tags=[
             "p",
             "br",

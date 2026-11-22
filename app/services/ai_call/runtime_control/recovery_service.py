@@ -71,6 +71,20 @@ class RecoveryControlService:
     async def run_once(self) -> int:
         async with self._session_factory() as session:
             now = await self._database_clock(session)
+            duration_limit_candidates = (
+                await session.execute(
+                    select(AiCallRecordModel.tenant_id, AiCallRecordModel.call_id)
+                    .where(
+                        AiCallRecordModel.runtime_control_mode == "owner_command_v1",
+                        AiCallRecordModel.entry_type.in_({"outbound", "direct_sip"}),
+                        AiCallRecordModel.total_call_deadline_at <= now,
+                        AiCallRecordModel.terminal_requested_at.is_(None),
+                        AiCallRecordModel.status.notin_({"completed", "failed"}),
+                    )
+                    .order_by(AiCallRecordModel.total_call_deadline_at)
+                    .limit(self._batch_size)
+                )
+            ).all()
             candidates = (
                 await session.execute(
                     select(
@@ -174,6 +188,41 @@ class RecoveryControlService:
                 )
             ).all()
 
+        duration_limited = 0
+        for tenant_id, call_id in duration_limit_candidates:
+            async with self._session_factory.begin() as session:
+                record = await session.scalar(
+                    select(AiCallRecordModel)
+                    .where(
+                        AiCallRecordModel.tenant_id == tenant_id,
+                        AiCallRecordModel.call_id == call_id,
+                    )
+                    .with_for_update()
+                )
+                now = await self._database_clock(session)
+                if (
+                    record is None
+                    or record.total_call_deadline_at is None
+                    or record.total_call_deadline_at > now
+                    or record.terminal_requested_at is not None
+                    or record.status in {"completed", "failed"}
+                ):
+                    continue
+                await RuntimeCommandRepository(
+                    session,
+                    database_clock=self._database_clock,
+                ).request_end(
+                    EndCallIntent(
+                        tenant_id=str(tenant_id),
+                        call_id=call_id,
+                        source="call_duration_limit",
+                        end_reason="max_total_call_duration",
+                        dedupe_key=f"max-total:{call_id}",
+                        event_at=record.total_call_deadline_at,
+                    )
+                )
+                duration_limited += 1
+
         assigned = 0
         for tenant_id, call_id in start_candidates:
             async with self._session_factory.begin() as session:
@@ -210,7 +259,7 @@ class RecoveryControlService:
                     call_id,
                 ):
                     ended += 1
-        return ended + assigned + await self._startup_reconcile.run_once()
+        return duration_limited + ended + assigned + await self._startup_reconcile.run_once()
 
     async def _establish_orphaned_end(
         self,

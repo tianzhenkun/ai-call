@@ -190,7 +190,18 @@ BUILTIN_QWEN_OMNI_REALTIME_VOICES: tuple[BuiltinVoiceProfile, ...] = (
 )
 
 
-# 3.8 使用独立音色目录，避免向新模型暴露旧版专属音色。
+# 官方列表未提供统一的性别与中文展示名，不从音色 ID 猜测。
+BUILTIN_QWEN_AUDIO_31_REALTIME_VOICES: tuple[BuiltinVoiceProfile, ...] = tuple(
+    BuiltinVoiceProfile(voice, voice, VOICE_GENDER_UNKNOWN, "Qwen Audio 3.1 内置音色")
+    for voice in (
+        "longanqian_v3.1", "longanhuan_v3.1", "longanlingxin_v3.1", "longanfengyue_v3.1",
+        "xunanchuan_v3.1", "beth_v3.1", "betty_v3.1", "cally_v3.1",
+        "longanqian", "longanlingxin", "longanlingxi", "longanxiaoxin", "longanlufeng",
+    )
+)
+
+
+# 3.8 的目录独立于 3.5，避免向新模型暴露未列出的旧音色。
 BUILTIN_QWEN_OMNI_38_REALTIME_VOICES = tuple(
     profile for profile in BUILTIN_QWEN_OMNI_REALTIME_VOICES
     if profile.voice not in {"Sunnybobi", "Ethan", "Harvey"}
@@ -205,10 +216,12 @@ BUILTIN_QWEN_OMNI_38_REALTIME_VOICES = tuple(
 
 def builtin_voice_profile_values(target_model: str) -> list[dict[str, object]]:
     profiles = (
-        BUILTIN_QWEN_OMNI_38_REALTIME_VOICES
-        if target_model == "qwen3.8-omni-flash-realtime"
+        BUILTIN_QWEN_AUDIO_31_REALTIME_VOICES
+        if target_model == "qwen-audio-3.1-realtime-plus"
         else BUILTIN_QWEN_OMNI_REALTIME_VOICES
     )
+    if target_model == "qwen3.8-omni-flash-realtime":
+        profiles = BUILTIN_QWEN_OMNI_38_REALTIME_VOICES
     return [
         {
             "voice": profile.voice,

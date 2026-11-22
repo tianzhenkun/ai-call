@@ -4,13 +4,15 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.crud import (
@@ -26,12 +28,25 @@ from app.api.v1.ai_call.model import (
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallHandoffModel,
+    AiCallRecordingTrackModel,
+    AiCallRecordModel,
     AiCallSemanticAnalysisModel,
 )
 from app.api.v1.ai_call.outbound.attempt_projection import reconcile_analyzed_call
+from app.api.v1.ai_call.outbound.rule_task_model import (
+    AiCallOutboundAttemptModel,
+    AiCallOutboundTaskModel,
+)
+from app.config.setting import settings
 from app.core.logger import log
+from app.services.ai_call.call_outcome import is_clear_voicemail_prompt
 from app.services.ai_call.call_termination import call_end_category
 from app.services.ai_call.classification_review import requires_classification_review
+from app.services.ai_call.credit_metering import (
+    CREDIT_SCENARIO_CODE,
+    ReachCreditUsageOutboxModel,
+    enqueue_connected_call_usage,
+)
 from app.services.ai_call.dialogue_merge import (
     dialogue_time_ranges_touch,
     is_cross_source_customer_transcript_conflict,
@@ -111,6 +126,11 @@ TIME_HINT_PATTERN = re.compile(
     r"(?:[0-9二两三四五六七八九十]{1,2}|十一|十二)点|"
     r"一点(?:半|钟|整|左右|之前|以后|后|前|再|联系|沟通))"
 )
+IMMEDIATE_CONTACT_TIME_PATTERN = re.compile(
+    r"(?:就)?(?:现在|马上|立即|立刻)"
+    r"(?:(?:就)?(?:可以|方便|有空|行|联系我|给我回电|给我打电话))?[呢啊吧]?"
+)
+IMMEDIATE_CONTACT_TIME_ALIASES = {"now", "现在", "马上", "立即", "立刻"}
 METADATA_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$"
@@ -211,9 +231,13 @@ summary 用 2 至 4 句完整短句概括客户关注点、明确意向和本次
 - confidence: 分类置信度，只能是 high、medium、low。
 - valid_dialogue: 布尔值；只有客户形成了可判断销售价值的有效业务对话时为 true，通话时长短本身不能作为低价值依据。
 - reason: 分类原因，必须对应客户侧证据。
-- evidence: 字符串数组，保存支持分类的客户原话，不得使用 assistant 话术。
-- evidence_conflict: 布尔值，客户证据冲突或转写不可靠时为 true。
+- evidence: 字符串数组，保存整通电话中支持分类或接听结论的客户原话，不得使用 assistant 话术。接听依据可以是可靠问候、拒绝、回应或提问，不要求具有销售价值。
+- evidence_conflict: 布尔值，影响销售价值分类的客户证据冲突或转写不可靠时为 true；不能仅凭此字段否定其他可靠轮次的接听证据。
 - low_value_reason: classification=low_value 时只能是 explicit_rejection、no_current_need、customer_mismatch、non_target_customer、invalid_contact、other；其他分类时为 null。
+
+接听核实字段（与销售价值分类独立）：
+- answer_type: 只能是 human、voicemail、unknown。只有客户侧可靠语音能确认真人回应时才选 human；真人拒绝、要求留言或很快挂断仍属于 human。明确自动留言提示才选 voicemail；只有菜单导航、转接等待、静音，或接听依据本身含糊、冲突时选 unknown。其他轮次的转写冲突不否定无冲突的真人回应；销售意向不确定也不代表接听类型不确定。
+- answer_evidence: 从整通电话的可靠客户对话中选一句代表性原话，必须逐字来自可信 role=user 轮次；其他支持结论的客户原话一并放入 evidence，不要只检查开场一句。unknown 时留空。接听核实不要求业务意向，可靠问候或回应即使 analysis_usage=record_only 也可作为接听证据；source_conflict 或 low_confidence_source 为 true 的轮次不能作为依据。线路接通信号和 assistant 话术不能作为真人依据。
 
 分类标准：interested 表示客户明确表达需求并有报价、试用、演示、采购时间等具体下一步；nurturing 表示有潜在需求但暂未准备好或要求以后联系；low_value 仅用于明确拒绝、暂无需求、客户不匹配、非目标客户或联系方式无效。不得因为无人接听、占线、技术失败、通话异常中断或仅仅通话较短而输出 low_value。"""
 
@@ -466,7 +490,14 @@ class AiCallSemanticAnalysisWorker:
             self.queue.task_done()
 
     async def _run(self) -> None:
+        next_recovery_scan = 0.0
         while not self._stopping.is_set() or not self.queue.empty():
+            if time.monotonic() >= next_recovery_scan and not self._stopping.is_set():
+                try:
+                    await self._enqueue_due_outbound_analysis()
+                except Exception:
+                    log.exception("AI Call 外呼话后分析恢复扫描失败")
+                next_recovery_scan = time.monotonic() + 30
             try:
                 job = await asyncio.wait_for(self.queue.get(), timeout=0.2)
             except TimeoutError:
@@ -485,6 +516,58 @@ class AiCallSemanticAnalysisWorker:
             finally:
                 self._queued_or_running.discard((job.call_id, job.scene_code))
                 self.queue.task_done()
+
+    async def _enqueue_due_outbound_analysis(self) -> None:
+        retry_after = datetime.now(timezone.utc) - timedelta(minutes=10)
+        finished_customer_asr = select(AiCallAsrJobModel.id).where(
+            AiCallAsrJobModel.track_id == AiCallRecordingTrackModel.id,
+            AiCallAsrJobModel.status.in_({"completed", "failed"}),
+        ).exists()
+        unready_customer_recording = select(AiCallRecordingTrackModel.id).where(
+            AiCallRecordingTrackModel.call_id == AiCallRecordModel.call_id,
+            AiCallRecordingTrackModel.track_role == SPEAKER_CUSTOMER,
+            or_(
+                AiCallRecordingTrackModel.status.not_in({"completed", "failed"}),
+                AiCallRecordingTrackModel.oss_id.is_not(None) & ~finished_customer_asr,
+            ),
+        ).exists()
+        async with self.session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(AiCallRecordModel.call_id, AiCallRecordModel.scene_code)
+                    .join(AiCallOutboundAttemptModel, AiCallOutboundAttemptModel.call_id == AiCallRecordModel.call_id)
+                    .join(ReachCreditUsageOutboxModel, (
+                        (ReachCreditUsageOutboxModel.source_id == AiCallRecordModel.call_id)
+                        & (ReachCreditUsageOutboxModel.tenant_id == AiCallRecordModel.tenant_id)
+                        & (ReachCreditUsageOutboxModel.scenario_code == CREDIT_SCENARIO_CODE)
+                        & (ReachCreditUsageOutboxModel.status == "blocked")
+                    ))
+                    .outerjoin(AiCallSemanticAnalysisModel, (
+                        (AiCallSemanticAnalysisModel.call_id == AiCallRecordModel.call_id)
+                        & (AiCallSemanticAnalysisModel.analysis_scene_code == ANALYSIS_SCENE_CODE)
+                    ))
+                    .where(
+                        AiCallRecordModel.ended_at <= retry_after,
+                        AiCallOutboundAttemptModel.call_result == "connected",
+                        AiCallOutboundAttemptModel.dialer_type.is_not(None),
+                        AiCallOutboundAttemptModel.dialer_type != "mock",
+                        AiCallOutboundAttemptModel.test_scenario.is_(None),
+                        *([~unready_customer_recording] if settings.AI_CALL_OFFLINE_ASR_ENABLED else []),
+                        or_(
+                            AiCallSemanticAnalysisModel.id.is_(None),
+                            (AiCallSemanticAnalysisModel.analysis_status == ANALYSIS_STATUS_PENDING)
+                            & (AiCallSemanticAnalysisModel.updated_at <= retry_after),
+                            (AiCallSemanticAnalysisModel.analysis_status == ANALYSIS_STATUS_FAILED)
+                            & (AiCallSemanticAnalysisModel.analysis_retry_count < 3)
+                            & (AiCallSemanticAnalysisModel.updated_at <= retry_after),
+                        ),
+                    )
+                    .order_by(AiCallSemanticAnalysisModel.updated_at)
+                    .limit(100)
+                )
+            ).all()
+        for call_id, scene_code in rows:
+            self.enqueue(call_id, scene_code)
 
     async def _process_job(self, job: _SemanticAnalysisJob) -> None:
         async with self.session_factory() as db:
@@ -1395,7 +1478,7 @@ class SemanticTranscriptBuilder:
         elif identity_candidate:
             unsupported_fact_types.append("identity")
 
-        if cls._supports_time_fact(text, previous_ai_text):
+        if not low_confidence_source and cls._supports_time_fact(text, previous_ai_text):
             supported_fact_types.append("time")
         if cls._supports_commitment_fact(text, previous_ai_text):
             supported_fact_types.append("commitment")
@@ -1413,6 +1496,7 @@ class SemanticTranscriptBuilder:
             or business_detail
             or conversation_control_intent
             or follow_up_consent
+            or "time" in supported_fact_types
             or (responds_to_previous_ai and normalized in SHORT_ANSWER_TEXTS)
         )
         analysis_usage = (
@@ -1575,6 +1659,11 @@ class SemanticTranscriptBuilder:
 
     @classmethod
     def _supports_time_fact(cls, text: str, previous_ai_text: str) -> bool:
+        if IMMEDIATE_CONTACT_TIME_PATTERN.fullmatch(cls._normalized_text_value(text)):
+            return bool(
+                FOLLOW_UP_CONTACT_OFFER_PATTERN.search(previous_ai_text)
+                or FOLLOW_UP_CONTACT_PATTERN.search(text)
+            )
         if not text or not TIME_HINT_PATTERN.search(text):
             return False
         return bool(cls._assistant_asks_question(previous_ai_text) or COMMITMENT_PATTERN.search(text))
@@ -1812,15 +1901,47 @@ class AiCallSemanticAnalysisService:
             handoffs=handoffs,
         )
         if record is not None:
+            end_category = call_end_category(record)
+            if record.end_reason in {"sip_participant_left", "browser_disconnect"}:
+                await self.repository.attach_end_context([record], tenant_id=tenant_id)
+                end_category = record._end_category
             snapshot["metadata"]["call_outcome"] = {
                 "status": record.status,
                 "end_reason": record.end_reason,
-                "end_category": call_end_category(record),
+                "end_category": end_category,
                 "ended_at": record.ended_at.isoformat() if record.ended_at else None,
             }
         snapshot_json = snapshot_to_json(snapshot)
         snapshot_hash = transcript_snapshot_hash(snapshot)
+        if settings.AI_CALL_OFFLINE_ASR_ENABLED and tenant_id:
+            tracks = await self.repository.list_recording_tracks(
+                tenant_id=tenant_id, call_id=call_id,
+            )
+            finished_asr_track_ids = {
+                job.track_id for job in asr_jobs if job.status in {"completed", "failed"}
+            }
+            if any(
+                track.track_role == SPEAKER_CUSTOMER
+                and (
+                    track.status not in {"completed", "failed"}
+                    or (track.oss_id is not None and track.id not in finished_asr_track_ids)
+                )
+                for track in tracks
+            ):
+                claimed.analysis_status = ANALYSIS_STATUS_PENDING
+                claimed.analysis_error = "客户分轨录音或离线转写尚未就绪"
+                claimed.analysis_started_at = None
+                claimed.updated_at = now or datetime.now(timezone.utc)
+                await self.repository.db.flush()
+                return claimed
         if not self.transcript_builder.has_effective_user_input(snapshot):
+            if any(job.track_role == SPEAKER_CUSTOMER and job.status == "failed" for job in asr_jobs):
+                claimed.analysis_status = ANALYSIS_STATUS_PENDING
+                claimed.analysis_error = "客户离线转写失败，收费依据待核实"
+                claimed.analysis_started_at = None
+                claimed.updated_at = now or datetime.now(timezone.utc)
+                await self.repository.db.flush()
+                return claimed
             no_user = await self.repository.update_semantic_analysis_no_user_input(
                 call_id=call_id,
                 analysis_error=NO_EFFECTIVE_USER_INPUT_ERROR,
@@ -1829,6 +1950,7 @@ class AiCallSemanticAnalysisService:
                 now=now,
             )
             if no_user is not None:
+                await self._record_outbound_billing_fact(call_id)
                 return no_user
             return claimed
 
@@ -1876,8 +1998,47 @@ class AiCallSemanticAnalysisService:
         if succeeded is not None:
             await reconcile_analyzed_call(self.repository.db, call_id, now=now)
             await AiCallFollowUpDataService(self.repository).apply_ai_analysis(succeeded)
+            await self._record_outbound_billing_fact(call_id)
             return succeeded
         return claimed
+
+    async def _record_outbound_billing_fact(self, call_id: str) -> None:
+        record = await self.repository.db.scalar(
+            select(AiCallRecordModel)
+            .where(AiCallRecordModel.call_id == call_id)
+            .execution_options(populate_existing=True)
+        )
+        if record is None or record.ended_at is None:
+            return
+        attempt = await self.repository.db.scalar(
+            select(AiCallOutboundAttemptModel).where(AiCallOutboundAttemptModel.call_id == call_id)
+        )
+        task = await self.repository.db.get(AiCallOutboundTaskModel, attempt.task_id) if attempt else None
+        if (
+            attempt is None or task is None or task.answer_mode != "linphone"
+            or attempt.call_result != "connected"
+            or attempt.dialer_type in {None, "mock"}
+            or attempt.test_scenario is not None
+        ):
+            return
+        # 结束投影负责首次记录用量；重新分析只能更新原事实，不能给历史电话补建收费。
+        original_usage = await self.repository.db.scalar(
+            select(ReachCreditUsageOutboxModel.id).where(
+                ReachCreditUsageOutboxModel.tenant_id == record.tenant_id,
+                ReachCreditUsageOutboxModel.source_id == call_id,
+                ReachCreditUsageOutboxModel.idempotency_key == f"reach:call:{attempt.id}",
+            )
+        )
+        if original_usage is None:
+            return
+        await enqueue_connected_call_usage(
+            self.repository.db,
+            tenant_id=str(record.tenant_id),
+            owner_id=str(task.created_by),
+            attempt_id=attempt.id,
+            call_id=call_id,
+            duration_ms=max(0, int(record.duration_ms or 0)),
+        )
 
     async def reanalyze_call_once(
         self,
@@ -1978,6 +2139,8 @@ def normalize_analysis_result(value: dict[str, Any] | None) -> dict[str, Any]:
         "evidence": _string_list(raw.get("evidence")),
         "evidence_conflict": raw.get("evidence_conflict") is True,
         "low_value_reason": low_value_reason,
+        "answer_type": raw.get("answer_type") if isinstance(raw.get("answer_type"), str) and raw.get("answer_type") in {"human", "voicemail"} else "unknown",
+        "answer_evidence": _string_value(raw.get("answer_evidence")),
     }
 
 
@@ -2003,7 +2166,9 @@ def enforce_semantic_evidence_on_result(
     normalized = _remove_transcript_listing_summary(normalized)
     normalized = _append_transcript_quality_risk_tags(normalized, snapshot)
     normalized = _enforce_follow_up_evidence(normalized, snapshot)
+    normalized = _normalize_immediate_follow_up_time(normalized, snapshot)
     normalized = _enforce_recorded_call_outcome(normalized, snapshot)
+    normalized = _enforce_answer_evidence(normalized, snapshot)
     if _snapshot_supports_strong_fact(snapshot, "identity"):
         return normalized
     unsupported_identity_texts = _snapshot_unsupported_strong_fact_texts(snapshot, "identity")
@@ -2030,6 +2195,42 @@ def enforce_semantic_evidence_on_result(
     })
 
 
+def _enforce_answer_evidence(result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    answer_type = result.get("answer_type")
+    turns = snapshot.get("turns")
+    # record_only 限制销售摘要，不代表问候等客户回应不可信。
+    trusted_turns = [
+        turn for turn in (turns if isinstance(turns, list) else [])
+        if isinstance(turn, dict)
+        and turn.get("role") == ROLE_USER
+        and (
+            not isinstance(turn.get("semantic_evidence"), dict)
+            or (
+                turn["semantic_evidence"].get("source_conflict") is not True
+                and turn["semantic_evidence"].get("low_confidence_source") is not True
+            )
+        )
+    ]
+    has_automatic_prompt = any(
+        is_clear_voicemail_prompt(str(turn.get("text") or ""))
+        for turn in trusted_turns
+    )
+    if answer_type in {"human", "voicemail"} and not (answer_type == "human" and has_automatic_prompt):
+        # 单句引用失败只排除该句，继续核验同一次分析中的其他客户证据。
+        # 模型仍须明确判断接听类型，不能仅凭销售价值、通话时长或轮数推断真人。
+        for quote in [result.get("answer_evidence") or "", *result.get("evidence", [])]:
+            normalized_quote = SemanticTranscriptBuilder._normalized_text_value(quote)
+            if not normalized_quote or (answer_type == "voicemail") != is_clear_voicemail_prompt(quote):
+                continue
+            if any(
+                normalized_quote in SemanticTranscriptBuilder._normalized_text_value(str(turn.get("text") or ""))
+                and (answer_type != "voicemail" or is_clear_voicemail_prompt(str(turn.get("text") or "")))
+                for turn in trusted_turns
+            ):
+                return {**result, "answer_evidence": quote}
+    return {**result, "answer_type": "unknown", "answer_evidence": ""}
+
+
 def _enforce_recorded_call_outcome(
     result: dict[str, Any], snapshot: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2050,6 +2251,7 @@ def _enforce_recorded_call_outcome(
     # 挂断和无回应属于运行事实，不能由摘要模型根据低置信文字补全。
     ending_claim = re.compile(
         r"(?:通话|电话).{0,20}(?:结束|挂断|断开|中断)|"
+        r"(?:具体)?结束原因未确认|"
         r"(?:结束|挂断|断开|中断)(?:了)?(?:通话|电话)|"
         r"(?:客户|用户|对方).{0,20}(?:挂断|挂了|掉线|断线)|"
         r"(?:客户|用户|对方|最后|随后|之后|后).{0,20}(?:未|不再|没有|无).{0,8}(?:回应|回复|响应)"
@@ -2515,6 +2717,13 @@ def _normalize_follow_up(value: Any) -> dict[str, Any]:
 def post_call_materialized_fields(result: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_analysis_result(result)
     follow_up = normalized["follow_up"]
+    preferred_at = _parse_rfc3339_or_none(follow_up["preferred_time"])
+    if (
+        follow_up["consent"] == "explicit"
+        and _string_value(follow_up["preferred_time"]).lower() in IMMEDIATE_CONTACT_TIME_ALIASES
+        and IMMEDIATE_CONTACT_TIME_PATTERN.fullmatch(normalized["time_hint"]["time_text"])
+    ):
+        preferred_at = _parse_rfc3339_or_none(normalized["time_hint"]["time_value"])
     return {
         "customer_intent": CUSTOMER_INTENT_BY_FEEDBACK[normalized["feedback_type"]],
         "follow_up_suggested": (
@@ -2523,9 +2732,7 @@ def post_call_materialized_fields(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "follow_up_consent": follow_up["consent"],
         "follow_up_reason": follow_up["reason"] or None,
-        "follow_up_preferred_at": _parse_rfc3339_or_none(
-            follow_up["preferred_time"]
-        ),
+        "follow_up_preferred_at": preferred_at,
         "follow_up_confidence": follow_up["confidence"],
     }
 
@@ -2541,6 +2748,51 @@ def _parse_rfc3339_or_none(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _normalize_immediate_follow_up_time(
+    result: dict[str, Any], snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    follow_up = result["follow_up"]
+    relative_now = _string_value(follow_up["preferred_time"]).lower() in IMMEDIATE_CONTACT_TIME_ALIASES
+    if not relative_now and not IMMEDIATE_CONTACT_TIME_PATTERN.fullmatch(
+        SemanticTranscriptBuilder._normalized_text_value(result["time_hint"]["time_text"]),
+    ):
+        return result
+    unresolved = (
+        {**result, "follow_up": {**follow_up, "preferred_time": None}}
+        if relative_now
+        else result
+    )
+    if follow_up["consent"] != "explicit":
+        return unresolved
+    for turn in reversed(snapshot.get("turns", [])):
+        evidence = turn.get("semantic_evidence") or {}
+        if (
+            turn.get("role") != ROLE_USER
+            or evidence.get("source_conflict") or evidence.get("low_confidence_source")
+            or "time" not in evidence.get("supported_strong_fact_types", [])
+        ):
+            continue
+        text = _string_value(turn.get("text"))
+        if not IMMEDIATE_CONTACT_TIME_PATTERN.fullmatch(SemanticTranscriptBuilder._normalized_text_value(text)):
+            return unresolved
+        # 相对时间锚定客户原话；历史重分析不能使用当前时间或模型臆测的日期。
+        instant = _parse_rfc3339_or_none(turn.get("ended_at")) or _parse_rfc3339_or_none(turn.get("started_at"))
+        timestamp = instant.isoformat() if instant else None
+        unconfirmed = re.compile(r"(?:但)?(?:尚未|未|没有)(?:确认|确定|约定)(?:具体)?(?:联系|回访|跟进)?时间")
+        return {
+            **result,
+            "summary": unconfirmed.sub("希望当时立即联系", result["summary"]),
+            "key_points": [unconfirmed.sub("希望当时立即联系", point) for point in result["key_points"]],
+            "reason": unconfirmed.sub("希望当时立即联系", result["reason"]),
+            "time_hint": {"time_text": "现在", "time_value": timestamp or "", "original_texts": [text]},
+            "follow_up": {
+                **follow_up, "preferred_time": timestamp,
+                "reason": unconfirmed.sub("希望当时立即联系", follow_up["reason"]),
+            },
+        }
+    return unresolved
 
 
 def _enforce_follow_up_evidence(

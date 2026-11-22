@@ -8,16 +8,21 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.ai_call.model import AiCallFollowUpDataModel, AiCallFollowUpTaskModel, AiCallHandoffModel
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
+from app.core.database import async_db_session
 from app.core.dependencies import (
     db_getter,
+    get_ai_call_agent_manager,
     get_ai_call_console,
     get_ai_call_manager,
     get_current_user,
+    has_ai_call_tenant_management,
 )
 from app.core.exceptions import CustomException
 from app.services.ai_call.agent_console_reconciler import (
@@ -60,6 +65,11 @@ AgentConsoleRouter = APIRouter(
 AgentAdminRouter = APIRouter(
     prefix="/admin",
     tags=["AI Call 坐席管理"],
+    dependencies=[Depends(get_ai_call_agent_manager)],
+)
+FollowUpOverviewRouter = APIRouter(
+    prefix="/admin",
+    tags=["AI Call 回访总览"],
     dependencies=[Depends(get_ai_call_manager)],
 )
 
@@ -135,8 +145,10 @@ async def _agent_console_event_stream(
     tenant_id: str,
     agent_identity: str,
     after_sequence: int,
+    user_id: int | None = None,
     broker=agent_console_event_broker,
     registry=agent_console_stream_registry,
+    session_factory=async_db_session,
 ):
     lease = registry.replace(tenant_id, agent_identity)
     sequence = after_sequence
@@ -170,11 +182,58 @@ async def _agent_console_event_stream(
             if not events:
                 yield ": heartbeat\n\n"
                 continue
+            sequence = events[-1].sequence
+            if user_id is not None:
+                events = await _account_console_events(
+                    events, tenant_id=tenant_id, user_id=user_id,
+                    agent_identity=agent_identity, session_factory=session_factory,
+                )
             for event in events:
-                sequence = event.sequence
                 yield _sse_event(event)
     finally:
         registry.release(lease)
+
+
+async def _account_console_events(events, *, tenant_id, user_id, agent_identity, session_factory):
+    visible = []
+    # 批量核验后归还连接；等待下一批事件和向浏览器发送时不持有数据库连接。
+    async with session_factory() as db:
+        for event in events:
+            payload = event.payload
+            if event.event_type == "presence.changed":
+                if payload.get("agent_identity") == agent_identity:
+                    visible.append(event)
+                continue
+            checks = []
+            if handoff_id := payload.get("handoff_id"):
+                checks.append(select(AiCallHandoffModel.id).where(
+                    AiCallHandoffModel.handoff_id == handoff_id,
+                    AiCallAgentConsoleService.account_handoff_scope(tenant_id, user_id),
+                ))
+            invalid_reference = False
+            for key, model, scope in (
+                ("follow_up_id", AiCallFollowUpTaskModel, AiCallFollowUpService.account_follow_up_scope),
+                ("follow_up_data_id", AiCallFollowUpDataModel, AiCallFollowUpService.account_follow_up_data_scope),
+            ):
+                if payload.get(key) is not None:
+                    try:
+                        row_id = int(payload[key])
+                    except (TypeError, ValueError):
+                        invalid_reference = True
+                        break
+                    checks.append(select(model.id).where(model.id == row_id, scope(tenant_id, user_id)))
+            if invalid_reference:
+                continue
+            if call_id := payload.get("call_id"):
+                calls = AiCallAgentConsoleService.account_call_ids(tenant_id, user_id).subquery()
+                checks.append(select(calls.c.call_id).where(calls.c.call_id == call_id))
+            if checks:
+                for query in checks:
+                    if (await db.execute(query)).first() is None:
+                        break
+                else:
+                    visible.append(event)
+    return visible
 
 
 def _issue_handoff_token(auth: AuthSchema, handoff) -> dict:
@@ -229,6 +288,17 @@ async def bootstrap_controller(
     return SuccessResponse(data=data)
 
 
+@AgentConsoleRouter.get("/scene-options", summary="查询可配置的坐席业务场景")
+async def agent_scene_options_controller(
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+    page_num: Annotated[int, Query(alias="pageNum", ge=1)] = 1,
+    page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 200,
+):
+    rows, total = await service.scene_options(auth, page_num=page_num, page_size=page_size)
+    return TableResponse(rows=rows, total=total)
+
+
 @AgentConsoleRouter.get("/events", summary="订阅坐席中心状态变化")
 async def agent_console_events_controller(
     request: Request,
@@ -238,7 +308,8 @@ async def agent_console_events_controller(
     tenant_id = _tenant_id(auth)
     profile = await AiCallAgentConsoleService(auth.db).require_current_agent(auth)
     agent_identity = profile.agent_identity
-    # SSE 不再读取数据库，提前释放认证查询占用的连接，避免长连接耗尽连接池。
+    user_id = None if has_ai_call_tenant_management(auth) else auth.user.id
+    # 提前释放认证连接；后续每批事件使用独立短连接核验账号范围。
     await auth.db.close()
 
     return StreamingResponse(
@@ -247,6 +318,7 @@ async def agent_console_events_controller(
             tenant_id=tenant_id,
             agent_identity=agent_identity,
             after_sequence=after_sequence,
+            user_id=user_id,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1059,7 +1131,7 @@ async def reconcile_admin_handoff_controller(
     return SuccessResponse(data=result)
 
 
-@AgentAdminRouter.get("/follow-ups", summary="查询跟进任务与指标")
+@FollowUpOverviewRouter.get("/follow-ups", summary="查询跟进任务与指标")
 async def list_admin_follow_ups_controller(
     auth: AuthenticatedUser,
     service: Annotated[
@@ -1089,6 +1161,7 @@ async def list_admin_follow_ups_controller(
     return SuccessResponse(
         data=await service.list_follow_ups(
             auth,
+            account_only=not has_ai_call_tenant_management(auth),
             status=status,
             source_type=source_type,
             scene_code=scene_code,
@@ -1103,7 +1176,7 @@ async def list_admin_follow_ups_controller(
     )
 
 
-@AgentAdminRouter.get("/follow-ups/{follow_up_id}", summary="查询跟进任务详情")
+@FollowUpOverviewRouter.get("/follow-ups/{follow_up_id}", summary="查询跟进任务详情")
 async def get_admin_follow_up_controller(
     follow_up_id: int,
     auth: AuthenticatedUser,
@@ -1112,4 +1185,6 @@ async def get_admin_follow_up_controller(
         Depends(get_agent_console_reconciler),
     ],
 ):
-    return SuccessResponse(data=await service.get_follow_up_detail(auth, follow_up_id))
+    return SuccessResponse(data=await service.get_follow_up_detail(
+        auth, follow_up_id, account_only=not has_ai_call_tenant_management(auth),
+    ))

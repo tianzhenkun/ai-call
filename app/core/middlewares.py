@@ -1,5 +1,6 @@
 import time
 
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import (
     BaseHTTPMiddleware,
     RequestResponseEndpoint,
@@ -8,12 +9,40 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.common.response import ErrorResponse
 from app.config.setting import settings
 from app.core.exceptions import CustomException
 from app.core.logger import log
+
+
+class ReachHttpConnectionMiddleware:
+    """普通 JSON 响应结束后关闭 HTTP/1.1 连接，避免网关复用临近过期的连接。"""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("http_version") != "1.1":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_response(message: Message) -> None:
+            if message["type"] == "http.response.start" and message["status"] != 101:
+                headers = MutableHeaders(scope=message)
+                media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                # 使用已知长度的普通 JSON；流、附件和升级连接保持原协议。
+                if (
+                    (media_type == "application/json" or media_type.endswith("+json"))
+                    and "content-length" in headers
+                    and "content-disposition" not in headers
+                    and not any(name.lower() == b"upgrade" for name, _ in scope["headers"])
+                ):
+                    headers["connection"] = "close"
+            await send(message)
+
+        await self.app(scope, receive, send_response)
 
 
 class CustomCORSMiddleware(CORSMiddleware):

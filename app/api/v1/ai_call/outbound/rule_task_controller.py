@@ -5,13 +5,27 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import select
 from starlette.background import BackgroundTask
 
+from app.api.v1.ai_call.schema import TokenOut
+from app.api.v1.ai_call.service import get_default_ai_call_service
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ResponseSchema, SuccessResponse, TableResponse
+from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.dependencies import get_ai_call_manager, get_current_user
+from app.core.exceptions import CustomException
 from app.services.ai_call.credit_metering import CreditMeteringClient
+from app.services.ai_call.livekit_room import LiveKitRoomManager
+from app.services.ai_call.runtime_control.bootstrap_service import RuntimeBootstrapService
+from app.services.ai_call.runtime_control.runtime_token_service import (
+    RuntimeTokenGateError,
+    RuntimeTokenGateRepository,
+    RuntimeTokenNotFoundError,
+    RuntimeTokenService,
+)
+from app.services.ai_call.session_registry import RUNNING_STATUSES
 
 from .controller import _identity
 from .exception_schema import (
@@ -21,6 +35,7 @@ from .exception_schema import (
     ExceptionSummaryOut,
 )
 from .exception_service import OutboundExceptionService
+from .rule_task_model import AiCallOutboundTaskModel
 from .rule_task_schema import (
     AcceptedCommandOut,
     CallRuleIn,
@@ -30,6 +45,8 @@ from .rule_task_schema import (
     CreateTaskResultOut,
     OutboundTaskOut,
     SingleValidationRequest,
+    TaskBillingSummaryOut,
+    TaskBrowserTokenOut,
     UpdateTaskScheduleRequest,
 )
 from .rule_task_service import OutboundRuleTaskService
@@ -41,7 +58,9 @@ _default_service = OutboundRuleTaskService(
     async_db_session,
     credit_metering_client=CreditMeteringClient.from_settings(),
 )
-_default_exception_service = OutboundExceptionService()
+_default_exception_service = OutboundExceptionService(
+    credit_metering_client=CreditMeteringClient.from_settings(),
+)
 
 
 def get_outbound_rule_task_service() -> OutboundRuleTaskService:
@@ -50,6 +69,21 @@ def get_outbound_rule_task_service() -> OutboundRuleTaskService:
 
 def get_outbound_exception_service() -> OutboundExceptionService:
     return _default_exception_service
+
+
+async def _get_owned_task_auth(
+    task_id: Annotated[int, Path(gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+) -> AuthSchema:
+    tenant_id, user_id = _identity(auth)
+    task_id = await auth.db.scalar(select(AiCallOutboundTaskModel.id).where(
+        AiCallOutboundTaskModel.tenant_id == tenant_id,
+        AiCallOutboundTaskModel.id == task_id,
+        AiCallOutboundTaskModel.created_by == user_id,
+    ))
+    if task_id is None:
+        raise CustomException(msg="外呼任务不存在", status_code=404)
+    return auth
 
 
 @OutboundRuleTaskRouter.get(
@@ -169,6 +203,22 @@ async def export_exception_targets_controller(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         background=BackgroundTask(unlink, path),
     )
+
+
+@OutboundRuleTaskRouter.post(
+    "/outbound-exceptions/retry-batches/{batch_id}/resume",
+    summary="继续原异常号码补呼批次",
+    response_model=ResponseSchema[ExceptionBatchOut],
+)
+async def resume_exception_batch_controller(
+    batch_id: Annotated[int, Path()],
+    auth: Annotated[AuthSchema, Depends(get_ai_call_manager)],
+    service: Annotated[OutboundExceptionService, Depends(get_outbound_exception_service)],
+) -> JSONResponse:
+    tenant_id, user_id = _identity(auth)
+    result = await service.resume_batch(auth.db, tenant_id, batch_id, user_id=user_id)
+    await auth.db.commit()
+    return SuccessResponse(data=result, msg="继续本批请求已受理")
 
 
 @OutboundRuleTaskRouter.get(
@@ -313,10 +363,11 @@ async def list_tasks_controller(
     end_time: Annotated[str | None, Query(alias="endTime")] = None,
     scene_code: Annotated[str | None, Query(alias="sceneCode")] = None,
 ) -> JSONResponse:
-    tenant_id, _ = _identity(auth)
+    tenant_id, user_id = _identity(auth)
     rows, total = await service.list_tasks(
         auth.db,
         tenant_id,
+        user_id=user_id,
         page_num=page_num,
         page_size=page_size,
         task_name=task_name,
@@ -366,7 +417,7 @@ async def create_task_controller(
 )
 async def get_task_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     service: Annotated[
         OutboundRuleTaskService,
         Depends(get_outbound_rule_task_service),
@@ -379,6 +430,74 @@ async def get_task_controller(
     )
 
 
+@OutboundRuleTaskRouter.get(
+    "/outbound-tasks/{task_id}/billing",
+    summary="查询任务已确认费用与待核实通话数",
+    response_model=ResponseSchema[TaskBillingSummaryOut],
+)
+async def get_task_billing_controller(
+    task_id: Annotated[int, Path(gt=0)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
+    service: Annotated[
+        OutboundRuleTaskService,
+        Depends(get_outbound_rule_task_service),
+    ],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    return SuccessResponse(
+        data=await service.get_task_billing(auth.db, tenant_id, task_id),
+        msg="查询成功",
+    )
+
+
+@OutboundRuleTaskRouter.post(
+    "/outbound-tasks/{task_id}/calls/{call_id}/token",
+    summary="签发任务浏览器接听凭证",
+    response_model=ResponseSchema[TaskBrowserTokenOut],
+)
+async def create_task_browser_token_controller(
+    task_id: Annotated[int, Path(gt=0)],
+    call_id: str,
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
+    service: Annotated[OutboundRuleTaskService, Depends(get_outbound_rule_task_service)],
+) -> JSONResponse:
+    tenant_id, _ = _identity(auth)
+    record = await service.get_browser_call(auth.db, tenant_id, task_id, call_id)
+    mode = record.runtime_control_mode
+    if mode == "legacy_local":
+        if record.status not in RUNNING_STATUSES or record.terminal_requested_at is not None:
+            raise CustomException(msg="通话尚未就绪或已经结束", status_code=409,
+                                  data={"errorCode": "CALL_NOT_READY"})
+        legacy = get_default_ai_call_service(auth.db)
+        session = await legacy.get_session(call_id)
+        token = await legacy.reissue_browser_token(call_id)
+        model = session.effective_config.model
+    elif mode == "owner_command_v1":
+        if not (settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET
+                and settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS > 0):
+            raise CustomException(msg="LiveKit Token 签名配置不可用", status_code=503,
+                                  data={"errorCode": "TOKEN_SIGNER_UNAVAILABLE"})
+        try:
+            token = await RuntimeTokenService(
+                repository=RuntimeTokenGateRepository(auth.db),
+                room_manager=LiveKitRoomManager(
+                    settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET,
+                    settings.LIVEKIT_BROWSER_TOKEN_TTL_SECONDS,
+                    browser_livekit_url=settings.LIVEKIT_BROWSER_URL,
+                ),
+            ).issue_browser_token(tenant_id=tenant_id, call_id=call_id)
+        except (RuntimeTokenNotFoundError, RuntimeTokenGateError) as exc:
+            raise CustomException(msg=str(exc), status_code=404 if isinstance(exc, RuntimeTokenNotFoundError) else 409,
+                                  data={"errorCode": exc.error_code}) from exc
+        bootstrap = await RuntimeBootstrapService(auth.db).get(tenant_id=tenant_id, call_id=call_id)
+        model = bootstrap.model
+    else:
+        raise CustomException(msg="通话运行模式不支持浏览器接听", status_code=409)
+    return SuccessResponse(data=TaskBrowserTokenOut(
+        **TokenOut.model_validate(token).model_dump(), model=model, runtime_control_mode=mode,
+    ), msg="浏览器接听凭证已签发")
+
+
 @OutboundRuleTaskRouter.put(
     "/outbound-tasks/{task_id}/schedule",
     summary="修改待执行任务名称和计划时间",
@@ -387,7 +506,7 @@ async def get_task_controller(
 async def update_task_schedule_controller(
     task_id: Annotated[int, Path(gt=0)],
     request: UpdateTaskScheduleRequest,
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     service: Annotated[
         OutboundRuleTaskService,
@@ -422,7 +541,7 @@ async def _run_task_action(
 )
 async def pause_task_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     service: Annotated[
         OutboundRuleTaskService,
@@ -439,7 +558,7 @@ async def pause_task_controller(
 )
 async def resume_task_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     service: Annotated[
         OutboundRuleTaskService,
@@ -456,7 +575,7 @@ async def resume_task_controller(
 )
 async def stop_task_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     service: Annotated[
         OutboundRuleTaskService,
@@ -473,7 +592,7 @@ async def stop_task_controller(
 )
 async def cancel_task_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     service: Annotated[
         OutboundRuleTaskService,
@@ -489,7 +608,7 @@ async def cancel_task_controller(
 )
 async def list_task_targets_controller(
     task_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_task_auth)],
     service: Annotated[
         OutboundRuleTaskService,
         Depends(get_outbound_rule_task_service),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
@@ -11,7 +11,8 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from pydantic.alias_generators import to_camel
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, tuple_, update
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import ErrorResponse, SuccessResponse
@@ -19,6 +20,21 @@ from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
+from app.services.ai_call.billing_read import (
+    EmailMessageBillingQuery,
+    EmailRecipientBillingQuery,
+    EmailTaskBillingQuery,
+    email_outbound_activity_query,
+    get_billing_client,
+    query_email_message_billing,
+    query_email_recipient_billing,
+    query_email_task_billing,
+)
+from app.services.ai_call.credit_metering import (
+    CreditMeteringClient,
+    CreditMeteringRejected,
+    CreditMeteringUnavailable,
+)
 from app.services.reach_email.content import COLUMNS, MAX_BYTES, has_email_content, xlsx_bytes
 from app.services.reach_email.limits import MAX_ATTACHMENT_BYTES
 from app.services.reach_email.models import (
@@ -36,6 +52,8 @@ from app.services.reach_email.schema import (
     AIInput,
     ClassificationInput,
     ContentInput,
+    OutlookCompleteInput,
+    OutlookStartInput,
     ReadInput,
     ReplyAIInput,
     ReplyInput,
@@ -136,12 +154,23 @@ def encryption_key():
     )
 
 
-async def service(request: Request, auth: AuthSchema = Depends(get_current_user)):
+def _email_identity(request: Request):
     # Always require the actual verified platform identity, even in legacy dev mode.
     tenant = request.scope.get("platform_tenant_id")
     owner = request.scope.get("user_id")
     if not tenant or not owner or request.scope.get("product_code") != "reach":
         raise CustomException(msg="邮件功能需要有效的 REACH 用户和租户身份", status_code=401)
+    return str(tenant), str(owner)
+
+
+async def billing_service(request: Request, auth: AuthSchema = Depends(get_current_user)):
+    tenant, owner = _email_identity(request)
+    # 账务查询只读原业务归属，不读取邮箱密钥，也不走邮件写入事务的提交路径。
+    return EmailService(auth.db, tenant, owner, "")
+
+
+async def service(request: Request, auth: AuthSchema = Depends(get_current_user)):
+    tenant, owner = _email_identity(request)
     async with async_db_session() as db:
         try:
             yield EmailService(db, str(tenant), str(owner), encryption_key())
@@ -220,9 +249,35 @@ async def import_report(identifier: str, s: Annotated[EmailService, Depends(serv
 
 @EmailRouter.get("/accounts/provider-presets")
 async def account_presets(s: Annotated[EmailService, Depends(service)]):
+    from app.services.reach_email.outlook import available
     from app.services.reach_email.providers import PROVIDERS
 
-    return SuccessResponse(data=PROVIDERS)
+    # 保留旧 Yahoo 账号的参数兼容，新增邮箱不再提供该类型。
+    presets = {key: value for key, value in PROVIDERS.items() if key != "yahoo"}
+    return SuccessResponse(data={**presets, "outlook_personal": {
+        **PROVIDERS["outlook_personal"], "oauthConfigured": available(),
+    }})
+
+
+@EmailRouter.post("/accounts/outlook/authorize")
+async def outlook_authorize(data: OutlookStartInput, s: Annotated[EmailService, Depends(service)]):
+    from app.services.reach_email.outlook import start
+
+    return SuccessResponse(data=await start(s, data))
+
+
+@EmailRouter.post("/accounts/outlook/complete")
+async def outlook_complete(data: OutlookCompleteInput, s: Annotated[EmailService, Depends(service)]):
+    from app.services.reach_email.outlook import complete
+
+    return SuccessResponse(data=await complete(s, data))
+
+
+@EmailRouter.post("/accounts/{identifier}/outlook/disconnect")
+async def outlook_disconnect(identifier: str, s: Annotated[EmailService, Depends(service)]):
+    from app.services.reach_email.outlook import disconnect
+
+    return SuccessResponse(data=await disconnect(s, identifier))
 
 
 @EmailRouter.get("/accounts")
@@ -259,24 +314,48 @@ async def edit_account(
     return SuccessResponse(data=await s.save_account(data, identifier))
 
 
+@EmailRouter.post("/accounts/{identifier}/send-restrictions/{restriction_id}/resume")
+async def resume_send_restriction(
+    identifier: str, restriction_id: str, s: Annotated[EmailService, Depends(service)]
+):
+    return SuccessResponse(data=await s.resume_send_restriction(identifier, restriction_id))
+
+
 async def probe_account(identifier, s, protocols):
+    from app.services.reach_email.outlook import OutlookError, connection_config
     from app.services.reach_email.transport import test_account as probe
 
     account = await s.owned(Account, identifier)
+    if account.oauth_status == 'pending':
+        raise ValueError("此邮箱连接未完成，请重新连接微软账号；上次失败原因已保留")
     version = account.version
-    config = dict(
-        json.loads(account.config),
-        **CredentialCipher(s.key).decrypt(account.secret),
-        email=account.email,
-    )
     await s.db.commit()  # Never hold a database transaction during network IO.
-    result = await asyncio.to_thread(probe, config, protocols)
+    try:
+        config = await connection_config(async_sessionmaker(s.db.bind, expire_on_commit=False),
+            CredentialCipher(s.key), identifier, s.tenant, s.owner, version)
+        result = await asyncio.to_thread(probe, config, protocols)
+    except OutlookError as exc:
+        await s.db.refresh(account)
+        # 失效处理可能已递增版本，不能把旧连接结果覆盖到更新后的配置。
+        if account.version != version:
+            if account.oauth_status != 'reauthorize':
+                raise ValueError("邮箱配置已变更，请重新测试") from None
+            result = {protocol: json.loads(getattr(account, f'{protocol}_test_result'))
+                      for protocol in protocols}
+            return SuccessResponse(data=dict(**(await s.account_json(account)), testResult=result))
+        result = {protocol: exc.diagnostic() for protocol in protocols}
+    checked_at = datetime.now(timezone.utc).isoformat()
+    updates = {}
+    for protocol, item in result.items():
+        item["checkedAt"] = checked_at
+        updates[f"{protocol}_status"] = item["status"]
+        updates[f"{protocol}_test_result"] = json.dumps(item, ensure_ascii=False)
     updated = await s.db.execute(
         update(Account)
         .where(
             *scope(Account, s.tenant, s.owner), Account.id == identifier, Account.version == version
         )
-        .values(**{f"{protocol}_status": item["status"] for protocol, item in result.items()})
+        .values(**updates)
     )
     if not updated.rowcount:
         raise ValueError("邮箱配置已变更，请重新测试")
@@ -347,6 +426,47 @@ async def tasks(
 @EmailRouter.post("/tasks")
 async def create_task(data: TaskInput, s: Annotated[EmailService, Depends(service)]):
     return SuccessResponse(data=await s.create_task(data))
+
+
+@EmailRouter.post("/tasks/billing/query")
+async def task_billing_query(
+    data: EmailTaskBillingQuery,
+    s: Annotated[EmailService, Depends(billing_service)],
+    client: Annotated[CreditMeteringClient, Depends(get_billing_client)],
+):
+    try:
+        items = await query_email_task_billing(s, task_ids=data.task_ids, client=client)
+    except (CreditMeteringUnavailable, CreditMeteringRejected) as exc:
+        raise CustomException(msg=f"邮件费用核对失败：{exc}", status_code=503) from exc
+    return SuccessResponse(data={"items": items})
+
+
+@EmailRouter.post("/messages/billing/query")
+async def message_billing_query(
+    data: EmailMessageBillingQuery,
+    s: Annotated[EmailService, Depends(billing_service)],
+    client: Annotated[CreditMeteringClient, Depends(get_billing_client)],
+):
+    try:
+        items = await query_email_message_billing(s, message_ids=data.message_ids, client=client)
+    except (CreditMeteringUnavailable, CreditMeteringRejected) as exc:
+        raise CustomException(msg=f"邮件费用核对失败：{exc}", status_code=503) from exc
+    return SuccessResponse(data={"items": items})
+
+
+@EmailRouter.post("/messages/recipients/billing/query")
+async def recipient_billing_query(
+    data: EmailRecipientBillingQuery,
+    s: Annotated[EmailService, Depends(billing_service)],
+    client: Annotated[CreditMeteringClient, Depends(get_billing_client)],
+):
+    try:
+        items = await query_email_recipient_billing(
+            s, task_id=data.task_id, recipients=data.recipients, client=client,
+        )
+    except (CreditMeteringUnavailable, CreditMeteringRejected) as exc:
+        raise CustomException(msg=f"邮件费用核对失败：{exc}", status_code=503) from exc
+    return SuccessResponse(data={"items": items})
 
 
 @EmailRouter.get("/tasks/{identifier}")
@@ -530,8 +650,10 @@ async def leads(
     taskId: str = "",
     classification: str = "",
     email: str = "",
+    hasReply: bool | None = None,
 ):
     filters = [
+        Lead.last_sent_at.is_not(None),
         Lead.task_id.in_(
             s.query(Task).with_only_columns(Task.id).where(Task.status.in_(LEAD_TASK_STATUSES))
         )
@@ -542,6 +664,8 @@ async def leads(
         filters.append(Lead.classification == classification)
     if email:
         filters.append(Lead.email.contains(email, autoescape=True))
+    if hasReply is not None:
+        filters.append(Lead.last_reply_at.is_not(None) if hasReply else Lead.last_reply_at.is_(None))
     rows, meta = await s.page(Lead, page, pageSize, filters)
     return SuccessResponse(data=dict(items=[await s.lead_json(row) for row in rows], **meta))
 
@@ -565,22 +689,22 @@ async def summary(
 ):
     from app.services.reach_email.reporting import summarize
 
-    attempted = select(Message.task_id).where(
-        *scope(Message, s.tenant, s.owner), Message.direction == "outbound",
-        Message.attempt_count > 0,
-    )
-    query = s.query(Task).where(Task.id.in_(attempted))
+    activity = email_outbound_activity_query(s)
+    activity_tasks = activity.with_only_columns(Message.task_id)
+    query = s.query(Task).where(Task.id.in_(activity_tasks))
     if taskId:
         query = query.where(Task.id == taskId)
     if keyword:
-        matching_sender = attempted.where(Message.from_email.contains(keyword, autoescape=True))
+        matching_sender = activity_tasks.where(Message.from_email.contains(keyword, autoescape=True))
         query = query.where(or_(Task.name.contains(keyword, autoescape=True), Task.id.in_(matching_sender)))
     total = await s.db.scalar(select(func.count()).select_from(query.subquery()))
     tasks = (await s.db.scalars(query.order_by(Task.created_at.desc(), Task.id)
         .offset((page - 1) * pageSize).limit(pageSize))).all()
-    rows = (await s.db.scalars(s.query(Message).where(Message.task_id.in_([task.id for task in tasks])))).all()
+    task_ids = [task.id for task in tasks]
+    rows = (await s.db.scalars(s.query(Message).where(Message.task_id.in_(task_ids)))).all()
+    visible_ids = set(await s.db.scalars(activity.where(Message.task_id.in_(task_ids)).with_only_columns(Message.id)))
     items = [dict(taskId=task.id, taskName=task.name,
-        **summarize([row for row in rows if row.task_id == task.id])) for task in tasks]
+        **summarize([row for row in rows if row.task_id == task.id], visible_outbound_ids=visible_ids)) for task in tasks]
     return SuccessResponse(data={"items": items, "total": total, "page": page, "pageSize": pageSize})
 
 
@@ -593,11 +717,13 @@ async def recipient_summary(
     from app.services.reach_email.reporting import summarize
 
     await s.task(taskId)
-    addresses = s.query(Message).where(Message.task_id == taskId, Message.direction == "outbound", Message.attempt_count > 0).with_only_columns(Message.from_email, Message.to_email).distinct()
+    activity = email_outbound_activity_query(s).where(Message.task_id == taskId)
+    addresses = activity.with_only_columns(Message.from_email, Message.to_email).distinct()
     if senderEmail:
         addresses = addresses.where(Message.from_email == senderEmail)
     total = await s.db.scalar(select(func.count()).select_from(addresses.subquery()))
     pairs = (await s.db.execute(addresses.order_by(Message.from_email, Message.to_email).offset((page - 1) * pageSize).limit(pageSize))).all()
+    visible_ids = set(await s.db.scalars(activity.where(tuple_(Message.from_email, Message.to_email).in_(pairs)).with_only_columns(Message.id)))
     emails = [recipient for _, recipient in pairs]
     # 收件人分页后仅加载该批会话及回执，复用与总表一致的证据统计。
     lead_ids = s.query(Lead).where(Lead.task_id == taskId, Lead.email.in_(emails)).with_only_columns(Lead.id)
@@ -611,7 +737,7 @@ async def recipient_summary(
             pair = (message.from_email, message.to_email)
             first_sent[pair] = min(first_sent.get(pair, message.sent_at), message.sent_at)
     details = [dict(senderEmail=sender, **row) for sender in sorted({sender for sender, _ in pairs})
-        for row in summarize(rows, sender_email=sender) if (sender, row['recipientEmail']) in pair_set]
+        for row in summarize(rows, sender_email=sender, visible_outbound_ids=visible_ids) if (sender, row['recipientEmail']) in pair_set]
     for detail in details:
         sent_at = first_sent.get((detail['senderEmail'], detail['recipientEmail']))
         detail['firstSentAt'] = sent_at.replace(tzinfo=timezone.utc).isoformat() if sent_at else None
@@ -628,7 +754,7 @@ async def messages(
     rows, meta = await s.page(
         Message, page, pageSize, [Message.task_id == taskId] if taskId else []
     )
-    return SuccessResponse(data=dict(items=[s.message_json(row) for row in rows], **meta))
+    return SuccessResponse(data=dict(items=[await s.message_json(row) for row in rows], **meta))
 
 
 @EmailRouter.get("/conversations/{identifier}")
@@ -654,22 +780,22 @@ async def conversation(
     attachments = list((await s.db.scalars(s.query(Attachment).where(Attachment.id.in_(attachment_ids)))).all()) if attachment_ids else []
     files = {row.id: {"id": row.id, "name": row.name, "size": row.size} for row in attachments}
 
-    def present(row):
-        return dict(s.message_json(row),
+    async def present(row):
+        return dict(await s.message_json(row),
             deliveryStatus="delivered" if row.id in delivered else "failed" if row.id in failed else "unconfirmed",
             attachments=[files[i] for i in json.loads(row.attachment_ids) if i in files])
     messages = []
     for row in reversed(rows):
         parent = parent_map.get(row.id)
-        messages.append(dict(present(row), replyTo=present(parent) if parent else None))
+        messages.append(dict(await present(row), replyTo=await present(parent) if parent else None))
     first, send_blocked_reason = await s.manual_send_context(lead)
     return SuccessResponse(
         data=dict(
             **(await s.lead_json(lead)),
             messages=messages,
             variables=json.loads(lead.values),
-            firstMessage=present(first) if first else None,
-            latestInbound=present(latest_inbound) if latest_inbound else None,
+            firstMessage=await present(first) if first else None,
+            latestInbound=await present(latest_inbound) if latest_inbound else None,
             canSend=not send_blocked_reason,
             sendBlockedReason=send_blocked_reason,
             doNotContact=bool(

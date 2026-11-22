@@ -36,6 +36,7 @@ from app.services.ai_call.providers.aliyun_qwen_realtime import (
     QwenRealtimeSessionConfig,
 )
 from app.services.ai_call.providers.base import ProviderEvent
+from app.services.ai_call.realtime_model import REACH_REALTIME_MODEL
 from app.services.ai_call.session_registry import CallSessionStatus
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.services.ai_call.voice_profile import (
@@ -233,6 +234,7 @@ class VoicePreviewService:
         resolved_voice, resolved_style = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             voice=voice,
         )
         async with self._lifecycle_lock:
@@ -318,6 +320,7 @@ class VoicePreviewService:
         resolved_voice, resolved_style = await self._resolve_voice(
             db,
             tenant_id=tenant_id,
+            user_id=user_id,
             voice=voice,
         )
         try:
@@ -448,6 +451,7 @@ class VoicePreviewService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         voice: str,
     ) -> tuple[str, VoiceSpeakingStyle]:
         normalized_tenant_id = str(tenant_id or "").strip()
@@ -470,6 +474,7 @@ class VoicePreviewService:
                 select(AiCallTenantVoiceProfileModel)
                 .where(
                     AiCallTenantVoiceProfileModel.tenant_id == normalized_tenant_id,
+                    AiCallTenantVoiceProfileModel.created_by == user_id,
                     AiCallTenantVoiceProfileModel.voice == normalized_voice,
                     AiCallTenantVoiceProfileModel.status == "ENABLED",
                     AiCallTenantVoiceProfileModel.target_model == self.target_model,
@@ -927,18 +932,23 @@ class VoicePreviewService:
 def build_default_voice_preview_service() -> VoicePreviewService:
     from app.config.setting import settings
 
+    # REACH 音色目录统一使用 3.8；试听使用独立配置，不继承其他通话的评估模型。
+    preview_settings = settings.model_copy(update={
+        "QWEN_REALTIME_MODEL": REACH_REALTIME_MODEL,
+        "QWEN_REALTIME_TURN_DETECTION_TYPE": "server_vad",
+    })
     return VoicePreviewService(
-        orchestrator=AiCallOrchestrator.from_settings(settings),
-        target_model=settings.QWEN_REALTIME_MODEL,
+        orchestrator=AiCallOrchestrator.from_settings(preview_settings),
+        target_model=preview_settings.QWEN_REALTIME_MODEL,
         preview_audio_provider_factory=lambda: AliyunQwenRealtimeProvider(
-            realtime_url=settings.DASHSCOPE_REALTIME_URL,
-            workspace_realtime_url=settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
-            api_key=settings.DASHSCOPE_API_KEY,
-            model=settings.QWEN_REALTIME_MODEL,
+            realtime_url=preview_settings.DASHSCOPE_REALTIME_URL,
+            workspace_realtime_url=preview_settings.DASHSCOPE_WORKSPACE_REALTIME_URL,
+            api_key=preview_settings.DASHSCOPE_API_KEY,
+            model=preview_settings.QWEN_REALTIME_MODEL,
         ),
-        vad_type=settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
-        vad_threshold=settings.QWEN_REALTIME_VAD_THRESHOLD,
-        vad_silence_duration_ms=settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
+        vad_type=preview_settings.QWEN_REALTIME_TURN_DETECTION_TYPE,
+        vad_threshold=preview_settings.QWEN_REALTIME_VAD_THRESHOLD,
+        vad_silence_duration_ms=preview_settings.QWEN_REALTIME_VAD_SILENCE_DURATION_MS,
     )
 
 
@@ -1002,10 +1012,12 @@ class VoiceDeletionService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
     ) -> dict[str, object]:
         profile = await VoiceRepository(db).get_tenant_profile(
             tenant_id=tenant_id,
+            user_id=user_id,
             profile_id=profile_id,
         )
         if profile is None or profile.status == "DELETED":
@@ -1030,12 +1042,14 @@ class VoiceDeletionService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
         availability_status: Literal["ENABLED", "DISABLED"],
     ) -> VoiceProfileOut:
         repository = VoiceRepository(db)
         profile = await repository.get_tenant_profile(
             tenant_id=tenant_id,
+            user_id=user_id,
             profile_id=profile_id,
             for_update=True,
         )
@@ -1061,12 +1075,13 @@ class VoiceDeletionService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         profile_id: int,
         speaking_style: VoiceSpeakingStyle,
     ) -> VoiceProfileOut:
         repository = VoiceRepository(db)
         profile = await repository.get_tenant_profile(
-            tenant_id=tenant_id, profile_id=profile_id, for_update=True
+            tenant_id=tenant_id, user_id=user_id, profile_id=profile_id, for_update=True
         )
         if profile is None or profile.status == "DELETED":
             self._raise_not_found()
@@ -1102,7 +1117,7 @@ class VoiceDeletionService:
         existing = await self._find_deletion(db, tenant_id, command_key)
         if existing is not None:
             try:
-                return self._resolve_idempotent(existing, profile_id=profile_id)
+                return self._resolve_idempotent(existing, user_id=user_id, profile_id=profile_id)
             finally:
                 if sqlite_immediate:
                     await self._safe_rollback(db)
@@ -1112,6 +1127,7 @@ class VoiceDeletionService:
         repository = VoiceRepository(db)
         profile = await repository.get_tenant_profile(
             tenant_id=tenant_id,
+            user_id=user_id,
             profile_id=profile_id,
             for_update=True,
         )
@@ -1123,6 +1139,7 @@ class VoiceDeletionService:
             try:
                 result = self._resolve_idempotent(
                     locked_existing,
+                    user_id=user_id,
                     profile_id=profile_id,
                 )
             finally:
@@ -1170,6 +1187,7 @@ class VoiceDeletionService:
                 await self._safe_rollback(db)
                 reconciled = await self._reconcile_deletion(
                     tenant_id=tenant_id,
+                    user_id=user_id,
                     command_key=command_key,
                     profile_id=profile_id,
                 )
@@ -1205,6 +1223,7 @@ class VoiceDeletionService:
             await self._safe_rollback(db)
             reconciled = await self._reconcile_deletion(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 command_key=command_key,
                 profile_id=profile_id,
             )
@@ -1217,6 +1236,7 @@ class VoiceDeletionService:
             await self._safe_rollback(db)
             reconciled = await self._reconcile_deletion(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 command_key=command_key,
                 profile_id=profile_id,
             )
@@ -1230,6 +1250,7 @@ class VoiceDeletionService:
             await self._safe_rollback(db)
             reconciled = await self._reconcile_deletion(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 command_key=command_key,
                 profile_id=profile_id,
             )
@@ -1271,6 +1292,7 @@ class VoiceDeletionService:
         self,
         *,
         tenant_id: str,
+        user_id: int,
         command_key: str,
         profile_id: int,
     ) -> dict[str, object] | None:
@@ -1286,6 +1308,7 @@ class VoiceDeletionService:
                 else:
                     result = self._resolve_idempotent(
                         deletion,
+                        user_id=user_id,
                         profile_id=profile_id,
                     )
                 await database.rollback()
@@ -1311,9 +1334,10 @@ class VoiceDeletionService:
         cls,
         deletion: AiCallVoiceDeletionModel,
         *,
+        user_id: int,
         profile_id: int,
     ) -> dict[str, object]:
-        if deletion.voice_profile_id != profile_id:
+        if deletion.requested_by != user_id or deletion.voice_profile_id != profile_id:
             cls._raise_idempotency_conflict()
         return cls._accepted(deletion)
 
@@ -1464,6 +1488,7 @@ class VoiceEnrollmentService:
             return await self._resolve_idempotent(
                 db,
                 tenant_id=tenant_id,
+                user_id=user_id,
                 enrollment=existing,
                 request_hash=request_hash,
                 expected_profile_id=existing_profile_id,
@@ -1480,7 +1505,7 @@ class VoiceEnrollmentService:
             if profile_lookup_failed:
                 await self._safe_rollback(db)
                 self._raise_persistence_failure()
-            if profile is None:
+            if profile is None or profile.created_by != user_id:
                 raise CustomException(
                     msg="音色资产不存在",
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1543,6 +1568,7 @@ class VoiceEnrollmentService:
                 )
                 reconciled = await self._reconcile_enrollment(
                     tenant_id=tenant_id,
+                    user_id=user_id,
                     command_key=command_key,
                     request_hash=request_hash,
                     expected_profile_id=existing_profile_id,
@@ -1573,6 +1599,7 @@ class VoiceEnrollmentService:
             await self._safe_rollback(db)
             reconciled = await self._reconcile_enrollment(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 command_key=command_key,
                 request_hash=request_hash,
                 expected_profile_id=existing_profile_id,
@@ -1595,6 +1622,7 @@ class VoiceEnrollmentService:
             await self._safe_rollback(db)
             reconciled = await self._reconcile_enrollment(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 command_key=command_key,
                 request_hash=request_hash,
                 expected_profile_id=existing_profile_id,
@@ -1966,11 +1994,12 @@ class VoiceEnrollmentService:
         db: AsyncSession,
         *,
         tenant_id: str,
+        user_id: int,
         enrollment: AiCallVoiceEnrollmentModel,
         request_hash: str,
         expected_profile_id: int | None,
     ) -> VoiceEnrollmentAcceptedOut:
-        if enrollment.request_hash != request_hash or (
+        if enrollment.consent_user_id != user_id or enrollment.request_hash != request_hash or (
             expected_profile_id is not None and enrollment.voice_profile_id != expected_profile_id
         ):
             raise CustomException(
@@ -1993,7 +2022,7 @@ class VoiceEnrollmentService:
                 msg="音色复刻任务受理失败，请稍后重试",
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        if profile is None:
+        if profile is None or profile.created_by != user_id:
             raise CustomException(
                 msg="幂等请求对应的音色资产不存在",
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2010,6 +2039,7 @@ class VoiceEnrollmentService:
         self,
         *,
         tenant_id: str,
+        user_id: int,
         command_key: str,
         request_hash: str,
         expected_profile_id: int | None,
@@ -2036,14 +2066,14 @@ class VoiceEnrollmentService:
             return _Reconciliation(state="failed")
         if enrollment is None:
             return _Reconciliation(state="missing")
-        if enrollment.request_hash != request_hash or (
+        if enrollment.consent_user_id != user_id or enrollment.request_hash != request_hash or (
             expected_profile_id is not None and enrollment.voice_profile_id != expected_profile_id
         ):
             return _Reconciliation(
                 state="conflict",
                 sample_object_key=enrollment.sample_object_key,
             )
-        if profile is None:
+        if profile is None or profile.created_by != user_id:
             return _Reconciliation(
                 state="failed",
                 sample_object_key=enrollment.sample_object_key,

@@ -743,7 +743,7 @@ class OutboundValidationService:
         tenant_id: str,
         prompt_profile_id: int | None = None,
     ) -> str:
-        labels = ["客户名称"]
+        labels: list[str] = []
         if prompt_profile_id is not None:
             from app.services.ai_call.prompt_editor import require_available_profile
             profile = await require_available_profile(db, tenant_id=tenant_id,
@@ -753,7 +753,14 @@ class OutboundValidationService:
             )
         workbook = Workbook(write_only=True)
         sheet = workbook.create_sheet("外呼名单")
-        sheet.append(["手机号", *labels])
+        sheet.sheet_format.defaultColWidth = 24
+        headers = list(dict.fromkeys(["手机号", "客户名称", *labels]))
+        sheet.append(headers)
+        sheet.append([
+            "请填写11位手机号",
+            "客户名称示例",
+            *(f"请填写{label}" for label in headers[2:]),
+        ])
         descriptor, template_path = tempfile.mkstemp(
             prefix="ai-call-outbound-template-",
             suffix=".xlsx",

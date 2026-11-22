@@ -300,12 +300,16 @@ class RuntimeCommandRepository:
         if existing is not None:
             return self._matching_snapshot(existing, fingerprint)
 
-        if request.payload.get("model") is not None:
+        if request.payload.get("model") is not None or request.payload.get("voice"):
+            from app.config.setting import settings
             from app.api.v1.ai_call.voice.repository import VoiceRepository
             await VoiceRepository(self._session).require_call_voice(
                 tenant_id=request.tenant_id,
+                user_id=request.payload.get("voice_user_id"),
                 voice=request.payload.get("voice"),
-                target_model=request.payload["model"],
+                target_model=request.payload.get("model") or settings.QWEN_REALTIME_MODEL,
+                business_type="outbound_task" if admitted_task else request.business_type,
+                business_id=str(request.payload.get("task_id")) if admitted_task else request.business_id,
             )
 
         if request.scene_code and request.entry_type in {"web", "direct_sip"} and not admitted_task:

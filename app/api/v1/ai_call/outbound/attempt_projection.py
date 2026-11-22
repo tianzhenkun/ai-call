@@ -160,6 +160,10 @@ async def apply_terminal_projection(
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
 
+    from app.services.ai_call.credit_postpaid import restore_credit_blocked_target
+
+    if await restore_credit_blocked_target(db, task=task, target=target, attempt=attempt, now=now):
+        return
     target_result = await target_business_result(db, attempt)
     if decision.call_result == "connected" and target_result == "no_answer":
         retry_allowed = retry_allowed and await voicemail_retry_allowed(db, attempt.call_id)
@@ -255,6 +259,10 @@ async def apply_exception_terminal_projection(
     attempt.ended_at = (record.ended_at if record is not None else None) or now
     attempt.updated_at = now
 
+    from app.services.ai_call.credit_postpaid import restore_credit_blocked_target
+
+    if await restore_credit_blocked_target(db, task=task, target=target, attempt=attempt, now=now):
+        return
     call_result = await target_business_result(db, attempt)
     if decision.call_result == "connected" and call_result == "no_answer":
         retry_allowed = retry_allowed and await voicemail_retry_allowed(db, attempt.call_id)

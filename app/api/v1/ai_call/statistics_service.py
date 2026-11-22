@@ -100,6 +100,7 @@ class OutboundStatisticsService:
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         started_at_begin: datetime,
         started_at_end: datetime,
         time_zone: str,
@@ -117,6 +118,7 @@ class OutboundStatisticsService:
         )
         current = await self.repository.aggregate_overview(
             tenant_id=tenant_id,
+            user_id=user_id,
             started_at=period.current_started_at,
             ended_at=period.current_ended_at,
             include_pending_follow_ups=True,
@@ -125,6 +127,7 @@ class OutboundStatisticsService:
         )
         previous = await self.repository.aggregate_overview(
             tenant_id=tenant_id,
+            user_id=user_id,
             started_at=period.previous_started_at,
             ended_at=period.previous_ended_at,
             include_pending_follow_ups=False,
@@ -134,12 +137,14 @@ class OutboundStatisticsService:
         buckets = self._build_buckets(period)
         trend_aggregates = await self.repository.aggregate_trend(
             tenant_id=tenant_id,
+            user_id=user_id,
             buckets=buckets,
             scene_code=scene_code,
             task_id=task_id,
         )
         result_counts = await self.repository.aggregate_results(
             tenant_id=tenant_id,
+            user_id=user_id,
             started_at=period.current_started_at,
             ended_at=period.current_ended_at,
             scene_code=scene_code,

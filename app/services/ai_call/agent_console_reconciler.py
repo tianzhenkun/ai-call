@@ -33,6 +33,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.common.constant import RET
+from app.core.dependencies import has_ai_call_tenant_management
 from app.core.exceptions import CustomException
 from app.core.logger import log
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
@@ -187,17 +188,7 @@ class AiCallAgentConsoleReconciler:
 
     async def list_agents(self, auth: AuthSchema) -> dict:
         _, tenant_id = self._identity(auth)
-        profiles = list(
-            (
-                await self.db.execute(
-                    select(AiCallAgentProfileModel)
-                    .where(AiCallAgentProfileModel.tenant_id == tenant_id)
-                    .order_by(AiCallAgentProfileModel.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        profiles = await self.agent_service.list_profiles(auth)
         presences = {
             row.agent_identity: row
             for row in (
@@ -254,6 +245,7 @@ class AiCallAgentConsoleReconciler:
     async def get_agent_status(self, auth: AuthSchema, agent_id: int) -> dict:
         _, tenant_id = self._identity(auth)
         profile = await self._required_profile(tenant_id, agent_id)
+        await self.agent_service.require_profile_access(auth, profile)
         presence = await self._presence(tenant_id, profile.agent_identity)
         scopes = await self._scene_scope_map(tenant_id)
         users = await self._user_map(tenant_id, [profile.user_id])
@@ -275,6 +267,7 @@ class AiCallAgentConsoleReconciler:
         self._require_confirmation(confirmed)
         user, tenant_id = self._identity(auth)
         profile = await self._required_profile(tenant_id, agent_id)
+        await self.agent_service.require_profile_access(auth, profile)
         scene_codes = (await self._scene_scope_map(tenant_id)).get(profile.agent_identity, [])
         user_row = (await self._user_map(tenant_id, [profile.user_id])).get(profile.user_id)
         presence = await self._presence(tenant_id, profile.agent_identity)
@@ -358,8 +351,10 @@ class AiCallAgentConsoleReconciler:
         requested_at_begin: datetime | None = None,
         requested_at_end: datetime | None = None,
     ) -> dict:
-        _, tenant_id = self._identity(auth)
+        user, tenant_id = self._identity(auth)
         stmt = select(AiCallHandoffModel).where(AiCallHandoffModel.tenant_id == tenant_id)
+        if not has_ai_call_tenant_management(auth):
+            stmt = stmt.where(self.agent_service.account_handoff_scope(tenant_id, user.id))
         if scene_code := (scene_code or "").strip():
             stmt = stmt.where(AiCallHandoffModel.scene_code == scene_code)
         if status := (status or "").strip():
@@ -460,6 +455,7 @@ class AiCallAgentConsoleReconciler:
         handoff = await self._handoff_by_id(tenant_id, handoff_id)
         if handoff is None:
             raise CustomException(msg="转人工记录不存在", status_code=404)
+        await self._require_handoff_access(auth, handoff)
         record = await self.repository.get_record(handoff.call_id)
         customer_name = (
             await self.repository.outbound_customer_names_by_call_ids(
@@ -526,6 +522,7 @@ class AiCallAgentConsoleReconciler:
         )
         if handoff is None:
             raise CustomException(msg="转人工记录不存在", status_code=404)
+        await self._require_handoff_access(auth, handoff)
         current = now or datetime.now(timezone.utc)
         if handoff.status in {"connected", "reconnecting"} and not await self._is_room_active(
             handoff.room_name
@@ -574,10 +571,25 @@ class AiCallAgentConsoleReconciler:
         await self.db.flush()
         return self._handoff_payload(handoff)
 
+    async def _require_handoff_access(self, auth: AuthSchema, handoff: AiCallHandoffModel) -> None:
+        user, tenant_id = self._identity(auth)
+        if has_ai_call_tenant_management(auth):
+            return
+        visible_id = await self.db.scalar(
+            select(AiCallHandoffModel.id).where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.id == handoff.id,
+                self.agent_service.account_handoff_scope(tenant_id, user.id),
+            )
+        )
+        if visible_id is None:
+            raise CustomException(msg="转人工记录不存在", status_code=404)
+
     async def list_follow_ups(
         self,
         auth: AuthSchema,
         *,
+        account_only: bool = False,
         status: str | None = None,
         source_type: str | None = None,
         scene_code: str | None = None,
@@ -589,7 +601,11 @@ class AiCallAgentConsoleReconciler:
         page_num: int = 1,
         page_size: int = 10,
     ) -> dict:
-        _, tenant_id = self._identity(auth)
+        user, tenant_id = self._identity(auth)
+        account_scope = (
+            self.follow_up_service.account_follow_up_scope(tenant_id, user.user_id)
+            if account_only else None
+        )
         normalized_status = (status or "").strip() or None
         normalized_source_type = (source_type or "").strip() or None
         normalized_scene_code = (scene_code or "").strip() or None
@@ -611,6 +627,8 @@ class AiCallAgentConsoleReconciler:
         filtered_stmt = select(AiCallFollowUpTaskModel).where(
             AiCallFollowUpTaskModel.tenant_id == tenant_id
         )
+        if account_scope is not None:
+            filtered_stmt = filtered_stmt.where(account_scope)
         formal_source_scope = None
         if normalized_status:
             filtered_stmt = filtered_stmt.where(AiCallFollowUpTaskModel.status == normalized_status)
@@ -778,6 +796,8 @@ class AiCallAgentConsoleReconciler:
                         0,
                     ),
                 ).where(AiCallFollowUpTaskModel.tenant_id == tenant_id)
+        if account_scope is not None:
+            metrics_stmt = metrics_stmt.where(account_scope)
         if formal_source_scope is not None:
             metrics_stmt = metrics_stmt.where(formal_source_scope)
         metrics_row = (await self.db.execute(metrics_stmt)).one()
@@ -794,9 +814,13 @@ class AiCallAgentConsoleReconciler:
             "total": total,
         }
 
-    async def get_follow_up_detail(self, auth: AuthSchema, follow_up_id: int) -> dict:
-        _, tenant_id = self._identity(auth)
-        task = await self._follow_up_by_id(tenant_id, follow_up_id)
+    async def get_follow_up_detail(
+        self, auth: AuthSchema, follow_up_id: int, *, account_only: bool = False,
+    ) -> dict:
+        user, tenant_id = self._identity(auth)
+        task = await self._follow_up_by_id(
+            tenant_id, follow_up_id, user_id=user.user_id if account_only else None,
+        )
         if task is None:
             raise CustomException(msg="跟进任务不存在", status_code=404)
         await self.follow_up_service._attach_follow_up_detail(task)
@@ -948,13 +972,16 @@ class AiCallAgentConsoleReconciler:
         self,
         tenant_id: str,
         follow_up_id: int,
+        *,
+        user_id: int | None = None,
     ) -> AiCallFollowUpTaskModel | None:
-        result = await self.db.execute(
-            select(AiCallFollowUpTaskModel).where(
-                AiCallFollowUpTaskModel.tenant_id == tenant_id,
-                AiCallFollowUpTaskModel.id == follow_up_id,
-            )
+        statement = select(AiCallFollowUpTaskModel).where(
+            AiCallFollowUpTaskModel.tenant_id == tenant_id,
+            AiCallFollowUpTaskModel.id == follow_up_id,
         )
+        if user_id is not None:
+            statement = statement.where(self.follow_up_service.account_follow_up_scope(tenant_id, user_id))
+        result = await self.db.execute(statement)
         return result.scalar_one_or_none()
 
     async def _latest_attempt_map(

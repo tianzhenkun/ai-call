@@ -8,6 +8,7 @@ OmniRealtimeModel = Literal[
     "qwen3.8-omni-flash-realtime",
 ]
 OMNI_REALTIME_MODELS = get_args(OmniRealtimeModel)
+REACH_REALTIME_MODEL: OmniRealtimeModel = "qwen3.8-omni-flash-realtime"
 
 
 def resolve_realtime_url(model: str, realtime_url: str, workspace_realtime_url: str = "") -> str:

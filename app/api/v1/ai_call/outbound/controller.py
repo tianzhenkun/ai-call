@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, Path, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
+from sqlalchemy import select
 from starlette.background import BackgroundTask
 
 from app.api.v1.system.auth.schema import AuthSchema
@@ -13,6 +14,7 @@ from app.core.database import async_db_session
 from app.core.dependencies import get_current_user
 from app.core.exceptions import CustomException
 
+from .model import AiCallOutboundValidationModel
 from .schema import BatchValidationRequest, ValidationResultOut
 from .service import OutboundValidationService
 
@@ -40,6 +42,21 @@ def _identity(auth: AuthSchema) -> tuple[str, int]:
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
     return tenant_id, int(user_id)
+
+
+async def _get_owned_validation_auth(
+    validation_id: Annotated[int, Path(gt=0)],
+    auth: Annotated[AuthSchema, Depends(get_current_user)],
+) -> AuthSchema:
+    tenant_id, user_id = _identity(auth)
+    owned_id = await auth.db.scalar(select(AiCallOutboundValidationModel.id).where(
+        AiCallOutboundValidationModel.tenant_id == tenant_id,
+        AiCallOutboundValidationModel.id == validation_id,
+        AiCallOutboundValidationModel.created_by == user_id,
+    ))
+    if owned_id is None:
+        raise CustomException(msg="校验结果不存在", status_code=404)
+    return auth
 
 
 def _parse_request(value: str) -> BatchValidationRequest:
@@ -102,7 +119,7 @@ async def create_batch_validation_controller(
 )
 async def get_validation_controller(
     validation_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_validation_auth)],
     service: Annotated[
         OutboundValidationService,
         Depends(get_outbound_validation_service),
@@ -119,7 +136,7 @@ async def get_validation_controller(
 )
 async def list_validation_issues_controller(
     validation_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_validation_auth)],
     service: Annotated[
         OutboundValidationService,
         Depends(get_outbound_validation_service),
@@ -148,7 +165,7 @@ async def list_validation_issues_controller(
 )
 async def export_validation_issues_controller(
     validation_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_validation_auth)],
     service: Annotated[
         OutboundValidationService,
         Depends(get_outbound_validation_service),
@@ -179,7 +196,7 @@ async def export_validation_issues_controller(
 )
 async def retry_validation_controller(
     validation_id: Annotated[int, Path(gt=0)],
-    auth: Annotated[AuthSchema, Depends(get_current_user)],
+    auth: Annotated[AuthSchema, Depends(_get_owned_validation_auth)],
     service: Annotated[
         OutboundValidationService,
         Depends(get_outbound_validation_service),

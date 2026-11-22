@@ -72,6 +72,19 @@ CALL_END_TOOL_INSTRUCTIONS = """通话结束工具约束：
 
 当前通话没有创建回访任务或安排顾问的工具，客户同意后续联系只代表联系意愿。可以询问联系意愿、需求和方便的时间，但不得承诺“稍后安排顾问联系”或声称“已安排回访、已提交预约、已记录需求”。通话结束后的分析与人工安排尚未执行，不能提前当作成功。schedule_call_end 只确认结束通话，不代表记录需求、发送资料或创建回访任务成功。"""
 
+REACH_VOICEMAIL_INSTRUCTIONS = (
+    "REACH 外呼语音信箱识别：仅听到明确的自动留言提示（如“请在提示音后留言”）时，"
+    "调用 schedule_call_end，reason 为 voicemail，并在 evidence_quote 中填写刚听到的客户侧原话。"
+    "真人要求留言、拒绝、按键菜单、转接等待、静音和含糊转写不能作为语音信箱依据；"
+    "这些情况继续正常沟通，不要告别。工具拒绝时继续通话。"
+    "提示语不一定逐字相同，结合当前上下文识别让来电者录下留言的自动提示；转述以前听到的提示不算。"
+    "也可通过 report_call_answer 提交 voicemail 及对应原话，由系统核实后结束。"
+    "客户针对你的话语提出问题、明确回答或控制本通交流时，使用 report_call_answer 提交 human，"
+    "同时引用完整客户原话 evidence_quote 和之前相关的你的原话 context_quote。"
+    "不能仅凭问候、声音、通话时长或没有听到留言提示就确认；背景广播、按键菜单不算客户回应。"
+    "这是内部记录，成功记录一次后正常交流，无需重复提交，不向客户提及识别、证据或收费。"
+)
+
 SENSITIVE_BUSINESS_PARAM_KEYS = ("token", "apikey", "api_key", "password", "secret")
 MAX_BUSINESS_PARAMS_BYTES = 8 * 1024
 

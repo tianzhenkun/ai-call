@@ -6,23 +6,27 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import status
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.v1.ai_call.agent_console_schema import AgentProfileCreateIn, AgentSceneScopesIn
 from app.api.v1.ai_call.crud import AiCallRecordRepository
 from app.api.v1.ai_call.model import (
+    AiCallAfterCallWorkModel,
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpDataModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
+    AiCallPromptProfileModel,
     AiCallRecordModel,
 )
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.constant import RET
 from app.config.setting import settings
+from app.core.dependencies import has_ai_call_tenant_management
 from app.core.exceptions import CustomException
 from app.services.ai_call.handoff_unanswered_service import (
     AiCallHandoffUnansweredService,
@@ -68,6 +72,76 @@ class AiCallAgentConsoleService:
         self.repository = AiCallRecordRepository(db)
         self.participant_verifier = participant_verifier
 
+    @staticmethod
+    def account_agent_identities(tenant_id: str, user_id: int):
+        return select(AiCallAgentProfileModel.agent_identity).where(
+            AiCallAgentProfileModel.tenant_id == tenant_id,
+            AiCallAgentProfileModel.user_id == user_id,
+        ).correlate(None)
+
+    @staticmethod
+    def account_call_ids(tenant_id: str, user_id: int):
+        created_calls = AiCallRecordRepository._record_filters(
+            select(AiCallRecordModel.call_id), tenant_id=tenant_id, user_id=user_id,
+        ).correlate(None)
+        # 任务发起人和实际处理坐席都能读取相关记录，历史无主记录不会进入公共池。
+        handled_calls = AiCallAgentConsoleService.account_handled_call_ids(tenant_id, user_id).subquery()
+        return created_calls.union(select(handled_calls.c.call_id))
+
+    @staticmethod
+    def account_handled_call_ids(tenant_id: str, user_id: int):
+        agents = AiCallAgentConsoleService.account_agent_identities(tenant_id, user_id)
+        return select(AiCallHandoffModel.call_id).where(
+                AiCallHandoffModel.tenant_id == tenant_id,
+                AiCallHandoffModel.human_agent_identity.in_(agents),
+            ).correlate(None).union(
+            select(AiCallAfterCallWorkModel.call_id).where(
+                AiCallAfterCallWorkModel.tenant_id == tenant_id,
+                AiCallAfterCallWorkModel.agent_identity.in_(agents),
+            ).correlate(None),
+            select(AiCallRecordModel.call_id).where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                AiCallRecordModel.operator_agent_identity.in_(agents),
+            ).correlate(None),
+        )
+
+    @staticmethod
+    def account_handoff_scope(tenant_id: str, user_id: int):
+        return and_(
+            AiCallHandoffModel.tenant_id == tenant_id,
+            AiCallHandoffModel.call_id.in_(
+                AiCallAgentConsoleService.account_call_ids(tenant_id, user_id)
+            ),
+        )
+
+    async def require_profile_access(self, auth: AuthSchema, profile: AiCallAgentProfileModel) -> None:
+        user, tenant_id = self._identity(auth)
+        if profile.tenant_id != tenant_id or (
+            not has_ai_call_tenant_management(auth) and profile.user_id != user.id
+        ):
+            raise CustomException(msg="坐席档案不存在", status_code=404)
+
+    def _handoff_scope(self, auth: AuthSchema):
+        user, tenant_id = self._identity(auth)
+        if has_ai_call_tenant_management(auth):
+            return AiCallHandoffModel.tenant_id == tenant_id
+        return self.account_handoff_scope(tenant_id, user.id)
+
+    async def scene_options(self, auth: AuthSchema, *, page_num: int, page_size: int):
+        _, tenant_id = self._identity(auth)
+        conditions = (
+            AiCallPromptProfileModel.tenant_id == tenant_id,
+            AiCallPromptProfileModel.lifecycle_status == "READY",
+            AiCallPromptProfileModel.deleted_at.is_(None),
+        )
+        total = await self.db.scalar(select(func.count()).select_from(AiCallPromptProfileModel).where(*conditions))
+        rows = (await self.db.execute(
+            select(AiCallPromptProfileModel.scene_code, AiCallPromptProfileModel.name)
+            .where(*conditions).order_by(AiCallPromptProfileModel.scene_code)
+            .offset((page_num - 1) * page_size).limit(page_size)
+        )).all()
+        return [{"scene_code": row.scene_code, "name": row.name} for row in rows], int(total or 0)
+
     async def online(
         self,
         auth: AuthSchema,
@@ -78,6 +152,8 @@ class AiCallAgentConsoleService:
         if not device_preflight_passed:
             self._raise_conflict("设备预检未通过，暂时不能上线", "MEDIA_NOT_READY")
         profile = await self.require_current_agent(auth)
+        if not await self._scene_codes(profile):
+            self._raise_conflict("请先在坐席管理中配置业务场景", "AGENT_SCOPE_MISMATCH")
         session_id = self._console_session_id(console_session_id)
         presence = await self._presence(profile)
         now = datetime.now(timezone.utc)
@@ -162,6 +238,7 @@ class AiCallAgentConsoleService:
             scene_codes=await self._scene_codes(profile),
             now=datetime.now(timezone.utc),
             limit=limit,
+            account_scope=self._handoff_scope(auth),
         )
 
     async def require_available_presence(
@@ -207,6 +284,7 @@ class AiCallAgentConsoleService:
         handoff = await self.repository.get_console_handoff_for_claim(
             tenant_id=profile.tenant_id,
             handoff_id=handoff_id,
+            account_scope=self._handoff_scope(auth),
         )
         if handoff is None:
             raise CustomException(msg="转人工任务不存在", status_code=404)
@@ -581,18 +659,51 @@ class AiCallAgentConsoleService:
             await self._publish_handoff_state(handoff)
         return handoff
 
-    async def require_current_agent(self, auth: AuthSchema) -> AiCallAgentProfileModel:
+    async def require_current_agent(
+        self, auth: AuthSchema, *, initialize: bool = False,
+    ) -> AiCallAgentProfileModel:
         user, tenant_id = self._identity(auth)
-        result = await self.db.execute(
-            select(AiCallAgentProfileModel).where(
-                AiCallAgentProfileModel.tenant_id == tenant_id,
-                AiCallAgentProfileModel.user_id == user.id,
-            )
+        query = select(AiCallAgentProfileModel).where(
+            AiCallAgentProfileModel.tenant_id == tenant_id,
+            AiCallAgentProfileModel.user_id == user.id,
         )
-        profile = result.scalar_one_or_none()
+        profile = await self.db.scalar(query)
+        if profile is None and initialize:
+            now = datetime.now(timezone.utc)
+            profile_id = generate_snowflake_id()
+            try:
+                # 首次进入工作台时建档；唯一约束处理多标签页并发，保持默认离线。
+                async with self.db.begin_nested():
+                    profile = AiCallAgentProfileModel(
+                        id=profile_id, tenant_id=tenant_id,
+                        agent_identity=f"agent-{profile_id}", user_id=user.id,
+                        enabled=True, created_by=user.id, updated_by=user.id,
+                        created_at=now, updated_at=now,
+                    )
+                    self.db.add(profile)
+                    scene_codes = (await self.db.scalars(
+                        select(AiCallPromptProfileModel.scene_code).where(
+                            AiCallPromptProfileModel.tenant_id == tenant_id,
+                            AiCallPromptProfileModel.deleted_at.is_(None),
+                            AiCallPromptProfileModel.lifecycle_status == "READY",
+                        )
+                    )).all()
+                    self.db.add_all([
+                        AiCallAgentSceneScopeModel(
+                            id=generate_snowflake_id(), tenant_id=tenant_id,
+                            agent_identity=profile.agent_identity, scene_code=scene_code,
+                            created_by=user.id, created_at=now,
+                        )
+                        for scene_code in scene_codes
+                    ])
+                    await self.db.flush()
+            except IntegrityError:
+                profile = await self.db.scalar(query)
+                if profile is None:
+                    raise
         if profile is None or not profile.enabled:
             raise CustomException(
-                msg="当前账号未开通坐席功能",
+                msg="当前坐席已停用" if profile is not None else "当前账号未开通坐席功能",
                 code=10403,
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -619,10 +730,13 @@ class AiCallAgentConsoleService:
         return profile
 
     async def list_profiles(self, auth: AuthSchema) -> list[AiCallAgentProfileModel]:
-        _, tenant_id = self._identity(auth)
+        user, tenant_id = self._identity(auth)
+        conditions = [AiCallAgentProfileModel.tenant_id == tenant_id]
+        if not has_ai_call_tenant_management(auth):
+            conditions.append(AiCallAgentProfileModel.user_id == user.id)
         result = await self.db.execute(
             select(AiCallAgentProfileModel)
-            .where(AiCallAgentProfileModel.tenant_id == tenant_id)
+            .where(*conditions)
             .order_by(AiCallAgentProfileModel.id)
         )
         return list(result.scalars().all())
@@ -631,13 +745,16 @@ class AiCallAgentConsoleService:
         self, auth: AuthSchema, payload: AgentProfileCreateIn
     ) -> AiCallAgentProfileModel:
         user, tenant_id = self._identity(auth)
+        if not has_ai_call_tenant_management(auth) and payload.user_id != user.id:
+            raise CustomException(msg="只能为当前账号创建坐席档案", status_code=403)
         if payload.enabled:
             raise CustomException(msg="启用坐席前必须先配置至少一个业务场景", status_code=409)
         now = datetime.now(timezone.utc)
+        profile_id = generate_snowflake_id()
         profile = AiCallAgentProfileModel(
-            id=generate_snowflake_id(),
+            id=profile_id,
             tenant_id=tenant_id,
-            agent_identity=payload.agent_identity,
+            agent_identity=(payload.agent_identity if has_ai_call_tenant_management(auth) else f"agent-{profile_id}"),
             user_id=payload.user_id,
             enabled=False,
             created_by=user.id,
@@ -654,6 +771,7 @@ class AiCallAgentConsoleService:
     ) -> AiCallAgentProfileModel:
         user, tenant_id = self._identity(auth)
         profile = await self._get_profile(tenant_id, profile_id)
+        await self.require_profile_access(auth, profile)
         if enabled and not await self._scene_codes(profile):
             raise CustomException(msg="启用坐席前必须先配置至少一个业务场景", status_code=409)
         profile.enabled = enabled
@@ -678,6 +796,7 @@ class AiCallAgentConsoleService:
     ) -> list[str]:
         user, tenant_id = self._identity(auth)
         profile = await self._get_profile(tenant_id, profile_id)
+        await self.require_profile_access(auth, profile)
         if profile.enabled and not payload.scene_codes:
             raise CustomException(msg="启用坐席必须保留至少一个业务场景", status_code=409)
         await self.db.execute(
@@ -714,7 +833,7 @@ class AiCallAgentConsoleService:
         }
 
     async def bootstrap_payload(self, auth: AuthSchema) -> dict:
-        profile = await self.require_current_agent(auth)
+        profile = await self.require_current_agent(auth, initialize=True)
         presence = await self._presence(profile)
         if (
             presence is not None
@@ -793,6 +912,7 @@ class AiCallAgentConsoleService:
         handoff = await self.repository.get_console_handoff_for_claim(
             tenant_id=profile.tenant_id,
             handoff_id=handoff_id,
+            account_scope=self._handoff_scope(auth),
         )
         if handoff is None:
             raise CustomException(msg="转人工任务不存在", status_code=404)
@@ -940,6 +1060,11 @@ class AiCallAgentConsoleService:
                     ),
                     "business_type": record.business_type if record else None,
                     "business_id": record.business_id if record else None,
+                    "call_answered_at": self._api_datetime(record.answered_at) if record else None,
+                    "total_call_deadline_at": self._api_datetime(record.total_call_deadline_at) if record else None,
+                    "max_total_call_duration_seconds": (
+                        record.max_total_call_duration_seconds if record else None
+                    ),
                     "follow_up_data_id": (
                         str(follow_up_data.id) if follow_up_data else None
                     ),

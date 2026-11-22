@@ -19,8 +19,8 @@ def reply_parents(messages):
     """在已按租户和用户隔离的会话中，为详情和送达统计解析同一父邮件。"""
     headers = defaultdict(list)
     for row in messages:
-        if row.message_id:
-            headers[(row.account_id, row.message_id)].append(row)
+        for identity in {row.message_id, row.provider_message_id} - {None, ''}:
+            headers[(row.account_id, identity)].append(row)
     parents = {}
     for row in messages:
         # References 只取最近父邮件，不能把更早的线程邮件当作直接回复对象。
@@ -33,13 +33,13 @@ def reply_parents(messages):
                 headerless=not row.in_reply_to and not row.references)
             if marker:
                 refs.append(marker)
-        candidates = [parent for ref in set(refs) for parent in headers[(row.account_id, ref)]
+        candidates = {parent.id: parent for ref in set(refs) for parent in headers[(row.account_id, ref)]
             if row.lead_id and parent.lead_id == row.lead_id and parent.task_id == row.task_id
             and (not marker or (parent.direction == 'outbound' and parent.status == 'accepted'
                 and parent.from_email.lower() == row.to_email.lower()
-                and parent.to_email.lower() == row.from_email.lower()))]
+                and parent.to_email.lower() == row.from_email.lower()))}
         if len(candidates) == 1:
-            parents[row.id] = candidates[0]
+            parents[row.id] = next(iter(candidates.values()))
     return parents
 
 
@@ -47,8 +47,8 @@ def delivery_evidence(messages):
     outbound = [m for m in messages if m.direction == "outbound" and m.attempt_count > 0]
     headers = defaultdict(list)
     for row in outbound:
-        if row.message_id:
-            headers[(row.account_id, row.message_id)].append(row)
+        for identity in {row.message_id, row.provider_message_id} - {None, ''}:
+            headers[(row.account_id, identity)].append(row)
     parents = reply_parents(messages)
     delivered, failed, replied = set(), set(), set()
     for incoming in messages:
@@ -82,13 +82,18 @@ def delivery_evidence(messages):
     return delivered - failed, failed, replied
 
 
-def summarize(messages, sender_email=None):
+def summarize(messages, sender_email=None, *, visible_outbound_ids=None):
     outbound = [m for m in messages if m.direction == "outbound" and m.attempt_count > 0]
+    # 准入和历史费用对应的邮箱对必须可见，但不能因此增加实际尝试发送数。
+    visible = outbound if visible_outbound_ids is None else [
+        m for m in messages if m.direction == "outbound" and m.id in visible_outbound_ids
+    ]
     delivered, failed, replied = delivery_evidence(messages)
     details = []
     if sender_email is not None:
         outbound = [m for m in outbound if m.from_email == sender_email]
-    addresses = {m.to_email if sender_email is not None else m.from_email for m in outbound}
+    addresses = {m.to_email if sender_email is not None else m.from_email for m in visible
+        if sender_email is None or m.from_email == sender_email}
     for sender in sorted(addresses):
         rows = [m for m in outbound if (m.to_email if sender_email is not None else m.from_email) == sender]
         ids = {m.id for m in rows}

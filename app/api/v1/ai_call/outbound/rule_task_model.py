@@ -244,6 +244,7 @@ class AiCallOutboundExceptionBatchModel(MappedBase):
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     category: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
     interval_days: Mapped[int] = mapped_column(Integer, nullable=False)
     max_retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
     cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

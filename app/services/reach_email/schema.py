@@ -40,10 +40,19 @@ class AccountInput(Input):
 
     _email = field_validator("email")(email_address)
 
+    @model_validator(mode="after")
+    def check_provider_email(self):
+        from app.services.reach_email.providers import PROVIDERS
+
+        excluded = PROVIDERS.get(self.provider_type, {}).get("unsupportedEmailDomains", [])
+        if self.email.rsplit("@", 1)[-1].lower() in excluded:
+            raise ValueError("请填写 Outlook 邮箱地址；163、QQ 等邮箱请选择对应类型，微软登录名请在授权页面使用。")
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def apply_provider(cls, data):
-        from app.services.reach_email.providers import PROVIDERS
+        from app.services.reach_email.providers import PROVIDERS, provider_settings
 
         values = dict(data)
         provider = values.pop("provider_type", values.get("providerType", "custom"))
@@ -51,8 +60,8 @@ class AccountInput(Input):
         if provider != "custom":
             if provider not in PROVIDERS:
                 raise ValueError("邮箱类型不受支持，请选择已有类型或自定义邮箱")
-            for key, value in PROVIDERS[provider].items():
-                if key != "label":
+            for key, value in provider_settings(provider, str(values.get("email", ""))).items():
+                if key in ("smtpHost", "smtpPort", "smtpSecurity", "imapHost", "imapPort", "imapSecurity"):
                     # 同时支持 Python 字段名与 HTTP 字段名，固定预设不可被覆盖。
                     snake = "".join("_" + c.lower() if c.isupper() else c for c in key)
                     values.pop(snake, None)
@@ -73,6 +82,22 @@ class AccountInput(Input):
         return value.strip()
 
 
+class OutlookStartInput(Input):
+    account: AccountInput
+    account_id: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+class OutlookCompleteInput(Input):
+    state: str = Field(min_length=1, max_length=200)
+    code: str = Field(default="", max_length=8192)
+    error: str = Field(default="", max_length=200)
+
+
+class TaskSenderAccount(Input):
+    account_id: str = Field(min_length=1, max_length=32)
+    weight: int = Field(ge=1, le=100, strict=True)
+
+
 class TaskSettings(Input):
     company_name: str = Field(default="", max_length=255)
     company_website: str = Field(default="", max_length=1024)
@@ -81,6 +106,14 @@ class TaskSettings(Input):
     follow_up_interval_days: int = Field(default=2, ge=1, le=365)
     follow_up_count: int = Field(default=2, ge=0, le=5)
     daily_limit: int = Field(default=50, ge=1, le=100000)
+    sender_accounts: list[TaskSenderAccount] | None = None
+
+    @field_validator("sender_accounts")
+    @classmethod
+    def unique_senders(cls, value):
+        if value is not None and len({item.account_id for item in value}) != len(value):
+            raise ValueError("本任务发件邮箱不能重复")
+        return value
 
     @model_validator(mode="after")
     def require_company_details(self):

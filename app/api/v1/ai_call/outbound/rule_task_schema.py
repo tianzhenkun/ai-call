@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from app.api.v1.ai_call.schema import TokenOut
 from app.services.ai_call.realtime_model import OmniRealtimeModel
 
 from .schema import OutboundSchema
@@ -15,13 +17,35 @@ SUPPORTED_RETRY_RESULTS = {"no_answer", "busy", "rejected", "call_failed"}
 MAX_RETRY_COUNT = 5
 
 
+class TaskBillingSummaryOut(OutboundSchema):
+    task_id: str
+    call_count: int = 0
+    confirmed_call_count: int = 0
+    pending_call_count: int = 0
+    unconfirmed_call_count: int = 0
+    waived_call_count: int = 0
+    adjustment_call_count: int = 0
+    billed_points: Decimal = Decimal(0)
+    settled_points: Decimal = Decimal(0)
+    outstanding_points: Decimal = Decimal(0)
+    refunded_points: Decimal = Decimal(0)
+    queried_at: str
+
+
+class TaskBrowserTokenOut(TokenOut):
+    model: str | None
+    runtime_control_mode: Literal["legacy_local", "owner_command_v1"]
+
+
 class CallWindow(OutboundSchema):
     start_time: str
     end_time: str
 
     @model_validator(mode="after")
     def validate_window(self) -> CallWindow:
-        if not TIME_PATTERN.fullmatch(self.start_time) or not TIME_PATTERN.fullmatch(self.end_time):
+        if not TIME_PATTERN.fullmatch(self.start_time) or (
+            self.end_time != "24:00" and not TIME_PATTERN.fullmatch(self.end_time)
+        ):
             raise ValueError("呼叫时段必须使用 HH:mm 格式")
         if self.start_time >= self.end_time:
             raise ValueError("呼叫时段开始时间必须早于结束时间")
@@ -229,4 +253,5 @@ class OutboundTargetOut(OutboundSchema):
     hangup_cause: str | None = None
     active_call_id: str | None = None
     active_call_status: str | None = None
+    active_attempt_status: str | None = None
     updated_at: str

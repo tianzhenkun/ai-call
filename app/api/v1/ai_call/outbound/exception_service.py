@@ -12,6 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai_call.call_outcome_query import target_call_result_expression
 from app.core.exceptions import CustomException
+from app.services.ai_call.credit_metering import (
+    CreditMeteringClient,
+    prepare_outbound_credit_resume,
+)
 from app.services.ai_call.sqlite_serialization import begin_sqlite_immediate_write
 from app.utils.id_util import generate_snowflake_id
 
@@ -56,6 +60,9 @@ def _mask_phone_number(phone_number: str | None) -> str | None:
 
 
 class OutboundExceptionService:
+    def __init__(self, *, credit_metering_client: CreditMeteringClient | None = None) -> None:
+        self.credit_metering_client = credit_metering_client
+
     async def get_summary(
         self,
         db: AsyncSession,
@@ -81,6 +88,7 @@ class OutboundExceptionService:
                 )
                 .where(
                     AiCallOutboundTargetModel.tenant_id == tenant_id,
+                    self._owned_target_condition(tenant_id, user_id),
                     AiCallOutboundTargetModel.exception_category.is_not(None),
                 )
                 .group_by(AiCallOutboundTargetModel.exception_category, display_status)
@@ -93,7 +101,8 @@ class OutboundExceptionService:
             await db.scalars(
                 select(AiCallOutboundExceptionBatchModel).where(
                     AiCallOutboundExceptionBatchModel.tenant_id == tenant_id,
-                    AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                    self._owned_batch_condition(tenant_id, user_id),
+                    AiCallOutboundExceptionBatchModel.status.in_({"RUNNING", "PAUSED"}),
                 )
             )
         ).all()
@@ -119,6 +128,8 @@ class OutboundExceptionService:
         active_batches = {
             batch.category: ExceptionActiveBatchOut(
                 batch_id=str(batch.id),
+                status=batch.status,
+                error_message=batch.error_message,
                 target_count=batch.target_count,
                 completed_count=completed_by_batch.get(batch.id, 0),
                 created_by=str(batch.created_by),
@@ -202,6 +213,7 @@ class OutboundExceptionService:
             )
         )
         if existing is not None:
+            await self._require_owned_batch(db, tenant_id, user_id, existing.id)
             if existing.request_fingerprint != fingerprint:
                 raise CustomException(
                     msg="Idempotency-Key 已用于其他请求",
@@ -216,6 +228,7 @@ class OutboundExceptionService:
             (AiCallOutboundTargetModel.task_id == AiCallOutboundTaskModel.id)
             & (AiCallOutboundTargetModel.tenant_id == AiCallOutboundTaskModel.tenant_id),
         ).where(AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.created_by == user_id,
                 AiCallOutboundTargetModel.exception_category == category,
                 AiCallOutboundTargetModel.exception_batch_id.is_(None),
                 AiCallOutboundTargetModel.status == "COMPLETED").distinct())).all()
@@ -244,6 +257,7 @@ class OutboundExceptionService:
             )
         )
         if existing is not None:
+            await self._require_owned_batch(db, tenant_id, user_id, existing.id)
             if existing.request_fingerprint != fingerprint:
                 raise CustomException(
                     msg="Idempotency-Key 已用于其他请求",
@@ -261,7 +275,7 @@ class OutboundExceptionService:
             raise CustomException(
                 msg="该异常类别已有未完成的重新外呼批次",
                 status_code=status.HTTP_409_CONFLICT,
-                data={"activeBatchId": str(active.id)},
+                data={"activeBatchId": str(active.id)} if active.created_by == user_id else None,
             )
 
         cutoff_at = _now()
@@ -334,6 +348,49 @@ class OutboundExceptionService:
         await db.flush()
         return self._batch_out(batch)
 
+    async def resume_batch(
+        self, db: AsyncSession, tenant_id: str, batch_id: int, *, user_id: int,
+    ) -> ExceptionBatchOut:
+        batch = await db.scalar(
+            select(AiCallOutboundExceptionBatchModel).where(
+                AiCallOutboundExceptionBatchModel.tenant_id == tenant_id,
+                AiCallOutboundExceptionBatchModel.id == batch_id,
+                self._owned_batch_condition(tenant_id, user_id),
+            ).with_for_update()
+        )
+        if batch is None:
+            raise CustomException(msg="重新外呼批次不存在", status_code=404)
+        if batch.status in {"RUNNING", "COMPLETED"}:
+            return self._batch_out(batch)
+        if batch.status != "PAUSED":
+            raise CustomException(msg="该批次当前状态不允许继续", status_code=409)
+        tasks = (await db.execute(
+            select(
+                AiCallOutboundTaskModel.created_by,
+                AiCallOutboundTaskModel.answer_mode,
+                AiCallOutboundTaskModel.status,
+            ).join(
+                AiCallOutboundTargetModel,
+                (AiCallOutboundTargetModel.tenant_id == AiCallOutboundTaskModel.tenant_id)
+                & (AiCallOutboundTargetModel.task_id == AiCallOutboundTaskModel.id),
+            ).where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTargetModel.exception_batch_id == batch_id,
+                AiCallOutboundTargetModel.status.in_({"RETRY_WAIT", "DIALING", "IN_CALL"}),
+            ).distinct()
+        )).all()
+        if any(task_status not in {"RUNNING", "COMPLETED"} for _, _, task_status in tasks):
+            raise CustomException(msg="批次中有原任务已暂停或停止，请先核实原任务状态", status_code=409)
+        if self.credit_metering_client is not None:
+            # 一个补呼批次可包含多个原任务，按实际账户分别检查。
+            for owner_id in sorted({str(owner) for owner, mode, _ in tasks if mode == "linphone"}):
+                await prepare_outbound_credit_resume(
+                    db, client=self.credit_metering_client, tenant_id=tenant_id, owner_id=owner_id,
+                )
+        batch.status, batch.error_message, batch.updated_at = "RUNNING", None, _now()
+        await db.flush()
+        return self._batch_out(batch)
+
     async def list_targets(
         self,
         db: AsyncSession,
@@ -351,6 +408,7 @@ class OutboundExceptionService:
         display_status = self._display_status_expression()
         conditions = [
             AiCallOutboundTargetModel.tenant_id == tenant_id,
+            AiCallOutboundTaskModel.created_by == user_id,
             AiCallOutboundTargetModel.exception_category == category,
         ]
         if target_status:
@@ -456,6 +514,36 @@ class OutboundExceptionService:
                 )
             )
         return result, total
+
+    @staticmethod
+    def _owned_target_condition(tenant_id: str, user_id: int):
+        return AiCallOutboundTargetModel.task_id.in_(
+            select(AiCallOutboundTaskModel.id).where(
+                AiCallOutboundTaskModel.tenant_id == tenant_id,
+                AiCallOutboundTaskModel.created_by == user_id,
+            )
+        )
+
+    @classmethod
+    def _owned_batch_condition(cls, tenant_id: str, user_id: int):
+        # 旧批次可能混入其他账号的任务，不能让某个账号继续操作整个批次。
+        foreign_targets = select(AiCallOutboundTargetModel.id).where(
+            AiCallOutboundTargetModel.tenant_id == tenant_id,
+            AiCallOutboundTargetModel.exception_batch_id == AiCallOutboundExceptionBatchModel.id,
+            ~cls._owned_target_condition(tenant_id, user_id),
+        ).correlate(AiCallOutboundExceptionBatchModel).exists()
+        return (AiCallOutboundExceptionBatchModel.created_by == user_id) & ~foreign_targets
+
+    async def _require_owned_batch(
+        self, db: AsyncSession, tenant_id: str, user_id: int, batch_id: int,
+    ) -> None:
+        owned_id = await db.scalar(select(AiCallOutboundExceptionBatchModel.id).where(
+            AiCallOutboundExceptionBatchModel.tenant_id == tenant_id,
+            AiCallOutboundExceptionBatchModel.id == batch_id,
+            self._owned_batch_condition(tenant_id, user_id),
+        ))
+        if owned_id is None:
+            raise CustomException(msg="重新外呼批次不存在", status_code=404)
 
     async def export_targets(
         self,
@@ -590,6 +678,7 @@ class OutboundExceptionService:
             batch_id=str(batch.id),
             category=batch.category,
             status=batch.status,
+            error_message=batch.error_message,
             target_count=batch.target_count,
             interval_days=batch.interval_days,
             max_retry_count=batch.max_retry_count,

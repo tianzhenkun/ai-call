@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +10,13 @@ from typing import Any, Protocol
 from sqlalchemy import select
 
 from app.core.exceptions import CustomException
+from app.services.ai_call.credit_metering import (
+    CreditAdmissionDenied,
+    CreditMeteringClient,
+    CreditMeteringRejected,
+    CreditMeteringUnavailable,
+)
+from app.services.ai_call.credit_postpaid import require_call_admission
 from app.services.ai_call.livekit_egress import (
     LiveKitEgressAlreadyCompleteError,
     LiveKitEgressNotFoundError,
@@ -136,7 +143,6 @@ class DatabaseRuntimeProviderResourceResolver:
             # 对账必须查询已创建的资源，不能用当前配置变化推断资源不存在。
             if (
                 not claim.reconcile_only
-                and model is not None
                 and claim.effect_type in {"CREATE_ROOM", "ATTACH_AGENT_PARTICIPANT"}
             ):
                 if self._orchestrator is None:
@@ -144,16 +150,21 @@ class DatabaseRuntimeProviderResourceResolver:
                 from app.api.v1.ai_call.voice.repository import VoiceRepository
                 config = self._orchestrator.config
                 try:
-                    validate_realtime_model(
-                        model,
-                        entry_type=record.entry_type,
-                        configured_model=config.qwen_realtime_model,
-                        vad_type=config.vad_type,
-                        customer_speech_review_enabled=config.customer_speech_review_enabled,
-                        workspace_realtime_url=config.dashscope_workspace_realtime_url,
-                    )
+                    if model is not None:
+                        validate_realtime_model(
+                            model,
+                            entry_type=record.entry_type,
+                            configured_model=config.qwen_realtime_model,
+                            vad_type=config.vad_type,
+                            customer_speech_review_enabled=config.customer_speech_review_enabled,
+                            workspace_realtime_url=config.dashscope_workspace_realtime_url,
+                        )
                     await VoiceRepository(session).require_call_voice(
-                        tenant_id=claim.tenant_id, voice=voice, target_model=model,
+                        tenant_id=claim.tenant_id, user_id=payload.get("voice_user_id"),
+                        voice=voice or config.qwen_realtime_voice,
+                        target_model=model or config.qwen_realtime_model,
+                        business_type=record.business_type,
+                        business_id=record.business_id,
                     )
                 except (ValueError, CustomException) as exc:
                     raise ProviderPreconditionError(str(exc)) from exc
@@ -296,6 +307,7 @@ class DatabaseRuntimeProviderResourceResolver:
             ).resolve(context)
         style = await VoiceRepository(session).resolve_call_speaking_style(
             tenant_id=context.tenant_id,
+            user_id=payload.get("voice_user_id"),
             voice=payload.get("voice") or self._orchestrator.config.qwen_realtime_voice,
             target_model=payload.get("model") or self._orchestrator.config.qwen_realtime_model,
             business_type=record.business_type,
@@ -671,6 +683,7 @@ class LiveKitRuntimeProvider:
         allowed_callee_phone_number: str | None = None,
         main_recording_enabled: bool = False,
         oss_config_provider: Callable[[], dict | None] | None = None,
+        credit_admission: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._resolver = resolver
         self._room_manager = room_manager
@@ -682,6 +695,7 @@ class LiveKitRuntimeProvider:
         self.provider_namespace = provider_namespace
         self.main_recording_enabled = main_recording_enabled
         self._oss_config_provider = oss_config_provider or (lambda: None)
+        self._credit_admission = credit_admission
         normalized_allowed_callee = (
             str(allowed_callee_phone_number).strip()
             if allowed_callee_phone_number is not None
@@ -730,6 +744,11 @@ class LiveKitRuntimeProvider:
             else:
                 provider_reference = None
             return await self._observe(effect, resource, provider_reference)
+        except (CreditAdmissionDenied, CreditMeteringRejected, CreditMeteringUnavailable) as exc:
+            return ProviderObservation(
+                kind=ProviderObservationKind.PERMANENT_NO_RESOURCE,
+                failure_code="credit_admission_failed", error_message=str(exc),
+            )
         except (ProviderResourceNotFoundError, LiveKitEgressNotFoundError):
             if effect.effect_type in {
                 "HANGUP_SIP",
@@ -801,6 +820,8 @@ class LiveKitRuntimeProvider:
                 != self._allowed_callee_phone_number
             ):
                 raise ProviderPolicyDeniedError("callee does not match allowlist")
+            if resource.entry_type == "outbound" and self._credit_admission is not None:
+                await self._credit_admission(resource.call_id)
             result = await self._sip_client.create_participant(
                 room_name=resource.room_name,
                 participant_identity=resource.customer_participant_identity,
@@ -1304,6 +1325,11 @@ def build_livekit_runtime_provider(
             )
         return True
 
+    credit_client = CreditMeteringClient.from_settings()
+
+    async def admit_outbound_call(call_id: str) -> None:
+        await require_call_admission(session_factory, call_id=call_id, client=credit_client)
+
     room_manager = LiveKitRoomManager(
         livekit_url=settings.LIVEKIT_URL,
         browser_livekit_url=settings.LIVEKIT_BROWSER_URL,
@@ -1357,6 +1383,7 @@ def build_livekit_runtime_provider(
         )
         handoff_trigger_worker.attach_event_store(orchestrator.event_store)
     return LiveKitRuntimeProvider(
+        credit_admission=admit_outbound_call,
         resolver=DatabaseRuntimeProviderResourceResolver(
             session_factory,
             orchestrator=orchestrator,

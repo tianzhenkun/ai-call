@@ -76,6 +76,7 @@ class OutboundStatisticsRepository:
         statement: Select,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         started_at: datetime,
         ended_at: datetime,
         scene_code: str | None,
@@ -91,12 +92,15 @@ class OutboundStatisticsRepository:
             statement = statement.where(AiCallOutboundTaskModel.scene_code == scene_code)
         if task_id is not None:
             statement = statement.where(AiCallOutboundTaskModel.id == task_id)
+        if user_id is not None:
+            statement = statement.where(AiCallOutboundTaskModel.created_by == user_id)
         return statement
 
     async def aggregate_overview(
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         started_at: datetime,
         ended_at: datetime,
         include_pending_follow_ups: bool,
@@ -111,18 +115,25 @@ class OutboundStatisticsRepository:
             pending_statement = pending_statement.where(
                 AiCallFollowUpTaskModel.scene_code == scene_code
             )
-        if task_id is not None:
+        if task_id is not None or user_id is not None:
             source_attempt = AiCallOutboundAttemptModel.__table__.alias(
                 "pending_source_attempt"
             )
+            source_task = AiCallOutboundTaskModel.__table__.alias("pending_source_task")
+            source = select(source_attempt.c.id).join(
+                source_task,
+                (source_task.c.id == source_attempt.c.task_id)
+                & (source_task.c.tenant_id == source_attempt.c.tenant_id),
+            ).where(
+                source_attempt.c.tenant_id == tenant_id,
+                source_attempt.c.call_id == AiCallFollowUpTaskModel.source_call_id,
+            )
+            if task_id is not None:
+                source = source.where(source_task.c.id == task_id)
+            if user_id is not None:
+                source = source.where(source_task.c.created_by == user_id)
             pending_statement = pending_statement.where(
-                select(source_attempt.c.id)
-                .where(
-                    source_attempt.c.tenant_id == tenant_id,
-                    source_attempt.c.task_id == task_id,
-                    source_attempt.c.call_id == AiCallFollowUpTaskModel.source_call_id,
-                )
-                .exists()
+                source.exists()
             )
         pending_expression = (
             pending_statement.scalar_subquery()
@@ -162,6 +173,7 @@ class OutboundStatisticsRepository:
         statement = self._apply_period(
             statement,
             tenant_id=tenant_id,
+            user_id=user_id,
             started_at=started_at,
             ended_at=ended_at,
             scene_code=scene_code,
@@ -180,6 +192,7 @@ class OutboundStatisticsRepository:
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         started_at: datetime,
         ended_at: datetime,
         scene_code: str | None = None,
@@ -223,6 +236,7 @@ class OutboundStatisticsRepository:
         statement = self._apply_period(
             statement,
             tenant_id=tenant_id,
+            user_id=user_id,
             started_at=started_at,
             ended_at=ended_at,
             scene_code=scene_code,
@@ -235,6 +249,7 @@ class OutboundStatisticsRepository:
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         buckets: list[tuple[datetime, datetime]],
         scene_code: str | None = None,
         task_id: int | None = None,
@@ -265,6 +280,7 @@ class OutboundStatisticsRepository:
                 self._apply_period(
                     statement,
                     tenant_id=tenant_id,
+                    user_id=user_id,
                     started_at=bucket_start,
                     ended_at=bucket_end,
                     scene_code=scene_code,

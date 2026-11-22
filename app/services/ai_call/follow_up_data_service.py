@@ -56,6 +56,7 @@ class AiCallFollowUpDataService:
         self,
         *,
         tenant_id: str,
+        user_id: int | None = None,
         classification: str | None,
         page_num: int,
         page_size: int,
@@ -79,6 +80,8 @@ class AiCallFollowUpDataService:
             )),
         )
         conditions = [AiCallFollowUpDataModel.tenant_id == tenant_id]
+        if user_id is not None:
+            conditions.append(AiCallOutboundTaskModel.created_by == user_id)
         if classification:
             conditions.append(AiCallFollowUpDataModel.classification == classification)
         else:

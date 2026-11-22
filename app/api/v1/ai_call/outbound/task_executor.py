@@ -16,10 +16,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.v1.ai_call.model import AiCallRecordModel
 from app.core.logger import log
 from app.services.ai_call.credit_metering import (
+    CREDIT_SCENARIO_CODE,
     CreditAdmissionDenied,
     CreditMeteringClient,
+    CreditMeteringRejected,
+    CreditMeteringUnavailable,
+    ReachCreditUsageOutboxModel,
     enqueue_connected_call_usage,
 )
+from app.services.ai_call.credit_postpaid import prepare_call_admission, require_call_admission
+from app.services.ai_call.runtime_control.models import AiCallSipLineReservationModel
 from app.utils.id_util import generate_snowflake_id
 
 from .attempt_projection import (
@@ -167,9 +173,16 @@ class OutboundTaskExecutor:
         owner_runtime_start: OwnerRuntimeStart | None = None,
         owner_queue_limits: OutboundQueueLimits = DEFAULT_OUTBOUND_QUEUE_LIMITS,
         credit_metering_client: CreditMeteringClient | None = None,
+        web_dialer: OutboundDialer | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.dialer = dialer
+        self.web_dialer = web_dialer
+        self.answer_modes = (
+            ("web",) if dialer.dialer_type == "web"
+            else ("linphone",) if dialer.dialer_type == "sip" and web_dialer is None and owner_runtime_start is None
+            else ("linphone", "web")
+        )
         self.task_batch_size = max(1, task_batch_size)
         self.target_batch_size = max(1, target_batch_size)
         self.now_provider = now_provider
@@ -187,6 +200,11 @@ class OutboundTaskExecutor:
         self.owner_queue_limits = owner_queue_limits
         self.credit_metering_client = credit_metering_client
         self.last_queue_snapshot: OutboundQueueSnapshot | None = None
+
+    def _dialer_for(self, request: OutboundDialRequest) -> OutboundDialer:
+        if request.answer_mode == "web" and self.web_dialer is not None:
+            return self.web_dialer
+        return self.dialer
 
     async def run_once(self) -> int:
         now = self.now_provider()
@@ -238,9 +256,7 @@ class OutboundTaskExecutor:
             )
             if task is None or task.status != "SCHEDULED":
                 raise ValueError("人工测试只接受 SCHEDULED 任务")
-            if task.answer_mode == "linphone" and (
-                self.dialer.dialer_type == "sip" or self.owner_runtime_start is not None
-            ) and not self._task_model(task):
+            if not self._task_model(task):
                 raise ValueError("任务缺少模型快照，请确认模型后重新创建任务")
 
             targets = (
@@ -306,6 +322,7 @@ class OutboundTaskExecutor:
                 prompt_profile_id=task.prompt_profile_id,
                 prompt_snapshot=self._task_prompt_snapshot(task),
                 line=self._task_line_snapshot(task),
+                answer_mode=task.answer_mode,
                 model=self._task_model(task),
             )
             call_id = uuid4().hex
@@ -345,14 +362,21 @@ class OutboundTaskExecutor:
             return ClaimedAttempt(request=request, call_id=call_id)
 
     async def execute_claimed(self, claimed: ClaimedAttempt) -> None:
+        dialer = self._dialer_for(claimed.request)
         try:
-            result = await self.dialer.dial(
+            if dialer.dialer_type == "sip" and self.credit_metering_client is not None:
+                await require_call_admission(
+                    self.session_factory, call_id=claimed.call_id, client=self.credit_metering_client,
+                )
+            result = await dialer.dial(
                 claimed.request,
                 call_id=claimed.call_id,
                 on_connected=lambda: self._mark_in_call(claimed),
             )
+        except (CreditAdmissionDenied, CreditMeteringRejected, CreditMeteringUnavailable) as exc:
+            result = DialResult(call_result="call_failed", error_message=str(exc), retry_allowed=False)
         except Exception as exc:
-            requires_cleanup = self.dialer.manages_call_record and self.dialer.dialer_type == "sip"
+            requires_cleanup = dialer.manages_call_record and dialer.dialer_type in {"sip", "web"}
             if requires_cleanup:
                 if not await self._terminate_managed_call(
                     claimed.request,
@@ -416,6 +440,7 @@ class OutboundTaskExecutor:
                 await db.scalars(
                     select(AiCallOutboundAttemptModel)
                     .where(
+                        or_(self.dialer.dialer_type != "web", AiCallOutboundAttemptModel.dialer_type == "web"),
                         AiCallOutboundAttemptModel.started_at <= cutoff,
                         or_(
                             (
@@ -427,7 +452,11 @@ class OutboundTaskExecutor:
                             ),
                             (
                                 AiCallOutboundAttemptModel.status.in_({"DIALING", "IN_CALL"})
-                                & (AiCallOutboundAttemptModel.dialer_type == "sip")
+                                & AiCallOutboundAttemptModel.dialer_type.in_(
+                                    {"web"} if self.dialer.dialer_type == "web"
+                                    else {"sip", "web"} if self.web_dialer is not None
+                                    else {"sip"}
+                                )
                             ),
                         ),
                     )
@@ -435,8 +464,9 @@ class OutboundTaskExecutor:
                     .limit(self.target_batch_size)
                 )
             ).all()
-            recovery_items: list[tuple[OutboundDialRequest, str, DialResult, bool]] = []
+            recovery_items: list[tuple[OutboundDialRequest, str, DialResult, bool, str]] = []
             for attempt in attempts:
+                cleanup_end_reason = "outbound_stale_recovery"
                 task = await db.scalar(
                     select(AiCallOutboundTaskModel).where(
                         AiCallOutboundTaskModel.tenant_id == attempt.tenant_id,
@@ -498,7 +528,27 @@ class OutboundTaskExecutor:
                             record,
                             media_connected=media_connected,
                         )
-                        requires_cleanup = False
+                        requires_cleanup = attempt.dialer_type == "web"
+                    elif (
+                        record is not None
+                        and record.entry_type == "sip_outbound"
+                        and record.total_call_deadline_at is not None
+                        and record.total_call_deadline_at.replace(
+                            tzinfo=record.total_call_deadline_at.tzinfo or timezone.utc
+                        ) <= now
+                    ):
+                        result = DialResult(
+                            call_result="connected" if record.answered_at is not None and media_connected else "call_failed",
+                            duration_ms=(
+                                max(0, int((now - record.answered_at.replace(
+                                    tzinfo=record.answered_at.tzinfo or timezone.utc
+                                )).total_seconds() * 1000))
+                                if record.answered_at is not None else 0
+                            ),
+                            retry_allowed=False,
+                        )
+                        requires_cleanup = True
+                        cleanup_end_reason = "max_total_call_duration"
                     elif record is None:
                         result = DialResult(
                             call_result="call_failed",
@@ -525,13 +575,15 @@ class OutboundTaskExecutor:
                         requires_cleanup = True
                     else:
                         continue
-                recovery_items.append((request, attempt.call_id, result, requires_cleanup))
+                recovery_items.append((
+                    request, attempt.call_id, result, requires_cleanup, cleanup_end_reason,
+                ))
             await db.commit()
-        for request, call_id, result, requires_cleanup in recovery_items:
+        for request, call_id, result, requires_cleanup, cleanup_end_reason in recovery_items:
             if requires_cleanup and not await self._terminate_managed_call(
                 request,
                 call_id=call_id,
-                end_reason="outbound_stale_recovery",
+                end_reason=cleanup_end_reason,
             ):
                 continue
             await self._finish_attempt_with_retry(
@@ -548,7 +600,7 @@ class OutboundTaskExecutor:
         call_id: str,
         end_reason: str,
     ) -> bool:
-        terminate = getattr(self.dialer, "terminate", None)
+        terminate = getattr(self._dialer_for(request), "terminate", None)
         if not callable(terminate):
             return False
         try:
@@ -567,7 +619,10 @@ class OutboundTaskExecutor:
             tasks = (
                 await db.scalars(
                     select(AiCallOutboundTaskModel)
-                    .where(AiCallOutboundTaskModel.status.in_(["PAUSING", "STOPPING"]))
+                    .where(
+                        AiCallOutboundTaskModel.status.in_(["PAUSING", "STOPPING"]),
+                        AiCallOutboundTaskModel.answer_mode.in_(self.answer_modes),
+                    )
                     .order_by(
                         AiCallOutboundTaskModel.updated_at,
                         AiCallOutboundTaskModel.id,
@@ -603,6 +658,7 @@ class OutboundTaskExecutor:
                     select(AiCallOutboundTaskModel)
                     .where(
                         AiCallOutboundTaskModel.status == "SCHEDULED",
+                        AiCallOutboundTaskModel.answer_mode.in_(self.answer_modes),
                         or_(
                             AiCallOutboundTaskModel.next_dispatch_at.is_(None),
                             AiCallOutboundTaskModel.next_dispatch_at <= now,
@@ -648,6 +704,7 @@ class OutboundTaskExecutor:
                     select(AiCallOutboundTaskModel)
                     .where(
                         AiCallOutboundTaskModel.status == "RUNNING",
+                        AiCallOutboundTaskModel.answer_mode.in_(self.answer_modes),
                         or_(
                             AiCallOutboundTaskModel.next_dispatch_at.is_(None),
                             AiCallOutboundTaskModel.next_dispatch_at <= now,
@@ -715,6 +772,7 @@ class OutboundTaskExecutor:
                         )
                         .where(
                             AiCallOutboundTaskModel.status.in_({"RUNNING", "COMPLETED"}),
+                            AiCallOutboundTaskModel.answer_mode.in_(self.answer_modes),
                             AiCallOutboundExceptionBatchModel.status == "RUNNING",
                             AiCallOutboundTargetModel.status == "RETRY_WAIT",
                             AiCallOutboundTargetModel.next_attempt_at <= now,
@@ -807,32 +865,40 @@ class OutboundTaskExecutor:
             )
             if (
                 task is None
+                or task.answer_mode not in self.answer_modes
                 or task.status not in ({"RUNNING", "COMPLETED"} if exception_batch else {"RUNNING"})
                 or not self._within_call_window(task, now)
             ):
                 return None
+            batch = None
+            if exception_batch:
+                batch = await db.scalar(
+                    select(AiCallOutboundExceptionBatchModel).where(
+                        AiCallOutboundExceptionBatchModel.tenant_id == task.tenant_id,
+                        AiCallOutboundExceptionBatchModel.status == "RUNNING",
+                        AiCallOutboundExceptionBatchModel.id.in_(
+                            select(AiCallOutboundTargetModel.exception_batch_id).where(
+                                AiCallOutboundTargetModel.tenant_id == task.tenant_id,
+                                AiCallOutboundTargetModel.task_id == task.id,
+                                AiCallOutboundTargetModel.status == "RETRY_WAIT",
+                                AiCallOutboundTargetModel.next_attempt_at <= now,
+                            )
+                        ),
+                    ).order_by(AiCallOutboundExceptionBatchModel.id).limit(1).with_for_update()
+                )
+                if batch is None:
+                    return None
             is_formal_phone_call = task.answer_mode == "linphone" and (
                 self.dialer.dialer_type == "sip" or self.owner_runtime_start is not None
             )
-            if is_formal_phone_call and not self._task_model(task):
+            if not self._task_model(task):
                 task.status = "PAUSED"
                 task.error_message = "任务缺少模型快照，请确认模型后重新创建任务"
                 task.updated_at = now
                 await db.commit()
                 return None
-            if is_formal_phone_call and self.credit_metering_client is not None:
-                try:
-                    await self.credit_metering_client.require_eligible(
-                        tenant_id=task.tenant_id,
-                        owner_id=str(task.created_by),
-                    )
-                except CreditAdmissionDenied as exc:
-                    task.status = "PAUSED"
-                    task.error_message = str(exc)
-                    task.updated_at = now
-                    await db.commit()
-                    return None
             line = self._task_line_snapshot(task)
+            line_has_capacity = True
             requires_sip_line = task.answer_mode == "linphone" and (
                 self.dialer.dialer_type == "sip" or self.owner_runtime_start is not None
             )
@@ -843,12 +909,7 @@ class OutboundTaskExecutor:
                 task.updated_at = now
                 await db.commit()
                 return None
-            if (
-                task.answer_mode == "linphone"
-                and self.owner_runtime_start is None
-                and self.dialer.dialer_type == "sip"
-                and line is not None
-            ):
+            if requires_sip_line and line is not None:
                 current_line = await db.scalar(
                     select(AiCallSipLineModel)
                     .where(
@@ -866,18 +927,89 @@ class OutboundTaskExecutor:
                     task.updated_at = now
                     await db.commit()
                     return None
-                active_line_attempts = int(
-                    await db.scalar(
-                        select(func.count(AiCallOutboundAttemptModel.id)).where(
-                            AiCallOutboundAttemptModel.tenant_id == task.tenant_id,
-                            AiCallOutboundAttemptModel.line_id == current_line.id,
-                            AiCallOutboundAttemptModel.status.in_({"DIALING", "IN_CALL"}),
+                # 等待线路的号码留在待拨列表，不提前创建有启动期限的命令。
+                # 尚未分配线路的尝试和清理中的线路都占位，同一通只计一次。
+                active_line_calls = (
+                    select(AiCallOutboundAttemptModel.call_id).where(
+                        AiCallOutboundAttemptModel.tenant_id == task.tenant_id,
+                        AiCallOutboundAttemptModel.line_id == current_line.id,
+                        AiCallOutboundAttemptModel.status.in_({
+                            "QUEUED", "STARTING", "DIALING", "IN_CALL",
+                        }),
+                    )
+                    .union(
+                        select(AiCallSipLineReservationModel.call_id).where(
+                            AiCallSipLineReservationModel.tenant_id == task.tenant_id,
+                            AiCallSipLineReservationModel.line_id == current_line.id,
+                            AiCallSipLineReservationModel.status.in_({
+                                "RESERVED", "ACTIVE", "RECONCILE_REQUIRED",
+                            }),
                         )
                     )
-                    or 0
+                    .subquery()
                 )
-                if active_line_attempts >= current_line.max_concurrency:
+                active_line_attempts = await db.scalar(
+                    select(func.count()).select_from(active_line_calls)
+                )
+                line_has_capacity = active_line_attempts < current_line.max_concurrency
+            # 先读取线路占用，再核对上一通费用，避免检查后线路才释放的窗口。
+            if is_formal_phone_call and self.credit_metering_client is not None:
+                unsettled_usage = (await db.execute(
+                    select(
+                        ReachCreditUsageOutboxModel.status,
+                        ReachCreditUsageOutboxModel.attempt_count,
+                        ReachCreditUsageOutboxModel.last_error,
+                    ).where(
+                        ReachCreditUsageOutboxModel.tenant_id == task.tenant_id,
+                        ReachCreditUsageOutboxModel.owner_id == str(task.created_by),
+                        ReachCreditUsageOutboxModel.scenario_code == CREDIT_SCENARIO_CODE,
+                        or_(
+                            ReachCreditUsageOutboxModel.status.in_({"pending", "sending", "failed", "adjustment", "blocked"}),
+                            (ReachCreditUsageOutboxModel.status == "admission")
+                            & or_(
+                                ReachCreditUsageOutboxModel.last_error.is_not(None),
+                                exists().where(
+                                    AiCallOutboundAttemptModel.tenant_id == task.tenant_id,
+                                    AiCallOutboundAttemptModel.call_id == ReachCreditUsageOutboxModel.source_id,
+                                    AiCallOutboundAttemptModel.ended_at.is_not(None),
+                                ),
+                                exists().where(
+                                    AiCallRecordModel.tenant_id == task.tenant_id,
+                                    AiCallRecordModel.call_id == ReachCreditUsageOutboxModel.source_id,
+                                    AiCallRecordModel.ended_at.is_not(None),
+                                ),
+                            ),
+                        ),
+                    ).order_by(ReachCreditUsageOutboxModel.status).limit(1)
+                )).first()
+                # 通话结束到接听核实、平台结算之间仍需等待；在途通话不占用这个等待条件。
+                if unsettled_usage is not None and (
+                    unsettled_usage.status in {"pending", "sending"}
+                    or (unsettled_usage.status == "admission" and unsettled_usage.last_error is None)
+                    or (unsettled_usage.status == "blocked" and unsettled_usage.attempt_count == 0)
+                ):
+                    task.next_dispatch_at = now + timedelta(seconds=2)
+                    task.updated_at = now
+                    await db.commit()
                     return None
+                block_reason = "已有通话费用待处理，请核实后继续" if unsettled_usage is not None else None
+                if block_reason is None:
+                    try:
+                        await self.credit_metering_client.require_eligible(
+                            tenant_id=task.tenant_id, owner_id=str(task.created_by),
+                        )
+                    except CreditAdmissionDenied as exc:
+                        block_reason = str(exc)
+                if block_reason is not None:
+                    if batch is not None:
+                        batch.status, batch.error_message, batch.updated_at = "PAUSED", block_reason, now
+                    else:
+                        task.status, task.error_message = "PAUSING", block_reason
+                        await self._refresh_task_counters_in_session(db, task, now)
+                    await db.commit()
+                    return None
+            if not line_has_capacity:
+                return None
             if (
                 task.answer_mode == "linphone"
                 and self.owner_runtime_start is not None
@@ -902,7 +1034,7 @@ class OutboundTaskExecutor:
                         AiCallOutboundTargetModel.task_id == task_key.task_id,
                         (
                             (
-                                AiCallOutboundTargetModel.exception_batch_id.is_not(None)
+                                (AiCallOutboundTargetModel.exception_batch_id == batch.id)
                                 & (AiCallOutboundTargetModel.status == "RETRY_WAIT")
                                 & (AiCallOutboundTargetModel.next_attempt_at <= now)
                                 & exists(
@@ -953,7 +1085,7 @@ class OutboundTaskExecutor:
                         ),
                         (
                             (
-                                AiCallOutboundTargetModel.exception_batch_id.is_not(None)
+                                (AiCallOutboundTargetModel.exception_batch_id == batch.id)
                                 & (AiCallOutboundTargetModel.status == "RETRY_WAIT")
                                 & (AiCallOutboundTargetModel.next_attempt_at <= now)
                                 & exists(
@@ -1019,18 +1151,28 @@ class OutboundTaskExecutor:
                         request,
                         now=now,
                     )
+                    if is_formal_phone_call and self.credit_metering_client is not None:
+                        attempt_id = await db.scalar(select(AiCallOutboundAttemptModel.id).where(
+                            AiCallOutboundAttemptModel.call_id == call_id,
+                        ))
+                        prepare_call_admission(
+                            db, tenant_id=task.tenant_id, owner_id=str(task.created_by),
+                            attempt_id=attempt_id, call_id=call_id, now=now,
+                        )
                     await db.commit()
                     return ClaimedAttempt(request=request, call_id=call_id)
                 call_id = uuid4().hex
+                dialer = self._dialer_for(request)
+                attempt_id = generate_snowflake_id()
                 db.add(
                     AiCallOutboundAttemptModel(
-                        id=generate_snowflake_id(),
+                        id=attempt_id,
                         tenant_id=request.tenant_id,
                         task_id=request.task_id,
                         target_id=request.target_id,
                         attempt_no=request.attempt_no,
                         call_id=call_id,
-                        dialer_type=self.dialer.dialer_type,
+                        dialer_type=dialer.dialer_type,
                         status="DIALING",
                         call_result=None,
                         error_message=None,
@@ -1045,8 +1187,13 @@ class OutboundTaskExecutor:
                         updated_at=now,
                     )
                 )
-                if not self.dialer.manages_call_record:
+                if not dialer.manages_call_record:
                     db.add(self._mock_record(request, call_id, now))
+                if is_formal_phone_call and self.credit_metering_client is not None:
+                    prepare_call_admission(
+                        db, tenant_id=task.tenant_id, owner_id=str(task.created_by),
+                        attempt_id=attempt_id, call_id=call_id, now=now,
+                    )
                 await db.commit()
                 return ClaimedAttempt(request=request, call_id=call_id)
             await db.rollback()

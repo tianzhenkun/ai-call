@@ -31,6 +31,7 @@ from app.api.v1.ai_call.call_outcome_query import (
 )
 from app.api.v1.ai_call.model import (
     AiCallAfterCallWorkModel,
+    AiCallAgentProfileModel,
     AiCallAsrJobModel,
     AiCallDialogueSegmentModel,
     AiCallEventModel,
@@ -60,7 +61,7 @@ from app.api.v1.ai_call.outbound.rule_task_model import (
     AiCallOutboundTaskModel,
 )
 from app.api.v1.ai_call.voice.model import AiCallTenantVoiceProfileModel
-from app.services.ai_call.call_outcome import detect_answer_type
+from app.services.ai_call.call_outcome import detect_answer_type, realtime_answer_type
 from app.services.ai_call.call_termination import call_end_category
 from app.services.ai_call.classification_review import requires_classification_review
 from app.services.ai_call.runtime_control.models import AiCallEndEvidenceModel
@@ -168,7 +169,14 @@ class AiCallRecordRepository:
         *,
         tenant_id: str,
         call_id: str,
+        user_id: int | None = None,
     ) -> AiCallRecordModel | None:
+        if user_id is not None:
+            result = await self.db.execute(self._record_filters(
+                select(AiCallRecordModel), tenant_id=tenant_id,
+                call_id=call_id, user_id=user_id,
+            ))
+            return result.scalars().first()
         result = await self.db.execute(
             select(AiCallRecordModel).where(
                 AiCallRecordModel.tenant_id == tenant_id,
@@ -176,6 +184,40 @@ class AiCallRecordRepository:
             )
         )
         return result.scalar_one_or_none()
+
+    async def has_assigned_follow_up_record(
+        self, *, tenant_id: str, call_id: str, user_id: int,
+    ) -> bool:
+        return await self.db.scalar(self._assigned_follow_up_record_ids(
+            tenant_id=tenant_id, user_id=user_id,
+        ).where(AiCallRecordModel.call_id == call_id).limit(1)) is not None
+
+    @staticmethod
+    def _assigned_follow_up_record_ids(*, tenant_id: str, user_id: int) -> Select:
+        # 仅在 GET 的只读补充授权中使用；延迟导入以复用服务规则且避免循环导入。
+        from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+        from app.services.ai_call.follow_up_service import AiCallFollowUpService
+
+        handled_scope = AiCallFollowUpService.account_handled_follow_up_scope(tenant_id, user_id)
+        follow_up_ids = select(AiCallFollowUpTaskModel.id).where(handled_scope).correlate(None)
+        source_call_ids = select(AiCallFollowUpTaskModel.source_call_id).where(handled_scope).correlate(None)
+        enabled_profile = select(AiCallAgentProfileModel.id).where(
+            AiCallAgentProfileModel.tenant_id == tenant_id,
+            AiCallAgentProfileModel.user_id == user_id,
+            AiCallAgentProfileModel.enabled.is_(True),
+        ).exists()
+        return (
+            select(AiCallRecordModel.id)
+            .where(
+                AiCallRecordModel.tenant_id == tenant_id,
+                enabled_profile,
+                or_(
+                    AiCallRecordModel.call_id.in_(AiCallAgentConsoleService.account_handled_call_ids(tenant_id, user_id)),
+                    AiCallRecordModel.call_id.in_(source_call_ids),
+                    AiCallRecordModel.follow_up_id.in_(follow_up_ids),
+                ),
+            )
+        )
 
     async def get_exception_handling(
         self,
@@ -635,6 +677,7 @@ class AiCallRecordRepository:
         self,
         *,
         tenant_id: str | None = None,
+        user_id: int | None = None,
         call_id: str | None = None,
         task_id: int | None = None,
         target_id: int | None = None,
@@ -659,6 +702,7 @@ class AiCallRecordRepository:
         stmt = self._record_filters(
             select(AiCallRecordModel),
             tenant_id=tenant_id,
+            user_id=user_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,
@@ -681,6 +725,7 @@ class AiCallRecordRepository:
         count_stmt = self._record_filters(
             select(func.count()).select_from(AiCallRecordModel),
             tenant_id=tenant_id,
+            user_id=user_id,
             call_id=call_id,
             task_id=task_id,
             target_id=target_id,
@@ -964,8 +1009,29 @@ class AiCallRecordRepository:
                     else None
                 ),
             }
+        pending_call_ids = [call_id for call_id in call_ids if (
+            analysis_by_call_id.get(call_id, {}).get("analysisStatus") != SEMANTIC_ANALYSIS_STATUS_SUCCEEDED
+        )]
+        verified_by_call = {}
+        if pending_call_ids:
+            evidence_rows = (await self.db.scalars(select(AiCallEventModel).join(
+                AiCallRecordModel, AiCallRecordModel.call_id == AiCallEventModel.call_id,
+            ).where(
+                AiCallEventModel.call_id.in_(pending_call_ids),
+                AiCallEventModel.event_type == "call_answer_verified",
+                AiCallEventModel.source == "agent",
+                AiCallEventModel.event_time >= AiCallRecordModel.answered_at,
+                or_(AiCallRecordModel.ended_at.is_(None), AiCallEventModel.event_time <= AiCallRecordModel.ended_at),
+            ).order_by(AiCallEventModel.id.desc()))).all()
+            for evidence in evidence_rows:
+                verified_by_call.setdefault(evidence.call_id, evidence)
         for record in records:
             context = analysis_by_call_id.get(record.call_id, {})
+            evidence = verified_by_call.get(record.call_id)
+            if evidence is not None:
+                answer_type = realtime_answer_type(evidence.payload)
+                if answer_type is not None:
+                    context["answerType"] = answer_type
             record._semantic_analysis_context = context
             record._semantic_analysis_result = context.get("analysisResult")
 
@@ -2762,12 +2828,14 @@ class AiCallRecordRepository:
         self,
         *,
         tenant_id: str,
+        user_id: int | None,
         voice: str,
         target_model: str,
     ) -> AiCallTenantVoiceProfileModel | None:
         result = await self.db.execute(
             select(AiCallTenantVoiceProfileModel).where(
                 AiCallTenantVoiceProfileModel.tenant_id == tenant_id,
+                AiCallTenantVoiceProfileModel.created_by == user_id,
                 AiCallTenantVoiceProfileModel.voice == voice,
                 AiCallTenantVoiceProfileModel.target_model == target_model,
                 AiCallTenantVoiceProfileModel.status == "ENABLED",
@@ -2898,6 +2966,7 @@ class AiCallRecordRepository:
         scene_codes: list[str],
         now: datetime,
         limit: int,
+        account_scope=None,
     ) -> list[AiCallHandoffModel]:
         if not scene_codes:
             return []
@@ -2907,6 +2976,7 @@ class AiCallRecordRepository:
                 AiCallHandoffModel.tenant_id == tenant_id,
                 AiCallHandoffModel.status == "requested",
                 AiCallHandoffModel.scene_code.in_(scene_codes),
+                account_scope if account_scope is not None else True,
                 or_(AiCallHandoffModel.expires_at.is_(None), AiCallHandoffModel.expires_at > now),
             )
             .order_by(asc(AiCallHandoffModel.requested_at), asc(AiCallHandoffModel.id))
@@ -2919,12 +2989,14 @@ class AiCallRecordRepository:
         *,
         tenant_id: str,
         handoff_id: str,
+        account_scope=None,
     ) -> AiCallHandoffModel | None:
         if self._dialect_name() == "postgresql":
             # 所有坐席写入口与 Runtime 一致，先锁通话，再锁交接和在线状态。
             call_id = select(AiCallHandoffModel.call_id).where(
                 AiCallHandoffModel.tenant_id == tenant_id,
                 AiCallHandoffModel.handoff_id == handoff_id,
+                account_scope if account_scope is not None else True,
             ).scalar_subquery()
             await self.db.execute(select(AiCallRecordModel).where(
                 AiCallRecordModel.tenant_id == tenant_id,
@@ -2933,6 +3005,7 @@ class AiCallRecordRepository:
         stmt = select(AiCallHandoffModel).execution_options(populate_existing=True).where(
             AiCallHandoffModel.tenant_id == tenant_id,
             AiCallHandoffModel.handoff_id == handoff_id,
+            account_scope if account_scope is not None else True,
         )
         if self._dialect_name() == "postgresql":
             stmt = stmt.with_for_update()
@@ -3210,6 +3283,11 @@ class AiCallRecordRepository:
                         == func.coalesce(source_call_id, AiCallRecordModel.call_id),
                         and_(
                             source_call_id.is_(None),
+                            # 人工回拨可引用原外呼 attempt，两次通话的 call_id 不同。
+                            or_(
+                                AiCallOutboundAttemptModel.call_id.is_(None),
+                                AiCallRecordModel.entry_type == "sip_callback",
+                            ),
                             AiCallRecordModel.business_type == "outbound_attempt",
                             AiCallRecordModel.business_id
                             == cast(AiCallOutboundAttemptModel.id, String),
@@ -3241,6 +3319,7 @@ class AiCallRecordRepository:
     @staticmethod
     def _record_filters(stmt: Select, **filters) -> Select:
         tenant_id = str(filters.get("tenant_id") or "").strip() or None
+        user_id = filters.get("user_id")
         phone_number = str(filters.get("phone_number") or "").strip() or None
         customer_name = str(filters.get("customer_name") or "").strip() or None
         call_result = str(filters.get("call_result") or "").strip() or None
@@ -3271,8 +3350,11 @@ class AiCallRecordRepository:
                 formal_outbound_only,
             )
         )
-        if tenant_id or has_outbound_filters:
+        if tenant_id or has_outbound_filters or user_id is not None:
             stmt = AiCallRecordRepository._join_record_outbound_context(stmt)
+        if user_id is not None:
+            # 普通记录按原任务创建人归属；未能关联任务的历史记录不向账号开放。
+            stmt = stmt.where(AiCallOutboundTaskModel.created_by == user_id)
         if tenant_id:
             tenant_conditions = [
                 and_(

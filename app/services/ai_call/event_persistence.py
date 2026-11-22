@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.v1.ai_call.crud import AiCallRecordRepository
+from app.api.v1.ai_call.model import AiCallRecordModel
 from app.config.setting import settings
 from app.core.logger import log
 from app.services.ai_call.event_store import AiCallEvent, InMemoryEventStore
@@ -13,6 +15,7 @@ from app.services.ai_call.handoff_service import AiCallHandoffService
 from app.services.ai_call.livekit_egress import LiveKitEgressManager
 from app.services.ai_call.record_service import AiCallRecordService
 from app.services.ai_call.recording_service import AiCallRecordingService
+from app.services.ai_call.semantic_analysis import AiCallSemanticAnalysisService
 
 TERMINAL_RECORD_EVENT_TYPES = frozenset({"session_completed", "session_failed", "model_error"})
 
@@ -135,6 +138,12 @@ class AiCallEventPersistenceWorker:
                 async with db.begin():
                     service = AiCallRecordService(AiCallRecordRepository(db))
                     persisted = await service.mirror_runtime_events(events)
+                    for call_id in {event.call_id for event in events if event.type == "call_answer_verified"}:
+                        # 和通话结束结算串行，兼容证据落库晚于结束投影的情况。
+                        await db.scalar(select(AiCallRecordModel).where(
+                            AiCallRecordModel.call_id == call_id,
+                        ).with_for_update())
+                        await AiCallSemanticAnalysisService(service.repository)._record_outbound_billing_fact(call_id)
                     if self.project_terminal_records:
                         terminal_call_ids = await self._mirror_terminal_records(
                             service,
