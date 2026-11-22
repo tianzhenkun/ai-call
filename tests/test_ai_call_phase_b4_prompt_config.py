@@ -1113,6 +1113,7 @@ async def test_prompt_optimizer_returns_candidate_without_saving() -> None:
         system_prompt = payload["messages"][0]["content"]
         assert "允许询问并记录微信等联系方式" in system_prompt
         assert "不得声称已经添加微信、发送资料、完成预约" in system_prompt
+        assert "也不得承诺尚未确认的后续联系" in system_prompt
         return httpx.Response(
             200,
             json={
@@ -1203,20 +1204,107 @@ async def test_prompt_optimizer_retries_once_with_validation_feedback() -> None:
 
 
 @pytest.mark.parametrize(
-    "candidate",
+    ("target_type", "candidate"),
     [
-        "我已经添加您微信了。",
-        "资料已经发给您了。",
-        "已经为您预约成功。",
-        "我先记录，稍后会有顾问联系您。",
+        ("opening", "我已经添加您微信了。"),
+        ("opening", "资料已经发给您了。"),
+        ("opening", "已经为您预约成功。"),
+        ("opening", "我先记录，稍后会有顾问联系您。"),
+        ("opening", "禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "稍后会有顾问联系您"),
+        ("scenePrompt", "请对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "禁止对客户说‘稍后会有顾问联系您’，改说“资料已经发给您了”。"),
+        ("scenePrompt", "稍后会有顾问联系您。禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "不必禁止对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "禁止对客户说‘您好。请对客户说‘稍后会有顾问联系您’"),
+        ("scenePrompt", "禁止对客户说稍后会有顾问联系您，改说您的预约已经办好了。"),
+        ("scenePrompt", "错误示例：“稍后会有顾问联系您。” 正确示例：“我明天下午三点给您回电。”"),
+        ("scenePrompt", "客户问：“稍后会有顾问联系我吗？” AI 回答：“顾问一定给您回电。”"),
+        ("scenePrompt", "客户问：“顾问会给我回电吗？”\nAI 回答：“会的。”"),
+        ("scenePrompt", "客户问：“我的预约已经办好了吗？”\nAI 回答：“是的。”"),
+        ("scenePrompt", "客户：“顾问会给我回电吗？”\n示例：“一定会。”"),
+        ("scenePrompt", "我明天下午会给您回电，可以吗？"),
+        ("scenePrompt", "已帮您约好了。"),
+        ("scenePrompt", "只有系统确认预约成功后，才可告知客户：“已经为您预约成功，顾问一定给您回电。”"),
+        ("scenePrompt", "只有系统确认资料发送成功后，才可告知客户：“您的预约已经办好了。”"),
+        ("scenePrompt", "系统尚未确认预约成功，也告诉客户“您的预约已经办好了”。"),
+        ("scenePrompt", "若客户同意，就回答“您的预约已经办好了”。"),
     ],
 )
-def test_prompt_optimizer_rejects_unavailable_follow_up_promises(candidate: str) -> None:
+def test_prompt_optimizer_rejects_unavailable_follow_up_promises(target_type: str, candidate: str) -> None:
     with pytest.raises(ValueError, match="系统未支持的动作承诺"):
         OpenAICompatiblePromptOptimizer._validate_result(
-            {"currentContent": "", "allowedVariables": []},
+            {"targetType": target_type},
             {"candidateContent": candidate},
         )
+
+
+@pytest.mark.parametrize("candidate", [
+    "禁止对客户说‘稍后会有顾问联系您’",
+    "沟通规则：不得向客户承诺：“稍后会有顾问联系您。”",
+    "1. 不要说「资料已经发给您了」。\n2. 禁止说‘已经为您预约成功’。",
+    "您希望顾问明天下午给您回电吗？",
+    "我不能保证顾问明天下午一定给您回电。",
+    "顾问不一定给您回电。",
+    "客户问：“您能帮我查一下预约已经办好了吗？”\nAI 回答：“可以，我帮您查一下。”",
+    "客户问：“您能帮我查一下预约已经办好了吗？”\nAI 回答：“会的。”",
+    "如果您已预约，请准备好到店所需的资料。",
+    "若系统返回预约成功，可告知客户：您的预约已经办好了。",
+    "只有系统确认回电已安排后，才可告知客户“已为您安排回电”。",
+])
+def test_scene_prompt_preserves_permitted_candidate(candidate: str) -> None:
+    result = OpenAICompatiblePromptOptimizer._validate_result(
+        {"targetType": "scenePrompt"}, {"candidateContent": candidate},
+    )
+    assert result["candidateContent"] == candidate
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("candidate", "status"), [
+    pytest.param("禁止对客户说稍后会有顾问联系您。", 200, id="unquoted-prohibition"),
+    pytest.param("错误示例：“稍后会有顾问联系您。”", 200, id="counterexample"),
+    pytest.param("禁止说“稍后会有顾问联系您”或“资料已经发给您了”。", 200, id="two-prohibited-examples"),
+    pytest.param("禁止对客户说：\n“稍后会有顾问联系您。”", 200, id="example-on-next-line"),
+    pytest.param("客户问：“稍后会有顾问联系我吗？”\nAI 回答：“您希望我们怎么联系您？”", 200, id="customer-question"),
+    pytest.param("您希望顾问回电吗？", 200, id="ask-consent"),
+    pytest.param("您放心，我们的顾问明天下午一定给您回电。", 502, id="promise-callback"),
+    pytest.param("您的预约已经办好了。", 502, id="claim-booking"),
+    pytest.param("只有系统确认预约成功后，才可告知客户：“已经为您预约成功。”", 200, id="confirmed-booking"),
+    pytest.param("已经为您预约成功。", 502, id="unconfirmed-booking"),
+    pytest.param("资料已经发给您了。", 502, id="unconfirmed-delivery"),
+    pytest.param("我已经添加您微信了。", 502, id="unconfirmed-contact"),
+])
+async def test_scene_prompt_promise_api(b4_service, candidate: str, status: int) -> None:
+    service, *_ = b4_service
+    requests = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = json.dumps({"candidateContent": candidate, "warnings": []}, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    service.prompt_optimizer = OpenAICompatiblePromptOptimizer(
+        base_url="https://model.test/v1", api_key="test-key", model="test-model",
+        transport=httpx.MockTransport(reply),
+    )
+    app = FastAPI()
+    app.include_router(AiCallRouter)
+    handle_exception(app)
+    app.dependency_overrides[get_ai_call_service] = lambda: service
+    app.dependency_overrides[get_prompt_manager] = lambda: SimpleNamespace(
+        user=SimpleNamespace(tenant_id=TEST_TENANT_ID, user_id=7),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        response = await client.post("/ai-call/prompt-profiles/ai-optimize", json={
+            "targetType": "scenePrompt", "operation": "generate", "sceneContext": {"sceneName": "门店咨询"},
+        })
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["data"]["candidateContent"] == candidate
+        assert len(requests) == 1
+    else:
+        assert response.json()["msg"] == "提示词 AI 优化失败：AI 优化生成了系统未支持的动作承诺"
+        assert len(requests) == 2
 
 
 @pytest.mark.parametrize(

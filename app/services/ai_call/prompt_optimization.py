@@ -18,9 +18,92 @@ UNSUPPORTED_PROMISE_RE = re.compile(
     r"(?:已(?:经)?安排|会有|将有).{0,8}(?:顾问|工作人员).{0,8}联系|"
     r"(?:我|我们|这边).{0,4}(?:会|将).{0,4}安排.{0,8}(?:顾问|工作人员).{0,8}联系)"
 )
-NEGATED_PROMISE_RULE_RE = re.compile(
-    r"""(?:不得|不要|不能|禁止|避免|不)(?:主动|直接|向客户|对客户)*(?:声称|宣称|承诺|说|告知)[ ：:“「‘"']*$"""
+_RULE_START = r"""(?:^|(?<=[\r\n。！？；，：、.!?;,:’”」』'"]))[ \t]*(?:[-*][ \t]*)?"""
+_VALUE_SPACE = r"[ \t]*(?:\r?\n[ \t]*)?"
+_QUOTED = r"""(?:‘[^‘’\r\n]*’|“[^“”\r\n]*”|「[^「」\r\n]*」|『[^『』\r\n]*』|'[^'\r\n]*'|"[^"\r\n]*")"""
+# 无引号时，禁语只管当前分句。转折、改说或下一位说话人开始新的话术。
+_PLAIN_EXAMPLE = (
+    r"(?:(?!但|不过|然而|而[要应]|改说|改为|然后|转而|(?:AI|坐席)[ \t]*(?:回答|答|说|回复))"
+    r"""[^\r\n，,。.!?！？；;：:‘’“”「」『』'"])+"""
 )
+_PROHIBITED_EXAMPLE = (
+    rf"{_RULE_START}(?:(?:我(?:们)?|这边)?请?(?:禁止|严禁|不要|不得|不能|无法|切勿|勿)(?:直接)?(?:[对向]客户)?"
+    r"(?:直接)?(?:说(?:出)?|承诺|声称|保证)[ \t]*[:：]?|(?:错误示例|反面示例|反例|禁用话术|禁语)[ \t]*[:：])"
+    rf"{_VALUE_SPACE}(?:{_QUOTED}(?:[ \t]*(?:或(?:者)?|、|以及|和)[ \t]*{_QUOTED})*|{_PLAIN_EXAMPLE})"
+)
+_CUSTOMER_QUESTION = (
+    rf"{_RULE_START}(?:客户|用户)(?:(?:提问|询问|问(?:道)?)[ \t]*[:：]?|[ \t]*[:：]){_VALUE_SPACE}"
+    r"""[‘“「『'"]?(?P<question>[^。.!！?？；;：:\r\n‘’“”「」『』'"]+(?:[？?]|[吗呢么](?=[。’”」』'"\r\n]|$)))"""
+)
+_AFFIRMATIVE_REPLY = re.compile(
+    r"""[’”」』'"]?\s*(?:(?:AI|坐席|客服|助手)[ \t]*(?:回答|回复|答|说)?|参考回答|回答|答|示例)[ \t]*[:：][ \t]*[‘“「『'"]?"""
+    r"""(?:会的?|一定会|肯定会|是的|没错|办好了|约好了)(?=[。！.!’”」』'"\r\n]|$)"""
+)
+_NON_ASSERTING_QUESTION = re.compile(
+    r"(?:帮我|替我|能否|麻烦|请)(?:先)?(?:查|核实|核对|确认一下)|尚未|还没|未必|不一定|(?<!会)不会"
+)
+
+_BOOKING_RECEIPT = (
+    r"(?:已(?:经)?(?:为|帮|给)[您你](?:预约(?:成功|完成|好了?)?|约好了?)|"
+    r"(?:[您你]的)?预约(?:已(?:经)?(?:办好|安排好|完成|成功|确认)了?|(?:办好|安排好|完成|成功)了)|"
+    r"""(?:^|(?<=[\r\n，,。；;：:‘“「『'"]))[ \t]*(?:[您你]的)?(?:已(?:经)?)?预约成功(?=[。！!，,；;”’」』'"\s]|$))"""
+)
+_CALLBACK_SCHEDULED = r"(?:已(?:经)?(?:为您|给您)?安排(?:了)?(?:顾问)?(?:回电|回拨)|(?:回电|回拨)已(?:经)?安排(?:好)?了?)"
+_CALLBACK_TIME = (
+    r"(?:稍后|晚点|待会儿?|明天|后天|今天|今晚)(?:上午|中午|下午|晚上)?"
+    r"(?:[一二两三四五六七八九十\d]{1,3}(?:点(?:半|\d{1,2}分?)?|[:：]\d{2}))?"
+)
+_STAFF = r"(?:业务顾问|顾问|工作人员|客服|同事|专员)"
+_CALLBACK = r"(?:主动|尽快|再)?(?:给[您你]|向[您你])?(?:再)?(?:回电|回拨|回(?:个)?电话|打(?:个)?电话|致电|联系[您你])"
+_CALLBACK_COMMITMENT = (
+    rf"(?:一定|肯定|保证|将会?|会|{_CALLBACK_TIME})(?:一定|肯定|将会?|会)?(?:安排|让)?{_STAFF}?{_CALLBACK}"
+)
+_CALLBACK_PLAN = rf"(?:安排|让|由)?(?:我(?:们)?(?:的)?)?{_STAFF}?在?(?:{_CALLBACK_TIME})?会?{_CALLBACK}"
+_CALLBACK_OFFER = rf"(?:[您你](?:是否)?(?:希望|需要|愿意)|是否需要){_CALLBACK_PLAN}(?:吗|呢)?[？?]"
+_UNCERTAIN_CALLBACK = rf"(?:不会|不一定|未必|可能)(?:会)?{_CALLBACK_PLAN}"
+_SCENE_PROMISE = re.compile(
+    rf"{UNSUPPORTED_PROMISE_RE.pattern}|{_BOOKING_RECEIPT}|{_CALLBACK_SCHEDULED}|{_CALLBACK_COMMITMENT}"
+)
+
+# 确认条件只覆盖紧接着告知的同一项结果，后续分句仍按普通话术检查。
+_CONFIRMED_REPORTS = tuple(
+    (
+        rf"{_RULE_START}(?:只有|只要|仅[当在]|当|如果|若|待|在)系统(?:明确|已经|已)?(?:确认|返回|显示)(?:了)?{outcome}"
+        r"(?:之?后|时)?[ \t]*[，,]?[ \t]*(?:才(?:可(?:以)?|能)?|再|方可|(?:则)?可(?:以)?)?"
+        r"(?:[向对]客户)?(?:告知|告诉|通知|回复|说(?:明)?)(?:客户)?[ \t]*[:：]?"
+        rf"""{_VALUE_SPACE}[‘“「『'"]?(?:您好[，,][ \t]*)?(?:我(?:们)?)?{receipt}"""
+    )
+    for outcome, receipt in (
+        (r"预约(?:已(?:经)?)?(?:成功|完成)", _BOOKING_RECEIPT),
+        (rf"(?:{_CALLBACK_SCHEDULED}|(?:回电|回拨)安排成功)", _CALLBACK_SCHEDULED),
+        (r"资料(?:已发送|发送成功)", r"(?:资料已(?:经)?(?:发送|发给您)了?|已(?:经)?(?:给您)?发送(?:了)?资料)"),
+        (r"微信(?:已添加|添加成功)", r"已(?:经)?(?:添加了?|加了)(?:您的?)?微信"),
+    )
+)
+_SCENE_CONTEXT = re.compile("|".join((
+    _PROHIBITED_EXAMPLE, _CUSTOMER_QUESTION, _CALLBACK_OFFER, _UNCERTAIN_CALLBACK, *_CONFIRMED_REPORTS,
+)))
+
+
+def _affirmed_customer_question(context: re.Match[str]) -> str:
+    question = context["question"]
+    if (
+        question
+        and _AFFIRMATIVE_REPLY.match(context.string, context.end())
+        and not _NON_ASSERTING_QUESTION.search(question)
+    ):
+        # 坐席只答“会的”或“是的”时，承接客户问的动作。“给我回电”在答复里指给客户回电。
+        affirmed = re.sub(r"(给|向|联系)我(?:们)?", r"\1您", question)
+        return "\n" + affirmed.replace("会不会", "会") + "\n"
+    return "\n"
+
+
+def _has_unsupported_promise(candidate: str, *, scene_prompt: bool) -> bool:
+    if not scene_prompt:
+        return bool(UNSUPPORTED_PROMISE_RE.search(candidate))
+    # 在原稿上划定每段范围，避免移除示例后把前后两段拼成一条新规则。
+    speech = _SCENE_CONTEXT.sub(_affirmed_customer_question, candidate)
+    return bool(_SCENE_PROMISE.search(speech))
 
 
 class PromptOptimizerProtocol(Protocol):
@@ -62,8 +145,9 @@ class OpenAICompatiblePromptOptimizer:
                 "只能使用 allowedVariables 中的变量，保留原内容已有变量；"
                 "currentContent 非空时必须产生实质改进，不得原样返回；"
                 "允许询问并记录微信等联系方式，也可以表达后续沟通意向；"
-                "不得声称已经添加微信、发送资料、完成预约，"
-                "也不得承诺尚未确认的后续联系；"
+                "动作未经系统确认时，不得声称已经添加微信、发送资料、完成预约，"
+                "也不得承诺尚未确认的后续联系，例如保证顾问稍后回电。"
+                "场景提示词可引用禁语示例和客户提问，也可规定系统明确确认成功后才告知对应结果。"
                 "开场白不要生成停顿标记。"
                 "开场白及对话示例的每轮口播总字数不超过 60 字，通常为 1 到 2 个短句，"
                 "单句尽量 10 到 20 字，只讲一个重点；不为凑字数加长，也不得省略金额、时间、否定或必要条件。"
@@ -193,17 +277,8 @@ class OpenAICompatiblePromptOptimizer:
             raise ValueError("AI 优化删除或修改了原有变量")
         if payload.get("targetType") == "opening" and "[停顿" in candidate:
             raise ValueError("开场白暂不支持精确停顿")
-        guarded_end = None
-        for match in UNSUPPORTED_PROMISE_RE.finditer(candidate):
-            # 场景规则里的禁止项可以列举受限动作，但新的句子或话术示例仍须独立校验。
-            guarded = payload.get("targetType") == "scenePrompt" and (
-                NEGATED_PROMISE_RULE_RE.search(candidate[max(0, match.start() - 40):match.start()])
-                or guarded_end is not None
-                and re.fullmatch(r"""[ 、/或和与“”「」‘’"']+""", candidate[guarded_end:match.start()])
-            )
-            if not guarded or re.search(r"[。？！；，\n]", match[0]):
-                raise ValueError("AI 优化生成了系统未支持的动作承诺")
-            guarded_end = match.end()
+        if _has_unsupported_promise(candidate, scene_prompt=payload.get("targetType") == "scenePrompt"):
+            raise ValueError("AI 优化生成了系统未支持的动作承诺")
         warnings = result.get("warnings")
         return {
             "candidateContent": candidate,
