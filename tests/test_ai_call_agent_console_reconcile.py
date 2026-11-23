@@ -273,6 +273,55 @@ async def _seed_management_rows(session_factory) -> datetime:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("changes", "enabled", "expected"),
+    [
+        ({}, True, "available"),
+        ({"last_seen_at": None}, True, "offline"),
+        ({"heartbeat_expired": True}, True, "offline"),
+        ({"console_session_id": None}, True, "offline"),
+        ({"status": "paused"}, True, "paused"),
+        ({"status": "in_call", "active_call_id": "call-1"}, True, "in_call"),
+        ({"active_handoff_id": "handoff-1"}, True, "occupied"),
+        ({"scene_removed": True}, True, "no_scene"),
+        ({}, False, "disabled"),
+    ],
+)
+async def test_agent_management_uses_the_same_readiness_in_list_detail_and_metrics(
+    session_factory, changes, enabled, expected
+) -> None:
+    now = await _seed_management_rows(session_factory)
+    async with session_factory() as db:
+        profile = await db.get(AiCallAgentProfileModel, 20)
+        presence = await db.get(AiCallHandoffAgentModel, 20)
+        profile.enabled = enabled
+        presence.status = "available"
+        presence.active_handoff_id = None
+        presence.active_call_id = None
+        for key, value in changes.items():
+            if key == "scene_removed":
+                await db.delete(await db.get(AiCallAgentSceneScopeModel, 200))
+            elif key == "heartbeat_expired":
+                presence.last_seen_at = now - timedelta(seconds=60)
+            else:
+                setattr(presence, key, value)
+        await db.flush()
+
+        service = AiCallAgentConsoleReconciler(db)
+        auth = _auth(db)
+        agents = await service.list_agents(auth)
+        row = next(row for row in agents["rows"] if row["id"] == "20")
+        detail = await service.get_agent_status(auth, 20)
+
+        assert row["runtime_status"] == detail["runtime_status"] == expected
+        assert row["status"] == detail["status"] == presence.status
+        assert row["last_seen_at"] == detail["last_seen_at"]
+        assert agents["metrics"]["available"] == int(expected == "available")
+        assert agents["metrics"]["in_call"] == int(expected == "in_call")
+        assert agents["metrics"]["online"] == int(expected not in {"disabled", "offline"})
+
+
+@pytest.mark.anyio
 async def test_admin_queries_return_metrics_details_and_string_ids(
     session_factory, monkeypatch
 ) -> None:

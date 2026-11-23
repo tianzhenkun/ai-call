@@ -36,7 +36,10 @@ from app.common.constant import RET
 from app.core.dependencies import has_ai_call_tenant_management
 from app.core.exceptions import CustomException
 from app.core.logger import log
-from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
+from app.services.ai_call.agent_console_service import (
+    AGENT_CONSOLE_HEARTBEAT_TTL,
+    AiCallAgentConsoleService,
+)
 from app.services.ai_call.exceptions import AiCallError
 from app.services.ai_call.follow_up_service import AiCallFollowUpService
 from app.services.ai_call.record_service import AiCallRecordService
@@ -235,8 +238,8 @@ class AiCallAgentConsoleReconciler:
             "metrics": {
                 "enabled": sum(row["enabled"] for row in rows),
                 "online": sum(bool(row["online"]) for row in rows),
-                "available": sum(row["status"] == "available" for row in rows),
-                "in_call": sum(row["status"] == "in_call" for row in rows),
+                "available": sum(row["runtime_status"] == "available" for row in rows),
+                "in_call": sum(row["runtime_status"] == "in_call" for row in rows),
                 "stale_occupied": sum(bool(row["stale_occupied"]) for row in rows),
             },
             "rows": rows,
@@ -1025,20 +1028,35 @@ class AiCallAgentConsoleReconciler:
             and presence.status in {"claiming", "in_call", "reconnecting", "wrap_up_quick"}
             and not active_reference
         )
-        stale_heartbeat = bool(
+        heartbeat_age = (
+            datetime.now(timezone.utc) - cls._utc(presence.last_seen_at)
+            if presence is not None and presence.last_seen_at is not None
+            else None
+        )
+        stale_heartbeat = (
             active_reference
-            and presence is not None
-            and presence.last_seen_at is not None
-            and (datetime.now(timezone.utc) - cls._utc(presence.last_seen_at)).total_seconds() > 30
+            and heartbeat_age is not None
+            and heartbeat_age > AGENT_CONSOLE_HEARTBEAT_TTL
         )
         stale = orphan_occupied or stale_heartbeat
         online = bool(
-            presence is not None
-            and presence.status != "offline"
-            and presence.last_seen_at is not None
-            and (datetime.now(timezone.utc) - cls._utc(presence.last_seen_at)).total_seconds()
-            <= 30
+            profile.enabled
+            and presence is not None
+            and presence.console_session_id
+            and status_value != "offline"
+            and heartbeat_age is not None
+            and heartbeat_age <= AGENT_CONSOLE_HEARTBEAT_TTL
         )
+        runtime_status = status_value
+        if not profile.enabled:
+            runtime_status = "disabled"
+        elif not online:
+            runtime_status = "offline"
+        elif status_value == "available":
+            if active_reference:
+                runtime_status = "occupied"
+            elif not scene_codes:
+                runtime_status = "no_scene"
         return {
             "id": str(profile.id),
             "user_id": str(profile.user_id),
@@ -1048,6 +1066,7 @@ class AiCallAgentConsoleReconciler:
             "enabled": profile.enabled,
             "scene_codes": scene_codes,
             "status": status_value,
+            "runtime_status": runtime_status,
             "online": online,
             "active_handoff_id": presence.active_handoff_id if presence else None,
             "active_call_id": presence.active_call_id if presence else None,

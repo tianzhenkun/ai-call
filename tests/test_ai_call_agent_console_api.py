@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -749,6 +749,8 @@ async def test_delete_own_idle_seat_and_restore_its_identity(db_session) -> None
         await db_session.flush()
         assert (await client.delete(path)).status_code == 409
         follow_up.status = "completed"
+        presence.status = "available"
+        presence.last_seen_at = now - timedelta(minutes=1)
         await db_session.flush()
         assert (await client.delete(path)).status_code == 200
         assert (await client.delete(path)).status_code == 404
@@ -757,6 +759,7 @@ async def test_delete_own_idle_seat_and_restore_its_identity(db_session) -> None
     assert await service.list_profiles(auth) == []
     assert profile.deleted_at is not None and not profile.enabled
     assert isinstance(presence, AiCallHandoffAgentModel) and presence.console_session_id is None
+    assert presence.status == "offline"
     assert (await db_session.get(AiCallFollowUpTaskModel, 1)).owner_agent_identity == profile.agent_identity
     with pytest.raises(CustomException, match="当前账号未开通坐席功能"):
         await service.bootstrap_payload(auth)

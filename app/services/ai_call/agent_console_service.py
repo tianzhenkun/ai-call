@@ -49,6 +49,9 @@ from app.services.ai_call.runtime_control.handoff_repository import (
 from app.utils.id_util import generate_snowflake_id
 
 
+AGENT_CONSOLE_HEARTBEAT_TTL = timedelta(seconds=30)
+
+
 @dataclass(frozen=True)
 class HandoffClaimResult:
     handoff: AiCallHandoffModel
@@ -807,10 +810,19 @@ class AiCallAgentConsoleService:
         profile = await self._locked_profile(tenant_id, profile_id)
         await self.require_profile_access(auth, profile)
         presence = await self._presence(profile, for_update=True)
+        now = datetime.now(timezone.utc)
+        online = (
+            presence is not None
+            and presence.status != "offline"
+            and presence.console_session_id
+            and presence.last_seen_at is not None
+            and now - self._ensure_utc(presence.last_seen_at) <= AGENT_CONSOLE_HEARTBEAT_TTL
+        )
         if presence is not None and (
-            presence.status != "offline" or presence.active_handoff_id or presence.active_call_id
+            online or presence.status in self._BUSY_PRESENCE_STATUSES
+            or presence.active_handoff_id or presence.active_call_id
         ):
-            self._raise_conflict("请让坐席离线并结束当前通话后再删除", "AGENT_DELETE_BUSY")
+            self._raise_conflict("请结束当前通话并让坐席离线后再删除", "AGENT_DELETE_BUSY")
         pending_follow_up = await self.db.scalar(
             select(AiCallFollowUpTaskModel.id)
             .where(
@@ -823,13 +835,14 @@ class AiCallAgentConsoleService:
         if pending_follow_up is not None:
             self._raise_conflict("请先处理该坐席名下未完成的回访任务", "AGENT_DELETE_BUSY")
 
-        now = datetime.now(timezone.utc)
         profile.enabled = False
         profile.deleted_at = now
         profile.updated_by = user.id
         profile.updated_at = now
         if presence is not None:
+            presence.status = "offline"
             presence.console_session_id = None
+            presence.status_updated_at = now
         await self._clear_scene_scopes(profile)
         await self.db.flush()
 
@@ -904,7 +917,7 @@ class AiCallAgentConsoleService:
             and not presence.active_call_id
             and presence.last_seen_at is not None
             and datetime.now(timezone.utc) - self._ensure_utc(presence.last_seen_at)
-            > timedelta(seconds=30)
+            > AGENT_CONSOLE_HEARTBEAT_TTL
         ):
             presence.status = "offline"
             presence.console_session_id = None
@@ -1314,7 +1327,7 @@ class AiCallAgentConsoleService:
             self._raise_conflict("坐席当前不可接单", "AGENT_NOT_AVAILABLE")
         if presence.last_seen_at is None or (
             datetime.now(timezone.utc) - self._ensure_utc(presence.last_seen_at)
-        ) > timedelta(seconds=30):
+        ) > AGENT_CONSOLE_HEARTBEAT_TTL:
             now = datetime.now(timezone.utc)
             presence.status = "offline"
             presence.status_updated_at = now
