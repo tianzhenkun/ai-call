@@ -1028,6 +1028,16 @@ async def update_agent_controller(
     return SuccessResponse(data=await service.profile_payload(profile))
 
 
+@AgentAdminRouter.delete("/agents/{agent_id}", summary="删除坐席档案")
+async def delete_agent_controller(
+    agent_id: int,
+    auth: AuthenticatedUser,
+    service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
+):
+    await service.delete_profile(auth, agent_id)
+    return SuccessResponse()
+
+
 @AgentAdminRouter.put("/agents/{agent_id}/scene-scopes", summary="整组替换坐席场景授权")
 async def replace_agent_scene_scopes_controller(
     agent_id: int,

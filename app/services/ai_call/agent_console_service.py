@@ -18,6 +18,7 @@ from app.api.v1.ai_call.model import (
     AiCallAgentProfileModel,
     AiCallAgentSceneScopeModel,
     AiCallFollowUpDataModel,
+    AiCallFollowUpTaskModel,
     AiCallHandoffAgentModel,
     AiCallHandoffModel,
     AiCallPromptProfileModel,
@@ -116,7 +117,7 @@ class AiCallAgentConsoleService:
 
     async def require_profile_access(self, auth: AuthSchema, profile: AiCallAgentProfileModel) -> None:
         user, tenant_id = self._identity(auth)
-        if profile.tenant_id != tenant_id or (
+        if profile.deleted_at is not None or profile.tenant_id != tenant_id or (
             not has_ai_call_tenant_management(auth) and profile.user_id != user.id
         ):
             raise CustomException(msg="坐席档案不存在", status_code=404)
@@ -151,7 +152,7 @@ class AiCallAgentConsoleService:
     ) -> AiCallHandoffAgentModel:
         if not device_preflight_passed:
             self._raise_conflict("设备预检未通过，暂时不能上线", "MEDIA_NOT_READY")
-        profile = await self.require_current_agent(auth)
+        profile = await self.require_current_agent(auth, for_update=True)
         if not await self._scene_codes(profile):
             self._raise_conflict("请先在坐席管理中配置业务场景", "AGENT_SCOPE_MISMATCH")
         session_id = self._console_session_id(console_session_id)
@@ -660,13 +661,15 @@ class AiCallAgentConsoleService:
         return handoff
 
     async def require_current_agent(
-        self, auth: AuthSchema, *, initialize: bool = False,
+        self, auth: AuthSchema, *, initialize: bool = False, for_update: bool = False,
     ) -> AiCallAgentProfileModel:
         user, tenant_id = self._identity(auth)
         query = select(AiCallAgentProfileModel).where(
             AiCallAgentProfileModel.tenant_id == tenant_id,
             AiCallAgentProfileModel.user_id == user.id,
         )
+        if for_update:
+            query = query.with_for_update().execution_options(populate_existing=True)
         profile = await self.db.scalar(query)
         if profile is None and initialize:
             now = datetime.now(timezone.utc)
@@ -701,9 +704,13 @@ class AiCallAgentConsoleService:
                 profile = await self.db.scalar(query)
                 if profile is None:
                     raise
-        if profile is None or not profile.enabled:
+        if profile is None or profile.deleted_at is not None or not profile.enabled:
             raise CustomException(
-                msg="当前坐席已停用" if profile is not None else "当前账号未开通坐席功能",
+                msg=(
+                    "当前坐席已停用"
+                    if profile is not None and profile.deleted_at is None
+                    else "当前账号未开通坐席功能"
+                ),
                 code=10403,
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -731,7 +738,10 @@ class AiCallAgentConsoleService:
 
     async def list_profiles(self, auth: AuthSchema) -> list[AiCallAgentProfileModel]:
         user, tenant_id = self._identity(auth)
-        conditions = [AiCallAgentProfileModel.tenant_id == tenant_id]
+        conditions = [
+            AiCallAgentProfileModel.tenant_id == tenant_id,
+            AiCallAgentProfileModel.deleted_at.is_(None),
+        ]
         if not has_ai_call_tenant_management(auth):
             conditions.append(AiCallAgentProfileModel.user_id == user.id)
         result = await self.db.execute(
@@ -750,6 +760,23 @@ class AiCallAgentConsoleService:
         if payload.enabled:
             raise CustomException(msg="启用坐席前必须先配置至少一个业务场景", status_code=409)
         now = datetime.now(timezone.utc)
+        existing = await self.db.scalar(
+            select(AiCallAgentProfileModel)
+            .where(
+                AiCallAgentProfileModel.tenant_id == tenant_id,
+                AiCallAgentProfileModel.user_id == payload.user_id,
+            )
+            .with_for_update()
+        )
+        if existing is not None:
+            if existing.deleted_at is None:
+                raise CustomException(msg="当前账号已有坐席", status_code=409)
+            # 恢复原坐席标识，保留历史通话和回访的归属。
+            existing.deleted_at = None
+            existing.updated_by = user.id
+            existing.updated_at = now
+            await self.db.flush()
+            return existing
         profile_id = generate_snowflake_id()
         profile = AiCallAgentProfileModel(
             id=profile_id,
@@ -762,15 +789,55 @@ class AiCallAgentConsoleService:
             updated_by=user.id,
             updated_at=now,
         )
-        self.db.add(profile)
-        await self.db.flush()
+        try:
+            async with self.db.begin_nested():
+                self.db.add(profile)
+                await self.db.flush()
+        except IntegrityError as exc:
+            if (
+                getattr(exc.orig, "sqlstate", None) != "23505"
+                and "UNIQUE constraint failed: ai_call_agent_profile." not in str(exc.orig)
+            ):
+                raise
+            raise CustomException(msg="该账号已有坐席或坐席标识已存在", status_code=409) from exc
         return profile
+
+    async def delete_profile(self, auth: AuthSchema, profile_id: int) -> None:
+        user, tenant_id = self._identity(auth)
+        profile = await self._locked_profile(tenant_id, profile_id)
+        await self.require_profile_access(auth, profile)
+        presence = await self._presence(profile, for_update=True)
+        if presence is not None and (
+            presence.status != "offline" or presence.active_handoff_id or presence.active_call_id
+        ):
+            self._raise_conflict("请让坐席离线并结束当前通话后再删除", "AGENT_DELETE_BUSY")
+        pending_follow_up = await self.db.scalar(
+            select(AiCallFollowUpTaskModel.id)
+            .where(
+                AiCallFollowUpTaskModel.tenant_id == tenant_id,
+                AiCallFollowUpTaskModel.owner_agent_identity == profile.agent_identity,
+                AiCallFollowUpTaskModel.status.in_(("pending", "processing")),
+            )
+            .limit(1)
+        )
+        if pending_follow_up is not None:
+            self._raise_conflict("请先处理该坐席名下未完成的回访任务", "AGENT_DELETE_BUSY")
+
+        now = datetime.now(timezone.utc)
+        profile.enabled = False
+        profile.deleted_at = now
+        profile.updated_by = user.id
+        profile.updated_at = now
+        if presence is not None:
+            presence.console_session_id = None
+        await self._clear_scene_scopes(profile)
+        await self.db.flush()
 
     async def update_profile(
         self, auth: AuthSchema, profile_id: int, *, enabled: bool
     ) -> AiCallAgentProfileModel:
         user, tenant_id = self._identity(auth)
-        profile = await self._get_profile(tenant_id, profile_id)
+        profile = await self._locked_profile(tenant_id, profile_id)
         await self.require_profile_access(auth, profile)
         if enabled and not await self._scene_codes(profile):
             raise CustomException(msg="启用坐席前必须先配置至少一个业务场景", status_code=409)
@@ -795,16 +862,11 @@ class AiCallAgentConsoleService:
         self, auth: AuthSchema, profile_id: int, payload: AgentSceneScopesIn
     ) -> list[str]:
         user, tenant_id = self._identity(auth)
-        profile = await self._get_profile(tenant_id, profile_id)
+        profile = await self._locked_profile(tenant_id, profile_id)
         await self.require_profile_access(auth, profile)
         if profile.enabled and not payload.scene_codes:
             raise CustomException(msg="启用坐席必须保留至少一个业务场景", status_code=409)
-        await self.db.execute(
-            delete(AiCallAgentSceneScopeModel).where(
-                AiCallAgentSceneScopeModel.tenant_id == tenant_id,
-                AiCallAgentSceneScopeModel.agent_identity == profile.agent_identity,
-            )
-        )
+        await self._clear_scene_scopes(profile)
         now = datetime.now(timezone.utc)
         self.db.add_all(
             [
@@ -1210,14 +1272,16 @@ class AiCallAgentConsoleService:
     async def _presence(
         self,
         profile: AiCallAgentProfileModel,
+        *,
+        for_update: bool = False,
     ) -> AiCallHandoffAgentModel | None:
-        result = await self.db.execute(
-            select(AiCallHandoffAgentModel).where(
-                AiCallHandoffAgentModel.tenant_id == profile.tenant_id,
-                AiCallHandoffAgentModel.agent_identity == profile.agent_identity,
-            )
+        query = select(AiCallHandoffAgentModel).where(
+            AiCallHandoffAgentModel.tenant_id == profile.tenant_id,
+            AiCallHandoffAgentModel.agent_identity == profile.agent_identity,
         )
-        return result.scalar_one_or_none()
+        if for_update:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        return await self.db.scalar(query)
 
     async def _require_console_presence(
         self,
@@ -1283,17 +1347,30 @@ class AiCallAgentConsoleService:
             data={"errorCode": error_code},
         )
 
-    async def _get_profile(self, tenant_id: str, profile_id: int) -> AiCallAgentProfileModel:
-        result = await self.db.execute(
-            select(AiCallAgentProfileModel).where(
+    async def _locked_profile(
+        self, tenant_id: str, profile_id: int,
+    ) -> AiCallAgentProfileModel:
+        profile = await self.db.scalar(
+            select(AiCallAgentProfileModel)
+            .where(
                 AiCallAgentProfileModel.tenant_id == tenant_id,
                 AiCallAgentProfileModel.id == profile_id,
+                AiCallAgentProfileModel.deleted_at.is_(None),
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        profile = result.scalar_one_or_none()
         if profile is None:
             raise CustomException(msg="坐席档案不存在", status_code=404)
         return profile
+
+    async def _clear_scene_scopes(self, profile: AiCallAgentProfileModel) -> None:
+        await self.db.execute(
+            delete(AiCallAgentSceneScopeModel).where(
+                AiCallAgentSceneScopeModel.tenant_id == profile.tenant_id,
+                AiCallAgentSceneScopeModel.agent_identity == profile.agent_identity,
+            )
+        )
 
     async def _scene_codes(self, profile: AiCallAgentProfileModel) -> list[str]:
         result = await self.db.execute(

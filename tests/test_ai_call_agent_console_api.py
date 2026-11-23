@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.v1.ai_call import AiCallRouter, agent_console_controller, controller
@@ -24,11 +25,21 @@ from app.api.v1.ai_call.agent_console_schema import (
     AgentProfileCreateIn,
     AgentSceneScopesIn,
 )
-from app.api.v1.ai_call.model import AiCallAgentProfileModel, AiCallAgentSceneScopeModel
+from app.api.v1.ai_call.model import (
+    AiCallAgentProfileModel,
+    AiCallAgentSceneScopeModel,
+    AiCallFollowUpTaskModel,
+    AiCallHandoffAgentModel,
+)
 from app.api.v1.system.auth.schema import AuthSchema
 from app.api.v1.system.user.model import UserModel
 from app.core.base_model import MappedBase
-from app.core.dependencies import get_ai_call_console, get_ai_call_manager, get_current_user
+from app.core.dependencies import (
+    get_ai_call_agent_manager,
+    get_ai_call_console,
+    get_ai_call_manager,
+    get_current_user,
+)
 from app.core.exceptions import CustomException, handle_exception
 from app.services.ai_call.agent_console_reconciler import AiCallAgentConsoleReconciler
 from app.services.ai_call.agent_console_service import AiCallAgentConsoleService
@@ -157,9 +168,13 @@ def test_agent_routes_use_expected_permission_dependencies() -> None:
         dependency.call
         for dependency in routes["/ai-call/agent-console/bootstrap"].dependant.dependencies
     }
-    assert get_ai_call_manager in {
+    assert get_ai_call_agent_manager in {
         dependency.call
         for dependency in routes["/ai-call/admin/agents"].dependant.dependencies
+    }
+    assert get_ai_call_manager in {
+        dependency.call
+        for dependency in routes["/ai-call/admin/follow-ups"].dependant.dependencies
     }
 
 
@@ -691,3 +706,61 @@ async def test_admin_crud_replaces_scopes_and_requires_scope_before_enable(db_se
         AgentSceneScopesIn(scene_codes=["intro_document"]),
     )
     assert replaced == ["intro_document"]
+
+
+@pytest.mark.anyio
+async def test_delete_own_idle_seat_and_restore_its_identity(db_session) -> None:
+    service = AiCallAgentConsoleService(db_session)
+    auth = _auth(db_session)
+    payload = AgentProfileCreateIn(user_id=auth.user.id, agent_identity="agent-20")
+    profile = await service.create_profile(auth, payload)
+    await service.replace_scene_scopes(
+        auth, profile.id, AgentSceneScopesIn(scene_codes=["intro_contract"]),
+    )
+    await service.update_profile(auth, profile.id, enabled=True)
+    presence = await service.online(
+        auth, console_session_id=str(uuid4()), device_preflight_passed=True,
+    )
+    path = f"/ai-call/admin/agents/{profile.id}"
+    web = _client(lambda: auth, service)
+    async with AsyncClient(transport=ASGITransport(app=web.app), base_url="http://testserver") as client:
+        auth = _auth(db_session, user_id=21)
+        assert (await client.delete(path)).status_code == 404
+        auth = _auth(db_session, user_id=1, tenant_id="tenant-b")
+        assert (await client.delete(path)).status_code == 404
+
+        auth = _auth(db_session)
+        assert (await client.delete(path)).status_code == 409
+        presence.status = "offline"
+        presence.active_call_id = "call-1"
+        await db_session.flush()
+        assert (await client.delete(path)).status_code == 409
+        presence.active_call_id = None
+
+        now = datetime.now(timezone.utc)
+        follow_up = AiCallFollowUpTaskModel(
+            id=1, tenant_id=profile.tenant_id, source_type="after_call_work",
+            source_key="call-1", source_call_id="call-1", scene_code="intro_contract",
+            contact_ref="call:call-1", masked_contact="未提供",
+            owner_agent_identity=profile.agent_identity, status="processing",
+            follow_up_reason="客户要求回访", created_at=now, updated_at=now,
+        )
+        db_session.add(follow_up)
+        await db_session.flush()
+        assert (await client.delete(path)).status_code == 409
+        follow_up.status = "completed"
+        await db_session.flush()
+        assert (await client.delete(path)).status_code == 200
+        assert (await client.delete(path)).status_code == 404
+        assert (await client.get(path + "/status")).status_code == 404
+
+    assert await service.list_profiles(auth) == []
+    assert profile.deleted_at is not None and not profile.enabled
+    assert isinstance(presence, AiCallHandoffAgentModel) and presence.console_session_id is None
+    assert (await db_session.get(AiCallFollowUpTaskModel, 1)).owner_agent_identity == profile.agent_identity
+    with pytest.raises(CustomException, match="当前账号未开通坐席功能"):
+        await service.bootstrap_payload(auth)
+    restored = await service.create_profile(auth, payload)
+    assert (restored.id, restored.agent_identity) == (profile.id, profile.agent_identity)
+    assert restored.deleted_at is None and not restored.enabled
+    assert (await service.profile_payload(restored))["scene_codes"] == []

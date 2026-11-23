@@ -209,7 +209,7 @@ class AiCallFollowUpService:
         payload: AfterCallWorkIn,
         idempotency_key: str | None = None,
     ) -> tuple[AiCallAfterCallWorkModel, AiCallFollowUpTaskModel | None]:
-        profile = await self.agent_service.require_current_agent(auth)
+        profile = await self.agent_service.require_current_agent(auth, for_update=True)
         handoff = await self._owned_handoff_for_call(
             tenant_id=profile.tenant_id,
             call_id=call_id,
@@ -554,7 +554,7 @@ class AiCallFollowUpService:
         *,
         follow_up_id: int,
     ) -> AiCallFollowUpTaskModel:
-        profile = await self.agent_service.require_current_agent(auth)
+        profile = await self.agent_service.require_current_agent(auth, for_update=True)
         await self._require_account_follow_up(auth, follow_up_id)
         task = await self._required_task(profile.tenant_id, follow_up_id)
         if task.owner_agent_identity is not None:
@@ -890,7 +890,7 @@ class AiCallFollowUpService:
         AiCallFollowUpTaskModel | None,
         AiCallFollowUpHandlingResultModel,
     ]:
-        profile = await self.agent_service.require_current_agent(auth)
+        profile = await self.agent_service.require_current_agent(auth, for_update=True)
         await self._require_account_follow_up_data(auth, follow_up_data_id)
         normalized_key = idempotency_key.strip()
         if not normalized_key:
