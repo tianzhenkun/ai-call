@@ -310,9 +310,6 @@ _UNNAMED_PRODUCT = {"status": "use", "product": ""}
 
 
 class _AcceptProductReview:
-    async def identify_product(self, scene_name, filenames):
-        return ""
-
     async def review(self, payload):
         return {"results": [{"id": item["id"], "supported": True,
                              "conditionEvidence": item["sources"][-1]["excerpt"] if item["conditionCheck"] else None}
@@ -333,8 +330,6 @@ async def test_single_selected_document_uses_product_from_the_document(max_batch
     class Extractor(OpenAICompatibleKnowledgeProductExtractor):
         async def _knowledge_json(self, *, system_content, payload, required):
             calls.append(payload)
-            if required == ("product",):
-                return {"product": "Mine GEO AI智能体"}
             if required == ("results",):
                 return {"results": [{"id": item["id"], "supported": True} for item in payload["items"]]}
             return {
@@ -348,28 +343,17 @@ async def test_single_selected_document_uses_product_from_the_document(max_batch
 
     extractor = Extractor(base_url="https://example.com", api_key="test", model="test")
     result = await KnowledgeProductInfoService(extractor, max_batch_chars=max_batch_chars)._extract_batches(
-        scene_code="demo", scene_name="Sales in 出海获客产品介绍1", chunks=chunks,
+        chunks=chunks,
     )
     assert result["draftText"] == "核心能力\n- " + "\n- ".join(facts)
     assert [source["excerpt"] for source in result["sources"]] == facts
     assert all(source["sourceFilename"] == filename for source in result["sources"])
-    assert all(not call.get("sceneName") for call in calls)
+    assert all("sceneName" not in call for call in calls)
     assert not result["reviewNotes"]
 
 
 @pytest.mark.anyio
-async def test_product_name_not_present_in_scene_is_not_a_product_hint() -> None:
-    class Extractor(OpenAICompatibleKnowledgeProductExtractor):
-        async def _knowledge_json(self, *, system_content, payload, required):
-            return {"product": "Mine GEO"}
-
-    extractor = Extractor(base_url="https://example.com", api_key="test", model="test")
-    assert await extractor.identify_product("客户回访", ["Mine GEO.pdf"]) == ""
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("scene", ["甲产品介绍", "客户回访"])
-async def test_mixed_product_sources_are_scoped_before_merge(scene) -> None:
+async def test_selected_products_keep_separate_sections_and_same_product_sources_merge() -> None:
     chunks = [
         {"versionId": str(i), "chunkId": str(i), "sourceFilename": name + ".pdf", "pageNo": 1, "content": body}
         for i, (name, body) in enumerate([
@@ -378,9 +362,6 @@ async def test_mixed_product_sources_are_scoped_before_merge(scene) -> None:
     ]
 
     class Extractor:
-        async def identify_product(self, scene_name, filenames):
-            return "甲产品" if scene_name == "甲产品介绍" else ""
-
         async def extract(self, payload):
             batch = payload["chunks"]
             if payload["mode"] == "extract":
@@ -388,22 +369,24 @@ async def test_mixed_product_sources_are_scoped_before_merge(scene) -> None:
             else:
                 assert {p["versionId"] for p in batch} == {"0", "2"}
             product = "乙产品" if "乙产品" in batch[0]["content"] else "甲产品"
-            status = "outside" if scene == "甲产品介绍" and product == "乙产品" else "use"
-            return {"scope": {"status": status, "product": product},
+            return {"scope": {"status": "use", "product": product},
                     "sections": {"核心能力": [_product_claim(p) for p in batch]}, "conflicts": []}
 
         async def review(self, payload):
+            product = payload["targetProduct"]
+            assert all(product in part["content"] for part in payload["passages"])
             return {"results": [{"id": item["id"], "supported": True} for item in payload["items"]]}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name=scene, chunks=chunks,
+        chunks=chunks,
     )
-    assert "乙产品" in " ".join(draft["reviewNotes"])
-    if scene == "客户回访":
-        assert draft["draftText"] == "" and draft["sources"] == []
-    else:
-        assert "班表" in draft["draftText"] and "盘点" not in draft["draftText"]
-        assert {s["versionId"] for s in draft["sources"]} == {"0", "2"}
+    assert "甲产品提供班表。" in draft["draftText"]
+    assert "甲产品可按门店展示班表。" in draft["draftText"]
+    assert "乙产品盘点仓库。" in draft["draftText"]
+    assert draft["draftText"].split("\n\n")[:2] == ["涉及产品：甲产品、乙产品", "甲产品"]
+    assert "\n\n乙产品\n\n核心能力\n- 乙产品盘点仓库。" in draft["draftText"]
+    assert {s["versionId"] for s in draft["sources"]} == {"0", "1", "2"}
+    assert not draft["reviewNotes"]
 
 
 @pytest.mark.anyio
@@ -420,10 +403,11 @@ async def test_shared_product_prefix_does_not_merge_distinct_products() -> None:
         for i, (name, fact) in enumerate([("Max Stock", "清点库存。"), ("Max Desk", "整理班表。")])
     ]
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="Max 产品介绍", chunks=chunks,
+        chunks=chunks,
     )
-    assert not draft["draftText"] and not draft["sources"]
-    assert any("Max Stock" in note and "Max Desk" in note for note in draft["reviewNotes"])
+    assert "Max Stock\n\n核心能力\n- 清点库存。" in draft["draftText"]
+    assert "Max Desk\n\n核心能力\n- 整理班表。" in draft["draftText"]
+    assert [s["versionId"] for s in draft["sources"]] == ["0", "1"]
 
 
 @pytest.mark.anyio
@@ -441,29 +425,39 @@ async def test_portfolio_uses_product_chapter_and_omits_recurring_footer_and_rol
     calls = []
 
     class Extractor(_AcceptProductReview):
-        async def identify_product(self, scene_name, filenames):
-            assert scene_name == "Orbit 产品介绍"
-            return "Orbit"
+        async def index_chapters(self, filename, titles):
+            assert filename == "产品合集.pdf"
+            assert [row["ref"] for row in titles] == [0, 1, 2]
+            return {"kind": "portfolio", "product": "", "chapters": [
+                {"product": "Orbit", "first": 1, "last": 1},
+                {"product": "Fern", "first": 2, "last": 2},
+            ]}
 
         async def extract(self, payload):
             batch = payload["chunks"]
             seen_pages = [p["pageNo"] for p in batch]
             calls.append(seen_pages)
             assert all(footer not in p["content"] for p in batch)
-            if not payload["targetProduct"]:
+            target = payload["targetProduct"]
+            if not target:
                 return {"scope": {"status": "unclear", "product": ""}, "sections": {}, "conflicts": []}
+            if target == "Fern":
+                assert seen_pages == [3]
+                return {"scope": {"status": "partial", "product": "Fern"},
+                        "sections": {"核心能力": [_product_claim(batch[0])]}, "conflicts": []}
             ref = next(p["ref"] for p in batch if p["pageNo"] == 2)
             facts = [{"claim": claim, "sources": [{"ref": ref, "excerpt": claim}]} for claim in (text, "建议先从小范围试点。", rule)]
             return {"scope": {"status": "partial", "product": "Orbit"},
                     "sections": {"核心能力": facts[:1], "关键边界": facts[1:]}, "conflicts": []}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="intro", scene_name="Orbit 产品介绍", chunks=chunks,
+        chunks=chunks,
     )
-    assert calls == [[1, 2, 3], [1, 2, 3], [2]]
+    assert calls == [[1, 2, 3], [2], [3]]
     assert text in draft["draftText"] and rule in draft["draftText"]
-    assert "建议" not in draft["draftText"] and "库存" not in draft["draftText"]
-    assert {s["pageNo"] for s in draft["sources"]} == {2}
+    assert "仓库使用条码清点库存。" in draft["draftText"]
+    assert "建议" not in draft["draftText"] and "产品矩阵" not in draft["draftText"]
+    assert {s["pageNo"] for s in draft["sources"]} == {2, 3}
     assert all(footer in row["content"] for row in chunks)
 
 
@@ -480,7 +474,7 @@ async def test_invalid_review_cannot_approve_a_commitment(results) -> None:
 
     with pytest.raises(ValueError, match="承诺复核"):
         await KnowledgeProductInfoService(Extractor())._extract_batches(
-            scene_code="demo", scene_name="产品咨询", chunks=[{"chunkId": "1", "content": "基础版仅限联网使用。"}],
+            chunks=[{"chunkId": "1", "content": "基础版仅限联网使用。"}],
         )
 
 
@@ -500,7 +494,6 @@ async def test_commitments_use_surrounding_source_and_rejected_claim_stays_pendi
             return {"results": [{"id": payload["items"][0]["id"], "supported": False, "reason": "原文写的是暂不支持。"}]}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_name="蓝桥", scene_code="demo",
         chunks=[{"chunkId": "1", "sourceFilename": "蓝桥.pdf", "pageNo": 1, "content": "蓝桥整理班表。基础版暂不支持离线导出。"}],
     )
     assert draft["draftText"] == "核心能力\n- 蓝桥整理班表。"
@@ -546,7 +539,7 @@ async def test_product_draft_summarizes_facts_and_keeps_short_original_quotes() 
             }
 
     result = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="演示预约", chunks=chunks,
+        chunks=chunks,
     )
     assert result["draftText"] == "核心能力\n- 提供普通话产品演示。\n\n关键边界\n- 每场演示 20 分钟，仅限工作日预约。"
     assert [(s["claim"], s["excerpt"], s["sourceFilename"], s["pageNo"]) for s in result["sources"]] == [
@@ -584,7 +577,6 @@ async def test_product_draft_keeps_all_verified_facts_in_each_section() -> None:
             return result
 
     result = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="产品咨询",
         chunks=[{"chunkId": "1", "content": "".join(fact for group in facts.values() for fact in group)}],
     )
     accepted = {section: [fact for fact in group if fact != abilities[0]] for section, group in facts.items()}
@@ -609,7 +601,7 @@ async def test_large_section_uses_the_editors_text_capacity(oversize) -> None:
                     "sections": {"核心能力": [_product_claim(p) for p in payload["chunks"]]}}
 
     chunks = [{"chunkId": str(i), "content": fact} for i, fact in enumerate(facts)]
-    extract = KnowledgeProductInfoService(Extractor())._extract_batches(scene_name="报表", scene_code="", chunks=chunks)
+    extract = KnowledgeProductInfoService(Extractor())._extract_batches(chunks=chunks)
     if oversize:
         with pytest.raises(CustomException, match="20000 字符") as error:
             await extract
@@ -640,7 +632,7 @@ async def test_rollout_advice_cannot_be_promoted_to_a_requirement(section, advic
             return {"scope": _UNNAMED_PRODUCT, "sections": {section: entries}, "conflicts": []}
 
     result = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="客户回访", chunks=[{"chunkId": "1", "content": advice + "\n" + rule}],
+        chunks=[{"chunkId": "1", "content": advice + "\n" + rule}],
     )
     assert result["draftText"] == f"{section}\n- {supported}"
     assert any(overstatement in note for note in result["reviewNotes"])
@@ -661,7 +653,7 @@ async def test_requirement_review_must_point_into_the_claims_own_quote(evidence)
             return {"results": [{"id": "1", "supported": True, "conditionEvidence": evidence}]}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="客户回访", chunks=[{"chunkId": "1", "content": "实名账户可创建项目。导出前必须授权。"}],
+        chunks=[{"chunkId": "1", "content": "实名账户可创建项目。导出前必须授权。"}],
     )
     assert not draft["draftText"]
     assert any("本条引文" in note for note in draft["reviewNotes"])
@@ -681,7 +673,7 @@ async def test_customers_business_need_is_not_a_product_prerequisite() -> None:
             return {"results": [{"id": "1", "supported": True, "conditionEvidence": None}]}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="客户回访", chunks=[{"chunkId": "1", "content": fact}],
+        chunks=[{"chunkId": "1", "content": fact}],
     )
     assert draft["draftText"] == "产品定位\n- " + fact
     assert not draft["reviewNotes"]
@@ -708,7 +700,7 @@ async def test_selected_source_lines_are_exact_and_the_claims_still_get_reviewed
                                 for item in payload["items"]]}
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="", scene_name="", chunks=[{"chunkId": "1", "pageNo": 15, "content": "\n".join(lines)}],
+        chunks=[{"chunkId": "1", "pageNo": 15, "content": "\n".join(lines)}],
     )
     assert draft["draftText"].splitlines() == ["核心能力", "- " + handoff, "- " + feedback]
     assert [(s["pageNo"], s["excerpt"]) for s in draft["sources"] if s["claim"] in (handoff, feedback)] == [
@@ -725,7 +717,7 @@ async def test_product_draft_without_selected_evidence_cannot_apply_free_text() 
 
     with pytest.raises(CustomException, match="有原文依据") as error:
         await KnowledgeProductInfoService(Extractor())._extract_batches(
-            scene_code="demo", scene_name="预约", chunks=[{"chunkId": "13", "content": "演示预约指南"}],
+            chunks=[{"chunkId": "13", "content": "演示预约指南"}],
         )
     assert error.value.status_code == 422
 
@@ -743,7 +735,7 @@ async def test_product_draft_rejects_refs_outside_this_model_input(invalid_at) -
     chunks = [{"chunkId": str(i), "content": content} for i, content in enumerate(["甲\n\n乙", "较长的第三段"])]
     with pytest.raises(ValueError, match="本批原文"):
         await KnowledgeProductInfoService(Extractor(), max_batch_chars=2)._extract_batches(
-            scene_code="demo", scene_name="演示", chunks=chunks,
+            chunks=chunks,
         )
 
 
@@ -759,7 +751,6 @@ async def test_product_draft_holds_missing_or_fabricated_quote_and_keeps_verifie
             }
 
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="演示",
         chunks=[{"chunkId": "1", "content": "每次产品演示收费。"}],
     )
     assert draft["draftText"] == "核心能力\n- 每次产品演示收费。"
@@ -782,7 +773,7 @@ async def test_product_draft_preserves_qualifiers_and_unresolved_conflicts_acros
             return {"scope": _UNNAMED_PRODUCT, "sections": {"核心能力": [_product_claim(p) for p in passages]}, "conflicts": []}
 
     result = await KnowledgeProductInfoService(Extractor(), max_batch_chars=10)._extract_batches(
-        scene_code="demo", scene_name="预约", chunks=chunks,
+        chunks=chunks,
     )
     assert result["draftText"] == "核心能力\n- 仅限会员：\n可到店办理。"
     pending = result["conflicts"][0]["description"]
@@ -807,7 +798,6 @@ async def test_conflicts_stay_out_of_draft_even_when_they_share_the_same_page(in
             }
 
     result = await KnowledgeProductInfoService(Extractor())._extract_batches(
-        scene_code="demo", scene_name="演示",
         chunks=[{"chunkId": "1", "sourceFilename": "演示.pdf", "pageNo": 2,
                  "content": "每场持续 20 分钟。 周末可以预约。 周末不接受预约。"}],
     )
@@ -833,7 +823,7 @@ async def test_word_headings_only_supply_context_across_extraction_batches() -> 
 
     service = KnowledgeProductInfoService(Extractor(), max_batch_chars=13)
     passages = await service._body_passages(rows, {1: version})
-    result = await service._extract_batches(scene_code="demo", scene_name="服务", chunks=passages)
+    result = await service._extract_batches(chunks=passages)
     expected = [
         (str(rows[0].id), "无需预约。", None), (str(rows[2].id), "仅限门店。", "适用条件"),
         (str(rows[4].id), "门店会发送邮件。", "联系方式"),
@@ -843,7 +833,7 @@ async def test_word_headings_only_supply_context_across_extraction_batches() -> 
     assert [(p["chunkId"], p["content"], p["sectionPath"]) for p in calls[-1]["chunks"]] == expected
     only_headings = await service._body_passages([rows[1], rows[3]], {1: version})
     with pytest.raises(CustomException, match="有原文依据"):
-        await service._extract_batches(scene_code="demo", scene_name="服务", chunks=only_headings)
+        await service._extract_batches(chunks=only_headings)
     assert len(calls) == 4
 
 

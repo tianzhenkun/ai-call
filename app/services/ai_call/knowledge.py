@@ -48,7 +48,13 @@ from app.services.ai_call.knowledge_processing import (
     parse_stored_document,
     version_original,
 )
-from app.services.ai_call.knowledge_spoken import ProductClarification, index_next_version, named_products, search_spoken
+from app.services.ai_call.knowledge_spoken import (
+    ProductClarification,
+    _chapter_owners,
+    index_next_version,
+    named_products,
+    search_spoken,
+)
 from app.services.ai_call.prompt_optimization import KnowledgeProductExtractorProtocol
 from app.services.ai_call.session_registry import SPOKEN_VERSION, KnowledgeRuntimeContext
 from app.utils.id_util import generate_snowflake_id
@@ -849,6 +855,21 @@ class _ProductInfoQuote:
     end: int
 
 
+type _ProductClaims = dict[str, tuple[str, list[_ProductInfoQuote]]]
+type _SummaryPartial = tuple[_ProductClaims, list[dict[str, Any]]]
+
+
+@dataclass
+class _ProductDraft:
+    product: str
+    label: str
+    partials: list[_SummaryPartial] = dataclass_field(default_factory=list)
+    conflicts: dict[tuple[_ProductInfoQuote, ...], None] = dataclass_field(default_factory=dict)
+    needs_review: set[str] = dataclass_field(default_factory=set)
+    unverified: dict[str, str] = dataclass_field(default_factory=dict)
+    notes: dict[str, None] = dataclass_field(default_factory=dict)
+
+
 def _quote_context(quote: _ProductInfoQuote, passage: str) -> str:
     text = "".join(passage.split())
     before = re.split(r"[。！？；.!?;]", text[max(0, quote.start - 20):quote.start])[-1]
@@ -877,32 +898,6 @@ def _named_product_matches(target: str, product: str) -> bool:
         return True
     phrase = re.escape(unicodedata.normalize("NFKC", target).strip()).replace(r"\ ", r"\s+")
     return bool(re.search(rf"(?<!\w){phrase}(?!\w)", unicodedata.normalize("NFKC", product), re.I))
-
-
-def _brand_in_title(scene: str, filenames: list[str], chunks: list[dict[str, Any]]) -> str | None:
-    # 场景与原文件名或正文标题共同点名品牌时，优先使用可直接核对的名称。
-    names = re.findall(r"[A-Za-z][A-Za-z0-9.+-]*(?:[ \t]+[A-Za-z0-9][A-Za-z0-9.+-]*)*", scene)
-    if len(names) != 1 or len(names[0]) < 3:
-        return None
-    name = names[0]
-    phrase = re.escape(name).replace(r"\ ", r"\s+")
-    if any(re.match(rf"{phrase}(?![a-z0-9])", f, re.I) for f in filenames):
-        return name
-    title = re.compile(rf"(?<![a-z0-9]){phrase}\s*[:：]", re.I)
-    return name if any(title.search(p["content"][:220]) for p in chunks) else None
-
-
-def _named_product_pages(rows: list[dict[str, Any]], product: str) -> set[int]:
-    # 按每页开头的产品专章标题识别归属，正文中顺带提到品牌不算专章。
-    headings: dict[int, str] = {}
-    for row in rows:
-        page = row.get("pageNo")
-        if page is not None and page not in headings:
-            headings[page] = _product_key(row["content"].lstrip().partition("\n")[0])
-    title = re.compile(rf"^{re.escape(_product_key(product))}(?:[·•:|/—–-]|$)")
-    return {
-        page for page, heading in headings.items() if title.match(heading) and heading.count(":") <= 1
-    }
 
 
 def _summary_body(chunks: list[dict[str, Any]]) -> Iterator[tuple[dict[str, Any], str]]:
@@ -943,19 +938,16 @@ class KnowledgeProductInfoService:
         tenant_id: str,
         user_id: int,
         prompt_profile_id: int | None = None,
-        scene_name: str = "",
         knowledge_item_ids: Collection[int] = (),
     ) -> dict[str, Any]:
         if self.extractor is None:
             raise CustomException(msg="产品信息提取服务未配置", status_code=503)
-        scene_code = ""
         if prompt_profile_id is None:
             versions = await load_selected_ready_knowledge_versions(
                 db, tenant_id=tenant_id, user_id=user_id, item_ids=knowledge_item_ids,
             )
         else:
-            profile = await _knowledge_profile(db, tenant_id, prompt_profile_id)
-            scene_code, scene_name = profile.scene_code, profile.name
+            await _knowledge_profile(db, tenant_id, prompt_profile_id)
             versions = await load_current_ready_knowledge_versions(
                 db, tenant_id=tenant_id, user_id=user_id, prompt_profile_id=prompt_profile_id,
             )
@@ -987,8 +979,6 @@ class KnowledgeProductInfoService:
         started = perf_counter()
         try:
             result = await self._extract_batches(
-                scene_code=scene_code,
-                scene_name=scene_name,
                 chunks=await self._body_passages(chunks, version_by_id),
             )
         except Exception as exc:
@@ -1082,17 +1072,13 @@ class KnowledgeProductInfoService:
     async def _extract_batches(
         self,
         *,
-        scene_code: str,
-        scene_name: str,
         chunks: list[dict[str, Any]],
     ) -> dict[str, Any]:
         documents: dict[str, list[dict[str, Any]]] = {}
         for chunk in chunks:
             documents.setdefault(chunk.get("versionId", ""), []).append(chunk)
-        # 单份资料按自身内容提取，只有产品归属不明时才用场景名称辅助定位。
-        scene_hint = scene_name if len(documents) > 1 else ""
         passages: dict[str, dict[str, Any]] = {}
-        batches: list[list[dict[str, Any]]] = []
+        batches: dict[str, list[list[dict[str, Any]]]] = {}
         intros: dict[str, str] = {}
         for version_id, rows in documents.items():
             batch: list[dict[str, Any]] = []
@@ -1110,78 +1096,78 @@ class KnowledgeProductInfoService:
                     input_chars = len(content) + len(chunk.get("sectionPath") or "")
                     if not batch or batch_chars + input_chars > self.max_batch_chars:
                         batch = []
-                        batches.append(batch)
+                        batches.setdefault(version_id, []).append(batch)
                         batch_chars = 0
                     batch.append(passage)
                     batch_chars += input_chars
 
-        conflicts: dict[tuple[_ProductInfoQuote, ...], None] = {}
         notes: dict[str, None] = {}
-        products: dict[str, str] = {}
-        needs_review: set[str] = set()
-        unverified: dict[str, str] = {}
-        ambiguous_source = False
-        source_names = list(dict.fromkeys(row.get("sourceFilename", "") for row in chunks))
+        products: dict[tuple[str, str], _ProductDraft] = {}
+        assert self.extractor is not None
+        extractor = self.extractor
+        model_slots = asyncio.Semaphore(4)
 
-        async def select(
-            batch: list[dict[str, Any]], mode: str, target: str | None, *, in_product_section: bool = False,
-        ) -> tuple[dict[str, tuple[str, list[_ProductInfoQuote]]], list[dict[str, Any]]]:
-            nonlocal ambiguous_source
-            assert self.extractor is not None
-            intro = intros.get(batch[0].get("versionId", ""), "") if mode == "extract" else ""
-            filenames = "、".join(dict.fromkeys(p.get("sourceFilename", "资料") for p in batch))
-            context = [_product_key(s) for s in (filenames, intro)]
-            context.extend(_product_key(p["content"]) for p in batch)
-            context.extend(_product_key(p["sectionPath"]) for p in batch if p.get("sectionPath"))
-            target_key = _product_key(target or "")
-            if target_key and not any(target_key in text for text in context):
-                document = documents.get(batch[0].get("versionId", ""), [])
-                if mode != "extract" or not any(
-                    target_key in _product_key(row["content"]) or target_key in _product_key(row.get("sectionPath") or "")
-                    for row in document
-                ):
-                    notes[f"《{filenames}》中未找到与场景产品“{target}”对应的内容。"] = None
-                return {}, []
-            result = await self.extractor.extract({
-                "mode": mode, "sceneCode": scene_code, "sceneName": scene_hint, "chunks": batch,
-                "documentIntro": intro, "targetProduct": target or "",
-            })
-            scope = result.get("scope")
-            if not isinstance(scope, dict) or scope.get("status") not in ("use", "partial", "outside", "unclear"):
+        async def request_batch(batch, target="", *, mode="extract"):
+            async with model_slots:
+                return await extractor.extract({
+                    "mode": mode, "chunks": batch, "targetProduct": target,
+                    "documentIntro": intros.get(batch[0].get("versionId", ""), "") if mode == "extract" else "",
+                })
+
+        def read_scope(result):
+            product_scope = result.get("scope")
+            if not isinstance(product_scope, dict) or product_scope.get("status") not in ("use", "partial", "outside", "unclear"):
                 raise ValueError("缺少可识别的产品归属")
-            product = scope.get("product")
+            product = product_scope.get("product")
             if not isinstance(product, str) or len(product) > 160:
                 raise ValueError("产品名称格式错误")
-            product = product.strip()
+            return product_scope["status"], product.strip()
+
+        async def extract_document(version_id, doc_batches):
+            responses = [(batch, "", await request_batch(batch)) for batch in doc_batches]
+            if all(read_scope(result)[0] not in ("partial", "unclear") for _, _, result in responses):
+                return responses
+            # 产品总览使用入库索引相同的专章校验，矩阵里出现产品名不代表该页归属于它。
+            rows = documents[version_id]
+            filename = rows[0].get("sourceFilename", "资料")
+            chapter_rows = [
+                {"ref": ref, "heading": row.get("sectionPath") or "", "body": row["content"]}
+                for ref, row in enumerate(rows)
+            ]
+            titles = [{"ref": r["ref"], "title": r["heading"] + " " + r["body"][:180]} for r in chapter_rows]
+            async with model_slots:
+                plan = await extractor.index_chapters(filename, titles)
+            owners = _chapter_owners(plan, chapter_rows, filename)
+            owners_by_chunk = {str(rows[ref]["chunkId"]): product for ref, product in owners.items() if product}
+            if not owners_by_chunk:
+                return responses
+            scoped = []
+            for batch in doc_batches:
+                sections: dict[str, list[dict[str, Any]]] = {}
+                for passage in batch:
+                    if product := owners_by_chunk.get(str(passage["chunkId"])):
+                        sections.setdefault(product, []).append(passage)
+                for product, section in sections.items():
+                    scoped.append((section, product, await request_batch(section, product)))
+            return scoped
+
+        def product_for(batch, result, target, review_notes) -> str | None:
+            status, product = read_scope(result)
             key = _product_key(product)
-            status = scope["status"]
-            if target is None and scene_name and (
-                status == "unclear"
-                or (scene_hint and (status == "outside" or not key or not _named_product_matches(product, scene_hint)))
+            filenames = "、".join(dict.fromkeys(p.get("sourceFilename", "资料") for p in batch))
+            context = [filenames, intros.get(batch[0].get("versionId", ""), "")]
+            context.extend(p["content"] for p in batch)
+            context.extend(p["sectionPath"] for p in batch if p.get("sectionPath"))
+            if (
+                status in ("outside", "unclear") or (status == "partial" and not target)
+                or (target and not _named_product_matches(target, product))
+                or (not target and key and not any(key in _product_key(value) for value in context))
             ):
-                requested = await self.extractor.identify_product(scene_name, source_names)
-                if requested and (status != "use" or not _named_product_matches(requested, product)):
-                    return await select(batch, mode, requested)
-                target = requested
-            if status == "outside":
-                notes[f"《{filenames}》介绍{product or '其他产品'}，与场景“{scene_name}”不匹配。"] = None
-                return {}, []
-            ungrounded_name = key and not any(key in text for text in context)
-            wrong_product = target and not _named_product_matches(target, product)
-            if status == "unclear" or (not key and len(documents) > 1) or ungrounded_name or wrong_product:
-                ambiguous_source = True
-                notes[f"《{filenames}》的产品归属待确认，请指定产品或调整所选资料。"] = None
-                return {}, []
-            if status == "partial" and mode == "extract" and product and not in_product_section:
-                pages = _named_product_pages(documents[batch[0].get("versionId", "")], product)
-                if pages:
-                    section_rows = [p for p in batch if p.get("pageNo") in pages]
-                    if not section_rows:
-                        return {}, []
-                    if len(section_rows) < len(batch):
-                        return await select(section_rows, mode, target or product, in_product_section=True)
-            if product:
-                products.setdefault(key, product)
+                review_notes[f"《{filenames}》有内容无法确认产品归属，已列为待核对。"] = None
+                return None
+            return target or product
+
+        def select(batch, result, draft: _ProductDraft, *, product_chapter: bool = False) -> _SummaryPartial:
             by_ref = {passage["ref"]: "".join(passage["content"].split()) for passage in batch}
             lines_by_ref = {}
             for passage in batch:
@@ -1232,7 +1218,7 @@ class KnowledgeProductInfoService:
                 entries != [] for name, entries in sections.items() if name not in _PRODUCT_INFO_SECTIONS
             ):
                 raise ValueError("产品信息草稿分组错误")
-            claims: dict[str, tuple[str, list[_ProductInfoQuote]]] = {}
+            claims: _ProductClaims = {}
             for section in _PRODUCT_INFO_SECTIONS:
                 entries = sections.get(section, [])
                 if not isinstance(entries, list):
@@ -1250,10 +1236,13 @@ class KnowledgeProductInfoService:
                     try:
                         verified = checked_quotes(entry.get("sources"))
                     except _UnverifiedProductQuote as exc:
-                        unverified[claim] = str(exc)
+                        draft.unverified[claim] = str(exc)
                         continue
-                    if review or status == "partial" or in_product_section or any("line" in src for src in entry["sources"]):
-                        needs_review.add(claim)
+                    if (
+                        review or product_chapter or result["scope"]["status"] == "partial"
+                        or any("line" in src for src in entry["sources"])
+                    ):
+                        draft.needs_review.add(claim)
                     _, quotes = claims.setdefault(claim, (section, []))
                     quotes.extend(verified)
                     selected_refs.update(q.ref for q in verified)
@@ -1265,91 +1254,119 @@ class KnowledgeProductInfoService:
                 if len(quotes) < 2:
                     raise ValueError("冲突需要至少两条不同的原文")
                 quotes.sort(key=lambda quote: (quote.ref, quote.start, quote.end))
-                conflicts.setdefault(tuple(quotes), None)
+                draft.conflicts.setdefault(tuple(quotes), None)
                 selected_refs.update(q.ref for q in quotes)
             return claims, [passage for passage in batch if passage["ref"] in selected_refs]
 
-        assert self.extractor is not None
-        requested = _brand_in_title(scene_hint, source_names, chunks) if scene_hint else None
-        if requested is None and scene_hint and len(batches) > 1:
-            requested = await self.extractor.identify_product(scene_name, source_names)
-        partials = [part for batch in batches if (part := await select(batch, "extract", requested))[1]]
-        if len(products) > 1:
-            notes[f"资料分别介绍{'、'.join(products.values())}。请在场景名称中指定产品，或只选择同一产品的资料。"] = None
-        if len(products) > 1 or (not requested and len(documents) > 1 and ambiguous_source):
-            return {"draftText": "", "sources": [], "conflicts": [], "reviewNotes": list(notes)}
-        target = requested or next(iter(products.values()), "")
-        product_name = next(iter(products.values()), target)
-        while len(partials) > 1:
-            merged = []
-            for offset in range(0, len(partials), 4):
-                group = partials[offset : offset + 4]
-                part = group[0] if len(group) == 1 else await select(
-                    [passage for _, selected in group for passage in selected], "merge", target
-                )
+        document_responses = await asyncio.gather(*(
+            extract_document(version_id, parts) for version_id, parts in batches.items()
+        ))
+        for responses in document_responses:
+            for batch, target, result in responses:
+                product = product_for(batch, result, target, notes)
+                if product is None:
+                    continue
+                # 有据的同名产品合并。资料未明确产品时，以来源文件为单位保留事实。
+                key = (_product_key(product), "" if product else batch[0].get("versionId", ""))
+                label = product or batch[0].get("sourceFilename", "资料")
+                draft = products.setdefault(key, _ProductDraft(product, label))
+                part = select(batch, result, draft, product_chapter=bool(target))
                 if part[1]:
-                    merged.append(part)
-            partials = merged
+                    draft.partials.append(part)
 
-        # 每批已发现的冲突都保留。同一页上不涉及冲突的事实仍可使用。
-        conflicted: dict[str, list[_ProductInfoQuote]] = {}
-        for group in conflicts:
-            for quote in group:
-                conflicted.setdefault(quote.ref, []).append(quote)
-        by_section: dict[str, list[str]] = {section: [] for section in _PRODUCT_INFO_SECTIONS}
+        async def summarize(draft: _ProductDraft):
+            partials = draft.partials
+            while len(partials) > 1:
+                merged = []
+                for offset in range(0, len(partials), 4):
+                    group = partials[offset : offset + 4]
+                    if len(group) == 1:
+                        merged.append(group[0])
+                        continue
+                    batch = [passage for _, selected in group for passage in selected]
+                    result = await request_batch(batch, draft.product, mode="merge")
+                    if product_for(batch, result, draft.product, draft.notes) is not None:
+                        part = select(batch, result, draft)
+                        if part[1]:
+                            merged.append(part)
+                partials = merged
+
+            # 保留每批已发现的冲突。同页的其他事实仍可使用。
+            conflicted: dict[str, list[_ProductInfoQuote]] = {}
+            for group in draft.conflicts:
+                for quote in group:
+                    conflicted.setdefault(quote.ref, []).append(quote)
+            by_section: dict[str, list[str]] = {section: [] for section in _PRODUCT_INFO_SECTIONS}
+            cited: list[tuple[str, _ProductInfoQuote]] = []
+            claims = partials[0][0] if partials else {}
+            for claim, reason in draft.unverified.items():
+                if claim not in claims:
+                    draft.notes[f"“{claim}”待确认。{reason}"] = None
+            remaining = {}
+            for claim, (section, quotes) in claims.items():
+                if _OPTIONAL_ROLLOUT.search(claim) or any(
+                    quote.start < other.end and other.start < quote.end
+                    for quote in quotes
+                    for other in conflicted.get(quote.ref, ())
+                ):
+                    continue
+                if section == "产品定位" and draft.product and _product_key(draft.product) not in _product_key(claim):
+                    claim = f"{draft.product}：{claim}"
+                    draft.needs_review.add(claim)
+                remaining[claim] = (section, list(dict.fromkeys(quotes)))
+
+            to_review = {
+                claim: (section, quotes) for claim, (section, quotes) in remaining.items()
+                if len(documents) > 1 or section == "关键边界" or claim in draft.needs_review
+                or _condition_check(claim) or _PRODUCT_PROMISE.search(claim)
+                or any(_PRODUCT_PROMISE.search(q.excerpt) or _QUALIFIER.search(_quote_context(q, passages[q.ref]["content"]))
+                       for q in quotes)
+            }
+            rejected = {}
+            if to_review:
+                async with model_slots:
+                    rejected = await self._review_commitments(draft.product, to_review, passages)
+            for claim, (section, quotes) in remaining.items():
+                if claim in rejected:
+                    draft.notes[f"“{claim}”待确认。{rejected[claim]}"] = None
+                    cited.extend((f"待确认：{claim}", quote) for quote in quotes)
+                    continue
+                by_section[section].append(claim)
+                cited.extend((claim, quote) for quote in quotes)
+            summary = "\n\n".join(
+                heading + "\n" + "\n".join("- " + claim for claim in entries)
+                for heading, entries in by_section.items() if entries
+            )
+            return summary, cited
+
+        blocks: list[str] = []
+        named_products_in_summary: list[str] = []
         cited: list[tuple[str, _ProductInfoQuote]] = []
-        claims = partials[0][0] if partials else {}
-        for claim, reason in unverified.items():
-            if claim not in claims:
-                notes[f"“{claim}”待确认。{reason}"] = None
-        remaining = {}
-        for claim, (section, quotes) in claims.items():
-            if _OPTIONAL_ROLLOUT.search(claim):
-                continue
-            if any(
-                quote.start < other.end and other.start < quote.end
-                for quote in quotes
-                for other in conflicted.get(quote.ref, ())
-            ):
-                continue
-            if section == "产品定位" and product_name and _product_key(product_name) not in _product_key(claim):
-                claim = f"{product_name}：{claim}"
-                needs_review.add(claim)
-            remaining[claim] = (section, list(dict.fromkeys(quotes)))
-
-        to_review = {
-            claim: (section, quotes) for claim, (section, quotes) in remaining.items()
-            if len(documents) > 1 or section == "关键边界" or claim in needs_review
-            or _condition_check(claim) or _PRODUCT_PROMISE.search(claim)
-            or any(_PRODUCT_PROMISE.search(q.excerpt) or _QUALIFIER.search(_quote_context(q, passages[q.ref]["content"]))
-                   for q in quotes)
-        }
-        rejected = await self._review_commitments(scene_hint, target, to_review, passages) if to_review else {}
-        for claim, (section, quotes) in remaining.items():
-            if claim in rejected:
-                notes[f"“{claim}”待确认。{rejected[claim]}"] = None
-                cited.extend((f"待确认：{claim}", quote) for quote in quotes)
-                continue
-            by_section[section].append(claim)
-            cited.extend((claim, quote) for quote in quotes)
-        draft_text = "\n\n".join(
-            heading + "\n" + "\n".join("- " + claim for claim in entries)
-            for heading, entries in by_section.items() if entries
-        )
         conflict_details = []
-        for number, group in enumerate(conflicts, start=1):
-            topic = f"资料表述待核对（{number}）"
-            alternatives = []
-            for quote in group:
-                passage = passages[quote.ref]
-                page = f" · 第 {passage['pageNo']} 页" if passage.get("pageNo") else ""
-                alternatives.append(f"- {passage['sourceFilename']}{page}：{quote.excerpt}")
-                cited.append((topic, quote))
-            conflict_details.append({
-                "topic": topic,
-                "description": "\n".join(alternatives),
-                "sourceChunkIds": list(dict.fromkeys(passages[quote.ref]["chunkId"] for quote in group)),
-            })
+        summaries = await asyncio.gather(*(summarize(draft) for draft in products.values()))
+        for draft, (summary, references) in zip(products.values(), summaries, strict=True):
+            notes.update(draft.notes)
+            cited.extend(references)
+            if summary:
+                blocks.append(f"{draft.label}\n\n{summary}" if len(products) > 1 else summary)
+                if draft.product:
+                    named_products_in_summary.append(draft.product)
+            for group in draft.conflicts:
+                topic = f"资料表述待核对（{len(conflict_details) + 1}）"
+                alternatives = []
+                for quote in group:
+                    passage = passages[quote.ref]
+                    page = f" · 第 {passage['pageNo']} 页" if passage.get("pageNo") else ""
+                    alternatives.append(f"- {passage['sourceFilename']}{page}：{quote.excerpt}")
+                    cited.append((topic, quote))
+                conflict_details.append({
+                    "topic": topic,
+                    "description": "\n".join(alternatives),
+                    "sourceChunkIds": list(dict.fromkeys(passages[quote.ref]["chunkId"] for quote in group)),
+                })
+        if len(named_products_in_summary) > 1:
+            blocks.insert(0, "涉及产品：" + "、".join(named_products_in_summary))
+        draft_text = "\n\n".join(blocks)
         if not draft_text and not conflict_details and not notes:
             raise CustomException(msg="关联资料中未提取到有原文依据的产品或服务信息", status_code=422)
         if len(draft_text) > 20_000:
@@ -1365,7 +1382,7 @@ class KnowledgeProductInfoService:
         return {"draftText": draft_text, "sources": sources, "conflicts": conflict_details, "reviewNotes": list(notes)}
 
     async def _review_commitments(
-        self, scene: str, product: str, claims: dict[str, tuple[str, list[_ProductInfoQuote]]],
+        self, product: str, claims: _ProductClaims,
         passages: dict[str, dict[str, Any]],
     ) -> dict[str, str]:
         assert self.extractor is not None
@@ -1378,7 +1395,7 @@ class KnowledgeProductInfoService:
             for q in quotes:
                 context[q.ref] = passages[q.ref]
         result = await self.extractor.review({
-            "sceneName": scene, "targetProduct": product, "items": items, "passages": list(context.values()),
+            "targetProduct": product, "items": items, "passages": list(context.values()),
         })
         expected = {item["id"]: item for item in items}
         rejected = {}

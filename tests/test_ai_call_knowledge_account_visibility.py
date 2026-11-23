@@ -318,10 +318,11 @@ async def test_unsaved_scene_extracts_only_ready_owned_selection_without_creatin
         for item in ("2", "3", "4"):
             assert (await client.post(path, json={"sceneName": "演示", "knowledgeItemIds": ["1", item]})).status_code == 409
         assert scope.extractor.inputs == []
-        result = await client.post(path, json={"sceneName": "", "knowledgeItemIds": ["1"]})
+        result = await client.post(path, json={"sceneName": "自定义外呼场景", "knowledgeItemIds": ["1"]})
         assert result.status_code == 200, result.text
         assert result.json()["data"]["sourceVersionIds"] == ["11"]
         assert "账号 7 的私有资料 1" in result.json()["data"]["draftText"]
+        assert all("sceneName" not in data for data in scope.extractor.inputs)
     assert set(await scope.db.scalars(select(AiCallPromptProfileModel.id))) == {101, 201}
     usage = await scope.db.scalar(select(AiCallKnowledgeUsageModel))
     assert usage.prompt_profile_id is None and usage.status == "OK"

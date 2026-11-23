@@ -513,7 +513,7 @@ async def extract_draft_product_info_controller(
     tenant_id, user_id = _identity(auth)
     result = await service.extract(
         db, tenant_id=tenant_id, user_id=user_id,
-        scene_name=request.scene_name.strip(), knowledge_item_ids=request.knowledge_item_ids,
+        knowledge_item_ids=request.knowledge_item_ids,
     )
     return SuccessResponse(
         data=ProductInfoExtractOut.model_validate(result),
