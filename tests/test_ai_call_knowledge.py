@@ -56,6 +56,7 @@ from app.services.ai_call.knowledge_binary_parser import (
     serve as serve_binary_parser,
 )
 from app.services.ai_call.knowledge_processing import version_chunks
+from app.services.ai_call.prompt_optimization import OpenAICompatibleKnowledgeProductExtractor
 
 
 def _unique_column_sets(model: type) -> set[tuple[str, ...]]:
@@ -319,6 +320,54 @@ class _AcceptProductReview:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("max_batch_chars", [30_000, 1])
+async def test_single_selected_document_uses_product_from_the_document(max_batch_chars) -> None:
+    calls = []
+    filename = "Mine GEO AI智能体产品介绍.pdf"
+    facts = ["Mine GEO 提供品牌可见性诊断。", "Mine GEO 分析品牌曝光情况。"]
+    chunks = [
+        {"versionId": "1", "chunkId": str(i), "sourceFilename": filename, "content": fact}
+        for i, fact in enumerate(facts)
+    ]
+
+    class Extractor(OpenAICompatibleKnowledgeProductExtractor):
+        async def _knowledge_json(self, *, system_content, payload, required):
+            calls.append(payload)
+            if required == ("product",):
+                return {"product": "Mine GEO AI智能体"}
+            if required == ("results",):
+                return {"results": [{"id": item["id"], "supported": True} for item in payload["items"]]}
+            return {
+                "scope": {"status": "use", "product": "Mine GEO"},
+                "sections": {"核心能力": [
+                    {"claim": row["content"].removeprefix("[L1] "), "sources": [{"ref": row["ref"], "line": 1}]}
+                    for row in payload["chunks"]
+                ]},
+                "conflicts": [],
+            }
+
+    extractor = Extractor(base_url="https://example.com", api_key="test", model="test")
+    result = await KnowledgeProductInfoService(extractor, max_batch_chars=max_batch_chars)._extract_batches(
+        scene_code="demo", scene_name="Sales in 出海获客产品介绍1", chunks=chunks,
+    )
+    assert result["draftText"] == "核心能力\n- " + "\n- ".join(facts)
+    assert [source["excerpt"] for source in result["sources"]] == facts
+    assert all(source["sourceFilename"] == filename for source in result["sources"])
+    assert all(not call.get("sceneName") for call in calls)
+    assert not result["reviewNotes"]
+
+
+@pytest.mark.anyio
+async def test_product_name_not_present_in_scene_is_not_a_product_hint() -> None:
+    class Extractor(OpenAICompatibleKnowledgeProductExtractor):
+        async def _knowledge_json(self, *, system_content, payload, required):
+            return {"product": "Mine GEO"}
+
+    extractor = Extractor(base_url="https://example.com", api_key="test", model="test")
+    assert await extractor.identify_product("客户回访", ["Mine GEO.pdf"]) == ""
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("scene", ["甲产品介绍", "客户回访"])
 async def test_mixed_product_sources_are_scoped_before_merge(scene) -> None:
     chunks = [
@@ -392,11 +441,17 @@ async def test_portfolio_uses_product_chapter_and_omits_recurring_footer_and_rol
     calls = []
 
     class Extractor(_AcceptProductReview):
+        async def identify_product(self, scene_name, filenames):
+            assert scene_name == "Orbit 产品介绍"
+            return "Orbit"
+
         async def extract(self, payload):
             batch = payload["chunks"]
             seen_pages = [p["pageNo"] for p in batch]
             calls.append(seen_pages)
             assert all(footer not in p["content"] for p in batch)
+            if not payload["targetProduct"]:
+                return {"scope": {"status": "unclear", "product": ""}, "sections": {}, "conflicts": []}
             ref = next(p["ref"] for p in batch if p["pageNo"] == 2)
             facts = [{"claim": claim, "sources": [{"ref": ref, "excerpt": claim}]} for claim in (text, "建议先从小范围试点。", rule)]
             return {"scope": {"status": "partial", "product": "Orbit"},
@@ -405,7 +460,7 @@ async def test_portfolio_uses_product_chapter_and_omits_recurring_footer_and_rol
     draft = await KnowledgeProductInfoService(Extractor())._extract_batches(
         scene_code="intro", scene_name="Orbit 产品介绍", chunks=chunks,
     )
-    assert calls == [[1, 2, 3], [2]]
+    assert calls == [[1, 2, 3], [1, 2, 3], [2]]
     assert text in draft["draftText"] and rule in draft["draftText"]
     assert "建议" not in draft["draftText"] and "库存" not in draft["draftText"]
     assert {s["pageNo"] for s in draft["sources"]} == {2}

@@ -368,9 +368,10 @@ class OpenAICompatibleKnowledgeProductExtractor(OpenAICompatiblePromptOptimizer)
             payload={"sceneName": scene_name, "filenames": filenames}, required=("product",),
         )
         name = result.get("product")
-        if not isinstance(name, str) or name.strip() not in scene_name:
-            raise ValueError("场景产品名必须出自场景名称")
-        return name.strip()
+        if not isinstance(name, str):
+            raise ValueError("场景产品名必须为文本")
+        name = name.strip()
+        return name if name in scene_name else ""
 
     async def extract(self, payload: dict[str, Any]) -> dict[str, Any]:
         chunks = [
@@ -387,9 +388,9 @@ class OpenAICompatibleKnowledgeProductExtractor(OpenAICompatiblePromptOptimizer)
                 '"sources":[{"ref":"r1","line":1}]}],'
                 '"核心能力":[],"关键边界":[]},"conflicts":[]}。'
                 "targetProduct 非空时是已经确定的唯一目标。先检查文件名、documentIntro、正文及章节归属。"
-                "专属其他产品的资料返回 outside 和空 sections。总览中有目标产品专章时仅从专章取证，"
-                "不使用产品矩阵、组合方案、公司价值或其他专章。场景名明确指定产品时只使用该产品，"
-                "如场景只写客户回访、产品介绍等通用名称则依资料判断。scope.product 填资料有据的简短品牌或服务名，"
+                "有明确目标时，专属其他产品的资料返回 outside 和空 sections，总览中仅从目标产品专章取证。"
+                "不使用产品矩阵、组合方案、公司价值或其他专章。targetProduct 为空时根据所选资料判断，"
+                "场景名称仅为标签。scope.product 填资料有据的简短品牌或服务名，"
                 "保留名称原文，去掉介绍、文档名后缀和通用宣传描述；无专名填空字符串。"
                 "scope.status：use 表示本资料对应单一适用产品；outside 表示明确属于另一产品；"
                 "partial 表示多产品总览中能准确归属指定产品的段落；unclear 表示多产品但目标未明确或无法归属。"

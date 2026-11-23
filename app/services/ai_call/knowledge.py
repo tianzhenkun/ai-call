@@ -1089,6 +1089,8 @@ class KnowledgeProductInfoService:
         documents: dict[str, list[dict[str, Any]]] = {}
         for chunk in chunks:
             documents.setdefault(chunk.get("versionId", ""), []).append(chunk)
+        # 单份资料按自身内容提取，只有产品归属不明时才用场景名称辅助定位。
+        scene_hint = scene_name if len(documents) > 1 else ""
         passages: dict[str, dict[str, Any]] = {}
         batches: list[list[dict[str, Any]]] = []
         intros: dict[str, str] = {}
@@ -1141,7 +1143,7 @@ class KnowledgeProductInfoService:
                     notes[f"《{filenames}》中未找到与场景产品“{target}”对应的内容。"] = None
                 return {}, []
             result = await self.extractor.extract({
-                "mode": mode, "sceneCode": scene_code, "sceneName": scene_name, "chunks": batch,
+                "mode": mode, "sceneCode": scene_code, "sceneName": scene_hint, "chunks": batch,
                 "documentIntro": intro, "targetProduct": target or "",
             })
             scope = result.get("scope")
@@ -1153,8 +1155,10 @@ class KnowledgeProductInfoService:
             product = product.strip()
             key = _product_key(product)
             status = scope["status"]
-            if target is None and (status not in ("use", "partial") or not key or not _named_product_matches(product, scene_name)):
-                # 普通单份同名资料一次即可；名称不一致时单独读场景名，避免被资料带偏。
+            if target is None and scene_name and (
+                status == "unclear"
+                or (scene_hint and (status == "outside" or not key or not _named_product_matches(product, scene_hint)))
+            ):
                 requested = await self.extractor.identify_product(scene_name, source_names)
                 if requested and (status != "use" or not _named_product_matches(requested, product)):
                     return await select(batch, mode, requested)
@@ -1266,9 +1270,8 @@ class KnowledgeProductInfoService:
             return claims, [passage for passage in batch if passage["ref"] in selected_refs]
 
         assert self.extractor is not None
-        requested = _brand_in_title(scene_name, source_names, chunks) if scene_name else ""
-        named_intro = re.fullmatch(r".+?(?:产品|服务)介绍", scene_name.strip())
-        if requested is None and batches and (len(batches) > 1 or named_intro):
+        requested = _brand_in_title(scene_hint, source_names, chunks) if scene_hint else None
+        if requested is None and scene_hint and len(batches) > 1:
             requested = await self.extractor.identify_product(scene_name, source_names)
         partials = [part for batch in batches if (part := await select(batch, "extract", requested))[1]]
         if len(products) > 1:
@@ -1321,7 +1324,7 @@ class KnowledgeProductInfoService:
             or any(_PRODUCT_PROMISE.search(q.excerpt) or _QUALIFIER.search(_quote_context(q, passages[q.ref]["content"]))
                    for q in quotes)
         }
-        rejected = await self._review_commitments(scene_name, target, to_review, passages) if to_review else {}
+        rejected = await self._review_commitments(scene_hint, target, to_review, passages) if to_review else {}
         for claim, (section, quotes) in remaining.items():
             if claim in rejected:
                 notes[f"“{claim}”待确认。{rejected[claim]}"] = None
