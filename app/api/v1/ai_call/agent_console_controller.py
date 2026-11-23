@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from app.api.v1.ai_call.model import AiCallFollowUpDataModel, AiCallFollowUpTask
 from app.api.v1.ai_call.outbound.sip_line_service import SipLineService
 from app.api.v1.system.auth.schema import AuthSchema
 from app.common.response import SuccessResponse, TableResponse
+from app.config.setting import settings
 from app.core.database import async_db_session
 from app.core.dependencies import (
     db_getter,
@@ -1031,10 +1033,42 @@ async def update_agent_controller(
 @AgentAdminRouter.delete("/agents/{agent_id}", summary="删除坐席档案")
 async def delete_agent_controller(
     agent_id: int,
+    request: Request,
     auth: AuthenticatedUser,
     service: Annotated[AiCallAgentConsoleService, Depends(get_agent_console_service)],
 ):
-    await service.delete_profile(auth, agent_id)
+    async def verify_administrator() -> bool:
+        url = settings.AI_CALL_PLATFORM_USER_INFO_URL
+        authorization = request.headers.get("authorization")
+        client_id = request.scope.get("client_id")
+        if not url or not authorization or not client_id:
+            raise CustomException(msg="暂时无法核对管理员身份", status_code=503)
+        try:
+            async with httpx.AsyncClient(timeout=4.0, trust_env=False) as client:
+                response = await client.get(
+                    url, headers={"Authorization": authorization, "clientid": client_id},
+                )
+                response.raise_for_status()
+                result = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise CustomException(msg="暂时无法核对管理员身份", status_code=503) from exc
+        # 菜单权限可能来自旧会话。跨账号删除以平台当前用户的有效角色为准。
+        data = result.get("data") if isinstance(result, dict) and result.get("code") == 200 else None
+        user = data.get("user") if isinstance(data, dict) else None
+        if (
+            not isinstance(user, dict)
+            or str(user.get("userId")) != str(auth.user.id)
+            or user.get("tenantId") != request.scope.get("platform_tenant_id")
+        ):
+            return False
+        roles = user.get("roles")
+        return isinstance(roles, list) and any(
+            isinstance(role, dict) and role.get("status") == "0"
+            and role.get("roleKey") in {"admin", "tenant_admin", "superadmin"}
+            for role in roles
+        )
+
+    await service.delete_profile(auth, agent_id, verify_administrator=verify_administrator)
     return SuccessResponse()
 
 

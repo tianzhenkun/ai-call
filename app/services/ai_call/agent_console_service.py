@@ -805,10 +805,17 @@ class AiCallAgentConsoleService:
             raise CustomException(msg="该账号已有坐席或坐席标识已存在", status_code=409) from exc
         return profile
 
-    async def delete_profile(self, auth: AuthSchema, profile_id: int) -> None:
+    async def delete_profile(
+        self, auth: AuthSchema, profile_id: int, *,
+        verify_administrator: Callable[[], Awaitable[bool]] | None = None,
+    ) -> None:
         user, tenant_id = self._identity(auth)
         profile = await self._locked_profile(tenant_id, profile_id)
         await self.require_profile_access(auth, profile)
+        if profile.user_id != user.id and (
+            verify_administrator is None or not await verify_administrator()
+        ):
+            raise CustomException(msg="坐席档案不存在", status_code=404)
         presence = await self._presence(profile, for_update=True)
         now = datetime.now(timezone.utc)
         online = (

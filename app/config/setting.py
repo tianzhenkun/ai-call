@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     PLATFORM_AUTH_ALLOWED_CLIENT_IDS: str = "e5cd7e4891bf95d1d19206ce24a7b32e"
     AI_CALL_PLATFORM_TENANT_ID: str = ""
     AI_CALL_LEGACY_DATA_TENANT_ID: str = ""
+    AI_CALL_PLATFORM_USER_INFO_URL: str = ""
     ALGORITHM: str = "HS256"  # JWT算法
     JWT_LEEWAY_SECONDS: int = 0
     JWT_AUDIENCE: str = ""

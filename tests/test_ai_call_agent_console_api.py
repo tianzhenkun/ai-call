@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -767,3 +767,35 @@ async def test_delete_own_idle_seat_and_restore_its_identity(db_session) -> None
     assert (restored.id, restored.agent_identity) == (profile.id, profile.agent_identity)
     assert restored.deleted_at is None and not restored.enabled
     assert (await service.profile_payload(restored))["scene_codes"] == []
+
+
+@pytest.mark.anyio
+async def test_delete_other_seat_checks_platform_role_despite_cached_permission(db_session, monkeypatch) -> None:
+    service = AiCallAgentConsoleService(db_session)
+    profile = await service.create_profile(
+        _auth(db_session), AgentProfileCreateIn(user_id=20, agent_identity="agent-20"),
+    )
+    auth = _auth(db_session, user_id=21, permissions=frozenset({"ai_call:agent:tenant_manage"}))
+    request = Request({
+        "type": "http",
+        "client_id": "reach",
+        "platform_tenant_id": "tenant-a",
+        "headers": [(b"authorization", b"Bearer fixture-token")],
+    })
+    monkeypatch.setattr(agent_console_controller.settings, "AI_CALL_PLATFORM_USER_INFO_URL", "http://platform/user/getInfo")
+    roles = [{"roleKey": "reach_user", "status": "0"}]
+    result = Mock()
+    result.json.return_value = {"code": 200, "data": {"user": {
+        "userId": 21, "tenantId": "tenant-a", "roles": roles,
+    }}}
+    platform = AsyncMock()
+    platform.__aenter__.return_value.get.return_value = result
+    monkeypatch.setattr(agent_console_controller.httpx, "AsyncClient", Mock(return_value=platform))
+
+    with pytest.raises(CustomException) as denied:
+        await agent_console_controller.delete_agent_controller(profile.id, request, auth, service)
+    assert denied.value.status_code == 404 and profile.deleted_at is None
+
+    roles[0]["roleKey"] = "admin"
+    await agent_console_controller.delete_agent_controller(profile.id, request, auth, service)
+    assert profile.deleted_at is not None
